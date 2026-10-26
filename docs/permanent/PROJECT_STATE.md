@@ -129,3 +129,20 @@ already where it needs to be.
 - deep-dive of the gc/asan round: download/PORT_README.md.
 - game soak harness: download/dorg3-integration-harness/ (repro/repro2/repro3).
 - session-by-session log: /home/z/my-project/worklog.md.
+
+## round 11 addendum (2026-10-27, pre-freeze)
+
+- **numeric-for implemented** (pending Q's review): fused FOR_PREP/FOR_LOOP,
+  frozen lua-style limit, colon step, `let` required for family consistency.
+  for-in converged on the same back edge. sandbox: loop_counter 2.4x vs the
+  C-for, arithmetic_sum 1.9x.
+- **disassembler exists now** (was v0.0.6): `ok --dump file.ok`. per-op decode,
+  jump targets, constants inline, proto recursion.
+- **local_pressure theory REFUTED**: constants already fold into operands; the
+  real cost was assign's temp+MOVE pairs. fixed same session (simple-left
+  binop rhs -> local's register): 283 -> 230ms sandbox. the two unsafe shapes
+  (`a = (a+1)+a`, `a = f()+a`) keep the old path, pinned by regressions.
+- v0.0.5 feature set now: arrays, defaults, numeric-for, disassembler,
+  assign peephole. remaining before tag: Q's review of the three patches,
+  lua-vs-oklang benchmark re-run on the owner's machine, dorg3 migration of
+  its ~15 C-style fors (optional for the tag, planned for the 27th).
