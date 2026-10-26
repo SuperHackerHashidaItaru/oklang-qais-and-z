@@ -1,7 +1,7 @@
 # spec: default arguments (`fu f(a, b = null)`) + the kwargs verdict
 
 date: 26/10. owner's proposed pre-halloween addition, reviewed against
-v0.0.4 master. verdict up front: **yes, doable and genuinely cheap — do it
+v0.0.4 master. ACCEPTED + IMPLEMENTED (723fa83; patches/default-args.patch). verdict up front: **yes, doable and genuinely cheap — do it
 this window, after arrays, before numeric-for. kwargs: later, and not the
 python kind.** the reason it's cheap is structural: all the hard
 prerequisites already shipped in v0.0.4 as bug fixes.

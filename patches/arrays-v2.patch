@@ -1,0 +1,2488 @@
+diff --git a/src/ok.c b/src/ok.c
+index 233a593..f207b24 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -25,6 +25,118 @@ struct ok {
+   ok_allocators raw_alloc;
+ };
+ 
++// core array natives. these are stopgaps in the natives-as-globals shape (D16):
++// when classes + methods land, push/pop/remove become methods and these globals
++// either retire or stay as free functions (len likely stays, go-style).
++// errors go through ok_native_error -> vm_native_error, the supported path.
++
++static ok_value native_len(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  if (!IS_VALUE_ARRAY(p_argv[0])) {
++    ok_native_error(p_ok, ok_create_string_view("invalid argument: 'len' expects an array.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  // f64 out, never an int tag: D3, numbers are the only public numeric type
++  return NUMBER_AS_VALUE((double)VALUE_AS_ARRAY(p_argv[0])->values.count);
++}
++
++static ok_value native_push(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  if (!IS_VALUE_ARRAY(p_argv[0])) {
++    ok_native_error(p_ok, ok_create_string_view("invalid argument: 'push' expects an array.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  object_array* arr = VALUE_AS_ARRAY(p_argv[0]);
++  // no gc guard needed here: the array is rooted through the caller's argument
++  // window ([0, top) marking), and value_array_append only reallocs the array's
++  // own buffer -- it never triggers a collection. do not "fix" this.
++  if (!value_array_append(&arr->values, p_argv[1])) {
++    ok_native_error(p_ok, ok_create_string_view("out of memory: failed to grow array.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  return NULL_AS_VALUE(); // inert: no chaining cleverness, no accidental length-of
++}
++
++static ok_value native_pop(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  if (!IS_VALUE_ARRAY(p_argv[0])) {
++    ok_native_error(p_ok, ok_create_string_view("invalid argument: 'pop' expects an array.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  object_array* arr = VALUE_AS_ARRAY(p_argv[0]);
++  if (arr->values.count == 0) {
++    return NULL_AS_VALUE(); // pop on empty is null, locked in D4
++  }
++  const value popped = arr->values.data[arr->values.count - 1];
++  value_array_pop(&arr->values); // does not shrink capacity, ever; fine, documented
++  return popped;
++}
++
++// remove(a, m, n): in-place removal of the half-open range [m, n). the language
++// surface is half-open (0-based indices compose with loop bounds, empty range is
++// m == n, adjacent ranges share an endpoint); the underlying OK_ARRAY remove is
++// inclusive-end, so translate here and keep the conventions where they belong.
++static ok_value native_remove(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  if (!IS_VALUE_ARRAY(p_argv[0])) {
++    ok_native_error(p_ok, ok_create_string_view("invalid argument: 'remove' expects an array.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  uint32_t range[2] = {0, 0};
++  for (uint8_t i = 1; i < 3; ++i) {
++    const value v = p_argv[i];
++    if (IS_VALUE_NUMBER(v)) {
++      const double d = VALUE_AS_NUMBER(v);
++      // cast-based integrality (no libm); the range guard runs first
++      if (!(d >= -9.0e15 && d <= 9.0e15) || d != (double)(int64_t)d) {
++        ok_native_error(p_ok, ok_create_string_view("invalid range for 'remove': bounds must be whole numbers.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        return NULL_AS_VALUE();
++      }
++      if (d < 0 || d > (double)UINT32_MAX) {
++        ok_native_error(p_ok, ok_create_string_view("invalid range for 'remove'.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        return NULL_AS_VALUE();
++      }
++      range[i - 1] = (uint32_t)d;
++    } else if (!IS_VALUE_NUMBER(v) && IS_VALUE_INT(v)) {
++      const int64_t iv = VALUE_AS_INT(v);
++      if (iv < 0 || iv > (int64_t)UINT32_MAX) {
++        ok_native_error(p_ok, ok_create_string_view("invalid range for 'remove'.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        return NULL_AS_VALUE();
++      }
++      range[i - 1] = (uint32_t)iv;
++    } else {
++      ok_native_error(p_ok, ok_create_string_view("invalid range for 'remove': bounds must be numbers.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      return NULL_AS_VALUE();
++    }
++  }
++  object_array* arr = VALUE_AS_ARRAY(p_argv[0]);
++  if (range[0] > range[1] || range[1] > arr->values.count) {
++    ok_native_error(p_ok, ok_create_string_view("invalid range for 'remove'.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  if (range[0] < range[1]) { // empty range is a legal no-op
++    value_array_remove(&arr->values, range[0], range[1] - 1); // inclusive-end impl
++  }
++  return NULL_AS_VALUE();
++}
++
++static bool ok_define_core_natives(ok* p_ok) {
++  const ok_string_view names[] = {
++      ok_create_string_view("len", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++      ok_create_string_view("push", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++      ok_create_string_view("pop", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++      ok_create_string_view("remove", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++  };
++  const uint8_t arities[] = {1, 2, 1, 3};
++  const ok_native_fn functions[] = {native_len, native_push, native_pop, native_remove};
++  for (uint8_t i = 0; i < 4; ++i) {
++    if (!ok_global_define_native_function(p_ok, names[i], arities[i], functions[i])) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ ok* ok_create(ok_specs p_specs) {
+   patch_specs(&p_specs);
+   ok* okay = p_specs.allocators.allocate(sizeof(ok));
+@@ -49,6 +161,10 @@ ok* ok_create(ok_specs p_specs) {
+       .alloc = &okay->alloc, .globals_store = &okay->globals_store, .objects_store = &okay->objects_store, .ok = okay};
+   vm_init(&okay->vm, vm_specs);
+   gc_watch_vm(&okay->gc, &okay->vm);
++  if (!ok_define_core_natives(okay)) {
++    ok_free(okay);
++    return NULL;
++  }
+   return okay;
+ }
+ 
+diff --git a/src/okast.c b/src/okast.c
+index 8abe78b..231bb08 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -23,16 +23,16 @@
+   X(AST_POSTFIX_UNARY_EXPRESSION, ast_postfix_unary_expression)                                                        \
+   X(AST_CALL_EXPRESSION, ast_call_expression)                                                                          \
+   X(AST_ASSIGN_EXPRESSION, ast_assign_expression)                                                                      \
+-  /*X(AST_COMPOUND_ASSIGN_EXPRESSION, ast_compound_assign_expression)*/                                                \
++  X(AST_COMPOUND_ASSIGN_EXPRESSION, ast_compound_assign_expression)                                                \
+   /*X(AST_CONDITIONAL_EXPRESSION, ast_conditional_expression)*/                                                        \
+   X(AST_BOOLEAN_EXPRESSION, ast_boolean_expression)                                                                    \
+   X(AST_NULL_EXPRESSION, ast_null_expression)                                                                          \
+   /*X(AST_ACCESS_EXPRESSION, ast_access_expression)*/                                                                  \
+   /*X(AST_THIS_EXPRESSION, ast_this_expression)*/                                                                      \
+   /*X(AST_SUPER_EXPRESSION, ast_super_expression)*/                                                                    \
+-  /*X(AST_NODE, ast_array_expression)*/                                                                                \
++  X(AST_ARRAY_EXPRESSION, ast_array_expression)                                                                                \
+   /*X(AST_MAP_EXPRESSION, ast_map_expression)*/                                                                        \
+-  /*X(AST_SUBSCRIPT_EXPRESSION, ast_subscript_expression)*/                                                            \
++  X(AST_SUBSCRIPT_EXPRESSION, ast_subscript_expression)                                                            \
+   X(AST_FUNCTION_EXPRESSION, ast_function_expression)                                                                  \
+   X(AST_EMPTY_STATEMENT, ast_empty_statement)                                                                          \
+   X(AST_EXPRESSION_STATEMENT, ast_expression_statement)                                                                \
+@@ -41,6 +41,7 @@
+   X(AST_IF_STATEMENT, ast_if_statement)                                                                                \
+   X(AST_WHILE_STATEMENT, ast_while_statement)                                                                          \
+   X(AST_FOR_STATEMENT, ast_for_statement)                                                                              \
++  X(AST_FOR_IN_STATEMENT, ast_for_in_statement)                                                                          \
+   X(AST_CONTROL_FLOW_STATEMENT, ast_control_flow_statement)                                                            \
+   X(AST_RETURN_STATEMENT, ast_return_statement)                                                                        \
+   /*X(AST_THROW_STATEMENT, ast_throw_statement)*/                                                                      \
+@@ -126,11 +127,17 @@ void ast_binding_init(ast_binding* p_binding,
+                       ast_specs* p_specs) {
+   ast_node_init(&p_binding->node, AST_BINDING, p_token, p_specs);
+   p_binding->lvalue = p_lvalue;
++  p_binding->default_value = NULL; // set by the parser when a parameter has "= <expr>"
+   p_binding->modifiers = p_modifiers;
+ }
+ 
+ void ast_binding_deinit(ast_binding* p_binding) {
+   allocators* alloc = p_binding->node.alloc;
++  if (p_binding->default_value != NULL) {
++    ast_dispatch_deinit((ast_node*)p_binding->default_value);
++    alloc->release(alloc, p_binding->default_value);
++    p_binding->default_value = NULL;
++  }
+   ast_dispatch_deinit((ast_node*)p_binding->lvalue);
+   alloc->release(alloc, p_binding->lvalue);
+   p_binding->lvalue = NULL;
+@@ -715,6 +722,113 @@ string ast_call_expression_asprint(const ast_call_expression* p_call) {
+   return ret;
+ }
+ 
++void ast_array_expression_init(ast_array_expression* p_array, token p_token, ast_expressions_list p_elements, ast_specs* p_specs) {
++  ast_expression_init(&p_array->expression, AST_ARRAY_EXPRESSION, p_token, p_specs);
++  p_array->elements = p_elements;
++}
++
++void ast_array_expression_deinit(ast_array_expression* p_array) {
++  ast_expressions_list_deinit(&p_array->elements, p_array->expression.node.alloc);
++  ast_expression_deinit(&p_array->expression);
++}
++
++bool ast_array_expression_print(const ast_array_expression* p_array) {
++  bool status = printf("[") > 0;
++  for (uint32_t i = 0; i < p_array->elements.count; ++i) {
++    status &= ast_dispatch_print((ast_node*)p_array->elements.data[i]);
++  }
++  status &= printf("]") > 0;
++  return status;
++}
++
++string ast_array_expression_asprint(const ast_array_expression* p_array) {
++  allocators* alloc = p_array->expression.node.alloc;
++  string elements_str = ast_expressions_list_asprint(&p_array->elements,
++                                                     ok_create_string_view(", ", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  string ret = asprint(alloc, "[%s]", elements_str.chars);
++  string_deinit(&elements_str, alloc);
++  return ret;
++}
++
++void ast_subscript_expression_init(ast_subscript_expression* p_subscript,
++                                   token p_token,
++                                   ast_expression* p_left,
++                                   ast_expression* p_index,
++                                   ast_specs* p_specs) {
++  ast_expression_init(&p_subscript->expression, AST_SUBSCRIPT_EXPRESSION, p_token, p_specs);
++  p_subscript->left = p_left;
++  p_subscript->index = p_index;
++}
++
++void ast_subscript_expression_deinit(ast_subscript_expression* p_subscript) {
++  allocators* alloc = p_subscript->expression.node.alloc;
++  ast_dispatch_deinit((ast_node*)p_subscript->left);
++  alloc->release(alloc, p_subscript->left);
++  p_subscript->left = NULL;
++  ast_dispatch_deinit((ast_node*)p_subscript->index);
++  alloc->release(alloc, p_subscript->index);
++  p_subscript->index = NULL;
++  ast_expression_deinit(&p_subscript->expression);
++}
++
++bool ast_subscript_expression_print(const ast_subscript_expression* p_subscript) {
++  bool status = ast_dispatch_print((ast_node*)p_subscript->left);
++  status &= printf("[") > 0;
++  status &= ast_dispatch_print((ast_node*)p_subscript->index);
++  status &= printf("]") > 0;
++  return status;
++}
++
++string ast_subscript_expression_asprint(const ast_subscript_expression* p_subscript) {
++  allocators* alloc = p_subscript->expression.node.alloc;
++  string left_str = ast_dispatch_asprint((ast_node*)p_subscript->left);
++  string index_str = ast_dispatch_asprint((ast_node*)p_subscript->index);
++  string ret = asprint(alloc, "%s[%s]", left_str.chars, index_str.chars);
++  string_deinit(&left_str, alloc);
++  string_deinit(&index_str, alloc);
++  return ret;
++}
++
++void ast_compound_assign_expression_init(ast_compound_assign_expression* p_compound,
++                                         token p_token,
++                                         const operator_type p_operator,
++                                         ast_expression* p_left,
++                                         ast_expression* p_right,
++                                         ast_specs* p_specs) {
++  ast_expression_init(&p_compound->expression, AST_COMPOUND_ASSIGN_EXPRESSION, p_token, p_specs);
++  p_compound->_operator = p_operator;
++  p_compound->left = p_left;
++  p_compound->right = p_right;
++}
++
++void ast_compound_assign_expression_deinit(ast_compound_assign_expression* p_compound) {
++  allocators* alloc = p_compound->expression.node.alloc;
++  ast_dispatch_deinit((ast_node*)p_compound->left);
++  alloc->release(alloc, p_compound->left);
++  p_compound->left = NULL;
++  ast_dispatch_deinit((ast_node*)p_compound->right);
++  alloc->release(alloc, p_compound->right);
++  p_compound->right = NULL;
++  ast_expression_deinit(&p_compound->expression);
++}
++
++bool ast_compound_assign_expression_print(const ast_compound_assign_expression* p_compound) {
++  bool status = ast_dispatch_print((ast_node*)p_compound->left);
++  status &= printf(" ?= ") > 0;
++  status &= ast_dispatch_print((ast_node*)p_compound->right);
++  return status;
++}
++
++string ast_compound_assign_expression_asprint(const ast_compound_assign_expression* p_compound) {
++  allocators* alloc = p_compound->expression.node.alloc;
++  string left_str = ast_dispatch_asprint((ast_node*)p_compound->left);
++  string right_str = ast_dispatch_asprint((ast_node*)p_compound->right);
++  string ret = asprint(alloc, "%s ?= %s", left_str.chars, right_str.chars);
++  string_deinit(&left_str, alloc);
++  string_deinit(&right_str, alloc);
++  return ret;
++}
++
+ void ast_eof_statement_init(ast_eof_statement* p_eof, token p_token, ast_specs* p_specs) {
+   ast_statement_init(&p_eof->statement, AST_EOF_STATEMENT, p_token, p_specs);
+ }
+@@ -931,6 +1045,43 @@ void ast_for_statement_init(ast_for_statement* p_for, token p_token, ast_specs*
+   p_for->body = NULL;
+ }
+ 
++void ast_for_in_statement_init(ast_for_in_statement* p_for_in, token p_token, ast_specs* p_specs) {
++  ast_statement_init(&p_for_in->statement, AST_FOR_IN_STATEMENT, p_token, p_specs);
++  p_for_in->binding = NULL;
++  p_for_in->iterable = NULL;
++  p_for_in->body = NULL;
++}
++
++void ast_for_in_statement_deinit(ast_for_in_statement* p_for_in) {
++  allocators* alloc = p_for_in->statement.node.alloc;
++  if (p_for_in->binding != NULL) {
++    ast_binding_deinit(p_for_in->binding);
++    alloc->release(alloc, p_for_in->binding);
++    p_for_in->binding = NULL;
++  }
++  if (p_for_in->iterable != NULL) {
++    ast_dispatch_deinit((ast_node*)p_for_in->iterable);
++    alloc->release(alloc, p_for_in->iterable);
++    p_for_in->iterable = NULL;
++  }
++  if (p_for_in->body != NULL) {
++    ast_dispatch_deinit((ast_node*)p_for_in->body);
++    alloc->release(alloc, p_for_in->body);
++    p_for_in->body = NULL;
++  }
++  ast_statement_deinit(&p_for_in->statement);
++}
++
++bool ast_for_in_statement_print(const ast_for_in_statement* p_for_in) {
++  bool status = ast_dispatch_print((ast_node*)p_for_in->iterable);
++  status &= ast_dispatch_print((ast_node*)p_for_in->body);
++  return status;
++}
++
++string ast_for_in_statement_asprint(const ast_for_in_statement* p_for_in) {
++  return create_static_string("for in", STRING_CALCULATE_LENGTH);
++}
++
+ void ast_for_statement_deinit(ast_for_statement* p_for) {
+   allocators* alloc = p_for->statement.node.alloc;
+   if (p_for->initializer != NULL) {
+diff --git a/src/okast.h b/src/okast.h
+index ff59a83..deed473 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -58,6 +58,7 @@ typedef enum {
+   AST_COMPOUND_STATEMENT,
+   AST_IF_STATEMENT,
+   AST_FOR_STATEMENT,
++  AST_FOR_IN_STATEMENT,
+   AST_WHILE_STATEMENT,
+   AST_CONTROL_FLOW_STATEMENT,
+   AST_RETURN_STATEMENT,
+@@ -129,6 +130,7 @@ string ast_binding_modifiers_asprint(ast_binding_modifiers_t p_modifiers);
+ typedef struct {
+   ast_node node;
+   ast_expression* lvalue;
++  ast_expression* default_value; // parameter default (NULL = required); functions only
+   ast_binding_modifiers modifiers;
+ } ast_binding;
+ 
+@@ -312,6 +314,48 @@ string ast_function_expression_asprint(const ast_function_expression* p_function
+ 
+ ARRAY_DECLARE_DEFAULT(ast_expressions_list, ast_expression*)
+ 
++typedef struct {
++  ast_expression expression;
++  ast_expressions_list elements;
++} ast_array_expression;
++
++void ast_array_expression_init(ast_array_expression* p_array, token p_token, ast_expressions_list p_elements, ast_specs* p_specs);
++void ast_array_expression_deinit(ast_array_expression* p_array);
++bool ast_array_expression_print(const ast_array_expression* p_array);
++string ast_array_expression_asprint(const ast_array_expression* p_array);
++
++typedef struct {
++  ast_expression expression;
++  ast_expression* left;
++  ast_expression* index;
++} ast_subscript_expression;
++
++void ast_subscript_expression_init(ast_subscript_expression* p_subscript,
++                                   token p_token,
++                                   ast_expression* p_left,
++                                   ast_expression* p_index,
++                                   ast_specs* p_specs);
++void ast_subscript_expression_deinit(ast_subscript_expression* p_subscript);
++bool ast_subscript_expression_print(const ast_subscript_expression* p_subscript);
++string ast_subscript_expression_asprint(const ast_subscript_expression* p_subscript);
++
++typedef struct {
++  ast_expression expression;
++  operator_type _operator;
++  ast_expression* left;
++  ast_expression* right;
++} ast_compound_assign_expression;
++
++void ast_compound_assign_expression_init(ast_compound_assign_expression* p_compound,
++                                         token p_token,
++                                         const operator_type p_operator,
++                                         ast_expression* p_left,
++                                         ast_expression* p_right,
++                                         ast_specs* p_specs);
++void ast_compound_assign_expression_deinit(ast_compound_assign_expression* p_compound);
++bool ast_compound_assign_expression_print(const ast_compound_assign_expression* p_compound);
++string ast_compound_assign_expression_asprint(const ast_compound_assign_expression* p_compound);
++
+ typedef struct {
+   ast_expression expression;
+   ast_expression* callable;
+@@ -417,6 +461,18 @@ void ast_for_statement_deinit(ast_for_statement* p_for);
+ bool ast_for_statement_print(const ast_for_statement* p_for);
+ string ast_for_statement_asprint(const ast_for_statement* p_for);
+ 
++typedef struct {
++  ast_statement statement;
++  ast_binding* binding;     // the loop variable (name + mutability)
++  ast_expression* iterable; // evaluated once at loop entry
++  ast_statement* body;
++} ast_for_in_statement;
++
++void ast_for_in_statement_init(ast_for_in_statement* p_for_in, token p_token, ast_specs* p_specs);
++void ast_for_in_statement_deinit(ast_for_in_statement* p_for_in);
++bool ast_for_in_statement_print(const ast_for_in_statement* p_for_in);
++string ast_for_in_statement_asprint(const ast_for_in_statement* p_for_in);
++
+ typedef enum {
+   CONTROL_FLOW_NONE,
+   CONTROL_FLOW_BREAK,
+diff --git a/src/okchunk.h b/src/okchunk.h
+index 7df1cdd..f2ed540 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -180,6 +180,12 @@ typedef enum {
+   OP_LESS_EQUAL,         // w:    (p, a, b, c)    -> r[a] = r[b] <= (p ? k[c] : r[c])
+   OP_LESS_EQUAL_LONG,    // 2w:   (p, A, B, C, q) -> r[A] = (q ? k[B] : r[B]) <= (p ? k[C] : r[C]); ip += w
+   OP_PRINT,              // w:    (p, A)          -> print r[A]
++  OP_ARRAY_NEW,          // w:    (a, b, c)       -> r[a] = new array, elements copied from r[b] .. r[b + c - 1] (c == 0 -> empty)
++  OP_ARRAY_NEW_LONG,     // 2w:   (A, B, C)       -> same; ip += w
++  OP_ARRAY_GET,          // w:    (p, a, b, c)    -> r[a] = r[b][p ? k[c] : r[c]]
++  OP_ARRAY_GET_LONG,     // 2w:   (p, A, B, C)    -> r[A] = r[B][p ? k[C] : r[C]]; ip += w (q unused)
++  OP_ARRAY_SET,          // w:    (p, a, b, c)    -> r[a][p ? k[b] : r[b]] = r[c] (value is a register in narrow)
++  OP_ARRAY_SET_LONG,     // 2w:   (p, q, A, B, C) -> r[A][p ? k[B] : r[B]] = (q ? k[C] : r[C]); ip += w
+ } opcode;
+ 
+ // clang-format on
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 3eda4f3..c493e34 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -379,6 +379,7 @@ static bool compile_compound_statement(compiler* p_compiler, ast_compound_statem
+ static bool compile_if_statement(compiler* p_compiler, ast_if_statement* p_if);
+ static bool compile_while_statement(compiler* p_compiler, ast_while_statement* p_while);
+ static bool compile_for_statement(compiler* p_compiler, ast_for_statement* p_for);
++static bool compile_for_in_statement(compiler* p_compiler, ast_for_in_statement* p_for_in);
+ static bool compile_control_flow_statement(compiler* p_compiler, ast_control_flow_statement* p_control);
+ static bool compile_return_statement(compiler* p_compiler, ast_return_statement* p_return);
+ 
+@@ -437,6 +438,15 @@ static bool compile_function_expression(compiler* p_compiler,
+                                         _register p_dest,
+                                         uint32_t p_requested_count,
+                                         expression_result* p_out);
++static bool compile_array_expression(
++    compiler* p_compiler, ast_array_expression* p_array, _register p_dest, uint32_t p_requested_count, expression_result* p_out);
++static bool compile_subscript_expression(
++    compiler* p_compiler, ast_subscript_expression* p_subscript, _register p_dest, uint32_t p_requested_count, expression_result* p_out);
++static bool compile_compound_assign_expression(compiler* p_compiler,
++                                                ast_compound_assign_expression* p_compound,
++                                                _register p_dest,
++                                                uint32_t p_requested_count,
++                                                expression_result* p_out);
+ 
+ static bool compile_function_impl(compiler* p_compiler,
+                                   ok_string_view p_name,
+@@ -571,6 +581,9 @@ static bool compile_statement(compiler* p_compiler, ast_statement* p_statement)
+   case AST_FOR_STATEMENT:
+     result = compile_for_statement(p_compiler, (ast_for_statement*)p_statement);
+     break;
++  case AST_FOR_IN_STATEMENT:
++    result = compile_for_in_statement(p_compiler, (ast_for_in_statement*)p_statement);
++    break;
+   case AST_CONTROL_FLOW_STATEMENT:
+     result = compile_control_flow_statement(p_compiler, (ast_control_flow_statement*)p_statement);
+     break;
+@@ -647,6 +660,18 @@ static bool compile_expression(compiler* p_compiler,
+     result = compile_function_expression(
+         p_compiler, (ast_function_expression*)p_expression, p_dest, p_requested_count, p_out);
+     break;
++  case AST_ARRAY_EXPRESSION:
++    result =
++        compile_array_expression(p_compiler, (ast_array_expression*)p_expression, p_dest, p_requested_count, p_out);
++    break;
++  case AST_SUBSCRIPT_EXPRESSION:
++    result = compile_subscript_expression(
++        p_compiler, (ast_subscript_expression*)p_expression, p_dest, p_requested_count, p_out);
++    break;
++  case AST_COMPOUND_ASSIGN_EXPRESSION:
++    result = compile_compound_assign_expression(
++        p_compiler, (ast_compound_assign_expression*)p_expression, p_dest, p_requested_count, p_out);
++    break;
+   default: {
+     CRASH_MSG(false, "unimplemented expression.");
+   }
+@@ -1143,6 +1168,7 @@ static location resolve_variable(compiler* p_compiler, const ok_string_view p_id
+ }
+ 
+ static lvalue resolve_lvalue(compiler* p_compiler, ast_expression* p_lvalue_expr) {
++  register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
+   switch (p_lvalue_expr->node.node_type) {
+   case AST_IDENTIFIER_EXPRESSION: {
+     ast_identifier_expression* ident = (ast_identifier_expression*)p_lvalue_expr;
+@@ -1152,6 +1178,48 @@ static lvalue resolve_lvalue(compiler* p_compiler, ast_expression* p_lvalue_expr
+     }
+     return (lvalue){LVALUE_VARIABLE, var};
+   }
++  case AST_SUBSCRIPT_EXPRESSION: {
++    // the 3-temp discipline: base and index are evaluated once, into their own
++    // registers, ABOVE the assignment's own checkpoint. they must survive
++    // compilation of the right-hand side: compile_expression resets temps to ITS
++    // entry checkpoint, which sits above these two, so they do.
++    // the index is snapshotted even when it names a mutable local: a[i] = f()
++    // uses the i from evaluation time, not whatever f left behind (left-to-right).
++    ast_subscript_expression* sub = (ast_subscript_expression*)p_lvalue_expr;
++    ast_node* author = (ast_node*)p_lvalue_expr;
++    _register base;
++    if (!register_allocator_allocate_temp(regalloc, &base)) {
++      report_oom(p_compiler, author);
++      return (lvalue){LVALUE_INVALID};
++    }
++    expression_result base_result;
++    if (!compile_expression(p_compiler, sub->left, base, 1, &base_result)) {
++      return (lvalue){LVALUE_INVALID};
++    }
++    // the base must live in its own register: the operand pair (base, index) is
++    // what GET/SET address, and both must be stable across the rhs compile.
++    if (!materialize_into(p_compiler, &base_result.value, base, author)) {
++      return (lvalue){LVALUE_INVALID};
++    }
++    _register index;
++    if (!register_allocator_allocate_temp(regalloc, &index)) {
++      report_oom(p_compiler, author);
++      return (lvalue){LVALUE_INVALID};
++    }
++    expression_result index_result;
++    if (!compile_expression(p_compiler, sub->index, index, 1, &index_result)) {
++      return (lvalue){LVALUE_INVALID};
++    }
++    if (index_result.value.kind != LOCATION_KIND_CONSTANT &&
++        !materialize_into(p_compiler, &index_result.value, index, author)) {
++      return (lvalue){LVALUE_INVALID};
++    }
++    lvalue lv;
++    lv.kind = LVALUE_SUBSCRIPT;
++    lv.subscript.base = (location){base.index, LOCATION_KIND_REGISTER, LOCATION_OK};
++    lv.subscript.index = index_result.value; // register (== the index temp) or constant
++    return lv;
++  }
+   default:
+     error_at(p_compiler,
+              (ast_node*)p_lvalue_expr,
+@@ -1178,6 +1246,36 @@ static bool store_lvalue(compiler* p_compiler, lvalue p_lvalue, expression_resul
+   switch (p_lvalue.kind) {
+   case LVALUE_VARIABLE:
+     return store_variable(p_compiler, p_lvalue.variable, p_value, p_author);
++  case LVALUE_SUBSCRIPT: {
++    // constants may flow through the long form's q flag; the narrow form has no
++    // value-const room (p is spent on the index), so constant values force long.
++    bool is_value_constant = false;
++    location value = p_value.value;
++    if (!materialize_if_not_common(p_compiler, &is_value_constant, &value, p_author)) {
++      return false;
++    }
++    const bool is_index_constant = p_lvalue.subscript.index.kind == LOCATION_KIND_CONSTANT;
++    const uint16_t base_index = p_lvalue.subscript.base.index;
++    const uint16_t index_operand = p_lvalue.subscript.index.index;
++    if (!is_value_constant && base_index <= a_MAX && index_operand <= b_MAX && value.index <= c_MAX) {
++      if (!emit_word(
++              p_compiler,
++              encode_oppabc(OP_ARRAY_SET, is_index_constant, base_index, index_operand, value.index),
++              p_author)) {
++        report_oom(p_compiler, p_author);
++        return false;
++      }
++      return true;
++    }
++    if (!emit_word2(p_compiler,
++                    encode_OPPABCQ(
++                        OP_ARRAY_SET_LONG, is_index_constant, base_index, index_operand, value.index, is_value_constant),
++                    p_author)) {
++      report_oom(p_compiler, p_author);
++      return false;
++    }
++    return true;
++  }
+   case LVALUE_INVALID:
+     ASSERT_MSG(false, "invalid lvalue.");
+     return false;
+@@ -2129,6 +2227,411 @@ bool compile_call_expression(compiler* p_compiler,
+   return true;
+ }
+ 
++// r[p_dest] = r[p_base][p_index] -- base is always a register (resolve_lvalue
++// materializes it), index may be a constant (GET carries a const-index flag).
++static bool emit_array_get(compiler* p_compiler, _register p_dest, location p_base, location p_index, ast_node* p_author) {
++  const bool is_index_constant = p_index.kind == LOCATION_KIND_CONSTANT;
++  if (p_dest.index > a_MAX || p_base.index > b_MAX || p_index.index > c_MAX) {
++    if (!emit_word2(p_compiler,
++                    encode_OPPABCQ(OP_ARRAY_GET_LONG, is_index_constant, p_dest.index, p_base.index, p_index.index, false),
++                    p_author)) {
++      report_oom(p_compiler, p_author);
++      return false;
++    }
++    return true;
++  }
++  if (!emit_word(
++        p_compiler, encode_oppabc(OP_ARRAY_GET, is_index_constant, p_dest.index, p_base.index, p_index.index), p_author)) {
++    report_oom(p_compiler, p_author);
++    return false;
++  }
++  return true;
++}
++
++static bool compile_array_expression(
++    compiler* p_compiler, ast_array_expression* p_array, _register p_dest, uint32_t p_requested_count, expression_result* p_out) {
++  (void)p_requested_count;
++  ast_node* author = (ast_node*)p_array;
++  // elements compile into consecutive temps at the frontier (compile_expressions_list
++  // allocates them one by one), so they end up exactly at [start .. start + count).
++  // NEW's (dest, src, count) operands are independent: the array lands directly in
++  // p_dest -- a local slot, a temp, or the devnull -- with no move.
++  _register elements_start = {0, REGISTER_FLAG_NONE, REGISTER_OK};
++  if (!compile_expressions_list(p_compiler, &p_array->elements, C_MAX, &elements_start, author)) {
++    return false;
++  }
++  const uint32_t count = p_array->elements.count;
++  const uint16_t src = count > 0 ? (uint16_t)elements_start.index : (uint16_t)p_dest.index; // unused when count == 0
++  if (p_dest.index > a_MAX || src > b_MAX || count > c_MAX) {
++    if (!emit_word2(p_compiler, encode_OPPABCQ(OP_ARRAY_NEW_LONG, false, p_dest.index, src, count, false), author)) {
++      report_oom(p_compiler, author);
++      return false;
++    }
++  } else if (!emit_word(p_compiler, encode_oppabc(OP_ARRAY_NEW, false, p_dest.index, src, (uint8_t)count), author)) {
++    report_oom(p_compiler, author);
++    return false;
++  }
++  p_out->type = EXPRESSION_VALUE;
++  p_out->value = (location){p_dest.index, LOCATION_KIND_REGISTER, LOCATION_OK};
++  p_out->lvalue = (lvalue){LVALUE_INVALID};
++  p_out->count = 1;
++  return true;
++}
++
++static bool compile_subscript_expression(
++    compiler* p_compiler, ast_subscript_expression* p_subscript, _register p_dest, uint32_t p_requested_count, expression_result* p_out) {
++  (void)p_requested_count;
++  // read path goes through the same resolve_lvalue as writes: base and index are
++  // evaluated identically in both, and `a[i]` compiles side effects even when its
++  // value is discarded (matching compile_call_expression's behavior at count 0).
++  lvalue lv = resolve_lvalue(p_compiler, (ast_expression*)p_subscript);
++  if (lv.kind == LVALUE_INVALID) {
++    return false;
++  }
++  if (!emit_array_get(p_compiler, p_dest, lv.subscript.base, lv.subscript.index, (ast_node*)p_subscript)) {
++    return false;
++  }
++  p_out->type = EXPRESSION_VALUE | EXPRESSION_SUBSCRIPT;
++  p_out->value = (location){p_dest.index, LOCATION_KIND_REGISTER, LOCATION_OK};
++  p_out->lvalue = lv;
++  p_out->count = 1;
++  return true;
++}
++
++static bool compile_compound_assign_expression(compiler* p_compiler,
++                                                ast_compound_assign_expression* p_compound,
++                                                _register p_dest,
++                                                uint32_t p_requested_count,
++                                                expression_result* p_out) {
++  CRASH_MSG(p_requested_count <= 1, "unimplemented multi-assign.");
++  register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
++  ast_node* author = (ast_node*)p_compound;
++
++  opcode op;
++  opcode op_long;
++  switch (p_compound->_operator) {
++  case OPERATOR_PLUS_EQUAL:
++    op = OP_ADD;
++    op_long = OP_ADD_LONG;
++    break;
++  case OPERATOR_MINUS_EQUAL:
++    op = OP_SUBTRACT;
++    op_long = OP_SUBTRACT_LONG;
++    break;
++  case OPERATOR_ASTERISK_EQUAL:
++    op = OP_MULTIPLY;
++    op_long = OP_MULTIPLY_LONG;
++    break;
++  case OPERATOR_SLASH_EQUAL:
++    op = OP_DIVIDE;
++    op_long = OP_DIVIDE_LONG;
++    break;
++  default:
++    error_at(p_compiler,
++             author,
++             ok_create_string_view("unsupported compound assignment operator.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return false;
++  }
++
++  // resolve the target once: base/index (subscripts) are evaluated here and never
++  // again, so a[f()] += g() calls f exactly once.
++  lvalue lv = resolve_lvalue(p_compiler, p_compound->left);
++  if (lv.kind == LVALUE_INVALID) {
++    return false;
++  }
++
++  // current value: locals update in place (they ARE registers); everything else
++  // loads into a temp first. the local mutability check happens before any code
++  // is emitted for it.
++  _register cur;
++  location cur_loc;
++  if (lv.kind == LVALUE_VARIABLE && lv.variable.kind == LOCATION_KIND_REGISTER) {
++    const _register local = current_context(p_compiler)->register_allocator.registers.data[lv.variable.index];
++    if ((local.flags & REGISTER_FLAG_MUTABLE) == 0) {
++      error_at_noted(p_compiler,
++                     author,
++                     ok_create_string_view(
++                         "attempting to mutate an immutable local variable.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                     ok_create_string_view("did you forget to declare it 'mut'?", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      return false;
++    }
++    cur = (_register){lv.variable.index, REGISTER_FLAG_NONE, REGISTER_OK};
++    cur_loc = lv.variable;
++  } else {
++    if (!register_allocator_allocate_temp(regalloc, &cur)) {
++      report_oom(p_compiler, author);
++      return false;
++    }
++    if (lv.kind == LVALUE_VARIABLE) {
++      if (!materialize_value(p_compiler, cur, lv.variable, author)) {
++        return false;
++      }
++    } else if (!emit_array_get(p_compiler, cur, lv.subscript.base, lv.subscript.index, author)) {
++      return false;
++    }
++    cur_loc = (location){cur.index, LOCATION_KIND_REGISTER, LOCATION_OK};
++  }
++
++  // right side into its own temp: evaluation order is base, index, current, rhs
++  _register rhs_reg;
++  if (!register_allocator_allocate_temp(regalloc, &rhs_reg)) {
++    report_oom(p_compiler, author);
++    return false;
++  }
++  expression_result rhs;
++  if (!compile_expression(p_compiler, p_compound->right, rhs_reg, 1, &rhs)) {
++    return false;
++  }
++  bool is_rhs_constant = false;
++  if (!materialize_into_if_not_common(p_compiler, &is_rhs_constant, &rhs.value, rhs_reg, author)) {
++    return false;
++  }
++
++  // cur = cur OP rhs (in place for locals: one ADD, per the desugaring table)
++  if (!emit_binop(p_compiler, op, op_long, cur, cur_loc, rhs.value, false, is_rhs_constant, author)) {
++    return false;
++  }
++
++  // store back through the same target
++  if (lv.kind == LVALUE_VARIABLE) {
++    if (lv.variable.kind == LOCATION_KIND_REGISTER) {
++      ; // updated in place
++    } else {
++      expression_result stored = {EXPRESSION_VALUE, cur_loc, (lvalue){LVALUE_INVALID}, 1};
++      if (!store_variable(p_compiler, lv.variable, stored, author)) {
++        return false; // mutability of the global/upvalue is checked here
++      }
++    }
++  } else {
++    // subscript: value is the cur register; store_lvalue handles narrow/long
++    expression_result stored = {EXPRESSION_VALUE, cur_loc, (lvalue){LVALUE_INVALID}, 1};
++    if (!store_lvalue(p_compiler, lv, stored, author)) {
++      return false;
++    }
++  }
++
++  *p_out = (expression_result){EXPRESSION_VALUE, cur_loc, (lvalue){LVALUE_INVALID}, 1};
++  return true;
++}
++
++static bool compile_for_in_statement(compiler* p_compiler, ast_for_in_statement* p_for_in) {
++  allocators* alloc = p_compiler->alloc;
++  compile_context* ctx = current_context(p_compiler);
++  register_allocator* regalloc = &ctx->register_allocator;
++  ast_node* author = (ast_node*)p_for_in;
++  {
++    loop_context lctx;
++    loop_context_init(&lctx, alloc);
++    if (!loop_stack_append(&ctx->loop_stack, lctx)) {
++      report_oom(p_compiler, author);
++      loop_context_deinit(&lctx, alloc);
++      return false;
++    }
++  }
++  if (!begin_scope(p_compiler, author)) {
++    pop_loop_context(ctx, alloc);
++    return false;
++  }
++  chunk* chunk = current_chunk(p_compiler);
++#define CTX ctx->loop_stack.data[ctx->loop_stack.count - 1]
++  CTX.scope_depth = ctx->scopes.count - 1;
++
++  // hidden state must be LOCALS, not temps: every body statement resets temps to
++  // local_top, which sits below any temp allocated here -- the registers would be
++  // handed out to the body's own expressions and clobbered. the leading space makes
++  // the names untypeable, and this loop's dedicated scope makes nesting safe.
++  variable_declaration arr_decl = {
++      .identifier = ok_create_string_view(" arr", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++      .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
++  _register arr = add_local(p_compiler, arr_decl, author);
++  if (!IS_REGISTER_VALID(arr)) {
++    goto fail;
++  }
++  variable_declaration len_decl = {
++      .identifier = ok_create_string_view(" len", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++      .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
++  _register len = add_local(p_compiler, len_decl, author);
++  if (!IS_REGISTER_VALID(len)) {
++    goto fail;
++  }
++  variable_declaration i_decl = {
++      .identifier = ok_create_string_view(" i", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++      .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
++  _register counter = add_local(p_compiler, i_decl, author);
++  if (!IS_REGISTER_VALID(counter)) {
++    goto fail;
++  }
++  variable_declaration var_decl = {
++      .identifier = ast_identifier_expression_get_value((ast_identifier_expression*)p_for_in->binding->lvalue),
++      .flags = variable_declaration_flags_from_modifiers(DECLARATION_NONE, p_for_in->binding->modifiers)};
++  _register var = add_local(p_compiler, var_decl, (ast_node*)p_for_in->binding);
++  if (!IS_REGISTER_VALID(var)) {
++    goto fail;
++  }
++  // the loop variable is defined by the first GET: clear the uninit flag so body
++  // resolution finds it (resolve_local skips uninitialized locals for shadowing).
++  regalloc->registers.data[var.index].flags &= ~REGISTER_FLAG_UNINITIALIZED;
++
++  // arr = <iterable> (evaluated exactly once, at loop entry)
++  {
++    expression_result iterable;
++    if (!compile_expression(p_compiler, p_for_in->iterable, arr, 1, &iterable)) {
++      goto fail;
++    }
++    if (!materialize_into(p_compiler, &iterable.value, arr, author)) {
++      goto fail;
++    }
++  }
++
++  // len = len(arr): the builtin native, by its compile-time global index. len is
++  // effectively reserved while for-in looks like this -- reassigning it breaks
++  // loops. the iteration protocol (post-classes) retires this dependency.
++  {
++    const global len_global =
++        globals_store_get(p_compiler->globals_store, ok_create_string_view("len", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    if (!IS_GLOBAL_VALID(len_global)) {
++      error_at_noted(p_compiler,
++                     author,
++                     ok_create_string_view("undefined variable: len.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                     ok_create_string_view("for-in needs the 'len' builtin; ok_create registers it.",
++                                           OK_STRING_VIEW_CALCULATE_LENGTH,
++                                           true));
++      goto fail;
++    }
++    _register t_len;
++    if (!register_allocator_allocate_temp(regalloc, &t_len)) {
++      report_oom(p_compiler, author);
++      goto fail;
++    }
++    if (t_len.index > aprime_MAX || len_global.index > bprime_MAX) {
++      if (!emit_word2(p_compiler, encode_OPPABCQ(OP_LOAD_GLOBAL_LONG, false, t_len.index, len_global.index, 0, 0), author)) {
++        report_oom(p_compiler, author);
++        goto fail;
++      }
++    } else if (!emit_word(p_compiler, encode_oppabprime(OP_LOAD_GLOBAL, false, t_len.index, len_global.index), author)) {
++      report_oom(p_compiler, author);
++      goto fail;
++    }
++    // stage the call window: callable at t_len, argument at t_len + 1
++    _register t_arg;
++    if (!register_allocator_allocate_temp(regalloc, &t_arg)) {
++      report_oom(p_compiler, author);
++      goto fail;
++    }
++    if (!materialize_value(p_compiler, t_arg, (location){arr.index, LOCATION_KIND_REGISTER, LOCATION_OK}, author)) {
++      goto fail;
++    }
++    if (t_len.index > a_MAX || t_arg.index > a_MAX) {
++      if (!emit_word2(p_compiler, encode_OPPABCQ(OP_CALL_LONG, false, t_len.index, 1, 2, 0), author)) {
++        report_oom(p_compiler, author);
++        goto fail;
++      }
++    } else if (!emit_word(p_compiler, encode_oppabc(OP_CALL, false, t_len.index, 1, 2), author)) {
++      report_oom(p_compiler, author);
++      goto fail;
++    }
++    // t_len now holds the count: move it into the hidden len local
++    if (!materialize_value(p_compiler, len, (location){t_len.index, LOCATION_KIND_REGISTER, LOCATION_OK}, author)) {
++      goto fail;
++    }
++  }
++
++  // i = 0
++  {
++    constant zero = add_constant(p_compiler, NUMBER_AS_VALUE(0), author);
++    if (!IS_CONSTANT_VALID(zero)) {
++      goto fail;
++    }
++    if (counter.index > aprime_MAX || zero.index > bprime_MAX) {
++      if (!emit_word2(p_compiler, encode_OPPABCQ(OP_LOAD_CONSTANT_LONG, false, counter.index, zero.index, 0, 0), author)) {
++        report_oom(p_compiler, author);
++        goto fail;
++      }
++    } else if (!emit_word(p_compiler, encode_oppabprime(OP_LOAD_CONSTANT, false, counter.index, zero.index), author)) {
++      report_oom(p_compiler, author);
++      goto fail;
++    }
++  }
++
++  {
++    const uint32_t loop_start = chunk->code.count;
++    _register cond;
++    if (!register_allocator_allocate_temp(regalloc, &cond)) {
++      report_oom(p_compiler, author);
++      goto fail;
++    }
++    if (!emit_binop(p_compiler,
++                    OP_LESS,
++                    OP_LESS_LONG,
++                    cond,
++                    (location){counter.index, LOCATION_KIND_REGISTER, LOCATION_OK},
++                    (location){len.index, LOCATION_KIND_REGISTER, LOCATION_OK},
++                    false,
++                    false,
++                    author)) {
++      goto fail;
++    }
++    uint32_t exit_jump;
++    if (!emit_incomplete_jump_if(p_compiler, false, cond, &exit_jump, author)) {
++      goto fail;
++    }
++
++    // var = arr[i] (fresh each iteration through the same slot; the body may
++    // capture it -- same shared-slot semantics as the C-style for today)
++    if (!emit_array_get(p_compiler,
++                        var,
++                        (location){arr.index, LOCATION_KIND_REGISTER, LOCATION_OK},
++                        (location){counter.index, LOCATION_KIND_REGISTER, LOCATION_OK},
++                        author)) {
++      goto fail;
++    }
++
++    CTX.continue_forward = true; // continue jumps to the increment, like C-for update
++    if (!compile_statement(p_compiler, p_for_in->body)) {
++      goto fail;
++    }
++
++    CTX.continue_target = chunk->code.count;
++    {
++      constant one = add_constant(p_compiler, NUMBER_AS_VALUE(1), author);
++      if (!IS_CONSTANT_VALID(one)) {
++        goto fail;
++      }
++      if (!emit_binop(p_compiler,
++                      OP_ADD,
++                      OP_ADD_LONG,
++                      counter,
++                      (location){counter.index, LOCATION_KIND_REGISTER, LOCATION_OK},
++                      (location){one.index, LOCATION_KIND_CONSTANT, LOCATION_OK},
++                      false,
++                      true,
++                      author)) {
++        goto fail;
++      }
++    }
++
++    if (!emit_loop(p_compiler, loop_start, author)) {
++      goto fail;
++    }
++    if (!patch_jump_if(p_compiler, false, exit_jump, current_chunk(p_compiler)->code.count, author)) {
++      goto fail;
++    }
++    CTX.break_target = current_chunk(p_compiler)->code.count;
++  }
++
++  if (!patch_loop_context(p_compiler, &CTX, author)) {
++    goto fail;
++  }
++  pop_loop_context(ctx, alloc);
++  ASSERT(end_scope(p_compiler, author));
++  return true;
++fail:
++  pop_loop_context(ctx, alloc);
++  ASSERT(end_scope(p_compiler, author));
++  return false;
++#undef CTX
++}
++
+ static bool compile_postfix_unary_expression(compiler* p_compiler,
+                                              ast_postfix_unary_expression* p_expression,
+                                              _register p_dest,
+diff --git a/src/okcompiler.h b/src/okcompiler.h
+index c9216c3..c11e494 100644
+--- a/src/okcompiler.h
++++ b/src/okcompiler.h
+@@ -87,6 +87,10 @@ typedef struct {
+   lvalue_kind kind;
+   union {
+     location variable;
++    struct {
++      location base;  // always materialized into a register by resolve_lvalue
++      location index; // register or constant (GET/SET carry a const-index flag)
++    } subscript;
+   };
+ } lvalue;
+ 
+diff --git a/src/okdebug.c b/src/okdebug.c
+index 7d60a1c..a799bac 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -127,6 +127,9 @@ static bool op_is_two_words(opcode p_op) {
+   case OP_LESS_LONG:
+   case OP_GREATER_EQUAL_LONG:
+   case OP_LESS_EQUAL_LONG:
++  case OP_ARRAY_NEW_LONG:
++  case OP_ARRAY_GET_LONG:
++  case OP_ARRAY_SET_LONG:
+     return true;
+   default:
+     return false;
+diff --git a/src/okgc.c b/src/okgc.c
+index 81200d0..0ac9123 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -284,6 +284,14 @@ static bool trace_object(gc* p_gc, object* p_object) {
+     }
+     break;
+   }
++  case OBJ_ARRAY: {
++    // the whole point of arrays: elements are values, values can be objects.
++    // mark_value_array already exists for chunk constants (okgc.c).
++    if (!mark_value_array(p_gc, &((object_array*)p_object)->values)) {
++      return false;
++    }
++    break;
++  }
+   }
+   return true;
+ }
+diff --git a/src/okobject.c b/src/okobject.c
+index 08d71cc..e63ecc6 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -211,6 +211,28 @@ create_object_native_function(ok_string_view p_name, uint16_t p_arity, ok_native
+   return native_function;
+ }
+ 
++static void object_array_init(object_array* p_object_array, object_specs* p_specs) {
++  object_init(&p_object_array->object, OBJ_ARRAY);
++  value_array_init(&p_object_array->values, p_specs->alloc);
++}
++
++static void object_array_deinit(object_array* p_object_array, object_specs* p_specs) {
++  // element values are gc owned (value_array's element deinit is a no-op), this only
++  // releases the backing buffer.
++  value_array_deinit(&p_object_array->values, p_specs->alloc);
++  object_deinit(&p_object_array->object);
++}
++
++object_array* create_object_array(object_specs* p_specs) {
++  object_array* object_arr = (object_array*)p_specs->alloc->allocate(p_specs->alloc, sizeof(object_array));
++  if (object_arr == NULL) {
++    return NULL;
++  }
++  object_array_init(object_arr, p_specs);
++  object_store_append(p_specs->store, (object*)object_arr);
++  return object_arr;
++}
++
+ void object_dispatch_deinit(object* p_object, object_specs* p_specs) {
+   switch (object_get_type(p_object)) {
+   case OBJ_STRING:
+@@ -231,6 +253,9 @@ void object_dispatch_deinit(object* p_object, object_specs* p_specs) {
+   case OBJ_NATIVE_FUNCTION:
+     object_native_function_deinit((object_native_function*)p_object, p_specs);
+     break;
++  case OBJ_ARRAY:
++    object_array_deinit((object_array*)p_object, p_specs);
++    break;
+   }
+ }
+ 
+diff --git a/src/okobject.h b/src/okobject.h
+index 1769879..62befdc 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -20,6 +20,7 @@
+ #define IS_VALUE_UPVALUE(value) value_is_object_type(value, OBJ_UPVALUE)
+ #define IS_VALUE_NATIVE_VALUE(value) value_is_object_type(value, OBJ_NATIVE_VALUE)
+ #define IS_VALUE_NATIVE_FUNCTION(value) value_is_object_type(value, OBJ_NATIVE_FUNCTION)
++#define IS_VALUE_ARRAY(value) value_is_object_type(value, OBJ_ARRAY)
+ 
+ #define VALUE_AS_STRING(value) ((object_string*)VALUE_AS_OBJECT(value))
+ #define VALUE_AS_FUNCTION(value) ((object_function*)VALUE_AS_OBJECT(value))
+@@ -27,6 +28,7 @@
+ #define VALUE_AS_UPVALUE(value) ((object_upvalue*)VALUE_AS_OBJECT(value))
+ #define VALUE_AS_NATIVE_VALUE(value) ((object_native_type*)VALUE_AS_OBJECT(value))
+ #define VALUE_AS_NATIVE_FUNCTION(value) ((object_native_function*)VALUE_AS_OBJECT(value))
++#define VALUE_AS_ARRAY(value) ((object_array*)VALUE_AS_OBJECT(value))
+ 
+ typedef struct {
+   allocators* alloc;
+@@ -40,6 +42,7 @@ typedef enum {
+   OBJ_UPVALUE,
+   OBJ_NATIVE_VALUE,
+   OBJ_NATIVE_FUNCTION,
++  OBJ_ARRAY,
+ } object_type;
+ 
+ struct object {
+@@ -124,6 +127,13 @@ typedef struct {
+ object_native_function*
+ create_object_native_function(ok_string_view p_name, uint16_t p_arity, ok_native_fn p_cb, object_specs* p_specs);
+ 
++typedef struct {
++  object object;
++  value_array values; // ARRAY_DECLARE(value_array, value, uint32_t) in okvalue.h
++} object_array;
++
++object_array* create_object_array(object_specs* p_specs);
++
+ void object_dispatch_deinit(object* p_object, object_specs* p_specs);
+ void objects_list_deinit(object* p_head, object_specs* p_specs);
+ 
+diff --git a/src/okparser.c b/src/okparser.c
+index 5f7318e..8083139 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -43,6 +43,17 @@ static ast_expression* parse_unary_prefix(parser* p_parser, token p_trigger);
+ static ast_expression* parse_grouping(parser* p_parser, token p_trigger);
+ // static ast_expression* parse_map(parser* p_parser, token p_trigger);
+ // static ast_expression* parse_array(parser* p_parser, token p_trigger);
++static ast_expression* parse_array_literal(parser* p_parser, token p_trigger);
++static ast_expression* parse_subscript(parser* p_parser,
++                                       ast_expression* p_left,
++                                       precedence p_precedence,
++                                       bool is_right_associative,
++                                       token p_trigger);
++static ast_expression* parse_compound_assign_expression(parser* p_parser,
++                                                        ast_expression* p_left,
++                                                        precedence p_precedence,
++                                                        bool is_right_associative,
++                                                        token p_trigger);
+ static ast_expression* parse_identifier(parser* p_parser, token p_trigger);
+ static ast_expression* parse_string(parser* p_parser, token p_trigger);
+ static ast_expression* parse_number(parser* p_parser, token p_trigger);
+@@ -92,10 +103,10 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_BAR] = {NULL, parse_binary_infix, PREC_OR},
+     //[TOKEN_PLUS_PLUS] = { parse_unary_prefix, parse_unary_postfix, PREC_POSTFIX },
+     //[TOKEN_MINUS_MINUS] = { parse_unary_prefix, parse_unary_postfix, PREC_POSTFIX },
+-    [TOKEN_PLUS_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+-    [TOKEN_MINUS_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+-    [TOKEN_ASTERISK_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+-    [TOKEN_SLASH_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
++    [TOKEN_PLUS_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
++    [TOKEN_MINUS_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
++    [TOKEN_ASTERISK_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
++    [TOKEN_SLASH_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+     [TOKEN_MODULO_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+     [TOKEN_CARET_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+     [TOKEN_AMPERSAND_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+@@ -116,7 +127,7 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_RIGHT_PAREN] = {NULL, NULL, PREC_NONE},
+     [TOKEN_LEFT_BRACE] = {NULL, NULL, PREC_NONE},
+     [TOKEN_RIGHT_BRACE] = {NULL, NULL, PREC_NONE},
+-    [TOKEN_LEFT_BRACKET] = {NULL, NULL, PREC_SUBSCRIPT},
++    [TOKEN_LEFT_BRACKET] = {parse_array_literal, parse_subscript, PREC_SUBSCRIPT},
+     [TOKEN_RIGHT_BRACKET] = {NULL, NULL, PREC_NONE},
+     [TOKEN_ARROW] = {NULL, NULL, PREC_NONE},
+     [TOKEN_IDENTIFIER] = {parse_identifier, NULL, PREC_NONE},
+@@ -588,6 +599,113 @@ ast_expression* parse_call(
+   return (ast_expression*)call;
+ }
+ 
++ast_expression* parse_array_literal(parser* p_parser, token p_trigger) {
++  allocators* alloc = p_parser->alloc;
++  token trigger = p_parser->previous; // '['
++  ast_expressions_list elements = parse_expressions_list(p_parser, TOKEN_COMMA, TOKEN_RIGHT_BRACKET);
++  if (elements.capacity == 1 && elements.count == 0) {
++    error_at(p_parser,
++             p_parser->previous,
++             ok_create_string_view("failed to parse array elements.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL;
++  }
++  advance(p_parser); // ']'
++  ast_array_expression* array = (ast_array_expression*)alloc->allocate(alloc, sizeof(ast_array_expression));
++  if (array == NULL) {
++    error_at(p_parser,
++             trigger,
++             ok_create_string_view("failed to allocate memory for array node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ast_expressions_list_deinit(&elements, alloc);
++    return NULL;
++  }
++  ast_specs s = {alloc};
++  ast_array_expression_init(array, trigger, elements, &s);
++  return (ast_expression*)array;
++}
++
++ast_expression* parse_subscript(parser* p_parser,
++                                ast_expression* p_left,
++                                precedence p_precedence,
++                                bool is_right_associative,
++                                token p_trigger) {
++  (void)p_precedence;
++  (void)is_right_associative;
++  allocators* alloc = p_parser->alloc;
++  token trigger = p_parser->previous; // '['
++  advance(p_parser); // move the first index token into previous for parse_expression
++  ast_expression* index = parse_expression(p_parser, PREC_NONE);
++  if (index == NULL) {
++    ast_dispatch_deinit((ast_node*)p_left);
++    alloc->release(alloc, p_left);
++    return NULL;
++  }
++  if (p_parser->current.type != TOKEN_RIGHT_BRACKET) {
++    error_at(p_parser, p_parser->current, ok_create_string_view("expected ']'.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ast_dispatch_deinit((ast_node*)index);
++    alloc->release(alloc, index);
++    ast_dispatch_deinit((ast_node*)p_left);
++    alloc->release(alloc, p_left);
++    return NULL;
++  }
++  advance(p_parser); // ']'
++  ast_subscript_expression* subscript = (ast_subscript_expression*)alloc->allocate(alloc, sizeof(ast_subscript_expression));
++  if (subscript == NULL) {
++    error_at(p_parser,
++             trigger,
++             ok_create_string_view("failed to allocate memory for subscript node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ast_dispatch_deinit((ast_node*)index);
++    alloc->release(alloc, index);
++    ast_dispatch_deinit((ast_node*)p_left);
++    alloc->release(alloc, p_left);
++    return NULL;
++  }
++  ast_specs s = {alloc};
++  ast_subscript_expression_init(subscript, trigger, p_left, index, &s);
++  return (ast_expression*)subscript;
++}
++
++ast_expression* parse_compound_assign_expression(parser* p_parser,
++                                                  ast_expression* p_left,
++                                                  precedence p_precedence,
++                                                  bool is_right_associative,
++                                                  token p_trigger) {
++  (void)p_precedence;
++  (void)is_right_associative;
++  allocators* alloc = p_parser->alloc;
++  advance(p_parser); // first rhs token into previous
++  if (!is_lvalue(p_left)) {
++    error_at_noted(p_parser,
++                   p_trigger,
++                   ok_create_string_view("invalid compound assignment target.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                   ok_create_string_view("the left side must be a variable, field or subscript.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto fail;
++  }
++  {
++    ast_expression* right = parse_expression(p_parser, PREC_ASSIGNMENT - 1);
++    if (right == NULL) {
++      goto fail;
++    }
++    ast_compound_assign_expression* compound =
++        (ast_compound_assign_expression*)alloc->allocate(alloc, sizeof(ast_compound_assign_expression));
++    if (compound == NULL) {
++      error_at(p_parser,
++               p_trigger,
++               ok_create_string_view("failed to allocate memory for compound assign node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      ast_dispatch_deinit((ast_node*)right);
++      alloc->release(alloc, right);
++      goto fail;
++    }
++    ast_specs s = {alloc};
++    ast_compound_assign_expression_init(
++        compound, p_trigger, operator_type_from_token_type(p_trigger.type, false), p_left, right, &s);
++    return (ast_expression*)compound;
++  }
++fail:
++  ast_dispatch_deinit((ast_node*)p_left);
++  alloc->release(alloc, p_left);
++  return NULL;
++}
++
+ ast_statement* parse_statement(parser* p_parser) {
+   switch (p_parser->previous.type) {
+   case TOKEN_PRINT:
+@@ -1179,6 +1297,160 @@ ast_while_statement* parse_while_statement(parser* p_parser) {
+   return _while;
+ }
+ 
++// called with current == TOKEN_COLON and the loop-variable head already consumed:
++// `for (let (mut)?) IDENT :` -- the rest is `<iterable> ? <statement>`.
++static ast_for_in_statement* parse_for_in_rest(parser* p_parser,
++                                               token p_for_tok,
++                                               token p_name_tok,
++                                               ast_binding_modifiers_t p_binds) {
++  allocators* alloc = p_parser->alloc;
++  advance(p_parser); // ':' consumed, current = first iterable token
++  advance(p_parser); // iterable's first token into previous
++  ast_expression* iterable = parse_expression(p_parser, PREC_NONE);
++  if (iterable == NULL) {
++    error_at(p_parser,
++             p_parser->previous,
++             ok_create_string_view("expected an expression to iterate.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL;
++  }
++  if (p_parser->current.type != TOKEN_QUESTION) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("expected '?' after for-in iterable.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ast_dispatch_deinit((ast_node*)iterable);
++    alloc->release(alloc, iterable);
++    return NULL;
++  }
++  advance(p_parser); // '?'
++  advance(p_parser); // '{' (or first body token)
++  ast_statement* body = parse_statement(p_parser);
++  if (body == NULL) {
++    error_at(p_parser,
++             p_parser->previous,
++             ok_create_string_view("expected a statement as for-in body.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ast_dispatch_deinit((ast_node*)iterable);
++    alloc->release(alloc, iterable);
++    return NULL;
++  }
++  ast_identifier_expression* ident = (ast_identifier_expression*)alloc->allocate(alloc, sizeof(ast_identifier_expression));
++  if (ident == NULL) {
++    error_at(p_parser,
++             p_for_tok,
++             ok_create_string_view("failed to allocate memory for for-in binding.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto fail_body;
++  }
++  ast_binding* binding = (ast_binding*)alloc->allocate(alloc, sizeof(ast_binding));
++  if (binding == NULL) {
++    error_at(p_parser,
++             p_for_tok,
++             ok_create_string_view("failed to allocate memory for for-in binding.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ast_identifier_expression_deinit(ident);
++    alloc->release(alloc, ident);
++    goto fail_body;
++  }
++  ast_for_in_statement* fin = (ast_for_in_statement*)alloc->allocate(alloc, sizeof(ast_for_in_statement));
++  if (fin == NULL) {
++    error_at(p_parser,
++             p_for_tok,
++             ok_create_string_view("failed to allocate memory for for-in node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ast_binding_deinit(binding); // frees ident
++    alloc->release(alloc, binding);
++    goto fail_body;
++  }
++  ast_specs s = {alloc};
++  ast_identifier_expression_init(ident, p_name_tok, &s);
++  ast_binding_init(binding, (ast_expression*)ident, p_binds, p_name_tok, &s);
++  ast_for_in_statement_init(fin, p_for_tok, &s);
++  fin->binding = binding;
++  fin->iterable = iterable;
++  fin->body = body;
++  return fin;
++fail_body:
++  ast_dispatch_deinit((ast_node*)body);
++  alloc->release(alloc, body);
++  ast_dispatch_deinit((ast_node*)iterable);
++  alloc->release(alloc, iterable);
++  return NULL;
++}
++
++// rebuilds `let (mut)? IDENT (= expr)? ;` from tokens the for-in discrimination already
++// consumed, mirroring parse_let_declaration's extraction. leaves the parser exactly
++// where the original C-style for flow expects it: previous = the init's ';'.
++static ast_let_declaration* build_let_init(parser* p_parser,
++                                           token p_let_tok,
++                                           token p_name_tok,
++                                           ast_binding_modifiers_t p_binds) {
++  allocators* alloc = p_parser->alloc;
++  ast_expression* expr = parse_expression(p_parser, PREC_NONE);
++  ast_binding* binding = (ast_binding*)alloc->allocate(alloc, sizeof(ast_binding));
++  ast_let_declaration* let = (ast_let_declaration*)alloc->allocate(alloc, sizeof(ast_let_declaration));
++  if (binding == NULL || let == NULL) {
++    error_at(p_parser,
++             p_let_tok,
++             ok_create_string_view("failed to allocate memory for let node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    if (expr != NULL) {
++      ast_dispatch_deinit((ast_node*)expr);
++      alloc->release(alloc, expr);
++    }
++    if (binding != NULL) {
++      alloc->release(alloc, binding);
++    }
++    if (let != NULL) {
++      alloc->release(alloc, let);
++    }
++    return NULL;
++  }
++  ast_specs s = {alloc};
++  ast_null_expression* null = NULL; // set for the bare `let x;` form, initialized by the ';'
++  if (expr != NULL && expr->node.node_type == AST_ASSIGN_EXPRESSION) {
++    ast_assign_expression* assign = (ast_assign_expression*)expr;
++    if (assign->left->node.node_type == AST_IDENTIFIER_EXPRESSION) {
++      ast_binding_init(binding, assign->left, p_binds, p_name_tok, &s);
++      ast_let_declaration_init(let, binding, assign->right, DECLARATION_NONE, p_let_tok, &s);
++      assign->left = NULL;
++      assign->right = NULL;
++      alloc->release(alloc, expr);
++    } else {
++      ast_dispatch_deinit((ast_node*)expr);
++      goto malformed;
++    }
++  } else if (expr != NULL && expr->node.node_type == AST_IDENTIFIER_EXPRESSION) {
++    // `let x;` style null initializer: the node is authored by the ';' (see below)
++    null = (ast_null_expression*)alloc->allocate(alloc, sizeof(ast_null_expression));
++    if (null == NULL) {
++      ast_dispatch_deinit((ast_node*)expr);
++      goto malformed;
++    }
++    ast_binding_init(binding, expr, p_binds, p_name_tok, &s);
++    ast_let_declaration_init(let, binding, (ast_expression*)null, DECLARATION_NONE, p_let_tok, &s);
++  } else {
++    if (expr != NULL) {
++      ast_dispatch_deinit((ast_node*)expr);
++    }
++    goto malformed;
++  }
++  advance(p_parser);
++  if (p_parser->previous.type != TOKEN_SEMICOLON) {
++    error_at(p_parser,
++             p_parser->previous,
++             ok_create_string_view("expected ';' after for initializer.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ast_let_declaration_deinit(let);
++    alloc->release(alloc, let);
++    return NULL;
++  }
++  if (null != NULL) {
++    ast_null_expression_init(null, p_parser->previous, &s); // the ';' authored the null
++  }
++  return let;
++malformed:
++  error_at(p_parser,
++           p_let_tok,
++           ok_create_string_view("expected an identifier in let declaration.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  alloc->release(alloc, binding);
++  alloc->release(alloc, let);
++  return NULL;
++}
++
+ ast_for_statement* parse_for_statement(parser* p_parser) {
+   allocators* alloc = p_parser->alloc;
+   token for_tok = p_parser->previous;
+@@ -1187,7 +1459,32 @@ ast_for_statement* parse_for_statement(parser* p_parser) {
+   ast_expression* cond = NULL;
+   ast_expression* up = NULL;
+ 
+-  if (p_parser->previous.type != TOKEN_SEMICOLON) {
++  if (p_parser->previous.type == TOKEN_LET) {
++    // `for let ...` is either the for-in form (`for let v : arr? {`) or a C-style
++    // let initializer (`for let mut i = 0; ...`). one-token lookahead: consume the
++    // binding head, then discriminate on ':'.
++    const ast_binding_modifiers_t binds = parse_binding_modifiers(p_parser, BINDING_MUT);
++    if (binds == BINDING_ERROR) {
++      return NULL;
++    }
++    if (p_parser->current.type != TOKEN_IDENTIFIER) {
++      error_at(p_parser,
++               p_parser->current,
++               ok_create_string_view("expected an identifier in for declaration.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      return NULL;
++    }
++    const token name_tok = p_parser->current;
++    advance(p_parser); // previous = name, current = ':' | '=' | ';' | ...
++    if (p_parser->current.type == TOKEN_COLON) {
++      // the cast is safe: both statements share the ast_statement prefix; the caller
++      // dispatches on node_type.
++      return (ast_for_statement*)parse_for_in_rest(p_parser, for_tok, name_tok, binds);
++    }
++    init = (ast_statement*)build_let_init(p_parser, for_tok, name_tok, binds);
++    if (init == NULL) {
++      return NULL;
++    }
++  } else if (p_parser->previous.type != TOKEN_SEMICOLON) {
+     init = try_parse_declaration(p_parser);
+     if (init == NULL) {
+       error_at(p_parser,
+@@ -1338,6 +1635,7 @@ parse_bindings_list(parser* p_parser, ast_binding_modifiers_t p_allowed_binds, t
+   allocators* alloc = p_parser->alloc;
+   ast_bindings_list list;
+   ast_bindings_list_init(&list, alloc);
++  bool seen_default = false; // defaults must be trailing: there are no keyword arguments
+   while (p_parser->current.type != p_end && p_parser->current.type != TOKEN_EOF) {
+     ast_binding_modifiers_t binds = parse_binding_modifiers(p_parser, p_allowed_binds);
+     token tok = p_parser->previous;
+@@ -1355,23 +1653,63 @@ parse_bindings_list(parser* p_parser, ast_binding_modifiers_t p_allowed_binds, t
+       goto free_bind_list;
+     }
+     advance(p_parser);
+-    ast_expression* ident = parse_expression(p_parser, PREC_NONE);
++    // the name is parsed with the assign infix disabled (PREC_ASSIGNMENT blocks
++    // TOKEN_ASSIGN's rule): a bare identifier is the only valid binding lvalue here.
++    // parsing at PREC_NONE used to swallow `b = null` into an assign node that the
++    // compiler later cast to an identifier -- silent garbage, never covered by a test.
++    ast_expression* ident = parse_expression(p_parser, PREC_ASSIGNMENT);
+     if (ident == NULL) {
+       error_at(p_parser,
+                p_parser->previous,
+                ok_create_string_view("failed to parse parameter.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+       goto free_bind_list;
+     }
++    if (ident->node.node_type != AST_IDENTIFIER_EXPRESSION) {
++      error_at(p_parser,
++               p_parser->previous,
++               ok_create_string_view("expected an identifier as parameter name.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      ast_dispatch_deinit((ast_node*)ident);
++      alloc->release(alloc, ident);
++      goto free_bind_list;
++    }
++    ast_expression* default_value = NULL;
++    if (p_parser->current.type == TOKEN_ASSIGN) {
++      advance(p_parser); // '=', first default token into previous
++      default_value = parse_expression(p_parser, PREC_NONE);
++      if (default_value == NULL) {
++        error_at(p_parser,
++                 p_parser->previous,
++                 ok_create_string_view("failed to parse parameter default.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        ast_dispatch_deinit((ast_node*)ident);
++        alloc->release(alloc, ident);
++        goto free_bind_list;
++      }
++    }
++    if (default_value == NULL && seen_default) {
++      error_at_noted(p_parser,
++                     p_parser->previous,
++                     ok_create_string_view("required parameter after a defaulted one.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                     ok_create_string_view("defaults must be trailing; there are no keyword arguments.",
++                                           OK_STRING_VIEW_CALCULATE_LENGTH,
++                                           true));
++      ast_dispatch_deinit((ast_node*)ident);
++      alloc->release(alloc, ident);
++      goto free_bind_list;
++    }
++    if (default_value != NULL) {
++      seen_default = true;
++    }
+     ast_binding* binding = (ast_binding*)alloc->allocate(alloc, sizeof(ast_binding));
+     if (binding == NULL) {
+       error_at(p_parser,
+                p_parser->previous,
+                ok_create_string_view(
+                    "failed to allocate memory for parameter binding node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+-      goto free_bind_list;
++      goto free_ident;
+     }
+     ast_specs s = {alloc};
+     ast_binding_init(binding, ident, binds, tok, &s);
++    binding->default_value = default_value;
+     if (!ast_bindings_list_append(&list, binding)) {
+       goto free_bind_list;
+     }
+@@ -1380,6 +1718,15 @@ parse_bindings_list(parser* p_parser, ast_binding_modifiers_t p_allowed_binds, t
+     } else if (p_parser->current.type != p_end) {
+       goto expect_end;
+     }
++    continue;
++  free_ident:
++    if (default_value != NULL) {
++      ast_dispatch_deinit((ast_node*)default_value);
++      alloc->release(alloc, default_value);
++    }
++    ast_dispatch_deinit((ast_node*)ident);
++    alloc->release(alloc, ident);
++    goto free_bind_list;
+   }
+   if (p_parser->current.type != p_end) {
+   expect_end: { // label followed by decl is c23 ext lol.
+diff --git a/src/okvm.c b/src/okvm.c
+index 494d51a..93f57d1 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -836,6 +836,52 @@ static inline interpret_result top_level_return(register_file* p_registers, call
+   return result;
+ }
+ 
++// array index resolution shared by OP_ARRAY_GET / OP_ARRAY_SET (and nothing else:
++// natives reimplement their own validation because this is static and vm-opaque).
++// number-gate first, exactly like perform_add: a raw double can alias the non-strict
++// tag bits, so IS_VALUE_INT is only safe to consult after IS_VALUE_NUMBER ruled out.
++// strictness doctrine: this is a gate (called on arbitrary operand values), not a chain.
++static bool resolve_array_index(vm* p_vm, value p_index, uint32_t p_count, uint32_t* p_out) {
++  if (IS_VALUE_NUMBER(p_index)) {
++    const double d = VALUE_AS_NUMBER(p_index);
++    // numeric literals are raw doubles (D3), so m[0] arrives as 0.0: integral doubles
++    // must be accepted or every literal index errors. refusing non-integral ones keeps
++    // m[1.5] loud instead of silently truncating.
++    // (cast-based integrality, not trunc(): keeps the link line free of libm. safe
++    // because the range guard runs before any narrowing could overflow int64.)
++    if (!(d >= -9.0e15 && d <= 9.0e15) || d != (double)(int64_t)d) {
++      runtime_error(p_vm, "array index must be a whole number, got %g.", d);
++      return false;
++    }
++    if (d < 0 || d >= (double)p_count) {
++      runtime_error(p_vm, "index out of bounds: %g (len %u).", d, p_count);
++      return false;
++    }
++    *p_out = (uint32_t)d;
++    return true;
++  }
++  if (IS_VALUE_INT(p_index)) { // safe here: not a number, so the tag is real
++    const int64_t i = VALUE_AS_INT(p_index);
++    if (i < 0 || (uint64_t)i >= (uint64_t)p_count) {
++      runtime_error(p_vm, "index out of bounds: %lld (len %u).", (long long)i, p_count);
++      return false;
++    }
++    *p_out = (uint32_t)i;
++    return true;
++  }
++  runtime_error(p_vm, "array index must be a number.");
++  return false;
++}
++
++// strict gate + cast for the subscript base operand: errors name the operand type
++static object_array* resolve_array_base(vm* p_vm, value p_base) {
++  if (!value_is_object_type(p_base, OBJ_ARRAY)) {
++    runtime_error(p_vm, "invalid operand for '[]': expected an array.");
++    return NULL;
++  }
++  return VALUE_AS_ARRAY(p_base);
++}
++
+ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+   execution_state* exe = p_vm->current_execution_state;
+   call_frame* frame = &exe->call_stack.data[exe->call_stack.count - 1];
+@@ -1441,6 +1487,129 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       }
+       break;
+     }
++    case OP_ARRAY_NEW: {
++      const uint8_t a = a_of(instruction);
++      const uint8_t b = b_of(instruction);
++      const uint8_t c = c_of(instruction);
++      // elements are live frame registers ([0, top) rooted). but value_array_grow
++      // reallocs through the gc-aware allocator, which DOES collect on growth:
++      // between creation and publication the array is linked in the store yet
++      // unreachable, so a collect inside append_n would sweep it (aggressive GC
++      // found this on every array test). guard the window -- phase-2 memorial.
++      object_specs s = {p_vm->alloc, p_vm->objects_store};
++      object_array* arr = create_object_array(&s);
++      if (arr == NULL) {
++        goto oom_new;
++      }
++      gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(arr));
++      const bool appended = c == 0 || value_array_append_n(&arr->values, &REG_AT(b), c);
++      gc_guard_down(p_vm->alloc->gc);
++      if (!appended) {
++        goto oom_new;
++      }
++      REG_AT(a) = OBJECT_AS_VALUE(arr);
++      break;
++    oom_new:
++      runtime_error(p_vm, "out of memory: failed to allocate array.");
++      interpret_result result;
++      result.status = RUNTIME_ERROR;
++      result.top_level_return = NULL_AS_VALUE();
++      return result;
++    }
++    case OP_ARRAY_NEW_LONG: {
++      const word2 words = JOIN_WORD(instruction);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      const uint16_t C = C_of(words);
++      object_specs s = {p_vm->alloc, p_vm->objects_store};
++      object_array* arr = create_object_array(&s);
++      if (arr == NULL) {
++        goto oom_new_long;
++      }
++      gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(arr));
++      const bool appended = C == 0 || value_array_append_n(&arr->values, &REG_AT(B), C);
++      gc_guard_down(p_vm->alloc->gc);
++      if (!appended) {
++        goto oom_new_long;
++      }
++      REG_AT(A) = OBJECT_AS_VALUE(arr);
++      break;
++    oom_new_long:
++      runtime_error(p_vm, "out of memory: failed to allocate array.");
++      interpret_result result;
++      result.status = RUNTIME_ERROR;
++      result.top_level_return = NULL_AS_VALUE();
++      return result;
++    }
++    case OP_ARRAY_GET: {
++      const bool p = p_of(instruction);
++      const uint8_t a = a_of(instruction);
++      const uint8_t b = b_of(instruction);
++      const uint8_t c = c_of(instruction);
++      const object_array* arr = resolve_array_base(p_vm, REG_AT(b));
++      uint32_t index = 0;
++      if (arr == NULL || !resolve_array_index(p_vm, resolve_operand(frame, reg, c, p), arr->values.count, &index)) {
++        interpret_result result;
++        result.status = RUNTIME_ERROR;
++        result.top_level_return = NULL_AS_VALUE();
++        return result;
++      }
++      REG_AT(a) = arr->values.data[index];
++      break;
++    }
++    case OP_ARRAY_GET_LONG: {
++      const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(words);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      const uint16_t C = C_of(words);
++      const object_array* arr = resolve_array_base(p_vm, REG_AT(B));
++      uint32_t index = 0;
++      if (arr == NULL || !resolve_array_index(p_vm, resolve_operand(frame, reg, C, p), arr->values.count, &index)) {
++        interpret_result result;
++        result.status = RUNTIME_ERROR;
++        result.top_level_return = NULL_AS_VALUE();
++        return result;
++      }
++      REG_AT(A) = arr->values.data[index];
++      break;
++    }
++    case OP_ARRAY_SET: {
++      const bool p = p_of(instruction);
++      const uint8_t a = a_of(instruction);
++      const uint8_t b = b_of(instruction);
++      const uint8_t c = c_of(instruction);
++      const object_array* arr = resolve_array_base(p_vm, REG_AT(a));
++      uint32_t index = 0;
++      if (arr == NULL || !resolve_array_index(p_vm, resolve_operand(frame, reg, b, p), arr->values.count, &index)) {
++        interpret_result result;
++        result.status = RUNTIME_ERROR;
++        result.top_level_return = NULL_AS_VALUE();
++        return result;
++      }
++      // narrow SET has no room for a value-const flag (p is spent on the index):
++      // the compiler materializes constant values, c is always a register here.
++      ((object_array*)arr)->values.data[index] = REG_AT(c);
++      break;
++    }
++    case OP_ARRAY_SET_LONG: {
++      const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(words);
++      const bool q = Q_of(words);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      const uint16_t C = C_of(words);
++      const object_array* arr = resolve_array_base(p_vm, REG_AT(A));
++      uint32_t index = 0;
++      if (arr == NULL || !resolve_array_index(p_vm, resolve_operand(frame, reg, B, p), arr->values.count, &index)) {
++        interpret_result result;
++        result.status = RUNTIME_ERROR;
++        result.top_level_return = NULL_AS_VALUE();
++        return result;
++      }
++      ((object_array*)arr)->values.data[index] = resolve_operand(frame, reg, C, q);
++      break;
++    }
+     case OP_PRINT: {
+       const bool p = p_of(instruction);
+       value_debug_print(resolve_operand(frame, reg, Alarge_of(instruction), p));
+diff --git a/tests/e2e/tests/arrays/aliasing.ok b/tests/e2e/tests/arrays/aliasing.ok
+new file mode 100644
+index 0000000..8cd8158
+--- /dev/null
++++ b/tests/e2e/tests/arrays/aliasing.ok
+@@ -0,0 +1,4 @@
++let a = [1, 2, 3];
++let b = a;
++b[0] = 99;
++print a[0]; // expect: 99
+diff --git a/tests/e2e/tests/arrays/compound_assign.ok b/tests/e2e/tests/arrays/compound_assign.ok
+new file mode 100644
+index 0000000..c326066
+--- /dev/null
++++ b/tests/e2e/tests/arrays/compound_assign.ok
+@@ -0,0 +1,12 @@
++let mut m = [1, 2, 3];
++m[0] += 10;
++m[1] -= 1;
++m[2] *= 4;
++print m[0]; // expect: 11
++print m[1]; // expect: 1
++print m[2]; // expect: 12
++let mut x = 5;
++x += 2;
++print x; // expect: 7
++x *= 3;
++print x; // expect: 21
+diff --git a/tests/e2e/tests/arrays/empty.ok b/tests/e2e/tests/arrays/empty.ok
+new file mode 100644
+index 0000000..4279466
+--- /dev/null
++++ b/tests/e2e/tests/arrays/empty.ok
+@@ -0,0 +1,5 @@
++let a = [];
++print len(a); // expect: 0
++push(a, 9);
++print len(a); // expect: 1
++print a[0]; // expect: 9
+diff --git a/tests/e2e/tests/arrays/equality_identity.ok b/tests/e2e/tests/arrays/equality_identity.ok
+new file mode 100644
+index 0000000..258013d
+--- /dev/null
++++ b/tests/e2e/tests/arrays/equality_identity.ok
+@@ -0,0 +1,4 @@
++let a = [1, 2];
++let b = [1, 2];
++print a == b; // expect: false
++print a == a; // expect: true
+diff --git a/tests/e2e/tests/arrays/errors/compound_immutable.ok b/tests/e2e/tests/arrays/errors/compound_immutable.ok
+new file mode 100644
+index 0000000..4eda58f
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/compound_immutable.ok
+@@ -0,0 +1,2 @@
++let x = 5;
++x += 1; // expect error
+diff --git a/tests/e2e/tests/arrays/errors/fractional_index.ok b/tests/e2e/tests/arrays/errors/fractional_index.ok
+new file mode 100644
+index 0000000..49c0c76
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/fractional_index.ok
+@@ -0,0 +1,2 @@
++let a = [1, 2, 3];
++print a[1.5]; // expect error
+diff --git a/tests/e2e/tests/arrays/errors/iterate_number.ok b/tests/e2e/tests/arrays/errors/iterate_number.ok
+new file mode 100644
+index 0000000..1f79507
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/iterate_number.ok
+@@ -0,0 +1,3 @@
++for let v : 5? {
++  print v;
++} // expect error
+diff --git a/tests/e2e/tests/arrays/errors/len_not_array.ok b/tests/e2e/tests/arrays/errors/len_not_array.ok
+new file mode 100644
+index 0000000..c200285
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/len_not_array.ok
+@@ -0,0 +1 @@
++print len(5); // expect error
+diff --git a/tests/e2e/tests/arrays/errors/negative_index.ok b/tests/e2e/tests/arrays/errors/negative_index.ok
+new file mode 100644
+index 0000000..386d57c
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/negative_index.ok
+@@ -0,0 +1,2 @@
++let a = [1, 2, 3];
++print a[-1]; // expect error
+diff --git a/tests/e2e/tests/arrays/errors/null_index.ok b/tests/e2e/tests/arrays/errors/null_index.ok
+new file mode 100644
+index 0000000..9e90b11
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/null_index.ok
+@@ -0,0 +1,2 @@
++let a = [1, 2, 3];
++print a[null]; // expect error
+diff --git a/tests/e2e/tests/arrays/errors/oob_get.ok b/tests/e2e/tests/arrays/errors/oob_get.ok
+new file mode 100644
+index 0000000..2248bc7
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/oob_get.ok
+@@ -0,0 +1,2 @@
++let a = [1, 2, 3];
++print a[3]; // expect error
+diff --git a/tests/e2e/tests/arrays/errors/oob_store.ok b/tests/e2e/tests/arrays/errors/oob_store.ok
+new file mode 100644
+index 0000000..82ac613
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/oob_store.ok
+@@ -0,0 +1,2 @@
++let mut a = [1, 2, 3];
++a[3] = 4; // expect error
+diff --git a/tests/e2e/tests/arrays/errors/pop_not_array.ok b/tests/e2e/tests/arrays/errors/pop_not_array.ok
+new file mode 100644
+index 0000000..a59f20a
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/pop_not_array.ok
+@@ -0,0 +1 @@
++print pop("hi"); // expect error
+diff --git a/tests/e2e/tests/arrays/errors/remove_bad_range.ok b/tests/e2e/tests/arrays/errors/remove_bad_range.ok
+new file mode 100644
+index 0000000..7e6a62b
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/remove_bad_range.ok
+@@ -0,0 +1,2 @@
++let mut a = [1, 2, 3];
++remove(a, 2, 1); // expect error
+diff --git a/tests/e2e/tests/arrays/errors/remove_oob.ok b/tests/e2e/tests/arrays/errors/remove_oob.ok
+new file mode 100644
+index 0000000..76f2f70
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/remove_oob.ok
+@@ -0,0 +1,2 @@
++let mut a = [1, 2, 3];
++remove(a, 0, 9); // expect error
+diff --git a/tests/e2e/tests/arrays/errors/string_index.ok b/tests/e2e/tests/arrays/errors/string_index.ok
+new file mode 100644
+index 0000000..94ff81e
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/string_index.ok
+@@ -0,0 +1,2 @@
++let a = [1, 2, 3];
++print a["1"]; // expect error
+diff --git a/tests/e2e/tests/arrays/errors/subscript_number.ok b/tests/e2e/tests/arrays/errors/subscript_number.ok
+new file mode 100644
+index 0000000..b7a355c
+--- /dev/null
++++ b/tests/e2e/tests/arrays/errors/subscript_number.ok
+@@ -0,0 +1,2 @@
++let x = 5;
++print x[0]; // expect error
+diff --git a/tests/e2e/tests/arrays/for_in.ok b/tests/e2e/tests/arrays/for_in.ok
+new file mode 100644
+index 0000000..4cea636
+--- /dev/null
++++ b/tests/e2e/tests/arrays/for_in.ok
+@@ -0,0 +1,7 @@
++let a = [10, 20, 30];
++for let v : a? {
++  print v;
++}
++// expect: 10
++// expect: 20
++// expect: 30
+diff --git a/tests/e2e/tests/arrays/for_in_break_continue.ok b/tests/e2e/tests/arrays/for_in_break_continue.ok
+new file mode 100644
+index 0000000..f2f1441
+--- /dev/null
++++ b/tests/e2e/tests/arrays/for_in_break_continue.ok
+@@ -0,0 +1,8 @@
++let a = [1, 2, 3, 4, 5];
++for let v : a? {
++  if v == 2? { continue; }
++  if v == 4? { break; }
++  print v;
++}
++// expect: 1
++// expect: 3
+diff --git a/tests/e2e/tests/arrays/for_in_empty.ok b/tests/e2e/tests/arrays/for_in_empty.ok
+new file mode 100644
+index 0000000..aa6eea7
+--- /dev/null
++++ b/tests/e2e/tests/arrays/for_in_empty.ok
+@@ -0,0 +1,4 @@
++for let v : []? {
++  print v;
++}
++print "done"; // expect: done
+diff --git a/tests/e2e/tests/arrays/for_in_mut.ok b/tests/e2e/tests/arrays/for_in_mut.ok
+new file mode 100644
+index 0000000..5dffd2d
+--- /dev/null
++++ b/tests/e2e/tests/arrays/for_in_mut.ok
+@@ -0,0 +1,8 @@
++let a = [1, 2, 3];
++for let mut v : a? {
++  v = v * 10;
++  print v;
++}
++// expect: 10
++// expect: 20
++// expect: 30
+diff --git a/tests/e2e/tests/arrays/for_in_nested.ok b/tests/e2e/tests/arrays/for_in_nested.ok
+new file mode 100644
+index 0000000..7174338
+--- /dev/null
++++ b/tests/e2e/tests/arrays/for_in_nested.ok
+@@ -0,0 +1,10 @@
++let grid = [[1, 2], [3, 4]];
++for let row : grid? {
++  for let v : row? {
++    print v;
++  }
++}
++// expect: 1
++// expect: 2
++// expect: 3
++// expect: 4
+diff --git a/tests/e2e/tests/arrays/get_set_roundtrip.ok b/tests/e2e/tests/arrays/get_set_roundtrip.ok
+new file mode 100644
+index 0000000..cd92d9d
+--- /dev/null
++++ b/tests/e2e/tests/arrays/get_set_roundtrip.ok
+@@ -0,0 +1,7 @@
++let mut m = [0, 0, 0];
++m[0] = 10;
++m[1] = 20;
++m[2] = 30;
++print m[0] + m[1] + m[2]; // expect: 60
++let i = 1;
++print m[i]; // expect: 20
+diff --git a/tests/e2e/tests/arrays/literal.ok b/tests/e2e/tests/arrays/literal.ok
+new file mode 100644
+index 0000000..896cf9b
+--- /dev/null
++++ b/tests/e2e/tests/arrays/literal.ok
+@@ -0,0 +1,4 @@
++let a = [1, 2, 3];
++print len(a); // expect: 3
++print a[0]; // expect: 1
++print a[2]; // expect: 3
+diff --git a/tests/e2e/tests/arrays/literal_order.ok b/tests/e2e/tests/arrays/literal_order.ok
+new file mode 100644
+index 0000000..d240feb
+--- /dev/null
++++ b/tests/e2e/tests/arrays/literal_order.ok
+@@ -0,0 +1,8 @@
++glob let mut log = [];
++fu note(x) {
++  push(log, x);
++  return x;
++}
++let a = [note(1), note(2), note(3)];
++print len(log); // expect: 3
++print a[2]; // expect: 3
+diff --git a/tests/e2e/tests/arrays/mixed.ok b/tests/e2e/tests/arrays/mixed.ok
+new file mode 100644
+index 0000000..31a1b94
+--- /dev/null
++++ b/tests/e2e/tests/arrays/mixed.ok
+@@ -0,0 +1,6 @@
++let a = [1, "two", true, null, [5]];
++print a[0]; // expect: 1
++print a[1]; // expect: two
++print a[2]; // expect: true
++print a[3]; // expect: null
++print a[4][0]; // expect: 5
+diff --git a/tests/e2e/tests/arrays/nested.ok b/tests/e2e/tests/arrays/nested.ok
+new file mode 100644
+index 0000000..4f4131d
+--- /dev/null
++++ b/tests/e2e/tests/arrays/nested.ok
+@@ -0,0 +1,5 @@
++let grid = [[1, 2], [3, 4], [5, 6]];
++print grid[0][1]; // expect: 2
++print grid[2][0]; // expect: 5
++grid[1][0] = 30;
++print grid[1][0]; // expect: 30
+diff --git a/tests/e2e/tests/arrays/push_pop.ok b/tests/e2e/tests/arrays/push_pop.ok
+new file mode 100644
+index 0000000..8284b78
+--- /dev/null
++++ b/tests/e2e/tests/arrays/push_pop.ok
+@@ -0,0 +1,11 @@
++let mut a = [];
++push(a, 1);
++push(a, 2);
++push(a, 3);
++print len(a); // expect: 3
++print pop(a); // expect: 3
++print pop(a); // expect: 2
++print len(a); // expect: 1
++print pop(a); // expect: 1
++print pop(a); // expect: null
++print len(a); // expect: 0
+diff --git a/tests/e2e/tests/arrays/regressions/captured_array.ok b/tests/e2e/tests/arrays/regressions/captured_array.ok
+new file mode 100644
+index 0000000..45d4270
+--- /dev/null
++++ b/tests/e2e/tests/arrays/regressions/captured_array.ok
+@@ -0,0 +1,8 @@
++fu make() {
++  let a = [7, 8];
++  return fu() {
++    return len(a) + a[0] + a[1];
++  };
++}
++let probe = make();
++print probe(); // expect: 17
+diff --git a/tests/e2e/tests/arrays/regressions/compound_single_eval.ok b/tests/e2e/tests/arrays/regressions/compound_single_eval.ok
+new file mode 100644
+index 0000000..5edfddf
+--- /dev/null
++++ b/tests/e2e/tests/arrays/regressions/compound_single_eval.ok
+@@ -0,0 +1,13 @@
++glob let mut calls = 0;
++fu f() {
++  calls += 1;
++  return 0;
++}
++fu g() {
++  calls += 1;
++  return 100;
++}
++let mut a = [1, 2, 3];
++a[f()] += g();
++print a[0]; // expect: 101
++print calls; // expect: 2
+diff --git a/tests/e2e/tests/arrays/regressions/for_in_shadow.ok b/tests/e2e/tests/arrays/regressions/for_in_shadow.ok
+new file mode 100644
+index 0000000..ac3baa7
+--- /dev/null
++++ b/tests/e2e/tests/arrays/regressions/for_in_shadow.ok
+@@ -0,0 +1,6 @@
++let v = "outer";
++let a = [1];
++for let v : a? {
++  print v; // expect: 1
++}
++print v; // expect: outer
+diff --git a/tests/e2e/tests/arrays/regressions/grow_300.ok b/tests/e2e/tests/arrays/regressions/grow_300.ok
+new file mode 100644
+index 0000000..736fe37
+--- /dev/null
++++ b/tests/e2e/tests/arrays/regressions/grow_300.ok
+@@ -0,0 +1,304 @@
++let mut a = [];
++push(a, 0);
++push(a, 1);
++push(a, 2);
++push(a, 3);
++push(a, 4);
++push(a, 5);
++push(a, 6);
++push(a, 7);
++push(a, 8);
++push(a, 9);
++push(a, 10);
++push(a, 11);
++push(a, 12);
++push(a, 13);
++push(a, 14);
++push(a, 15);
++push(a, 16);
++push(a, 17);
++push(a, 18);
++push(a, 19);
++push(a, 20);
++push(a, 21);
++push(a, 22);
++push(a, 23);
++push(a, 24);
++push(a, 25);
++push(a, 26);
++push(a, 27);
++push(a, 28);
++push(a, 29);
++push(a, 30);
++push(a, 31);
++push(a, 32);
++push(a, 33);
++push(a, 34);
++push(a, 35);
++push(a, 36);
++push(a, 37);
++push(a, 38);
++push(a, 39);
++push(a, 40);
++push(a, 41);
++push(a, 42);
++push(a, 43);
++push(a, 44);
++push(a, 45);
++push(a, 46);
++push(a, 47);
++push(a, 48);
++push(a, 49);
++push(a, 50);
++push(a, 51);
++push(a, 52);
++push(a, 53);
++push(a, 54);
++push(a, 55);
++push(a, 56);
++push(a, 57);
++push(a, 58);
++push(a, 59);
++push(a, 60);
++push(a, 61);
++push(a, 62);
++push(a, 63);
++push(a, 64);
++push(a, 65);
++push(a, 66);
++push(a, 67);
++push(a, 68);
++push(a, 69);
++push(a, 70);
++push(a, 71);
++push(a, 72);
++push(a, 73);
++push(a, 74);
++push(a, 75);
++push(a, 76);
++push(a, 77);
++push(a, 78);
++push(a, 79);
++push(a, 80);
++push(a, 81);
++push(a, 82);
++push(a, 83);
++push(a, 84);
++push(a, 85);
++push(a, 86);
++push(a, 87);
++push(a, 88);
++push(a, 89);
++push(a, 90);
++push(a, 91);
++push(a, 92);
++push(a, 93);
++push(a, 94);
++push(a, 95);
++push(a, 96);
++push(a, 97);
++push(a, 98);
++push(a, 99);
++push(a, 100);
++push(a, 101);
++push(a, 102);
++push(a, 103);
++push(a, 104);
++push(a, 105);
++push(a, 106);
++push(a, 107);
++push(a, 108);
++push(a, 109);
++push(a, 110);
++push(a, 111);
++push(a, 112);
++push(a, 113);
++push(a, 114);
++push(a, 115);
++push(a, 116);
++push(a, 117);
++push(a, 118);
++push(a, 119);
++push(a, 120);
++push(a, 121);
++push(a, 122);
++push(a, 123);
++push(a, 124);
++push(a, 125);
++push(a, 126);
++push(a, 127);
++push(a, 128);
++push(a, 129);
++push(a, 130);
++push(a, 131);
++push(a, 132);
++push(a, 133);
++push(a, 134);
++push(a, 135);
++push(a, 136);
++push(a, 137);
++push(a, 138);
++push(a, 139);
++push(a, 140);
++push(a, 141);
++push(a, 142);
++push(a, 143);
++push(a, 144);
++push(a, 145);
++push(a, 146);
++push(a, 147);
++push(a, 148);
++push(a, 149);
++push(a, 150);
++push(a, 151);
++push(a, 152);
++push(a, 153);
++push(a, 154);
++push(a, 155);
++push(a, 156);
++push(a, 157);
++push(a, 158);
++push(a, 159);
++push(a, 160);
++push(a, 161);
++push(a, 162);
++push(a, 163);
++push(a, 164);
++push(a, 165);
++push(a, 166);
++push(a, 167);
++push(a, 168);
++push(a, 169);
++push(a, 170);
++push(a, 171);
++push(a, 172);
++push(a, 173);
++push(a, 174);
++push(a, 175);
++push(a, 176);
++push(a, 177);
++push(a, 178);
++push(a, 179);
++push(a, 180);
++push(a, 181);
++push(a, 182);
++push(a, 183);
++push(a, 184);
++push(a, 185);
++push(a, 186);
++push(a, 187);
++push(a, 188);
++push(a, 189);
++push(a, 190);
++push(a, 191);
++push(a, 192);
++push(a, 193);
++push(a, 194);
++push(a, 195);
++push(a, 196);
++push(a, 197);
++push(a, 198);
++push(a, 199);
++push(a, 200);
++push(a, 201);
++push(a, 202);
++push(a, 203);
++push(a, 204);
++push(a, 205);
++push(a, 206);
++push(a, 207);
++push(a, 208);
++push(a, 209);
++push(a, 210);
++push(a, 211);
++push(a, 212);
++push(a, 213);
++push(a, 214);
++push(a, 215);
++push(a, 216);
++push(a, 217);
++push(a, 218);
++push(a, 219);
++push(a, 220);
++push(a, 221);
++push(a, 222);
++push(a, 223);
++push(a, 224);
++push(a, 225);
++push(a, 226);
++push(a, 227);
++push(a, 228);
++push(a, 229);
++push(a, 230);
++push(a, 231);
++push(a, 232);
++push(a, 233);
++push(a, 234);
++push(a, 235);
++push(a, 236);
++push(a, 237);
++push(a, 238);
++push(a, 239);
++push(a, 240);
++push(a, 241);
++push(a, 242);
++push(a, 243);
++push(a, 244);
++push(a, 245);
++push(a, 246);
++push(a, 247);
++push(a, 248);
++push(a, 249);
++push(a, 250);
++push(a, 251);
++push(a, 252);
++push(a, 253);
++push(a, 254);
++push(a, 255);
++push(a, 256);
++push(a, 257);
++push(a, 258);
++push(a, 259);
++push(a, 260);
++push(a, 261);
++push(a, 262);
++push(a, 263);
++push(a, 264);
++push(a, 265);
++push(a, 266);
++push(a, 267);
++push(a, 268);
++push(a, 269);
++push(a, 270);
++push(a, 271);
++push(a, 272);
++push(a, 273);
++push(a, 274);
++push(a, 275);
++push(a, 276);
++push(a, 277);
++push(a, 278);
++push(a, 279);
++push(a, 280);
++push(a, 281);
++push(a, 282);
++push(a, 283);
++push(a, 284);
++push(a, 285);
++push(a, 286);
++push(a, 287);
++push(a, 288);
++push(a, 289);
++push(a, 290);
++push(a, 291);
++push(a, 292);
++push(a, 293);
++push(a, 294);
++push(a, 295);
++push(a, 296);
++push(a, 297);
++push(a, 298);
++push(a, 299);
++print len(a); // expect: 300
++print a[299]; // expect: 299
++print a[0]; // expect: 0
+diff --git a/tests/e2e/tests/arrays/regressions/literal_300.ok b/tests/e2e/tests/arrays/regressions/literal_300.ok
+new file mode 100644
+index 0000000..881d2da
+--- /dev/null
++++ b/tests/e2e/tests/arrays/regressions/literal_300.ok
+@@ -0,0 +1,4 @@
++let a = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285, 286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298, 299];
++print len(a); // expect: 300
++print a[0]; // expect: 0
++print a[299]; // expect: 299
+diff --git a/tests/e2e/tests/arrays/regressions/literal_in_call.ok b/tests/e2e/tests/arrays/regressions/literal_in_call.ok
+new file mode 100644
+index 0000000..3106f35
+--- /dev/null
++++ b/tests/e2e/tests/arrays/regressions/literal_in_call.ok
+@@ -0,0 +1,8 @@
++fu first(a) {
++  return a[0];
++}
++print first([42, 43]); // expect: 42
++fu sum3(a) {
++  return a[0] + a[1] + a[2];
++}
++print sum3([1, 2, 3]); // expect: 6
+diff --git a/tests/e2e/tests/arrays/regressions/make_counter.ok b/tests/e2e/tests/arrays/regressions/make_counter.ok
+new file mode 100644
+index 0000000..e1c0fa0
+--- /dev/null
++++ b/tests/e2e/tests/arrays/regressions/make_counter.ok
+@@ -0,0 +1,15 @@
++// the closures-as-objects dogfood: array state + closure behavior, the reason
++// gc-rooted arrays exist at all (dorg3's parallel-globals era ends here).
++fu make_counter(start) {
++  let box = [start];
++  return fu() {
++    box[0] += 1;
++    return box[0];
++  };
++}
++let c1 = make_counter(10);
++let c2 = make_counter(100);
++print c1(); // expect: 11
++print c1(); // expect: 12
++print c2(); // expect: 101
++print c1(); // expect: 13
+diff --git a/tests/e2e/tests/arrays/remove.ok b/tests/e2e/tests/arrays/remove.ok
+new file mode 100644
+index 0000000..feb808c
+--- /dev/null
++++ b/tests/e2e/tests/arrays/remove.ok
+@@ -0,0 +1,11 @@
++let mut a = [0, 1, 2, 3, 4];
++remove(a, 1, 3);
++print len(a); // expect: 3
++print a[0]; // expect: 0
++print a[1]; // expect: 3
++print a[2]; // expect: 4
++remove(a, 0, 0); // empty range is a legal no-op
++print len(a); // expect: 3
++remove(a, 2, 3); // remove the tail
++print len(a); // expect: 2
++print a[1]; // expect: 3

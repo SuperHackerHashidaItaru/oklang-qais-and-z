@@ -143,3 +143,48 @@ arrays and numeric-for because they're small, self-contained, touch only
 call() + one opcode + the parser, and the game's function signatures want
 them before the game is written. kwargs explicitly deferred to the classes
 round (DEFAULT-ARGS §4).
+
+## session-10 addendum — 26/10 (evening): the arrays/defaults round, rulings in
+
+owner verdicts on this wave's drafts, recorded as delivered:
+
+- **D4 amended (len)**: `len` is a native function, NOT an opcode. owner's
+  pushback accepted: the opcode budget is real (54/128 used before arrays;
+  maps + classes + numeric-for are still owed), len is cached at loop entry
+  by the for-in desugar anyway, and a native extends to strings/maps later
+  with zero bytecode changes. cost: the for-in desugar depends on the `len`
+  global by compile-time index — `len` is effectively a reserved name until
+  the iteration protocol retires the dependency. documented in the spec.
+- **for-in syntax**: `:` not `in` — c++ style, no new keyword. the colon
+  family: `for let v : arr? {}` (values from a sequence) and, when numeric-for
+  lands, `for i = 0 : n? {}` (numbers from a range). collision audit clean
+  (ternary is then/otherwise; map literals are brace-context).
+- **remove native**: `remove(a, m, n)` — half-open [m, n) at the language
+  surface, translated onto the inclusive-end OK_ARRAY primitive. the reasons
+  half-open is right: n-m is the count, empty is m==n, adjacent ranges share
+  an endpoint, loop bounds compose. (dijkstra's ewd831 argument; the owner's
+  memory of "there was a benefit, i swear" was correct.)
+- **safe-get native: ruled out.** out-of-bounds access must stay a hard error
+  (explicit over implicit is the owner's doctrine, not mine to soften); the
+  idiom is `if i < len(a) then a[i] else null otherwise ...`-shaped until
+  methods exist. these four natives are stubs for methods anyway.
+- **defaults: accepted as specced** — call-time, trailing-only, no skipping,
+  "illegal period". kwargs: later, compile-time-resolved-only if ever.
+- **numeric-for: draft requested + delivered** (docs/drafts/NUMERIC-FOR.md).
+  open questions listed there (step syntax, frozen limit, direction strategy).
+- **patch-the-array follow-up logged**: when numeric-for lands, for-in's
+  counter tail (LESS+JUMP_IF+ADD+LOOP, 5 dispatches/iter) switches to FOR_LOOP.
+- **v0.0.4 tag**: owner will delete + retag with the ok.c fix folded in
+  (zero consumers; patch-slot-for-youth versioning is intentional and fine).
+
+process notes from the implementation itself:
+
+- the gc-guard memorial earned its keep again: OP_ARRAY_NEW initially skipped
+  the guard on the reasoning "append_n only reallocs" — wrong, the gc-aware
+  allocator collects on EVERY reallocate growth, so the fresh array was swept
+  between linking and publication. aggressive GC caught it on all 19 array
+  tests; guard window added; lesson unchanged, just re-learned.
+- latent parser bug fixed in passing: `fu f(b = 5)` used to parse the assign
+  into the binding's lvalue and the compiler cast it to an identifier —
+  silent garbage, never covered by a test. param names now parse at
+  PREC_ASSIGNMENT and are validated as identifiers.

@@ -1,0 +1,397 @@
+diff --git a/src/okchunk.h b/src/okchunk.h
+index f2ed540..6892860 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -186,6 +186,7 @@ typedef enum {
+   OP_ARRAY_GET_LONG,     // 2w:   (p, A, B, C)    -> r[A] = r[B][p ? k[C] : r[C]]; ip += w (q unused)
+   OP_ARRAY_SET,          // w:    (p, a, b, c)    -> r[a][p ? k[b] : r[b]] = r[c] (value is a register in narrow)
+   OP_ARRAY_SET_LONG,     // 2w:   (p, q, A, B, C) -> r[A][p ? k[B] : r[B]] = (q ? k[C] : r[C]); ip += w
++  OP_JUMP_IF_ARGC,       // 2w:   (p, A, B)       -> ip += A when (p == 1) == (frame->argc > B); B is the 0-based parameter position
+ } opcode;
+ 
+ // clang-format on
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index c493e34..13b1d5e 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -1397,6 +1397,19 @@ static bool emit_incomplete_jump_if_set(
+   return true;
+ }
+ 
++// defaults-ladder guard: jump forward when the argument for parameter position
++// p_position was supplied (frame->argc > position). patched with patch_jump_if,
++// which preserves B (the position) while rewriting A.
++static bool emit_incomplete_jump_if_argc(
++    compiler* p_compiler, bool p_supplied, uint16_t p_position, uint32_t* p_out, ast_node* p_author) {
++  *p_out = current_chunk(p_compiler)->code.count;
++  if (!emit_word2(p_compiler, encode_OPPABCQ(OP_JUMP_IF_ARGC, p_supplied, 0, p_position, 0, 0), p_author)) {
++    report_oom(p_compiler, p_author);
++    return false;
++  }
++  return true;
++}
++
+ static bool
+ patch_jump(compiler* p_compiler, bool p_is_loop, uint32_t p_jump_instruction, uint32_t p_jump_end, ast_node* p_author) {
+   // offsets are relative to the word after the 1 word jump instruction
+@@ -2747,6 +2760,7 @@ static bool compile_function_impl(compiler* p_compiler,
+     return false;
+   }
+ 
++  location param_locations[UINT8_MAX + 1];
+   for (uint32_t i = 0; i < p_params.count; ++i) {
+     ast_binding* binding = p_params.data[i];
+     variable_declaration decl = {
+@@ -2759,6 +2773,7 @@ static bool compile_function_impl(compiler* p_compiler,
+       return false;
+     }
+     location loc = {param.index, LOCATION_KIND_REGISTER, LOCATION_OK};
++    param_locations[i] = loc;
+ 
+     if (!define_variable(
+             p_compiler,
+@@ -2770,6 +2785,47 @@ static bool compile_function_impl(compiler* p_compiler,
+       return false;
+     }
+   }
++
++  // the defaults ladder, as the function's first code: one guard per defaulted
++  // param, skipping the default when the argument was supplied. call-time
++  // evaluation, c++ style -- fresh mutable defaults per call, earlier params in
++  // scope. functions without defaults emit nothing at all.
++  {
++    uint16_t ndefaults = 0;
++    for (uint32_t i = 0; i < p_params.count; ++i) {
++      if (p_params.data[i]->default_value != NULL) {
++        ndefaults = (uint16_t)(p_params.count - i); // defaults are trailing, parser-enforced
++        break;
++      }
++    }
++    current_context(p_compiler)->function.function->ndefaults = ndefaults;
++    for (uint32_t i = p_params.count - ndefaults; i < p_params.count; ++i) {
++      ast_binding* binding = p_params.data[i];
++      uint32_t guard;
++      if (!emit_incomplete_jump_if_argc(p_compiler, true, (uint16_t)i, &guard, (ast_node*)binding)) {
++        end_scope(p_compiler, p_author);
++        end_context(p_compiler);
++        return false;
++      }
++      _register param_reg = {param_locations[i].index, REGISTER_FLAG_NONE, REGISTER_OK};
++      expression_result filled;
++      if (!compile_expression(p_compiler, binding->default_value, param_reg, 1, &filled)) {
++        end_scope(p_compiler, p_author);
++        end_context(p_compiler);
++        return false;
++      }
++      if (!materialize_into(p_compiler, &filled.value, param_reg, (ast_node*)binding)) {
++        end_scope(p_compiler, p_author);
++        end_context(p_compiler);
++        return false;
++      }
++      if (!patch_jump_if(p_compiler, false, guard, current_chunk(p_compiler)->code.count, (ast_node*)binding)) {
++        end_scope(p_compiler, p_author);
++        end_context(p_compiler);
++        return false;
++      }
++    }
++  }
+   if (!compile_statement(p_compiler, p_body)) {
+     end_scope(p_compiler, p_author);
+     end_context(p_compiler);
+diff --git a/src/okdebug.c b/src/okdebug.c
+index a799bac..fb433ba 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -130,6 +130,7 @@ static bool op_is_two_words(opcode p_op) {
+   case OP_ARRAY_NEW_LONG:
+   case OP_ARRAY_GET_LONG:
+   case OP_ARRAY_SET_LONG:
++  case OP_JUMP_IF_ARGC:
+     return true;
+   default:
+     return false;
+diff --git a/src/okobject.c b/src/okobject.c
+index e63ecc6..1906b33 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -56,6 +56,7 @@ static void object_function_init(object_function* p_object_function,
+   object_init(&p_object_function->object, OBJ_FUNCTION);
+   p_object_function->name = p_name;
+   p_object_function->arity = p_arity;
++  p_object_function->ndefaults = 0; // compiler sets this when the function is complete
+   p_object_function->registers = 0; // compiler sets this when the function is complete
+   upvalue_descriptor_array_init(&p_object_function->upvalues, p_specs->alloc);
+   chunk_init(&p_object_function->chunk, p_specs->alloc);
+diff --git a/src/okobject.h b/src/okobject.h
+index 62befdc..dd2ca97 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -78,6 +78,7 @@ typedef struct {
+   object_string* name;
+   chunk chunk;
+   uint16_t arity;
++  uint16_t ndefaults; // trailing defaulted params: floor = arity - ndefaults
+   uint16_t registers;
+   upvalue_descriptor_array upvalues;
+ } object_function;
+diff --git a/src/okparser.c b/src/okparser.c
+index 8083139..aee5c9b 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -1674,7 +1674,8 @@ parse_bindings_list(parser* p_parser, ast_binding_modifiers_t p_allowed_binds, t
+     }
+     ast_expression* default_value = NULL;
+     if (p_parser->current.type == TOKEN_ASSIGN) {
+-      advance(p_parser); // '=', first default token into previous
++      advance(p_parser); // consume '='
++      advance(p_parser); // first default token into previous (parse_expression starts there)
+       default_value = parse_expression(p_parser, PREC_NONE);
+       if (default_value == NULL) {
+         error_at(p_parser,
+diff --git a/src/okvm.c b/src/okvm.c
+index 93f57d1..8e7df03 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -1610,6 +1610,15 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       ((object_array*)arr)->values.data[index] = resolve_operand(frame, reg, C, q);
+       break;
+     }
++    case OP_JUMP_IF_ARGC: {
++      const word2 words = JOIN_WORD(instruction);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      const bool p = p_of(words);
++      const bool jump = (p ? 1u : 0u) == (frame->argc > B ? 1u : 0u);
++      ip += jump * A;
++      break;
++    }
+     case OP_PRINT: {
+       const bool p = p_of(instruction);
+       value_debug_print(resolve_operand(frame, reg, Alarge_of(instruction), p));
+@@ -1688,12 +1697,28 @@ static inline bool call(vm* p_vm,
+                         uint32_t p_callee,
+                         uint16_t p_argc,
+                         uint32_t p_retc) {
+-  if (p_argc != p_closure->function->arity) {
+-    runtime_error(p_vm,
+-                  "invalid call to '%s': expected %d arguments, got: %d.",
+-                  p_closure->function->name->string.chars,
+-                  p_closure->function->arity,
+-                  p_argc);
++  const object_function* fu = p_closure->function;
++  if (p_argc < (uint32_t)(fu->arity - fu->ndefaults) || p_argc > fu->arity) {
++    if (fu->ndefaults == 0) {
++      // exact-arity message is load-bearing: pre-defaults tests and hosts pin it
++      runtime_error(p_vm,
++                    "invalid call to '%s': expected %d arguments, got: %d.",
++                    fu->name->string.chars,
++                    fu->arity,
++                    p_argc);
++    } else if (p_argc < fu->arity - fu->ndefaults) {
++      runtime_error(p_vm,
++                    "invalid call to '%s': expected at least %d arguments, got: %d.",
++                    fu->name->string.chars,
++                    fu->arity - fu->ndefaults,
++                    p_argc);
++    } else {
++      runtime_error(p_vm,
++                    "invalid call to '%s': expected at most %d arguments, got: %d.",
++                    fu->name->string.chars,
++                    fu->arity,
++                    p_argc);
++    }
+     return false;
+   }
+   const uint32_t frame_top = p_callee + p_closure->function->registers;
+@@ -1739,6 +1764,7 @@ static inline bool call(vm* p_vm,
+   frame.registers_base = p_callee;
+   frame.return_base = p_callee;
+   frame.return_count = p_retc;
++  frame.argc = p_argc;
+   return call_stack_append(&p_exe->call_stack, frame);
+ }
+ 
+diff --git a/src/okvm.h b/src/okvm.h
+index d5fac8c..becb965 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -24,6 +24,7 @@ typedef struct {
+   uint32_t registers_base;
+   uint32_t return_base;
+   uint32_t return_count;
++  uint16_t argc; // set by call(): the callee's own prologue (defaults ladder) reads it
+ } call_frame;
+ 
+ ARRAY_DECLARE_DEFAULT(call_stack, call_frame)
+diff --git a/tests/e2e/tests/defaults/all_defaulted.ok b/tests/e2e/tests/defaults/all_defaulted.ok
+new file mode 100644
+index 0000000..0dd1e90
+--- /dev/null
++++ b/tests/e2e/tests/defaults/all_defaulted.ok
+@@ -0,0 +1,7 @@
++fu f(a = 1, b = 2, c = 3) {
++  return a * 100 + b * 10 + c;
++}
++print f(); // expect: 123
++print f(9); // expect: 923
++print f(9, 8); // expect: 983
++print f(9, 8, 7); // expect: 987
+diff --git a/tests/e2e/tests/defaults/basic.ok b/tests/e2e/tests/defaults/basic.ok
+new file mode 100644
+index 0000000..0d0ff36
+--- /dev/null
++++ b/tests/e2e/tests/defaults/basic.ok
+@@ -0,0 +1,6 @@
++fu f(a, b = 20, c = 30) {
++  return a + b + c;
++}
++print f(1); // expect: 51
++print f(1, 2); // expect: 33
++print f(1, 2, 3); // expect: 6
+diff --git a/tests/e2e/tests/defaults/default_expression.ok b/tests/e2e/tests/defaults/default_expression.ok
+new file mode 100644
+index 0000000..901ace0
+--- /dev/null
++++ b/tests/e2e/tests/defaults/default_expression.ok
+@@ -0,0 +1,4 @@
++fu f(a, b = 2 + 3 * 4) {
++  return b;
++}
++print f(0); // expect: 14
+diff --git a/tests/e2e/tests/defaults/default_global_ref.ok b/tests/e2e/tests/defaults/default_global_ref.ok
+new file mode 100644
+index 0000000..3a386d9
+--- /dev/null
++++ b/tests/e2e/tests/defaults/default_global_ref.ok
+@@ -0,0 +1,5 @@
++glob let base = 100;
++fu f(a = base) {
++  return a;
++}
++print f(); // expect: 100
+diff --git a/tests/e2e/tests/defaults/default_with_nested_call.ok b/tests/e2e/tests/defaults/default_with_nested_call.ok
+new file mode 100644
+index 0000000..ee255dc
+--- /dev/null
++++ b/tests/e2e/tests/defaults/default_with_nested_call.ok
+@@ -0,0 +1,8 @@
++fu inner(x) {
++  return x + 1;
++}
++fu outer(a = inner(10)) {
++  return a;
++}
++print outer(); // expect: 11
++print outer(5); // expect: 5
+diff --git a/tests/e2e/tests/defaults/dynamic_callee.ok b/tests/e2e/tests/defaults/dynamic_callee.ok
+new file mode 100644
+index 0000000..8897b0f
+--- /dev/null
++++ b/tests/e2e/tests/defaults/dynamic_callee.ok
+@@ -0,0 +1,8 @@
++fu make() {
++  return fu(a, b = 7) {
++    return a * b;
++  };
++}
++let g = make();
++print g(6); // expect: 42
++print g(6, 3); // expect: 18
+diff --git a/tests/e2e/tests/defaults/earlier_param.ok b/tests/e2e/tests/defaults/earlier_param.ok
+new file mode 100644
+index 0000000..363467d
+--- /dev/null
++++ b/tests/e2e/tests/defaults/earlier_param.ok
+@@ -0,0 +1,5 @@
++fu f(a, b = a * 2) {
++  return b;
++}
++print f(4); // expect: 8
++print f(4, 1); // expect: 1
+diff --git a/tests/e2e/tests/defaults/errors/non_trailing.ok b/tests/e2e/tests/defaults/errors/non_trailing.ok
+new file mode 100644
+index 0000000..3ffc808
+--- /dev/null
++++ b/tests/e2e/tests/defaults/errors/non_trailing.ok
+@@ -0,0 +1,4 @@
++fu f(a = 1, b) {
++  return a;
++}
++print f(); // expect error
+diff --git a/tests/e2e/tests/defaults/errors/too_few.ok b/tests/e2e/tests/defaults/errors/too_few.ok
+new file mode 100644
+index 0000000..e634751
+--- /dev/null
++++ b/tests/e2e/tests/defaults/errors/too_few.ok
+@@ -0,0 +1,4 @@
++fu f(a, b = 2) {
++  return a;
++}
++print f(); // expect error
+diff --git a/tests/e2e/tests/defaults/errors/too_many.ok b/tests/e2e/tests/defaults/errors/too_many.ok
+new file mode 100644
+index 0000000..5620ba9
+--- /dev/null
++++ b/tests/e2e/tests/defaults/errors/too_many.ok
+@@ -0,0 +1,4 @@
++fu f(a, b = 2) {
++  return a;
++}
++print f(1, 2, 3); // expect error
+diff --git a/tests/e2e/tests/defaults/fresh_mutable_default.ok b/tests/e2e/tests/defaults/fresh_mutable_default.ok
+new file mode 100644
+index 0000000..8d245ba
+--- /dev/null
++++ b/tests/e2e/tests/defaults/fresh_mutable_default.ok
+@@ -0,0 +1,9 @@
++fu fresh(box = []) {
++  return box;
++}
++let a = fresh();
++let b = fresh();
++push(a, 1);
++push(a, 2);
++print len(a); // expect: 2
++print len(b); // expect: 0
+diff --git a/tests/e2e/tests/defaults/lambda_default.ok b/tests/e2e/tests/defaults/lambda_default.ok
+new file mode 100644
+index 0000000..21d53e3
+--- /dev/null
++++ b/tests/e2e/tests/defaults/lambda_default.ok
+@@ -0,0 +1,5 @@
++let f = fu(a, b = 10) {
++  return a + b;
++};
++print f(1); // expect: 11
++print f(1, 2); // expect: 3
+diff --git a/tests/e2e/tests/defaults/side_effect_once.ok b/tests/e2e/tests/defaults/side_effect_once.ok
+new file mode 100644
+index 0000000..35400e1
+--- /dev/null
++++ b/tests/e2e/tests/defaults/side_effect_once.ok
+@@ -0,0 +1,14 @@
++glob let mut calls = 0;
++fu tick() {
++  calls += 1;
++  return 9;
++}
++fu f(a = tick()) {
++  return a;
++}
++print f(1); // expect: 1
++print calls; // expect: 0
++print f(); // expect: 9
++print calls; // expect: 1
++print f(); // expect: 9
++print calls; // expect: 2
+diff --git a/tests/e2e/tests/defaults/single.ok b/tests/e2e/tests/defaults/single.ok
+new file mode 100644
+index 0000000..8bc4f47
+--- /dev/null
++++ b/tests/e2e/tests/defaults/single.ok
+@@ -0,0 +1,5 @@
++fu f(a, b = 5) {
++  return a * b;
++}
++print f(3); // expect: 15
++print f(3, 4); // expect: 12

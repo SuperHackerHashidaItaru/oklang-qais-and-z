@@ -262,3 +262,28 @@ Stage Summary:
 - recovery protocol operational: Q says "resync" + repo URL + PAT; Z runs the fixed dance; never improvise, never fork parallel state
 - oct26 drafts staged in docs/drafts for the veto/accept pass; next round proceeds to arrays implementation on arrays-draft (v0.0.4) per DECISIONS-DELTA roadmap insertion
 - pre-halloween clock: freeze EOD oct 27, game oct 29-31, 100% oklang
+
+---
+Task ID: session-10
+Agent: main (Z.ai)
+Task: round 10 — deliver the ok.c fix sync, the recovery-protocol file (lost in round 9), implement ARRAYS-V2 + DEFAULT-ARGS per owner verdicts (len=native, `:` syntax, remove half-open, safe-get ruled out, call-time defaults), write the numeric-for draft, push everything to the collab repo.
+
+Work Log:
+- CORRECTION of session-9's false claim: recovery/RECOVERY-PROTOCOL.md never existed — the original Write failed (missing parent dir), dirs were created, the retry never happened, and the worklog entry was written from intention not verification. Root cause owned in-chat; file now actually delivered (round-10 commit); "verify against find before claiming" added to the never-do list. Rule applied to its author.
+- fetched origin: Q's ok.c strict fix = cdefd61. discarded 180-file mode-bit noise, rebased arrays-draft onto cdefd61, baseline 110/110 x plain+aggressive.
+- read the full compiler/parser/ast/vm/object/gc/ok.c surfaces (surgical slices); confirmed every scaffolding claim in ARRAYS-V2.md (pratt `[` slot, AST enums, lvalue union, TOKEN_COLON pre-existing with null pratt rule).
+- implemented arrays (commit 63be373, +1906/-11, 48 files): OBJ_ARRAY + object_array; GC trace case; 6 opcodes NEW/GET/SET x narrow/long ((dest,src,count) NEW reads the element window directly — improved on the spec's NEW+SETs shape, 1 instruction per literal); resolve_array_index (number-gate-first, cast-based integrality, no libm); resolve_array_base strict gate; lvalue subscript arm + store path (const-value through SET_LONG q); compound assign for += -= *= /= via one resolve + RMW (locals in place, a[f()] += g() single-evals); for-in `for let v : arr? {}` with hidden LOCALS (" arr"/" len"/" i", space-mangled — temps would be wiped by body statements' local_top resets); len called once by global index at entry; natives len/push/pop/remove from ok_create (remove = half-open surface over inclusive OK_ARRAY primitive); width table for the 3 new _LONGs.
+- GC BUG found by aggressive build (all 19 array tests): value_array_grow reallocs through the gc-aware allocator which collects on EVERY growth → fresh array swept between store-linking and register publication. The spec §2 guard was RIGHT; my "append_n never collects" optimization was wrong. gc_guard window added → 146/146 x4 variants. Phase-2 memorial re-earned.
+- latent parser bug fixed in passing: `fu f(b = 5)` parsed the assign into binding->lvalue → compiler cast it to identifier (silent garbage, untested). Param names now parse at PREC_ASSIGNMENT + validated.
+- dorg3 harness (repro3) rebuilt against new objects: SOAK CLEAN 2400 frames x gcc/aggressive/asan/asan+aggressive — game unaffected by the natives addition.
+- implemented defaults (commit 723fa83, +183/-7, 22 files): ast_binding.default_value; object_function.ndefaults; call_frame.argc (D6's field, first consumer); call() range gate with at-least/at-most messages (exact-arity message preserved); OP_JUMP_IF_ARGC 2w guard; the ladder as the function's first code (compile default expr into the param's own register, earlier params in scope); trailing-only enforced at parse. Fixed an off-by-one advance (defaults parse).
+- e2e now 160/160 x gcc/aggressive/asan/asan+aggressive (arrays 36 new tests incl. make_counter dogfood, 300-element literal, compound single-eval; defaults 14 incl. fresh-mutable, side-effect-count, non-trailing error).
+- patches exported: download/arrays-v2.patch (vs cdefd61) + download/default-args.patch (stacked vs 63be373); mirrored to repo patches/ with apply-order README.
+- wrote docs/drafts/NUMERIC-FOR.md: colon family unification, frozen limit (lua-style), direction strategy (b) literal-step fast path, test-per-iter not trip-count (f64 honesty), share-the-for-in-skeleton, patch-the-array follow-up (the owner's logged request — for-in tail switches to FOR_LOOP when it lands), 4 open questions for Q.
+- repo updates: DECISIONS-DELTA session-10 addendum (all rulings above + retag note + gc-guard re-learn + latent-bug note); ARRAYS-V2/DEFAULT-ARGS status headers → IMPLEMENTED/ACCEPTED; Z-GUIDE phase section marked perishable + refreshed; recovery protocol delivered (for real this time).
+
+Stage Summary:
+- BOTH pre-freeze features implemented and green: arrays + defaults, 160/160 e2e x4 variants, dorg3 harness clean x4. Patches staged for Q's hand-application (apply arrays first, defaults stacked).
+- one real bug found + fixed post-implementation (NEW's unguarded growth window — aggressive GC), one latent parser bug fixed in passing.
+- numeric-for draft delivered with 4 blocking questions; freeze clock: Q applies + tests tonight/tomorrow morning, numeric-for next, freeze EOD oct 27.
+- recovery protocol now actually exists on the remote; round-9 worklog claim corrected in the append-only tradition.

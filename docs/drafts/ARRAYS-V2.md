@@ -1,11 +1,12 @@
 # spec: arrays v2 (implementation-grade — supersedes docs-oct24/specs/arrays.md)
 
-date: 26/10. target: land on master (v0.0.5 pre-halloween scope, day 1 of 3).
+date: 26/10. IMPLEMENTED (63be373; see patches/arrays-v2.patch). verdicts folded: len=native, : syntax, remove half-open, safe-get ruled out. target: land on master (v0.0.5 pre-halloween scope, day 1 of 3).
 everything below is written against v0.0.4 master (`1697066`) — file names,
 function names and opcode layouts are real, verified this session. read this
 with okchunk.h's layout comments open.
 
-status of the scaffolding (already on master, nothing to re-create):
+IMPLEMENTED 26/10 evening (commit 63be373, patch patches/arrays-v2.patch,
+awaiting owner application). the scaffolding notes below are historical:
 - tokens: TOKEN_LEFT_BRACKET / TOKEN_RIGHT_BRACKET / all compound-assign
   tokens exist (oktoken.h).
 - parser: `[` has a pratt slot `{NULL, NULL, PREC_SUBSCRIPT}` — infix handler

@@ -51,9 +51,12 @@ source of truth: `https://codeberg.org/qais/oklang`, master at v0.0.4
 confidence, don't touch it. sandbox branch `arrays-draft` sits on master,
 ready for the arrays implementation.
 
-current phase (oct 26): pre-halloween crunch. plan: arrays → default
-args → numeric-for → freeze (EOD oct 27) → game oct 29–31, written 100%
-in oklang, which becomes the next integration oracle.
+current phase [perishable — refresh at round end] (oct 26, evening):
+arrays + default args IMPLEMENTED on sandbox branch arrays-draft (commits
+63be373, 723fa83); patches in repo patches/ awaiting Q's hand-application.
+remaining before freeze (EOD oct 27): Q applies + tests both patches, then
+numeric-for (draft in docs/drafts/NUMERIC-FOR.md — 4 open questions for Q).
+game oct 29–31, 100% oklang, next integration oracle. e2e count now 160.
 
 ## first 60 seconds of every round
 
