@@ -1,0 +1,1037 @@
+diff --git a/src/okast.c b/src/okast.c
+index 228af31..ae25042 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -42,6 +42,7 @@
+   X(AST_WHILE_STATEMENT, ast_while_statement)                                                                          \
+   X(AST_FOR_STATEMENT, ast_for_statement)                                                                              \
+   X(AST_FOR_IN_STATEMENT, ast_for_in_statement)                                                                        \
++  X(AST_FOR_NUMERIC_STATEMENT, ast_for_numeric_statement)                                                                        \
+   X(AST_CONTROL_FLOW_STATEMENT, ast_control_flow_statement)                                                            \
+   X(AST_RETURN_STATEMENT, ast_return_statement)                                                                        \
+   /*X(AST_THROW_STATEMENT, ast_throw_statement)*/                                                                      \
+@@ -1086,6 +1087,56 @@ string ast_for_in_statement_asprint(const ast_for_in_statement* p_for_in) {
+   return create_static_string("for in", STRING_CALCULATE_LENGTH);
+ }
+ 
++void ast_for_numeric_statement_init(ast_for_numeric_statement* p_for_numeric, token p_token, ast_specs* p_specs) {
++  ast_statement_init(&p_for_numeric->statement, AST_FOR_NUMERIC_STATEMENT, p_token, p_specs);
++  p_for_numeric->binding = NULL;
++  p_for_numeric->start = NULL;
++  p_for_numeric->limit = NULL;
++  p_for_numeric->step = NULL;
++  p_for_numeric->body = NULL;
++}
++
++void ast_for_numeric_statement_deinit(ast_for_numeric_statement* p_for_numeric) {
++  allocators* alloc = p_for_numeric->statement.node.alloc;
++  if (p_for_numeric->binding != NULL) {
++    ast_binding_deinit(p_for_numeric->binding);
++    alloc->release(alloc, p_for_numeric->binding);
++    p_for_numeric->binding = NULL;
++  }
++  if (p_for_numeric->start != NULL) {
++    ast_dispatch_deinit((ast_node*)p_for_numeric->start);
++    alloc->release(alloc, p_for_numeric->start);
++    p_for_numeric->start = NULL;
++  }
++  if (p_for_numeric->limit != NULL) {
++    ast_dispatch_deinit((ast_node*)p_for_numeric->limit);
++    alloc->release(alloc, p_for_numeric->limit);
++    p_for_numeric->limit = NULL;
++  }
++  if (p_for_numeric->step != NULL) {
++    ast_dispatch_deinit((ast_node*)p_for_numeric->step);
++    alloc->release(alloc, p_for_numeric->step);
++    p_for_numeric->step = NULL;
++  }
++  if (p_for_numeric->body != NULL) {
++    ast_dispatch_deinit((ast_node*)p_for_numeric->body);
++    alloc->release(alloc, p_for_numeric->body);
++    p_for_numeric->body = NULL;
++  }
++  ast_statement_deinit(&p_for_numeric->statement);
++}
++
++bool ast_for_numeric_statement_print(const ast_for_numeric_statement* p_for_numeric) {
++  bool status = ast_dispatch_print((ast_node*)p_for_numeric->start);
++  status &= ast_dispatch_print((ast_node*)p_for_numeric->limit);
++  status &= ast_dispatch_print((ast_node*)p_for_numeric->body);
++  return status;
++}
++
++string ast_for_numeric_statement_asprint(const ast_for_numeric_statement* p_for_numeric) {
++  return create_static_string("for numeric", STRING_CALCULATE_LENGTH);
++}
++
+ void ast_for_statement_deinit(ast_for_statement* p_for) {
+   allocators* alloc = p_for->statement.node.alloc;
+   if (p_for->initializer != NULL) {
+diff --git a/src/okast.h b/src/okast.h
+index c7d7dc4..b8e89dc 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -59,6 +59,7 @@ typedef enum {
+   AST_IF_STATEMENT,
+   AST_FOR_STATEMENT,
+   AST_FOR_IN_STATEMENT,
++  AST_FOR_NUMERIC_STATEMENT,
+   AST_WHILE_STATEMENT,
+   AST_CONTROL_FLOW_STATEMENT,
+   AST_RETURN_STATEMENT,
+@@ -476,6 +477,20 @@ void ast_for_in_statement_deinit(ast_for_in_statement* p_for_in);
+ bool ast_for_in_statement_print(const ast_for_in_statement* p_for_in);
+ string ast_for_in_statement_asprint(const ast_for_in_statement* p_for_in);
+ 
++typedef struct {
++  ast_statement statement;
++  ast_binding* binding;     // the loop counter (name + mutability)
++  ast_expression* start;    // evaluated once at loop entry
++  ast_expression* limit;    // evaluated once at loop entry, frozen for the whole trip
++  ast_expression* step;     // nullable, defaults to 1; zero step is a runtime error
++  ast_statement* body;
++} ast_for_numeric_statement;
++
++void ast_for_numeric_statement_init(ast_for_numeric_statement* p_for_numeric, token p_token, ast_specs* p_specs);
++void ast_for_numeric_statement_deinit(ast_for_numeric_statement* p_for_numeric);
++bool ast_for_numeric_statement_print(const ast_for_numeric_statement* p_for_numeric);
++string ast_for_numeric_statement_asprint(const ast_for_numeric_statement* p_for_numeric);
++
+ typedef enum {
+   CONTROL_FLOW_NONE,
+   CONTROL_FLOW_BREAK,
+diff --git a/src/okchunk.h b/src/okchunk.h
+index 6cb0fb4..331459d 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -187,6 +187,14 @@ typedef enum {
+   OP_ARRAY_SET,          // w:    (p, a, b, c)    -> r[a][p then k[b] otherwise r[b]] = r[c] (value is a register in narrow)
+   OP_ARRAY_SET_LONG,     // 2w:   (p, q, A, B, C) -> r[A][p then k[B] : r[B]] = (q otherwise k[C] : r[C]); ip += w
+   OP_JUMP_IF_ARGC,       // 2w:   (p, A, B)       -> ip += A when (p == 1) == (frame->argc > B); B is the 0-based parameter position
++  OP_FOR_PREP,           // 2w:   (A, B)          -> numeric for entry: r[B] is the counter, r[B + 1] the limit, r[B + 2] the step
++                         //                        (compiler allocates the three adjacently and asserts it). validates all
++                         //                        three are numbers, errors when the step is zero, then runs the first
++                         //                        bounds test (step > 0 then r[B] < r[B + 1] otherwise r[B] > r[B + 1]):
++                         //        when it fails ip += A (skip the whole loop, A is a forward offset like OP_JUMP_IF's)
++  OP_FOR_LOOP,           // 2w:   (A, B)          -> numeric for back edge: r[B] = r[B] + r[B + 2] (counter += step), then
++                         //        when still in range (step > 0 then r[B] < r[B + 1] otherwise r[B] > r[B + 1])
++                         //        ip -= A (jump back to the body top, A is a backward offset like OP_LOOP's)
+ } opcode;
+ 
+ // clang-format on
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 328e13f..e0aa682 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -380,6 +380,7 @@ static bool compile_if_statement(compiler* p_compiler, ast_if_statement* p_if);
+ static bool compile_while_statement(compiler* p_compiler, ast_while_statement* p_while);
+ static bool compile_for_statement(compiler* p_compiler, ast_for_statement* p_for);
+ static bool compile_for_in_statement(compiler* p_compiler, ast_for_in_statement* p_for_in);
++static bool compile_for_numeric_statement(compiler* p_compiler, ast_for_numeric_statement* p_for_numeric);
+ static bool compile_control_flow_statement(compiler* p_compiler, ast_control_flow_statement* p_control);
+ static bool compile_return_statement(compiler* p_compiler, ast_return_statement* p_return);
+ 
+@@ -590,6 +591,9 @@ static bool compile_statement(compiler* p_compiler, ast_statement* p_statement)
+   case AST_FOR_IN_STATEMENT:
+     result = compile_for_in_statement(p_compiler, (ast_for_in_statement*)p_statement);
+     break;
++  case AST_FOR_NUMERIC_STATEMENT:
++    result = compile_for_numeric_statement(p_compiler, (ast_for_numeric_statement*)p_statement);
++    break;
+   case AST_CONTROL_FLOW_STATEMENT:
+     result = compile_control_flow_statement(p_compiler, (ast_control_flow_statement*)p_statement);
+     break;
+@@ -1416,6 +1420,20 @@ static bool emit_incomplete_jump_if_argc(
+   return true;
+ }
+ 
++// numeric for jump pair: both carry their offset in A (PREP forwards to the loop
++// exit, LOOP backwards to the body top) and the counter register in B, with the
++// limit and step at B + 1 and B + 2. patched with patch_jump_if, which preserves
++// B while rewriting A — same contract as OP_JUMP_IF.
++static bool
++emit_incomplete_for_jump(compiler* p_compiler, opcode p_op, _register p_counter, uint32_t* p_out, ast_node* p_author) {
++  *p_out = current_chunk(p_compiler)->code.count;
++  if (!emit_word2(p_compiler, encode_OPPABCQ(p_op, false, 0, p_counter.index, 0, 0), p_author)) {
++    report_oom(p_compiler, p_author);
++    return false;
++  }
++  return true;
++}
++
+ static bool
+ patch_jump(compiler* p_compiler, bool p_is_loop, uint32_t p_jump_instruction, uint32_t p_jump_end, ast_node* p_author) {
+   // offsets are relative to the word after the 1 word jump instruction
+@@ -2468,22 +2486,33 @@ static bool compile_for_in_statement(compiler* p_compiler, ast_for_in_statement*
+   // local_top, which sits below any temp allocated here. the registers would be
+   // handed out to the body's own expressions and clobbered. the leading space makes
+   // the names untypeable, and this loop's dedicated scope makes nesting safe.
+-  variable_declaration arr_decl = {.identifier = ok_create_string_view(" arr", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                   .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
+-  _register arr = add_local(p_compiler, arr_decl, author);
+-  if (!IS_REGISTER_VALID(arr)) {
++  // the counter, limit and step are declared adjacently because the FOR ops read
++  // the limit at counter + 1 and the step at counter + 2 (the same fused back edge
++  // the numeric for uses — one increment/test dispatch per iteration).
++  variable_declaration counter_decl = {
++      .identifier = ok_create_string_view(" i", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++      .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
++  _register counter = add_local(p_compiler, counter_decl, author);
++  if (!IS_REGISTER_VALID(counter)) {
+     goto fail;
+   }
+-  variable_declaration len_decl = {.identifier = ok_create_string_view(" len", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                   .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
+-  _register len = add_local(p_compiler, len_decl, author);
+-  if (!IS_REGISTER_VALID(len)) {
++  variable_declaration limit_decl = {.identifier = ok_create_string_view(" limit", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                                     .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
++  _register limit = add_local(p_compiler, limit_decl, author);
++  if (!IS_REGISTER_VALID(limit)) {
+     goto fail;
+   }
+-  variable_declaration i_decl = {.identifier = ok_create_string_view(" i", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                 .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
+-  _register counter = add_local(p_compiler, i_decl, author);
+-  if (!IS_REGISTER_VALID(counter)) {
++  variable_declaration step_decl = {.identifier = ok_create_string_view(" step", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                                    .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
++  _register step = add_local(p_compiler, step_decl, author);
++  if (!IS_REGISTER_VALID(step)) {
++    goto fail;
++  }
++  ASSERT(limit.index == counter.index + 1 && step.index == counter.index + 2);
++  variable_declaration arr_decl = {.identifier = ok_create_string_view(" arr", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                                   .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
++  _register arr = add_local(p_compiler, arr_decl, author);
++  if (!IS_REGISTER_VALID(arr)) {
+     goto fail;
+   }
+   variable_declaration var_decl = {
+@@ -2508,7 +2537,7 @@ static bool compile_for_in_statement(compiler* p_compiler, ast_for_in_statement*
+     }
+   }
+ 
+-  // len = len(arr): the builtin native, by its compile-time global index. len is
++  // limit = len(arr): the builtin native, by its compile-time global index. len is
+   // effectively reserved while for-in looks like this. reassigning it breaks
+   // loops. the future iteration protocol (post classes) retires this dependency.
+   {
+@@ -2557,13 +2586,13 @@ static bool compile_for_in_statement(compiler* p_compiler, ast_for_in_statement*
+       report_oom(p_compiler, author);
+       goto fail;
+     }
+-    // t_len now holds the count: move it into the hidden len local
+-    if (!materialize_value(p_compiler, len, (location){t_len.index, LOCATION_KIND_REGISTER, LOCATION_OK}, author)) {
++    // t_len now holds the count: move it into the hidden limit local
++    if (!materialize_value(p_compiler, limit, (location){t_len.index, LOCATION_KIND_REGISTER, LOCATION_OK}, author)) {
+       goto fail;
+     }
+   }
+ 
+-  // i = 0
++  // counter = 0, step = 1: constants feeding the fused FOR pair
+   {
+     constant zero = add_constant(p_compiler, NUMBER_AS_VALUE(0), author);
+     if (!IS_CONSTANT_VALID(zero)) {
+@@ -2580,73 +2609,207 @@ static bool compile_for_in_statement(compiler* p_compiler, ast_for_in_statement*
+       goto fail;
+     }
+   }
+-
+   {
+-    const uint32_t loop_start = chunk->code.count;
+-    _register cond;
+-    if (!register_allocator_allocate_temp(regalloc, &cond)) {
++    constant one = add_constant(p_compiler, NUMBER_AS_VALUE(1), author);
++    if (!IS_CONSTANT_VALID(one)) {
++      goto fail;
++    }
++    if (step.index > aprime_MAX || one.index > bprime_MAX) {
++      if (!emit_word2(
++              p_compiler, encode_OPPABCQ(OP_LOAD_CONSTANT_LONG, false, step.index, one.index, 0, 0), author)) {
++        report_oom(p_compiler, author);
++        goto fail;
++      }
++    } else if (!emit_word(p_compiler, encode_oppabprime(OP_LOAD_CONSTANT, false, step.index, one.index), author)) {
+       report_oom(p_compiler, author);
+       goto fail;
+     }
+-    if (!emit_binop(p_compiler,
+-                    OP_LESS,
+-                    OP_LESS_LONG,
+-                    cond,
+-                    (location){counter.index, LOCATION_KIND_REGISTER, LOCATION_OK},
+-                    (location){len.index, LOCATION_KIND_REGISTER, LOCATION_OK},
+-                    false,
+-                    false,
+-                    author)) {
++  }
++
++  // entry: FOR_PREP runs the first bounds test (0 < len) and skips the whole
++  // loop for empty iterables. per iteration from here on: one ARRAY_GET at the
++  // body top, one FOR_LOOP at the bottom — the counter machinery is the same
++  // fused back edge as the numeric for.
++  uint32_t prep;
++  if (!emit_incomplete_for_jump(p_compiler, OP_FOR_PREP, counter, &prep, author)) {
++    goto fail;
++  }
++
++  const uint32_t body_start = chunk->code.count;
++
++  // var = arr[i] (fresh each iteration through the same slot; the body may
++  // capture it. same shared-slot semantics as the C style for today)
++  if (!emit_array_get(p_compiler,
++                      var,
++                      (location){arr.index, LOCATION_KIND_REGISTER, LOCATION_OK},
++                      (location){counter.index, LOCATION_KIND_REGISTER, LOCATION_OK},
++                      author)) {
++    goto fail;
++  }
++
++  CTX.continue_forward = true; // continue jumps to the increment, like C for update
++  if (!compile_statement(p_compiler, p_for_in->body)) {
++    goto fail;
++  }
++
++  CTX.continue_target = chunk->code.count;
++  uint32_t back_edge;
++  if (!emit_incomplete_for_jump(p_compiler, OP_FOR_LOOP, counter, &back_edge, author)) {
++    goto fail;
++  }
++  if (!patch_jump_if(p_compiler, true, back_edge, body_start, author)) {
++    goto fail;
++  }
++  if (!patch_jump_if(p_compiler, false, prep, chunk->code.count, author)) {
++    goto fail;
++  }
++  CTX.break_target = chunk->code.count;
++
++  if (!patch_loop_context(p_compiler, &CTX, author)) {
++    goto fail;
++  }
++  pop_loop_context(ctx, alloc);
++  ASSERT(end_scope(p_compiler, author));
++  return true;
++fail:
++  pop_loop_context(ctx, alloc);
++  ASSERT(end_scope(p_compiler, author));
++  return false;
++#undef CTX
++}
++
++// `for let (mut)? i = <start> : <limit> (: <step>)? <statement>` — the fused
++// numeric loop. start, limit and step are evaluated once, left to right, before
++// the first bounds test; the limit is frozen for the whole trip (lua style). the
++// counter is a normal binding: assignable when `mut` (reseats the current
++// iteration's value, never the trip), captureable with shared slot semantics.
++static bool compile_for_numeric_statement(compiler* p_compiler, ast_for_numeric_statement* p_for_numeric) {
++  allocators* alloc = p_compiler->alloc;
++  compile_context* ctx = current_context(p_compiler);
++  register_allocator* regalloc = &ctx->register_allocator;
++  ast_node* author = (ast_node*)p_for_numeric;
++  {
++    loop_context lctx;
++    loop_context_init(&lctx, alloc);
++    if (!loop_stack_append(&ctx->loop_stack, lctx)) {
++      report_oom(p_compiler, author);
++      loop_context_deinit(&lctx, alloc);
++      return false;
++    }
++  }
++  if (!begin_scope(p_compiler, author)) {
++    pop_loop_context(ctx, alloc);
++    return false;
++  }
++  chunk* chunk = current_chunk(p_compiler);
++#define CTX ctx->loop_stack.data[ctx->loop_stack.count - 1]
++  CTX.scope_depth = ctx->scopes.count - 1;
++
++  // the counter is the user-visible binding, declared first so the two hidden
++  // locals can sit directly after it: the FOR ops read the limit at B + 1 and
++  // the step at B + 2, so the three declarations must stay adjacent (asserted).
++  // the hidden names' leading space makes them untypeable, and this loop's
++  // dedicated scope makes nesting safe. hidden state must be locals, not temps:
++  // every body statement resets temps to local_top and would clobber them.
++  variable_declaration counter_decl = {
++      .identifier = ast_identifier_expression_get_value((ast_identifier_expression*)p_for_numeric->binding->lvalue),
++      .flags = variable_declaration_flags_from_modifiers(DECLARATION_NONE, p_for_numeric->binding->modifiers)};
++  _register counter = add_local(p_compiler, counter_decl, (ast_node*)p_for_numeric->binding);
++  if (!IS_REGISTER_VALID(counter)) {
++    goto fail;
++  }
++  variable_declaration limit_decl = {.identifier = ok_create_string_view(" limit", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                                     .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
++  _register limit = add_local(p_compiler, limit_decl, author);
++  if (!IS_REGISTER_VALID(limit)) {
++    goto fail;
++  }
++  variable_declaration step_decl = {.identifier = ok_create_string_view(" step", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                                    .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
++  _register step = add_local(p_compiler, step_decl, author);
++  if (!IS_REGISTER_VALID(step)) {
++    goto fail;
++  }
++  ASSERT(limit.index == counter.index + 1 && step.index == counter.index + 2);
++
++  // counter = <start>. the counter stays uninitialized while the start resolves,
++  // so it behaves like a let initializer: `for let i = i : ...` sees the outer i.
++  {
++    expression_result start;
++    if (!compile_expression(p_compiler, p_for_numeric->start, counter, 1, &start)) {
+       goto fail;
+     }
+-    uint32_t exit_jump;
+-    if (!emit_incomplete_jump_if(p_compiler, false, cond, &exit_jump, author)) {
++    if (!materialize_into(p_compiler, &start.value, counter, author)) {
+       goto fail;
+     }
++  }
++  // from here the counter is live: the limit and step see it, like sequential lets.
++  regalloc->registers.data[counter.index].flags &= ~REGISTER_FLAG_UNINITIALIZED;
+ 
+-    // var = arr[i] (fresh each iteration through the same slot; the body may
+-    // capture it. same shared-slot semantics as the C style for today)
+-    if (!emit_array_get(p_compiler,
+-                        var,
+-                        (location){arr.index, LOCATION_KIND_REGISTER, LOCATION_OK},
+-                        (location){counter.index, LOCATION_KIND_REGISTER, LOCATION_OK},
+-                        author)) {
++  // limit = <limit expr> (evaluated once, frozen for the whole trip)
++  {
++    expression_result limit_value;
++    if (!compile_expression(p_compiler, p_for_numeric->limit, limit, 1, &limit_value)) {
+       goto fail;
+     }
+-
+-    CTX.continue_forward = true; // continue jumps to the increment, like C for update
+-    if (!compile_statement(p_compiler, p_for_in->body)) {
++    if (!materialize_into(p_compiler, &limit_value.value, limit, author)) {
+       goto fail;
+     }
++  }
+ 
+-    CTX.continue_target = chunk->code.count;
+-    {
+-      constant one = add_constant(p_compiler, NUMBER_AS_VALUE(1), author);
+-      if (!IS_CONSTANT_VALID(one)) {
+-        goto fail;
+-      }
+-      if (!emit_binop(p_compiler,
+-                      OP_ADD,
+-                      OP_ADD_LONG,
+-                      counter,
+-                      (location){counter.index, LOCATION_KIND_REGISTER, LOCATION_OK},
+-                      (location){one.index, LOCATION_KIND_CONSTANT, LOCATION_OK},
+-                      false,
+-                      true,
+-                      author)) {
+-        goto fail;
+-      }
++  // step = <step expr> or the default 1
++  if (p_for_numeric->step != NULL) {
++    expression_result step_value;
++    if (!compile_expression(p_compiler, p_for_numeric->step, step, 1, &step_value)) {
++      goto fail;
+     }
+-
+-    if (!emit_loop(p_compiler, loop_start, author)) {
++    if (!materialize_into(p_compiler, &step_value.value, step, author)) {
++      goto fail;
++    }
++  } else {
++    constant one = add_constant(p_compiler, NUMBER_AS_VALUE(1), author);
++    if (!IS_CONSTANT_VALID(one)) {
+       goto fail;
+     }
+-    if (!patch_jump_if(p_compiler, false, exit_jump, current_chunk(p_compiler)->code.count, author)) {
++    if (step.index > aprime_MAX || one.index > bprime_MAX) {
++      if (!emit_word2(
++              p_compiler, encode_OPPABCQ(OP_LOAD_CONSTANT_LONG, false, step.index, one.index, 0, 0), author)) {
++        report_oom(p_compiler, author);
++        goto fail;
++      }
++    } else if (!emit_word(p_compiler, encode_oppabprime(OP_LOAD_CONSTANT, false, step.index, one.index), author)) {
++      report_oom(p_compiler, author);
+       goto fail;
+     }
+-    CTX.break_target = current_chunk(p_compiler)->code.count;
+   }
+ 
++  // entry: validate + first bounds test, skip the whole loop when it fails
++  uint32_t prep;
++  if (!emit_incomplete_for_jump(p_compiler, OP_FOR_PREP, counter, &prep, author)) {
++    goto fail;
++  }
++
++  // body. continue lands on the FOR_LOOP back edge (the increment site, same
++  // discipline as the C style for's update clause); break lands after it.
++  const uint32_t body_start = chunk->code.count;
++  CTX.continue_forward = true;
++  if (!compile_statement(p_compiler, p_for_numeric->body)) {
++    goto fail;
++  }
++
++  CTX.continue_target = chunk->code.count;
++  uint32_t back_edge;
++  if (!emit_incomplete_for_jump(p_compiler, OP_FOR_LOOP, counter, &back_edge, author)) {
++    goto fail;
++  }
++  if (!patch_jump_if(p_compiler, true, back_edge, body_start, author)) {
++    goto fail;
++  }
++  if (!patch_jump_if(p_compiler, false, prep, chunk->code.count, author)) {
++    goto fail;
++  }
++  CTX.break_target = chunk->code.count;
++
+   if (!patch_loop_context(p_compiler, &CTX, author)) {
+     goto fail;
+   }
+diff --git a/src/okdebug.c b/src/okdebug.c
+index fb433ba..f9df7e2 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -131,6 +131,8 @@ static bool op_is_two_words(opcode p_op) {
+   case OP_ARRAY_GET_LONG:
+   case OP_ARRAY_SET_LONG:
+   case OP_JUMP_IF_ARGC:
++  case OP_FOR_PREP:
++  case OP_FOR_LOOP:
+     return true;
+   default:
+     return false;
+diff --git a/src/okparser.c b/src/okparser.c
+index 453fa6a..7ee6c9e 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -1370,13 +1370,122 @@ fail_body:
+   return NULL;
+ }
+ 
+-// rebuilds `let (mut)? IDENT (= expr)? ;` from tokens the for-in discrimination already
+-// consumed, mirroring parse_let_declaration's extraction. leaves the parser exactly
+-// where the original C style for flow expects it: previous = the init's ';'.
+-static ast_let_declaration*
+-build_let_init(parser* p_parser, token p_let_tok, token p_name_tok, ast_binding_modifiers_t p_binds) {
++// `for let (mut)? IDENT = <start> : <limit> (: <step>)? ? <statement>`.
++// called with current == TOKEN_COLON and the head already parsed into p_init_expr
++// (an `IDENT = <expr>` assign expression, dismantled here the same way
++// build_let_init dismantles the C style initializer).
++static ast_for_numeric_statement* parse_for_numeric_rest(
++    parser* p_parser, token p_for_tok, token p_name_tok, ast_binding_modifiers_t p_binds, ast_expression* p_init_expr) {
++  allocators* alloc = p_parser->alloc;
++  if (p_init_expr == NULL || p_init_expr->node.node_type != AST_ASSIGN_EXPRESSION ||
++      ((ast_assign_expression*)p_init_expr)->left->node.node_type != AST_IDENTIFIER_EXPRESSION) {
++    error_at(p_parser,
++             p_name_tok,
++             ok_create_string_view("expected '=' after the for binding.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    if (p_init_expr != NULL) {
++      ast_dispatch_deinit((ast_node*)p_init_expr);
++      alloc->release(alloc, p_init_expr);
++    }
++    return NULL;
++  }
++  ast_assign_expression* assign = (ast_assign_expression*)p_init_expr;
++
++  advance(p_parser); // ':' consumed, current = first limit token
++  advance(p_parser); // limit's first token into previous
++  ast_expression* limit = parse_expression(p_parser, PREC_NONE);
++  if (limit == NULL) {
++    error_at(p_parser,
++             p_parser->previous,
++             ok_create_string_view("expected an expression as numeric for limit.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto fail_assign;
++  }
++
++  ast_expression* step = NULL;
++  if (p_parser->current.type == TOKEN_COLON) {
++    advance(p_parser); // second ':' consumed, current = first step token
++    advance(p_parser); // step's first token into previous
++    step = parse_expression(p_parser, PREC_NONE);
++    if (step == NULL) {
++      error_at(p_parser,
++               p_parser->previous,
++               ok_create_string_view("expected an expression as numeric for step.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      goto fail_limit;
++    }
++  }
++
++  if (p_parser->current.type != TOKEN_QUESTION) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("expected '?' after numeric for clauses.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto fail_step;
++  }
++  advance(p_parser); // '?'
++  advance(p_parser); // '{' (or first body token)
++  ast_statement* body = parse_statement(p_parser);
++  if (body == NULL) {
++    error_at(p_parser,
++             p_parser->previous,
++             ok_create_string_view("expected a statement as numeric for body.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto fail_step;
++  }
++
++  ast_binding* binding = (ast_binding*)alloc->allocate(alloc, sizeof(ast_binding));
++  if (binding == NULL) {
++    error_at(p_parser,
++             p_for_tok,
++             ok_create_string_view(
++                 "failed to allocate memory for numeric for binding.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto fail_body;
++  }
++  ast_for_numeric_statement* fnum = (ast_for_numeric_statement*)alloc->allocate(alloc, sizeof(ast_for_numeric_statement));
++  if (fnum == NULL) {
++    error_at(p_parser,
++             p_for_tok,
++             ok_create_string_view(
++                 "failed to allocate memory for numeric for node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    alloc->release(alloc, binding);
++    goto fail_body;
++  }
++  ast_specs s = {alloc};
++  // steal the assign's sides like build_let_init does, then free the hollow shell
++  ast_binding_init(binding, assign->left, p_binds, p_name_tok, &s);
++  ast_for_numeric_statement_init(fnum, p_for_tok, &s);
++  fnum->binding = binding;
++  fnum->start = assign->right;
++  fnum->limit = limit;
++  fnum->step = step;
++  fnum->body = body;
++  assign->left = NULL;
++  assign->right = NULL;
++  alloc->release(alloc, assign);
++  return fnum;
++fail_body:
++  ast_dispatch_deinit((ast_node*)body);
++  alloc->release(alloc, body);
++fail_step:
++  if (step != NULL) {
++    ast_dispatch_deinit((ast_node*)step);
++    alloc->release(alloc, step);
++  }
++fail_limit:
++  ast_dispatch_deinit((ast_node*)limit);
++  alloc->release(alloc, limit);
++fail_assign:
++  ast_dispatch_deinit((ast_node*)assign);
++  alloc->release(alloc, assign);
++  return NULL;
++}
++
++// rebuilds `let (mut)? IDENT (= expr)? ;` from the expression the for head
++// discrimination already parsed, mirroring parse_let_declaration's extraction.
++// leaves the parser exactly where the original C style for flow expects it:
++// previous = the init's ';'.
++static ast_let_declaration* build_let_init_from_expression(parser* p_parser,
++                                                           token p_let_tok,
++                                                           token p_name_tok,
++                                                           ast_binding_modifiers_t p_binds,
++                                                           ast_expression* expr) {
+   allocators* alloc = p_parser->alloc;
+-  ast_expression* expr = parse_expression(p_parser, PREC_NONE);
+   ast_binding* binding = (ast_binding*)alloc->allocate(alloc, sizeof(ast_binding));
+   ast_let_declaration* let = (ast_let_declaration*)alloc->allocate(alloc, sizeof(ast_let_declaration));
+   if (binding == NULL || let == NULL) {
+@@ -1476,7 +1585,17 @@ ast_for_statement* parse_for_statement(parser* p_parser) {
+       // the caller dispatches on node_type.
+       return (ast_for_statement*)parse_for_in_rest(p_parser, for_tok, name_tok, binds);
+     }
+-    init = (ast_statement*)build_let_init(p_parser, for_tok, name_tok, binds);
++    // `for let (mut)? IDENT = <expr> ...` or the bare `for let x; ...` C init:
++    // parse the head expression once (previous = name, so `x = 0` parses as an
++    // assign expression exactly like build_let_init's own parse did), then
++    // discriminate on its terminator: ':' -> numeric, ';' -> C style.
++    ast_expression* init_expr = parse_expression(p_parser, PREC_NONE);
++    if (p_parser->current.type == TOKEN_COLON) {
++      // the cast is safe: both statements share the ast_statement prefix.
++      // the caller dispatches on node_type.
++      return (ast_for_statement*)parse_for_numeric_rest(p_parser, for_tok, name_tok, binds, init_expr);
++    }
++    init = (ast_statement*)build_let_init_from_expression(p_parser, for_tok, name_tok, binds, init_expr);
+     if (init == NULL) {
+       return NULL;
+     }
+diff --git a/src/okvm.c b/src/okvm.c
+index 4e253cc..6e76884 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -873,6 +873,22 @@ static bool resolve_array_index(vm* p_vm, value p_index, uint32_t p_count, uint3
+   return false;
+ }
+ 
++// strict gate + cast for the numeric for operands. int-tagged values are
++// accepted and widened: the int48 fast path is parked (D3), but the door stays
++// honest so a future int surface cannot silently miscompare here.
++static bool for_operand_as_number(vm* p_vm, value p_value, const char* p_which, double* p_out) {
++  if (IS_VALUE_NUMBER(p_value)) {
++    *p_out = VALUE_AS_NUMBER(p_value);
++    return true;
++  }
++  if (IS_VALUE_INT(p_value)) {
++    *p_out = (double)VALUE_AS_INT(p_value);
++    return true;
++  }
++  runtime_error(p_vm, "%s must be a number.", p_which);
++  return false;
++}
++
+ // strict gate + cast for the subscript base operand: errors name the operand type
+ static object_array* resolve_array_base(vm* p_vm, value p_base) {
+   if (!value_is_object_type(p_base, OBJ_ARRAY)) {
+@@ -1619,6 +1635,58 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       ip += jump * A;
+       break;
+     }
++    case OP_FOR_PREP: {
++      const word2 words = JOIN_WORD(instruction);
++      const uint16_t A = A_of(words); // forward offset to the loop exit
++      const uint16_t B = B_of(words); // counter; limit at B + 1, step at B + 2
++      double start, limit, step;
++      if (!for_operand_as_number(p_vm, REG_AT(B), "numeric for start", &start) ||
++          !for_operand_as_number(p_vm, REG_AT(B + 1), "numeric for limit", &limit) ||
++          !for_operand_as_number(p_vm, REG_AT(B + 2), "numeric for step", &step)) {
++        interpret_result result;
++        result.status = RUNTIME_ERROR;
++        result.top_level_return = NULL_AS_VALUE();
++        return result;
++      }
++      if (step == 0.0) {
++        runtime_error(p_vm, "numeric for step is zero.");
++        interpret_result result;
++        result.status = RUNTIME_ERROR;
++        result.top_level_return = NULL_AS_VALUE();
++        return result;
++      }
++      // direction is the step's sign, derived per test — the branch predictor
++      // eats it (loop invariant), and no enum slots are spent on UP/DOWN twins.
++      const bool in_range = step > 0.0 ? start < limit : start > limit;
++      if (!in_range) {
++        ip += A;
++      }
++      break;
++    }
++    case OP_FOR_LOOP: {
++      const word2 words = JOIN_WORD(instruction);
++      const uint16_t A = A_of(words); // backward offset to the body top
++      const uint16_t B = B_of(words); // counter; limit at B + 1, step at B + 2
++      // only the counter is reachable by name (mut reseats it): gate it. the
++      // limit and step are hidden locals validated once by FOR_PREP — read them
++      // without revalidation, tag check only to widen ints.
++      double counter;
++      if (!for_operand_as_number(p_vm, REG_AT(B), "numeric for counter", &counter)) {
++        interpret_result result;
++        result.status = RUNTIME_ERROR;
++        result.top_level_return = NULL_AS_VALUE();
++        return result;
++      }
++      const double limit = IS_VALUE_NUMBER(REG_AT(B + 1)) ? VALUE_AS_NUMBER(REG_AT(B + 1)) : (double)VALUE_AS_INT(REG_AT(B + 1));
++      const double step = IS_VALUE_NUMBER(REG_AT(B + 2)) ? VALUE_AS_NUMBER(REG_AT(B + 2)) : (double)VALUE_AS_INT(REG_AT(B + 2));
++      counter += step;
++      REG_AT(B) = NUMBER_AS_VALUE(counter);
++      const bool in_range = step > 0.0 ? counter < limit : counter > limit;
++      if (in_range) {
++        ip -= A;
++      }
++      break;
++    }
+     case OP_PRINT: {
+       const bool p = p_of(instruction);
+       value_debug_print(resolve_operand(frame, reg, Alarge_of(instruction), p));
+diff --git a/tests/e2e/tests/loops/numeric/basic.ok b/tests/e2e/tests/loops/numeric/basic.ok
+new file mode 100644
+index 0000000..fa37c6b
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/basic.ok
+@@ -0,0 +1,8 @@
++for let i = 0 : 5? {
++  print i;
++}
++// expect: 0
++// expect: 1
++// expect: 2
++// expect: 3
++// expect: 4
+diff --git a/tests/e2e/tests/loops/numeric/bounds_evaluated_once.ok b/tests/e2e/tests/loops/numeric/bounds_evaluated_once.ok
+new file mode 100644
+index 0000000..8c9c4cb
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/bounds_evaluated_once.ok
+@@ -0,0 +1,11 @@
++fu limit() {
++  print 7;
++  return 3;
++}
++for let i = 0 : limit()? {
++  print i;
++}
++// expect: 7
++// expect: 0
++// expect: 1
++// expect: 2
+diff --git a/tests/e2e/tests/loops/numeric/break_continue.ok b/tests/e2e/tests/loops/numeric/break_continue.ok
+new file mode 100644
+index 0000000..ab57f1d
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/break_continue.ok
+@@ -0,0 +1,13 @@
++for let i = 0 : 10? {
++  if i == 2? {
++    continue;
++  }
++  if i == 5? {
++    break;
++  }
++  print i;
++}
++// expect: 0
++// expect: 1
++// expect: 3
++// expect: 4
+diff --git a/tests/e2e/tests/loops/numeric/capture.ok b/tests/e2e/tests/loops/numeric/capture.ok
+new file mode 100644
+index 0000000..25f5348
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/capture.ok
+@@ -0,0 +1,13 @@
++let mut late = null;
++for let i = 0 : 3? {
++  let f = fu() {
++    return i;
++  };
++  if i == 1? {
++    late = f;
++    print f();
++  }
++}
++print late();
++// expect: 1
++// expect: 3
+diff --git a/tests/e2e/tests/loops/numeric/direction_mismatch_is_empty.ok b/tests/e2e/tests/loops/numeric/direction_mismatch_is_empty.ok
+new file mode 100644
+index 0000000..c6a1aa6
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/direction_mismatch_is_empty.ok
+@@ -0,0 +1,5 @@
++for let i = 0 : 5 : -1? {
++  print i;
++}
++print 99;
++// expect: 99
+diff --git a/tests/e2e/tests/loops/numeric/errors/immutable_counter.ok b/tests/e2e/tests/loops/numeric/errors/immutable_counter.ok
+new file mode 100644
+index 0000000..b4e9351
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/errors/immutable_counter.ok
+@@ -0,0 +1,4 @@
++for let i = 0 : 5? {
++  i = 3;
++}
++// expect error
+diff --git a/tests/e2e/tests/loops/numeric/errors/mut_counter_non_number.ok b/tests/e2e/tests/loops/numeric/errors/mut_counter_non_number.ok
+new file mode 100644
+index 0000000..b346653
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/errors/mut_counter_non_number.ok
+@@ -0,0 +1,5 @@
++// reseating a mut counter to a non-number fails loudly at the back edge.
++for let mut i = 0 : 5? {
++  i = "x";
++}
++// expect error
+diff --git a/tests/e2e/tests/loops/numeric/errors/non_number_limit.ok b/tests/e2e/tests/loops/numeric/errors/non_number_limit.ok
+new file mode 100644
+index 0000000..ec320b5
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/errors/non_number_limit.ok
+@@ -0,0 +1,4 @@
++for let i = 0 : "x"? {
++  print i;
++}
++// expect error
+diff --git a/tests/e2e/tests/loops/numeric/errors/non_number_start.ok b/tests/e2e/tests/loops/numeric/errors/non_number_start.ok
+new file mode 100644
+index 0000000..fcccb7e
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/errors/non_number_start.ok
+@@ -0,0 +1,4 @@
++for let i = "x" : 5? {
++  print i;
++}
++// expect error
+diff --git a/tests/e2e/tests/loops/numeric/errors/non_number_step.ok b/tests/e2e/tests/loops/numeric/errors/non_number_step.ok
+new file mode 100644
+index 0000000..3565160
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/errors/non_number_step.ok
+@@ -0,0 +1,4 @@
++for let i = 0 : 5 : "x"? {
++  print i;
++}
++// expect error
+diff --git a/tests/e2e/tests/loops/numeric/errors/step_zero.ok b/tests/e2e/tests/loops/numeric/errors/step_zero.ok
+new file mode 100644
+index 0000000..5a1667d
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/errors/step_zero.ok
+@@ -0,0 +1,4 @@
++for let i = 0 : 5 : 0? {
++  print i;
++}
++// expect error
+diff --git a/tests/e2e/tests/loops/numeric/fractional_step.ok b/tests/e2e/tests/loops/numeric/fractional_step.ok
+new file mode 100644
+index 0000000..49fceb4
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/fractional_step.ok
+@@ -0,0 +1,7 @@
++for let i = 0 : 1 : 0.25? {
++  print i;
++}
++// expect: 0
++// expect: 0.25
++// expect: 0.5
++// expect: 0.75
+diff --git a/tests/e2e/tests/loops/numeric/frozen_limit.ok b/tests/e2e/tests/loops/numeric/frozen_limit.ok
+new file mode 100644
+index 0000000..4770809
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/frozen_limit.ok
+@@ -0,0 +1,10 @@
++let mut n = 3;
++for let i = 0 : n? {
++  n = 100;
++  print i;
++}
++print n;
++// expect: 0
++// expect: 1
++// expect: 2
++// expect: 100
+diff --git a/tests/e2e/tests/loops/numeric/limit_sees_counter.ok b/tests/e2e/tests/loops/numeric/limit_sees_counter.ok
+new file mode 100644
+index 0000000..ce5cf05
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/limit_sees_counter.ok
+@@ -0,0 +1,8 @@
++// like sequential lets: the start sees the outer binding, the limit sees the counter.
++let i = 40;
++for let i = i + 2 : i + 3? {
++  print i;
++}
++// expect: 42
++// expect: 43
++// expect: 44
+diff --git a/tests/e2e/tests/loops/numeric/mut_reseat.ok b/tests/e2e/tests/loops/numeric/mut_reseat.ok
+new file mode 100644
+index 0000000..7c26e08
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/mut_reseat.ok
+@@ -0,0 +1,7 @@
++// a mut counter can be reassigned: it reseats the current iteration's value,
++// the trip itself follows the reseat (documented, lua-adjacent but explicit).
++for let mut i = 0 : 5? {
++  i = i + 10;
++  print i;
++}
++// expect: 10
+diff --git a/tests/e2e/tests/loops/numeric/negative_step.ok b/tests/e2e/tests/loops/numeric/negative_step.ok
+new file mode 100644
+index 0000000..41759f1
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/negative_step.ok
+@@ -0,0 +1,8 @@
++for let i = 5 : 0 : -1? {
++  print i;
++}
++// expect: 5
++// expect: 4
++// expect: 3
++// expect: 2
++// expect: 1
+diff --git a/tests/e2e/tests/loops/numeric/nested_shadowing.ok b/tests/e2e/tests/loops/numeric/nested_shadowing.ok
+new file mode 100644
+index 0000000..db5ae87
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/nested_shadowing.ok
+@@ -0,0 +1,12 @@
++for let i = 0 : 2? {
++  for let i = 10 : 12? {
++    print i;
++  }
++  print i;
++}
++// expect: 10
++// expect: 11
++// expect: 0
++// expect: 10
++// expect: 11
++// expect: 1
+diff --git a/tests/e2e/tests/loops/numeric/nested_with_for_in.ok b/tests/e2e/tests/loops/numeric/nested_with_for_in.ok
+new file mode 100644
+index 0000000..9e57037
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/nested_with_for_in.ok
+@@ -0,0 +1,10 @@
++let a = [1, 2];
++for let i = 0 : 2? {
++  for let v : a? {
++    print i * 10 + v;
++  }
++}
++// expect: 1
++// expect: 2
++// expect: 11
++// expect: 12
+diff --git a/tests/e2e/tests/loops/numeric/one_iter.ok b/tests/e2e/tests/loops/numeric/one_iter.ok
+new file mode 100644
+index 0000000..50ef075
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/one_iter.ok
+@@ -0,0 +1,6 @@
++for let i = 0 : 1? {
++  print i;
++}
++print 99;
++// expect: 0
++// expect: 99
+diff --git a/tests/e2e/tests/loops/numeric/step_expr.ok b/tests/e2e/tests/loops/numeric/step_expr.ok
+new file mode 100644
+index 0000000..6371c3b
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/step_expr.ok
+@@ -0,0 +1,9 @@
++let s = 2;
++for let i = 0 : 9 : s? {
++  print i;
++}
++// expect: 0
++// expect: 2
++// expect: 4
++// expect: 6
++// expect: 8
+diff --git a/tests/e2e/tests/loops/numeric/two_pow_53_boundary.ok b/tests/e2e/tests/loops/numeric/two_pow_53_boundary.ok
+new file mode 100644
+index 0000000..397b891
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/two_pow_53_boundary.ok
+@@ -0,0 +1,7 @@
++// every integer below 2^53 is exact in f64: the trip count is exact at the edge.
++let mut count = 0;
++for let i = 9007199254740988 : 9007199254740992? {
++  count = count + 1;
++}
++print count;
++// expect: 4
+diff --git a/tests/e2e/tests/loops/numeric/zero_iter.ok b/tests/e2e/tests/loops/numeric/zero_iter.ok
+new file mode 100644
+index 0000000..9aa313b
+--- /dev/null
++++ b/tests/e2e/tests/loops/numeric/zero_iter.ok
+@@ -0,0 +1,5 @@
++for let i = 5 : 5? {
++  print i;
++}
++print 99;
++// expect: 99

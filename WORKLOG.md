@@ -287,3 +287,28 @@ Stage Summary:
 - one real bug found + fixed post-implementation (NEW's unguarded growth window — aggressive GC), one latent parser bug fixed in passing.
 - numeric-for draft delivered with 4 blocking questions; freeze clock: Q applies + tests tonight/tomorrow morning, numeric-for next, freeze EOD oct 27.
 - recovery protocol now actually exists on the remote; round-9 worklog claim corrected in the append-only tradition.
+
+---
+
+## session 11 — round 11: numeric-for + disassembler + assign peephole
+
+Task: implement numeric-for per the reviewed draft + the owner's four rulings; pre-pone the disassembler (owner's buffer-day request) to inspect the local_pressure theory; optimize if time allowed. patches must now ship a review guide (owner's explicit ask: "where i might be the best places to look").
+
+Work Log:
+- fetched master 9e9fd41 (owner's squash of arrays+defaults with their edits: magic numbers -> okutils.h defines, then/otherwise comment syntax). branched numeric-for-draft. learned the edit conventions from the diff before writing code.
+- answered the consistency question: no good reason for optional let — `for let (mut)? i = ...` now matches for-in + C-for. also killed the shadow-vs-assign ambiguity.
+- direction strategy: analyzed the 2-slot UP/DOWN option seriously before rejecting it (serial back edges = same sign test for positive, worse for negative; entry selection needs body duplication or self-modifying bytecode which breaks re-entrancy under recursion). shipped the single fused FOR_LOOP with per-iteration sign test. zero extra enum slots.
+- encoding: offset in A (patch_jump_if reuse), counter in B, limit/step at B+1/B+2 with compiler-asserted adjacency — forced by the 2-word layout, documented in okchunk.h.
+- shape: PREP does the first test directly (lua's pre-subtract overflows to +-inf and infinite-loops at f64 extremes; direct test is exact).
+- implemented: parser discrimination (head expression parsed once, `:` -> numeric, `;` -> C-style), AST node, compile_for_numeric_statement (mirrors for-in), VM cases with named-operand number gating, 21 test files.
+- for-in convergence shipped in the same commit: hidden locals reordered for adjacency, 4-dispatch tail -> FOR_PREP + FOR_LOOP.
+- disassembler v0: replaced the placeholder — 62-name table with compile-time sync assert, per-op operand decode, resolved jump targets, inline constants/globals, source lines on change, proto recursion, ok --dump + ok_debug_dump_bytecode API. trace builds verified too.
+- THE INSPECTION: dumped local_pressure. theory refuted — constants already fold (ADD r11 = r2 + k10 '1', no LOADK). real cost: assign's temp+MOVE-back pairs, 18/iteration.
+- the fix (same session, separate commit): simple-left binop rhs compiles straight into the local's register. found the two landmines before shipping (a = (a+1) + a, a = f() + a — variable re-read after left-side staging) and gated them out; both pinned by regressions. materialize_value self-move guard added.
+- results: 185/185 e2e x gcc/asan/aggressive; local_pressure 283->230ms; loop_counter numeric 246ms vs C-for 586ms (2.4x); arithmetic_sum numeric 376ms vs 711ms (1.9x). sandbox numbers, indicative.
+- delivered: download/{01,02,03}-*.patch + REVIEW-GUIDE-round11.md (the where-to-look guide). repo patches/ updated, DECISIONS-DELTA round-11 addendum, NUMERIC-FOR.md -> IMPLEMENTED with rulings.
+
+Stage Summary:
+- v0.0.5 feature set complete pending Q's review: arrays, defaults, numeric-for (+ the frozen-limit semantics that were the selling point), disassembler, assign peephole.
+- the disassembler paid for itself within the hour it landed: one theory refuted, one real bottleneck found AND fixed, two semantic landmines mapped before they shipped.
+- parked + logged: compound-assign peephole, MOVE staging before ARRAY_GET/CALL (register-window design question), C-for retirement (D14, iteration-protocol round).

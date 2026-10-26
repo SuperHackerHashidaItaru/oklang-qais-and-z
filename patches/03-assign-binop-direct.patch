@@ -1,0 +1,108 @@
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index e0aa682..47e64a7 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -691,6 +691,9 @@ static bool compile_expression(compiler* p_compiler,
+ }
+ 
+ static bool materialize_value(compiler* p_compiler, _register p_dest, location p_value, ast_node* p_author) {
++  if (p_value.kind == LOCATION_KIND_REGISTER && p_value.index == p_dest.index) {
++    return true; // already there: no self move
++  }
+   opcode op;
+   opcode op_long;
+   switch (p_value.kind) {
+@@ -2170,11 +2173,35 @@ static bool compile_assign_expression(compiler* p_compiler,
+   if (lv.kind == LVALUE_INVALID) {
+     return false;
+   }
++  // `local = <simple> op <rhs>`: compile the rhs straight into the variable's
++  // register and skip the temp + move-back pair (the local_pressure finding:
++  // `a = a + 1` cost ADD-to-temp + MOVE, 2 dispatches where 1 suffices). safe
++  // because value binops write their destination exactly once, at the final
++  // op, reading both operands at emit time — the destination may alias an
++  // operand. the left operand must stay simple (identifier/literal): shapes
++  // like `a = (a + 1) + a` or `a = f() + a` re-read the variable after the
++  // left side may have staged intermediate state in the destination, so they
++  // keep the scratch-then-store path. store_lvalue still runs afterwards:
++  // the mutability gate and the (now no-op) self move check both still apply.
++  _register rhs_dest = p_dest;
++  if (lv.kind == LVALUE_VARIABLE && lv.variable.kind == LOCATION_KIND_REGISTER && p_assign->right != NULL &&
++      p_assign->right->node.node_type == AST_INFIX_BINARY_EXPRESSION) {
++    ast_infix_binary_expression* bin = (ast_infix_binary_expression*)p_assign->right;
++    if (bin->_operator >= OPERATOR_RANGE_BIN_VALUE_BEGIN && bin->_operator <= OPERATOR_RANGE_BIN_VALUE_END) {
++      const ast_node_type left_type = bin->left->node.node_type;
++      if (left_type == AST_IDENTIFIER_EXPRESSION || left_type == AST_NUMBER_EXPRESSION ||
++          left_type == AST_BOOLEAN_EXPRESSION || left_type == AST_STRING_EXPRESSION) {
++        rhs_dest.errors = REGISTER_OK;
++        rhs_dest.index = lv.variable.index;
++        rhs_dest.flags = REGISTER_FLAG_NONE;
++      }
++    }
++  }
+   expression_result right;
+-  if (!compile_expression(p_compiler, p_assign->right, p_dest, 1, &right)) {
++  if (!compile_expression(p_compiler, p_assign->right, rhs_dest, 1, &right)) {
+     return false;
+   }
+-  if (!materialize_into_if_not_register(p_compiler, &right.value, p_dest, (ast_node*)p_assign)) {
++  if (!materialize_into_if_not_register(p_compiler, &right.value, rhs_dest, (ast_node*)p_assign)) {
+     return false;
+   }
+   if (!store_lvalue(p_compiler, lv, right, (ast_node*)p_assign)) {
+diff --git a/tests/e2e/tests/errors/immutable_binop_assign.ok b/tests/e2e/tests/errors/immutable_binop_assign.ok
+new file mode 100644
+index 0000000..4f6c326
+--- /dev/null
++++ b/tests/e2e/tests/errors/immutable_binop_assign.ok
+@@ -0,0 +1,3 @@
++let a = 0;
++a = a + 1;
++// expect error
+diff --git a/tests/e2e/tests/regressions/assign_direct_binop_shapes.ok b/tests/e2e/tests/regressions/assign_direct_binop_shapes.ok
+new file mode 100644
+index 0000000..e1c7fe0
+--- /dev/null
++++ b/tests/e2e/tests/regressions/assign_direct_binop_shapes.ok
+@@ -0,0 +1,25 @@
++// the direct-into-local binop assignment and the shapes that must NOT take it.
++let mut a = 1;
++a = a + 1;
++print a;
++// expect: 2
++
++// left operand is not simple: the variable is re-read after the left side
++// evaluates, so this must keep the scratch path (and stay correct).
++a = (a + 1) + a;
++print a;
++// expect: 5
++
++// call on the left: same rule, the call may stage state in the destination.
++fu ten() {
++  return 10;
++}
++a = ten() + a;
++print a;
++// expect: 15
++
++// the destination appears on the right only: still one fused op, still correct.
++let mut b = 4;
++b = b * b;
++print b;
++// expect: 16
+diff --git a/tests/e2e/tests/regressions/assign_operand_read_timing.ok b/tests/e2e/tests/regressions/assign_operand_read_timing.ok
+new file mode 100644
+index 0000000..2424e08
+--- /dev/null
++++ b/tests/e2e/tests/regressions/assign_operand_read_timing.ok
+@@ -0,0 +1,10 @@
++// binop operands are read at op time: a mutating call on the right side of
++// `a = a + f()` observes the mutation before the add (pinned behavior).
++let mut a = 1;
++let mutate = fu() {
++  a = 100;
++  return 5;
++};
++a = a + mutate();
++print a;
++// expect: 105

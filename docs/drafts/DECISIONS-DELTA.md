@@ -188,3 +188,47 @@ process notes from the implementation itself:
   into the binding's lvalue and the compiler cast it to an identifier —
   silent garbage, never covered by a test. param names now parse at
   PREC_ASSIGNMENT and are validated as identifiers.
+
+## round 11 addendum (numeric-for + disassembler + assign peephole)
+
+- **direction strategy resolved**: zero extra enum slots. one fused FOR_LOOP
+  with a per-iteration step-sign test (lua 5.4 float-loop shape). the 2-slot
+  UP/DOWN option was analyzed and rejected: serial back edges cost the same
+  sign test for positive loops and strictly more for negative; entry-selected
+  back edges need body duplication or self-modifying bytecode, and
+  self-modifying breaks re-entrancy (recursive function, differing loop
+  direction per frame, resumed on a rewritten back edge). the owner
+  pre-authorized the slots; spending none is the better deal.
+- **`let` required in the numeric for head** — consistency ruling from the
+  owner's review. the draft's optional let had no good reason and created a
+  shadow-vs-assign ambiguity. the whole for family now reads
+  `for let (mut)? IDENT ...`.
+- **exclusive bounds, both directions**: up runs while i < limit, down while
+  i > limit. symmetric, matches the `i < n` idiom the game's loops use.
+- **adjacency encoding**: FOR_PREP/FOR_LOOP read limit at counter+1 and step
+  at counter+2. forced by the 2-word layout (offset takes one 16-bit slot,
+  three registers do not fit the other); the compiler declares the three
+  adjacently and asserts. documented in okchunk.h.
+- **PREP does the first test directly** (no lua pre-subtract): start - step
+  overflows to ±inf and infinite-loops at f64 extremes; the direct test is
+  exact there.
+- **NaN bounds = empty loop** (all comparisons false). documented, not
+  special-cased.
+- **disassembler pre-poned from v0.0.6** (owner's call, buffer day): per-op
+  decode, jump targets, constants inline, proto recursion, `ok --dump`.
+- **local_pressure theory REFUTED by inspection**: constants already fold
+  into binop operands; no LOADK-before-ADD exists post-rewrite. the real cost
+  was assign's scratch-temp + move-back pair.
+- **assign peephole shipped**: `local = <simple-left> op <rhs>` compiles the
+  rhs straight into the local's register (ADD r2 = r2 + k, no temp+MOVE).
+  gate is load-bearing: left operand must be identifier/literal —
+  `a = (a + 1) + a` and `a = f() + a` re-read the variable after the left
+  side may stage state in the destination, so they keep the scratch path
+  (both have regression pins). operands are read at op time (pinned by
+  assign_operand_read_timing.ok: a mutating call on the right observes the
+  mutation before the add).
+- **materialize_value skips self moves** (register already in dest) — pure
+  win, may remove other redundant moves.
+- parked, logged: compound-assign (`a += 1`) has the same temp+move shape
+  (natural follow-up); MOVE staging before ARRAY_GET/CALL arguments is the
+  register-window convention (bigger design question, not a peephole).
