@@ -1,0 +1,7 @@
+glob let mut g_counter = 0;
+let mut i = 0;
+while i < 5000000? {
+  g_counter = g_counter + 1;
+  i = i + 1;
+}
+print g_counter;

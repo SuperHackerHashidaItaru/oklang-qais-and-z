@@ -1,0 +1,10 @@
+fu bump(p_value) {
+  return p_value + 1;
+}
+let mut value = 0;
+let mut i = 0;
+while i < 1000000? {
+  value = bump(value);
+  i = i + 1;
+}
+print value;

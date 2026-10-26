@@ -1,0 +1,5 @@
+fu fib(p_n) {
+  if p_n < 2? { return p_n; }
+  return fib(p_n - 1) + fib(p_n - 2);
+}
+print fib(25);

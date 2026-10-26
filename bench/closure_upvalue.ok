@@ -1,0 +1,15 @@
+fu make_counter() {
+  let mut captured = 0;
+  return fu() {
+    captured = captured + 1;
+    return captured;
+  };
+}
+let next = make_counter();
+let mut i = 0;
+let mut result = 0;
+while i < 500000? {
+  result = next();
+  i = i + 1;
+}
+print result;
