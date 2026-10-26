@@ -1,0 +1,552 @@
+diff --git a/src/okvm.c b/src/okvm.c
+index 480906a..9e9d8e6 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -132,7 +132,7 @@ static inline value resolve_operand(call_frame* p_frame, register_file* p_reg, u
+ }
+ 
+ static interpret_result
+-perform_not(execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_on) {
++perform_not(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_on) {
+   const uint32_t base = p_frame->registers_base;
+   value on = p_on;
+   if (IS_VALUE_NUMBER(on)) {
+@@ -145,8 +145,7 @@ perform_not(execution_state* p_exe, register_file* p_reg, call_frame* p_frame, u
+     // TODO
+   } else {
+   invalid: {
+-    // TODO
+-    // runtime_error(p_exe, "invalid opperands: invalid opperands for unary prefix '!'.");
++    runtime_error(p_vm, "invalid operand for unary '!'.");
+     interpret_result res;
+     res.status = RUNTIME_ERROR;
+     res.top_level_return = NULL_AS_VALUE();
+@@ -160,7 +159,7 @@ perform_not(execution_state* p_exe, register_file* p_reg, call_frame* p_frame, u
+ }
+ 
+ static interpret_result
+-perform_negate(execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_on) {
++perform_negate(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_on) {
+   const uint32_t base = p_frame->registers_base;
+   value on = p_on;
+   if (IS_VALUE_NUMBER(on)) {
+@@ -172,8 +171,7 @@ perform_negate(execution_state* p_exe, register_file* p_reg, call_frame* p_frame
+     // TODO
+   } else {
+   invalid: {
+-    // TODO
+-    // runtime_error(p_exe, "invalid opperands: invalid opperands for unary prefix '-'.");
++    runtime_error(p_vm, "invalid operand for unary '-'.");
+     interpret_result res;
+     res.status = RUNTIME_ERROR;
+     res.top_level_return = NULL_AS_VALUE();
+@@ -187,7 +185,7 @@ perform_negate(execution_state* p_exe, register_file* p_reg, call_frame* p_frame
+ }
+ 
+ static interpret_result perform_add(
+-    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++    vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+   value rhs = p_rhs;
+@@ -222,8 +220,7 @@ static interpret_result perform_add(
+     // TODO
+   } else {
+   invalid: {
+-    // TODO
+-    // runtime_error(p_exe, "invalid opperands: invalid opperands for binary '+'.");
++    runtime_error(p_vm, "invalid operands for binary '+'.");
+     interpret_result res;
+     res.status = RUNTIME_ERROR;
+     res.top_level_return = NULL_AS_VALUE();
+@@ -237,7 +234,7 @@ static interpret_result perform_add(
+ }
+ 
+ static interpret_result perform_subtract(
+-    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++    vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+   value rhs = p_rhs;
+@@ -272,8 +269,7 @@ static interpret_result perform_subtract(
+     // TODO
+   } else {
+   invalid: {
+-    // TODO
+-    // runtime_error(p_exe, "invalid opperands: invalid opperands for binary '-'.");
++    runtime_error(p_vm, "invalid operands for binary '-'.");
+     interpret_result res;
+     res.status = RUNTIME_ERROR;
+     res.top_level_return = NULL_AS_VALUE();
+@@ -287,7 +283,7 @@ static interpret_result perform_subtract(
+ }
+ 
+ static interpret_result perform_multiply(
+-    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++    vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+   value rhs = p_rhs;
+@@ -322,8 +318,7 @@ static interpret_result perform_multiply(
+     // TODO
+   } else {
+   invalid: {
+-    // TODO
+-    // runtime_error(p_exe, "invalid opperands: invalid opperands for binary '*'.");
++    runtime_error(p_vm, "invalid operands for binary '*'.");
+     interpret_result res;
+     res.status = RUNTIME_ERROR;
+     res.top_level_return = NULL_AS_VALUE();
+@@ -337,7 +332,7 @@ static interpret_result perform_multiply(
+ }
+ 
+ static interpret_result perform_divide(
+-    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++    vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+   value rhs = p_rhs;
+@@ -383,8 +378,7 @@ static interpret_result perform_divide(
+     // TODO
+   } else {
+   invalid: {
+-    // TODO
+-    // runtime_error(p_exe, "invalid opperands: invalid opperands for binary '/'.");
++    runtime_error(p_vm, "invalid operands for binary '/'.");
+     interpret_result res;
+     res.status = RUNTIME_ERROR;
+     res.top_level_return = NULL_AS_VALUE();
+@@ -398,8 +392,7 @@ static interpret_result perform_divide(
+     return res;
+   }
+ division_by_zero: {
+-  // TODO
+-  // runtime_error(p_exe, "division by zero.");
++  runtime_error(p_vm, "division by zero.");
+   interpret_result res;
+   res.status = RUNTIME_ERROR;
+   res.top_level_return = NULL_AS_VALUE();
+@@ -408,7 +401,7 @@ division_by_zero: {
+ }
+ 
+ static interpret_result perform_equal(
+-    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++    vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+   value rhs = p_rhs;
+@@ -447,13 +440,10 @@ static interpret_result perform_equal(
+     }
+   } else {
+   invalid:
+-    // TODO: we don't want identity checks
++    // mixed-type equality intentionally falls back to a raw identity check
++    // (null/bool vs anything): turning this into a type error is a semantic
++    // decision deferred to the error-model design round.
+     lhs = BOOL_AS_VALUE(lhs == rhs);
+-    // runtime_error(p_exe, "invalid opperands: invalid opperands for binary '=='.");
+-    // interpret_result res;
+-    // res.status = RUNTIME_ERROR;
+-    // res.top_level_return = NULL_AS_VALUE();
+-    // return res;
+   }
+   {
+     p_reg->array.data[base + p_dest] = lhs;
+@@ -464,7 +454,7 @@ static interpret_result perform_equal(
+ }
+ 
+ static interpret_result perform_not_equal(
+-    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++    vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+   value rhs = p_rhs;
+@@ -503,13 +493,10 @@ static interpret_result perform_not_equal(
+     }
+   } else {
+   invalid:
+-    // TODO: we don't want identity checks
++    // mixed-type equality intentionally falls back to a raw identity check
++    // (null/bool vs anything): turning this into a type error is a semantic
++    // decision deferred to the error-model design round.
+     lhs = BOOL_AS_VALUE(lhs != rhs);
+-    // runtime_error(p_exe, "invalid opperands: invalid opperands for binary '=='.");
+-    // interpret_result res;
+-    // res.status = RUNTIME_ERROR;
+-    // res.top_level_return = NULL_AS_VALUE();
+-    // return res;
+   }
+   {
+     p_reg->array.data[base + p_dest] = lhs;
+@@ -520,7 +507,7 @@ static interpret_result perform_not_equal(
+ }
+ 
+ static interpret_result perform_greater(
+-    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++    vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+   value rhs = p_rhs;
+@@ -559,8 +546,7 @@ static interpret_result perform_greater(
+     }
+   } else {
+   invalid: {
+-    // TODO
+-    // runtime_error(p_exe, "invalid opperands: invalid opperands for binary '>'.");
++    runtime_error(p_vm, "invalid operands for binary '>'.");
+     interpret_result res;
+     res.status = RUNTIME_ERROR;
+     res.top_level_return = NULL_AS_VALUE();
+@@ -576,7 +562,7 @@ static interpret_result perform_greater(
+ }
+ 
+ static interpret_result perform_less(
+-    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++    vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+   value rhs = p_rhs;
+@@ -615,8 +601,7 @@ static interpret_result perform_less(
+     }
+   } else {
+   invalid: {
+-    // TODO
+-    // runtime_error(p_exe, "invalid opperands: invalid opperands for binary '<'.");
++    runtime_error(p_vm, "invalid operands for binary '<'.");
+     interpret_result res;
+     res.status = RUNTIME_ERROR;
+     res.top_level_return = NULL_AS_VALUE();
+@@ -632,7 +617,7 @@ static interpret_result perform_less(
+ }
+ 
+ static interpret_result perform_greater_equal(
+-    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++    vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+   value rhs = p_rhs;
+@@ -671,8 +656,7 @@ static interpret_result perform_greater_equal(
+     }
+   } else {
+   invalid: {
+-    // TODO
+-    // runtime_error(p_exe, "invalid opperands: invalid opperands for binary '>='.");
++    runtime_error(p_vm, "invalid operands for binary '>='.");
+     interpret_result res;
+     res.status = RUNTIME_ERROR;
+     res.top_level_return = NULL_AS_VALUE();
+@@ -688,7 +672,7 @@ static interpret_result perform_greater_equal(
+ }
+ 
+ static interpret_result perform_less_equal(
+-    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++    vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+   value rhs = p_rhs;
+@@ -727,8 +711,7 @@ static interpret_result perform_less_equal(
+     }
+   } else {
+   invalid: {
+-    // TODO
+-    //  runtime_error(p_vm, "invalid opperands: invalid opperands for binary '<='.");
++    runtime_error(p_vm, "invalid operands for binary '<='.");
+     interpret_result res;
+     res.status = RUNTIME_ERROR;
+     res.top_level_return = NULL_AS_VALUE();
+@@ -745,8 +728,20 @@ static interpret_result perform_less_equal(
+ 
+ static inline void cleanup_frame(execution_state* p_exe, register_file* p_registers, call_frame* p_frame) {
+   close_upvalues(p_exe, p_frame->registers_base);
+-  p_registers->top = p_frame->registers_base;
+   call_stack_remove(&p_exe->call_stack, p_exe->call_stack.count - 1, p_exe->call_stack.count - 1);
++  // the register watermark must go back to the CALLER's frame top, not to the
++  // callee's base slot: mark_vm roots registers in [0, top) and the caller's
++  // locals/temps above the call window are still live. collapsing to the base
++  // slot unroots them and the next collection sweeps live closures (dorg3:
++  // "invalid call: expected 8 arguments, got: 0" via swept-then-reused memory).
++  // with no caller left (top level popped, or ok_call from C) nothing in the
++  // file is live: fold to 0 so the next ok_call stages from the bottom.
++  if (p_exe->call_stack.count > 0) {
++    call_frame* caller = &p_exe->call_stack.data[p_exe->call_stack.count - 1];
++    p_registers->top = caller->registers_base + caller->closure->function->registers;
++  } else {
++    p_registers->top = 0;
++  }
+ }
+ 
+ static inline uint16_t
+@@ -1086,7 +1081,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const bool p = p_of(instruction);
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+-      interpret_result res = perform_not(exe, reg, frame, ap, resolve_operand(frame, reg, bp, p));
++      interpret_result res = perform_not(p_vm, reg, frame, ap, resolve_operand(frame, reg, bp, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1097,7 +1092,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+-      interpret_result res = perform_not(exe, reg, frame, A, resolve_operand(frame, reg, B, p));
++      interpret_result res = perform_not(p_vm, reg, frame, A, resolve_operand(frame, reg, B, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1107,7 +1102,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const bool p = p_of(instruction);
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+-      interpret_result res = perform_negate(exe, reg, frame, ap, resolve_operand(frame, reg, bp, p));
++      interpret_result res = perform_negate(p_vm, reg, frame, ap, resolve_operand(frame, reg, bp, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1118,7 +1113,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+-      interpret_result res = perform_negate(exe, reg, frame, A, resolve_operand(frame, reg, B, p));
++      interpret_result res = perform_negate(p_vm, reg, frame, A, resolve_operand(frame, reg, B, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1130,7 +1125,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+       interpret_result res =
+-          perform_add(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++          perform_add(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1144,7 +1139,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       interpret_result res =
+-          perform_add(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++          perform_add(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1156,7 +1151,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+       interpret_result res =
+-          perform_subtract(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++          perform_subtract(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1170,7 +1165,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       interpret_result res =
+-          perform_subtract(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++          perform_subtract(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1182,7 +1177,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+       interpret_result res =
+-          perform_multiply(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++          perform_multiply(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1196,7 +1191,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       interpret_result res =
+-          perform_multiply(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++          perform_multiply(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1208,7 +1203,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+       interpret_result res =
+-          perform_divide(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++          perform_divide(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1222,7 +1217,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       interpret_result res =
+-          perform_divide(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++          perform_divide(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1234,7 +1229,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+       interpret_result res =
+-          perform_equal(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++          perform_equal(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1248,7 +1243,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       interpret_result res =
+-          perform_equal(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++          perform_equal(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1260,7 +1255,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+       interpret_result res =
+-          perform_not_equal(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++          perform_not_equal(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1274,7 +1269,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       interpret_result res =
+-          perform_not_equal(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++          perform_not_equal(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1286,7 +1281,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+       interpret_result res =
+-          perform_greater(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++          perform_greater(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1300,7 +1295,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       interpret_result res =
+-          perform_greater(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++          perform_greater(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1312,7 +1307,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+       interpret_result res =
+-          perform_less(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++          perform_less(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1326,7 +1321,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       interpret_result res =
+-          perform_less(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++          perform_less(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1338,7 +1333,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+       interpret_result res =
+-          perform_greater_equal(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++          perform_greater_equal(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1352,7 +1347,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       interpret_result res =
+-          perform_greater_equal(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++          perform_greater_equal(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1364,7 +1359,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+       interpret_result res =
+-          perform_less_equal(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++          perform_less_equal(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1378,7 +1373,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       interpret_result res =
+-          perform_less_equal(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++          perform_less_equal(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1416,9 +1411,13 @@ void runtime_error(vm* p_vm, const char* p_fmt, ...) {
+   va_start(ap, p_fmt);
+   vfprintf(stderr, p_fmt, ap);
+   va_end(ap);
++  // the message must always be newline terminated: with an empty call stack
++  // (ok_call from C) no stack trace follows and the next terminal line would
++  // glue onto the error (the mystery '%' in dorg3's output).
++  fputc('\n', stderr);
+ 
+   if (exe->call_stack.count > 0) {
+-    fputs("\nstack trace (most recent call last):\n", stderr);
++    fputs("stack trace (most recent call last):\n", stderr);
+ 
+     for (uint32_t i = 0; i < exe->call_stack.count; ++i) {
+       call_frame* frame = &exe->call_stack.data[i];
+@@ -1455,7 +1454,11 @@ static inline bool call(vm* p_vm,
+                         uint16_t p_argc,
+                         uint32_t p_retc) {
+   if (p_argc != p_closure->function->arity) {
+-    runtime_error(p_vm, "invalid call: expected %d arguments, got: %d.", p_closure->function->arity, p_argc);
++    runtime_error(p_vm,
++                  "invalid call to '%s': expected %d arguments, got: %d.",
++                  p_closure->function->name->string.chars,
++                  p_closure->function->arity,
++                  p_argc);
+     return false;
+   }
+   const uint32_t frame_top = p_callee + p_closure->function->registers;
+@@ -1497,7 +1500,8 @@ static inline bool call_native(vm* p_vm,
+                                uint32_t p_retc) {
+   if (p_argc != p_native->arity) {
+     runtime_error(p_vm,
+-                  "invalid call: expected %d arguments, got: %d.\nnote: when calling a native function.",
++                  "invalid call to native '%s': expected %d arguments, got: %d.",
++                  p_native->name.chars,
+                   p_native->arity,
+                   p_argc);
+     return false;
+@@ -1521,7 +1525,18 @@ static inline bool call_native(vm* p_vm,
+   // belongs. per OP_CALL semantics (r[a]... = r[a](r[a+1]...)) the result goes
+   // to the call window start, which is the callee slot.
+   register_file* reg = &p_exe->registers;
+-  reg->top = p_callee;
++  // restore the caller's watermark, same contract as cleanup_frame: mark_vm
++  // roots [0, top) and leaving top at the callee slot would unroot every
++  // register above the call window for the rest of the caller's execution.
++  // when there is no bytecode caller (ok_call from C on an empty stack) keep
++  // the old behavior: top = window base, so the result slot doubles as the
++  // staging point for the next ok_call.
++  if (p_exe->call_stack.count > 0) {
++    call_frame* caller = &p_exe->call_stack.data[p_exe->call_stack.count - 1];
++    reg->top = caller->registers_base + caller->closure->function->registers;
++  } else {
++    reg->top = p_callee;
++  }
+   reg->array.data[p_callee] = result;
+   gc_guard_down(p_vm->alloc->gc);
+   return true;

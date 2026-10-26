@@ -1,0 +1,91 @@
+From 3fdec27cd320a820a7c9e866b7d6ce1652ef518f Mon Sep 17 00:00:00 2001
+From: z <z@z>
+Date: Sat, 24 Oct 2026 21:09:08 +0000
+Subject: [PATCH] okvm: OP_LOAD_NULL operand B is a count, not an exclusive end
+ index
+
+---
+ src/okvm.c                                    | 13 ++++--
+ .../regressions/load_null_count_operand.ok    | 46 +++++++++++++++++++
+ 2 files changed, 56 insertions(+), 3 deletions(-)
+ create mode 100644 tests/e2e/tests/regressions/load_null_count_operand.ok
+
+diff --git a/src/okvm.c b/src/okvm.c
+index 9e9d8e6..1e92c6c 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -889,9 +889,16 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+-      // TODO: decide inclusive or not? currently specs says yes, but specs designed without compiler/runtimer in
+-      // mind just based on vibes, and almost all other ranges in specs are exclusive so??!
+-      for (uint16_t i = A; i < B; ++i) {
++      // B is a COUNT, not an exclusive end index: the chunk contract is
++      // "r[A] ... r[A + B - 1] = null" (okchunk.h) and the compiler emits
++      // (dest, requested_count). the loop used to be `i < B`, which matched
++      // the contract only when A == 0: any null materialized into a register
++      // other than r[0] wrote NOTHING and left stale bits in place.
++      // dorg3 crash chain: `glob let mut g_current_music = null` compiled to
++      // LOAD_NULL r[1] (skipped, stale 0.0 double) + STORE_GLOBAL, so the
++      // global held the number 0.0; `g_current_music != null` then passed and
++      // stop_music(0.0) threw "expected argument of type 'music'".
++      for (uint32_t i = A; i < (uint32_t)A + (uint32_t)B; ++i) {
+         REG_AT(i) = NULL_AS_VALUE();
+       }
+       break;
+diff --git a/tests/e2e/tests/regressions/load_null_count_operand.ok b/tests/e2e/tests/regressions/load_null_count_operand.ok
+new file mode 100644
+index 0000000..32eecde
+--- /dev/null
++++ b/tests/e2e/tests/regressions/load_null_count_operand.ok
+@@ -0,0 +1,46 @@
++// regression: OP_LOAD_NULL treated operand B as an exclusive end index
++// instead of a count, so a null materialized into any register other than
++// r[0] was never written and the destination kept stale bits (dorg3's
++// "expected argument of type 'music'" crash, 2026-10-24 round).
++glob let mut g0 = null;
++glob let mut g1 = null;
++let a = 1;
++let b = 2;
++let c = 3;
++glob let mut g2 = null;
++let l0 = null;
++let d = 4;
++let l1 = null;
++
++print g0 == null; // expect: true
++print g1 == null; // expect: true
++print g2 == null; // expect: true
++print l0 == null; // expect: true
++print l1 == null; // expect: true
++
++print g0 != null; // expect: false
++print g1 != null; // expect: false
++
++fu probe(p_v) {
++  return p_v == null;
++}
++
++print probe(g1); // expect: true
++print probe(null); // expect: true
++print probe(5); // expect: false
++
++fu local_null() {
++  let x = 10;
++  let y = null;
++  let z = 30;
++  return y == null;
++}
++
++print local_null(); // expect: true
++
++glob let mut current = null;
++if current != null? {
++  print "bad: guard passed";
++} else {
++  print "guard ok"; // expect: guard ok
++}
+-- 
+2.47.3
+

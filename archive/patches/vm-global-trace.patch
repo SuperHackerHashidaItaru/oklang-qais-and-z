@@ -1,0 +1,70 @@
+From b3c3653e15f4c4a79b1e8e898fa9b1bbd3aa66cf Mon Sep 17 00:00:00 2001
+From: z <z@z>
+Date: Sat, 24 Oct 2026 21:09:16 +0000
+Subject: [PATCH] okvm: opt-in OK_TRACE_GLOBALS instrumentation (compile with
+ -DOK_TRACE_GLOBALS)
+
+---
+ src/okvm.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/okvm.c b/src/okvm.c
+index 1e92c6c..2288d8c 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -901,6 +901,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       for (uint32_t i = A; i < (uint32_t)A + (uint32_t)B; ++i) {
+         REG_AT(i) = NULL_AS_VALUE();
+       }
++#ifdef OK_TRACE_GLOBALS
++      fprintf(stderr, "[tg] NULL r[%u..r[%u) in %s\n", A, (uint32_t)A + B,
++              frame->closure->function->name ? frame->closure->function->name->string.chars : "?");
++#endif
+       break;
+     }
+     case OP_LOAD_FALSE: {
+@@ -917,6 +921,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+       REG_AT(ap) = p_vm->globals_store->global_values.data[bp];
++#ifdef OK_TRACE_GLOBALS
++      fprintf(stderr, "[tg] L  g[%u] -> r[%u]  bits=0x%016llx\n", bp, ap, (unsigned long long)REG_AT(ap));
++#endif
+       break;
+     }
+     case OP_LOAD_GLOBAL_LONG: {
+@@ -924,6 +931,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       REG_AT(A) = p_vm->globals_store->global_values.data[B];
++#ifdef OK_TRACE_GLOBALS
++      fprintf(stderr, "[tg] L  g[%u] -> r[%u] (long)  bits=0x%016llx\n", B, A, (unsigned long long)REG_AT(A));
++#endif
+       break;
+     }
+     case OP_STORE_GLOBAL: {
+@@ -931,6 +941,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+       p_vm->globals_store->global_values.data[ap] = resolve_operand(frame, reg, bp, p);
++#ifdef OK_TRACE_GLOBALS
++      fprintf(stderr, "[tg] S  g[%u] <- %s[%u]  bits=0x%016llx\n", ap, p ? "k" : "r", bp,
++              (unsigned long long)p_vm->globals_store->global_values.data[ap]);
++#endif
+       break;
+     }
+     case OP_STORE_GLOBAL_LONG: {
+@@ -939,6 +953,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       p_vm->globals_store->global_values.data[A] = resolve_operand(frame, reg, B, p);
++#ifdef OK_TRACE_GLOBALS
++      fprintf(stderr, "[tg] S  g[%u] <- %s[%u] (long)  bits=0x%016llx\n", A, p ? "k" : "r", B,
++              (unsigned long long)p_vm->globals_store->global_values.data[A]);
++#endif
+       break;
+     }
+     case OP_LOAD_UPVALUE: {
+-- 
+2.47.3
+

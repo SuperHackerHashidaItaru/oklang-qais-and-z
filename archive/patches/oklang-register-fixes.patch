@@ -1,0 +1,2336 @@
+diff --git a/src/ok.c b/src/ok.c
+index 4626cd2..28c9692 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -155,41 +155,54 @@ ok_cstring_view ok_value_as_string(ok_value p_value) {
+ }
+ 
+ bool ok_call(ok* p_ok, ok_value p_callee, uint8_t p_argc, const ok_value* p_argv, ok_value* p_result) {
+-  uint32_t stack_top = p_ok->vm.stack.top;
+-  stack_push(&p_ok->vm.stack, p_callee);
++  execution_state* exe = p_ok->vm.current_execution_state;
++  register_file* reg = &exe->registers;
++  const uint32_t base = reg->top;
++
++  // stage the call window at the top of the register file: [base] = callee, [base+1..] = args.
++  // the VM grows the file further when the callee frame needs more registers.
++  if ((uint32_t)(base + p_argc + 1) > reg->array.capacity) {
++    if (!register_array_grow(&reg->array, base + p_argc + 1)) {
++      *p_result = NULL_AS_VALUE();
++      return false;
++    }
++  }
++  reg->array.data[base] = p_callee;
+   for (uint8_t i = 0; i < p_argc; ++i) {
+-    stack_push(&p_ok->vm.stack, p_argv[i]);
++    reg->array.data[base + 1 + i] = p_argv[i];
+   }
++  reg->top = base + p_argc + 1;
++
+   interpret_result result = vm_call(&p_ok->vm, p_callee, p_argc);
+   if (result.status != RUNTIME_OK) {
+-    stack_resize(&p_ok->vm.stack, stack_top);
++    // runtime_error already reset the execution state.
+     *p_result = NULL_AS_VALUE();
+     return false;
+   }
+-  *p_result = stack_popr(&p_ok->vm.stack);
++  *p_result = reg->array.data[base];
+   return true;
+ }
+ 
+ bool ok_global_define(ok* p_ok, ok_string_view p_name, ok_value p_value, bool p_is_mutable) {
+   gc_guard_up(&p_ok->gc, p_value);
+-  uint32_t packed = globals_store_add(&p_ok->globals_store, p_name, p_is_mutable);
+-  uint32_t index = global_get_raw_index(packed);
+-  if (!IS_GLOBAL_VALID(packed)) {
++  global_id id =
++      globals_store_add(&p_ok->globals_store, p_name, p_is_mutable ? GLOBAL_FLAG_MUTABLE : GLOBAL_FLAG_NONE);
++  if (!IS_GLOBAL_VALID(id)) {
+     gc_guard_down(&p_ok->gc);
+     return false;
+   }
+-  p_ok->globals_store.global_values.data[index] = p_value;
++  p_ok->globals_store.global_values.data[id.index] = p_value;
+   gc_guard_down(&p_ok->gc);
+   return true;
+ }
+ 
+ bool ok_global_get(ok* p_ok, ok_string_view p_name, ok_value* p_value) {
+-  uint32_t packed = globals_store_get(&p_ok->globals_store, p_name);
+-  if (!IS_GLOBAL_VALID(packed)) {
++  global_id id = globals_store_get(&p_ok->globals_store, p_name);
++  if (!IS_GLOBAL_VALID(id)) {
+     *p_value = NULL_AS_VALUE();
+     return false;
+   }
+-  *p_value = p_ok->globals_store.global_values.data[global_get_raw_index(packed)];
++  *p_value = p_ok->globals_store.global_values.data[id.index];
+   return true;
+ }
+ 
+diff --git a/src/okarray.h b/src/okarray.h
+index 3b1c685..f2f0a9e 100644
+--- a/src/okarray.h
++++ b/src/okarray.h
+@@ -81,6 +81,10 @@
+   }                                                                                                                    \
+                                                                                                                        \
+   bool name##_append_n(name* p_array, const type* p_elements, const size_type p_elements_count) {                      \
++    /* check in full width: count + n can overflow size_type and the grow target would truncate */                     \
++    if ((size_t)p_array->count + (size_t)p_elements_count > (size_t)size_type_max) {                                   \
++      return false;                                                                                                    \
++    }                                                                                                                  \
+     if (p_array->capacity < p_array->count + p_elements_count) {                                                       \
+       const size_t new_capacity = array_grow_capacity(p_array->capacity, p_elements_count, size_type_max);             \
+       if (!name##_grow(p_array, (size_type)new_capacity)) {                                                            \
+@@ -89,7 +93,7 @@
+     }                                                                                                                  \
+     memcpy(p_array->data + p_array->count,                                                                             \
+            p_elements,                                                                                                 \
+-           p_elements_count > size_type_max ? size_type_max : sizeof(type) * p_elements_count);                        \
++           sizeof(type) * (size_t)p_elements_count);                                                                   \
+     p_array->count += p_elements_count;                                                                                \
+     return true;                                                                                                       \
+   }                                                                                                                    \
+diff --git a/src/okchunk.c b/src/okchunk.c
+index 9468273..8f6fda5 100644
+--- a/src/okchunk.c
++++ b/src/okchunk.c
+@@ -8,6 +8,8 @@
+ 
+ ARRAY_DEFINE_DEFAULT(code, word, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(source_info, ok_line_info_repeated, ARRAY_DEFAULT_TYPE_DEINIT)
++#define IDENTIFIERS_DEINIT(x, a) string_deinit(x, a)
++ARRAY_DEFINE(identifiers, string, uint32_t, UINT32_MAX, IDENTIFIERS_DEINIT)
+ 
+ bool source_info_write(source_info* p_source_info, const ok_line_info_repeated p_line_info) {
+   if (p_source_info->count == 0) {
+@@ -26,12 +28,14 @@ bool source_info_write(source_info* p_source_info, const ok_line_info_repeated p
+ void chunk_init(chunk* p_chunk, allocators* p_alloc) {
+   p_chunk->alloc = p_alloc;
+   code_init(&p_chunk->code, p_alloc);
++  identifiers_init(&p_chunk->identifiers, p_alloc);
+   value_array_init(&p_chunk->constants, p_alloc);
+   source_info_init(&p_chunk->source_info, p_alloc);
+ }
+ 
+ void chunk_deinit(chunk* p_chunk) {
+   code_deinit(&p_chunk->code, p_chunk->alloc);
++  identifiers_deinit(&p_chunk->identifiers, p_chunk->alloc);
+   value_array_deinit(&p_chunk->constants, p_chunk->alloc);
+   source_info_deinit(&p_chunk->source_info, p_chunk->alloc);
+ }
+@@ -56,28 +60,38 @@ bool chunk_write_2words(chunk* p_chunk, const word p_word1, const word p_word2,
+   return source_info_write(&p_chunk->source_info, info);
+ }
+ 
++bool chunk_write_word2(chunk* p_chunk, const word2 p_words, const ok_line_info p_line_info) {
++  // low 32 bits first, high 32 bits second (matches VM JOIN_WORD + patch helpers)
++  return chunk_write_2words(p_chunk, (word)(p_words & UINT64_C(0xffffffff)), (word)(p_words >> 32u), p_line_info);
++}
++
+ index_wrapper chunk_add_constant(chunk* p_chunk, const value p_constant, const ok_line_info p_line_info) {
+-  if (p_chunk->constants.count >= CONSTANT_MAX) {
+-    return {
+-      0, 0, CONSTANT_OVERFLOW
+-    }
++  if (p_chunk->constants.count >= CONSTANTS_MAX) {
++    return (index_wrapper){
++        0, 0, CONSTANT_OVERFLOW
++    };
+   }
+   if (!value_array_append(&p_chunk->constants, p_constant)) {
+-    return {0, 0, CONSTANT_ALLOCATION_FAILED};
++    return (index_wrapper){0, 0, CONSTANT_ALLOCATION_FAILED};
+   }
+-  return {p_chunk->constants.count - 1, 0, CONSTANT_OK};
++  return (index_wrapper){p_chunk->constants.count - 1, 0, CONSTANT_OK};
+ }
+ 
+-index_wrapper chunk_add_identifier(chunk* p_chunk, const string_view p_identifier, const ok_line_info p_line_info) {
++index_wrapper chunk_add_identifier(chunk* p_chunk, const ok_string_view p_identifier, const ok_line_info p_line_info) {
+   if (p_chunk->identifiers.count >= IDENTIFIERS_MAX) {
+-    return {
+-      0, 0, IDENTIFIER_OVERFLOW
+-    }
++    return (index_wrapper){
++        0, 0, IDENTIFIER_OVERFLOW
++    };
++  }
++  string owned = create_string_from_string_view(p_identifier, p_chunk->alloc);
++  if (owned.chars == NULL) {
++    return (index_wrapper){0, 0, IDENTIFIER_ALLOCATION_FAILED};
+   }
+-  if (!identifiers_append(&p_chunk->identifiers, p_identifier)) {
+-    return {0, 0, IDENTIFIER_ALLOCATION_FAILED};
++  if (!identifiers_append(&p_chunk->identifiers, owned)) {
++    string_deinit(&owned, p_chunk->alloc);
++    return (index_wrapper){0, 0, IDENTIFIER_ALLOCATION_FAILED};
+   }
+-  return {p_chunk->identifiers.count - 1, 0, IDENTIFIER_OK};
++  return (index_wrapper){p_chunk->identifiers.count - 1, 0, IDENTIFIER_OK};
+ }
+ 
+ ok_line_info_repeated* chunk_find_line_info(const chunk* p_chunk, const uint32_t p_instruction_index) {
+diff --git a/src/okchunk.h b/src/okchunk.h
+index 7bd5192..5fb7c77 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -108,6 +108,17 @@ typedef enum {
+  * ip starts at an offset of exactly 1 word ahead of the current decoded instruction.
+    thus the _LONG variants should increment ip by 1 word.
+  *
++ * jump offsets (OP_JUMP / OP_JUMP_IF / OP_JUMP_IF_SET / OP_LOOP) are measured
++ * relative to the word AFTER the last word of the jump instruction itself:
++ *   target = (instruction_index + instruction_words) + offset   for forward jumps
++ *   target = (instruction_index + instruction_words) - offset   for OP_LOOP
++ * (instruction_words = 1 for OP_JUMP/OP_LOOP, 2 for OP_JUMP_IF/OP_JUMP_IF_SET)
++ *
++ * 2-word instructions are stored LOW 32 bits first, then HIGH 32 bits.
++ * the p flag on OP_JUMP_IF / OP_JUMP_IF_SET selects jump polarity:
++ *   p == 1 -> jump when r[B] is truthy
++ *   p == 0 -> jump when r[B] is falsy
++ *
+  *=======================================================================================*/
+ 
+ typedef uint32_t word;
+@@ -123,8 +134,8 @@ typedef enum {
+   OP_LOAD_CONSTANT_LONG, // 2w:   (A, B)       -> r[A] = k[B]; ip += w
+   OP_JUMP,               // w:    (A)          -> ip += A
+   OP_LOOP,               // w:    (A)          -> ip -= A
+-  OP_JUMP_IF,            // 2w:   (p, A, B)    -> ip += A * (p & bool(r[B]))
+-  OP_JUMP_IF_SET,        // 2w:   (p, A, B, C) -> (p & bool(r[B])) && ip += A and r[C] = r[B]
++  OP_JUMP_IF,            // 2w:   (p, A, B)    -> ip += A when (p == 1) == truthy(r[B])
++  OP_JUMP_IF_SET,        // 2w:   (p, A, B, C) -> when (p == 1) == truthy(r[B]): ip += A and r[C] = r[B]
+   OP_LOAD_NULL,          // 2w:   (A, B)       -> r[A] ... r[A + B - 1] = null
+   OP_LOAD_FALSE,         // w:    (A)          -> r[A] = false
+   OP_LOAD_TRUE,          // w:    (A)          -> r[A] = true
+@@ -137,7 +148,7 @@ typedef enum {
+   OP_STORE_UPVALUE,      // w:    (p, a', b')  -> u[a'] = p then k[b'] otherwise r[b']
+   OP_STORE_UPVALUE_LONG, // 2w:   (p, A, B)    -> u[A] = p then k[B] otherwise r[B];
+   OP_CLOSE_UPVALUES,     // w:    (A)          -> close upvalues where index >= A
+-  OP_CALL,               // w:    (p, a, b, c) -> r[a] ... r[a + c - 2] = r[a](r[a + 1] ... r[a + b]); { p == 1 ? argc = r[a + 1] ... r[top - 1] } { c == 0 => no discard }
++  OP_CALL,               // w:    (p, a, b, c) -> r[a] ... r[a + c - 2] = r[a](r[a + 1] ... r[a + b]); { p == 1 ? argc = r[a + 1] ... r[top - 1] } { c == 0 => take all returned, else take c - 1 }
+   OP_CALL_LONG,          // 2w:   (p, A, B, C) -> r[A] ... r[A + C - 2] = r[A](r[A + 1] ... r[A + B - 1]); { same as narrow variant }
+   OP_RETURN,             // w:    (a', b')     -> return r[a'] ... r[a' + b' - 1] { b' == 0 => return r[a'] ... r[top - 1] (passthrough) }
+   OP_RETURN_LONG,        // 2w:   (A, B)       -> return r[A] ... r[A + B - 1]; { same as narrow variant }
+@@ -150,24 +161,24 @@ typedef enum {
+   OP_NEGATE_LONG,        // 2w:   (p, A, B)       -> r[A] = p == 0 then -r[B] otherwise -k[B]
+   OP_ADD,                // w:    (p, a, b, c)    -> r[a] = r[b] + p then k[c] otherwise r[c]
+   OP_ADD_LONG,           // 2w:   (p, A, B, C, q) -> r[A] = q then k[B] otherwise r[B] + p then k[C] otherwise r[C];
+-  OP_SUBTRACT,           // w:    (a, b, c)    -> r[a] = r[b] - r[c]
+-  OP_SUBTRACT_LONG,      // 2w:   (A, B, C)    -> r[A] = r[B] - r[C]; ip += w
+-  OP_MULTIPLY,           // w:    (a, b, c)    -> r[a] = r[b] * r[c]
+-  OP_MULTIPLY_LONG,      // 2w:   (A, B, C)    -> r[A] = r[B] * r[C]; ip += w
+-  OP_DIVIDE,             // w:    (a, b, c)    -> r[a] = r[b] / r[c]
+-  OP_DIVIDE_LONG,        // 2w:   (A, B, C)    -> r[A] = r[B] / r[C]; ip += w
+-  OP_EQUALS,             // w:    (a, b, c)    -> r[a] = r[b] == r[c]
+-  OP_EQUALS_LONG,        // 2w:   (A, B, C)    -> r[A] = r[B] == r[C]; ip += w
+-  OP_NOT_EQUAL,          // w:    (a, b, c)    -> r[a] = r[b] != r[c]
+-  OP_NOT_EQUAL_LONG,     // 2w:   (A, B, C)    -> r[A] = r[B] != r[C]; ip += w
+-  OP_GREATER,            // w:    (a, b, c)    -> r[a] = r[b] > r[c]
+-  OP_GREATER_LONG,       // 2w:   (A, B, C)    -> r[A] = r[B] > r[C]; ip += w
+-  OP_LESS,               // w:    (a, b, c)    -> r[a] = r[b] < r[c]
+-  OP_LESS_LONG,          // 2w:   (p, A, B, C, q) -> r[A] = r[B] < r[C]; ip += w
+-  OP_GREATER_EQUAL,      // w:    (p, a, b, c)    -> r[a] = r[b] >= r[c]
+-  OP_GREATER_EQUAL_LONG, // 2w:   (p, A, B, C, q) -> r[A] = r[B] >= r[C]; ip += w
+-  OP_LESS_EQUAL,         // w:    (p, a, b, c)    -> r[a] = r[b] <= r[c]
+-  OP_LESS_EQUAL_LONG,    // 2w:   (A, B, C, q, s) -> r[A] = r[B] <= r[C]; ip += w
++  OP_SUBTRACT,           // w:    (p, a, b, c)    -> r[a] = r[b] - (p ? k[c] : r[c])
++  OP_SUBTRACT_LONG,      // 2w:   (p, A, B, C, q) -> r[A] = (q ? k[B] : r[B]) - (p ? k[C] : r[C]); ip += w
++  OP_MULTIPLY,           // w:    (p, a, b, c)    -> r[a] = r[b] * (p ? k[c] : r[c])
++  OP_MULTIPLY_LONG,      // 2w:   (p, A, B, C, q) -> r[A] = (q ? k[B] : r[B]) * (p ? k[C] : r[C]); ip += w
++  OP_DIVIDE,             // w:    (p, a, b, c)    -> r[a] = r[b] / (p ? k[c] : r[c])
++  OP_DIVIDE_LONG,        // 2w:   (p, A, B, C, q) -> r[A] = (q ? k[B] : r[B]) / (p ? k[C] : r[C]); ip += w
++  OP_EQUALS,             // w:    (p, a, b, c)    -> r[a] = r[b] == (p ? k[c] : r[c])
++  OP_EQUALS_LONG,        // 2w:   (p, A, B, C, q) -> r[A] = (q ? k[B] : r[B]) == (p ? k[C] : r[C]); ip += w
++  OP_NOT_EQUAL,          // w:    (p, a, b, c)    -> r[a] = r[b] != (p ? k[c] : r[c])
++  OP_NOT_EQUAL_LONG,     // 2w:   (p, A, B, C, q) -> r[A] = (q ? k[B] : r[B]) != (p ? k[C] : r[C]); ip += w
++  OP_GREATER,            // w:    (p, a, b, c)    -> r[a] = r[b] > (p ? k[c] : r[c])
++  OP_GREATER_LONG,       // 2w:   (p, A, B, C, q) -> r[A] = (q ? k[B] : r[B]) > (p ? k[C] : r[C]); ip += w
++  OP_LESS,               // w:    (p, a, b, c)    -> r[a] = r[b] < (p ? k[c] : r[c])
++  OP_LESS_LONG,          // 2w:   (p, A, B, C, q) -> r[A] = (q ? k[B] : r[B]) < (p ? k[C] : r[C]); ip += w
++  OP_GREATER_EQUAL,      // w:    (p, a, b, c)    -> r[a] = r[b] >= (p ? k[c] : r[c])
++  OP_GREATER_EQUAL_LONG, // 2w:   (p, A, B, C, q) -> r[A] = (q ? k[B] : r[B]) >= (p ? k[C] : r[C]); ip += w
++  OP_LESS_EQUAL,         // w:    (p, a, b, c)    -> r[a] = r[b] <= (p ? k[c] : r[c])
++  OP_LESS_EQUAL_LONG,    // 2w:   (p, A, B, C, q) -> r[A] = (q ? k[B] : r[B]) <= (p ? k[C] : r[C]); ip += w
+   OP_PRINT,              // w:    (p, A)          -> print r[A]
+ } opcode;
+ 
+@@ -195,10 +206,11 @@ ARRAY_DECLARE_DEFAULT(identifiers, string)
+ #define c_LOFFSET (b_LOFFSET + 8)
+ 
+ // a'b'
+-#define aprime_MASK UINT32_C(0x00000fff) // 12 bit width
+-#define bprime_MASK UINT32_C(0x00fff000) // 12 bit width
++// wide layout is op(7) p(1) a'(12) b'(12): a' at bits 8..19, b' at bits 20..31
++#define aprime_MASK UINT32_C(0x000fff00) // 12 bit width
++#define bprime_MASK UINT32_C(0xfff00000) // 12 bit width
+ 
+-#define aprime_LOFFSET 0u
++#define aprime_LOFFSET (p_LOFFSET + 1u)
+ #define bprime_LOFFSET (aprime_LOFFSET + 12u)
+ 
+ #define A_LARGE_MASK UINT32_C(0x00ffff00)
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 95b0366..cdf6257 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -56,7 +56,7 @@ static bool register_allocator_allocate_local(register_allocator* p_regalloc, _r
+   }
+   p_regalloc->registers.count = p_regalloc->local_top;
+   p_out->index = p_regalloc->local_top;
+-  p_out->flags = REGISTER_FLAG_LOCAL;
++  p_out->flags |= REGISTER_FLAG_LOCAL; // preserve incoming flags (mutability)
+   p_out->errors = REGISTER_OK;
+ 
+   if (!registers_append(&p_regalloc->registers, *p_out)) {
+@@ -91,7 +91,9 @@ static void register_allocator_rollback_local(register_allocator* p_regalloc) {
+ }
+ 
+ static void register_allocator_rollback_temp(register_allocator* p_regalloc) {
+-  p_regalloc->temp_top--;
++  // keep metadata array in sync with the register index, otherwise
++  // the next temp append would write metadata at the wrong slot (index drift).
++  p_regalloc->registers.count = --p_regalloc->temp_top;
+ }
+ 
+ static void register_allocator_reset_temps(register_allocator* p_regalloc, uint32_t p_checkpoint) {
+@@ -239,7 +241,7 @@ static bool cleanup_scope(compiler* p_compiler, scope* p_scope, ast_node* p_auth
+ static bool end_scope(compiler* p_compiler, ast_node* p_author) {
+   compile_context* ctx = current_context(p_compiler);
+   scope* scp = current_scope(p_compiler);
+-  bool status;
++  bool status = true;
+   if (!cleanup_scope(p_compiler, scp, p_author)) {
+     status = false;
+   }
+@@ -281,9 +283,11 @@ static inline void end_context(compiler* p_compiler) {
+ }
+ 
+ static _register add_local(compiler* p_compiler, const variable_declaration p_declration, ast_node* p_author) {
+-  register_flags flags = (REGISTER_FLAG_LOCAL | p_declration.flags & VARIABLE_DECLARATION_FLAGS_MUTABLE) != 0
+-                             ? REGISTER_FLAG_MUTABLE
+-                             : REGISTER_FLAG_NONE;
++  // full flag set must be computed BEFORE allocation: the metadata array copies the
++  // register at append time inside allocate_local, later changes to the local copy drift.
++  register_flags flags = REGISTER_FLAG_LOCAL | REGISTER_FLAG_UNINITIALIZED |
++                         ((p_declration.flags & VARIABLE_DECLARATION_FLAGS_MUTABLE) != 0 ? REGISTER_FLAG_MUTABLE
++                                                                                        : REGISTER_FLAG_NONE);
+   _register reg = {0, flags, REGISTER_OK};
+   allocators* alloc = p_compiler->alloc;
+   hashed_string hs = create_hashed_string_hash(p_declration.identifier, alloc);
+@@ -469,6 +473,7 @@ compile_result compiler_compile(compiler* p_compiler, compile_specs p_specs) {
+   }
+   bool res = compile_root(p_compiler, p_specs.root);
+   result.function = current_context(p_compiler)->function.function;
++  result.function->registers = current_context(p_compiler)->register_allocator.registers_count;
+   res &= emit_default_return(p_compiler, (ast_node*)p_specs.root);
+   res &= end_scope(p_compiler, (ast_node*)p_specs.root);
+   end_context(p_compiler);
+@@ -525,36 +530,55 @@ static bool compile_statement(compiler* p_compiler, ast_statement* p_statement)
+   ASSERT_MSG(p_statement->node.node_type >= AST_RANGE_STATEMENT_BEGIN &&
+                  p_statement->node.node_type <= AST_RANGE_STATEMENT_END,
+              "invalid statement.");
++  // statements own the temps they allocate: reset the temp frontier after each one.
++  // reset to local_top (not the entry temp_top): the statement may have added locals,
++  // and a stale checkpoint would truncate metadata below the locals (slot aliasing).
++  register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
++  bool result;
+   switch (p_statement->node.node_type) {
+   case AST_EMPTY_STATEMENT:
+     ASSERT_MSG(false, "empty statement leaked to compiler.");
++    result = false;
+     break;
+   case AST_EXPRESSION_STATEMENT:
+-    return compile_expression_statement(p_compiler, (ast_expression_statement*)p_statement);
++    result = compile_expression_statement(p_compiler, (ast_expression_statement*)p_statement);
++    break;
+   case AST_PRINT_STATEMENT:
+-    return compile_print_statement(p_compiler, (ast_print_statement*)p_statement);
++    result = compile_print_statement(p_compiler, (ast_print_statement*)p_statement);
++    break;
+   case AST_COMPOUND_STATEMENT:
+-    return compile_compound_statement(p_compiler, (ast_compound_statement*)p_statement);
++    result = compile_compound_statement(p_compiler, (ast_compound_statement*)p_statement);
++    break;
+   case AST_IF_STATEMENT:
+-    return compile_if_statement(p_compiler, (ast_if_statement*)p_statement);
++    result = compile_if_statement(p_compiler, (ast_if_statement*)p_statement);
++    break;
+   case AST_WHILE_STATEMENT:
+-    return compile_while_statement(p_compiler, (ast_while_statement*)p_statement);
++    result = compile_while_statement(p_compiler, (ast_while_statement*)p_statement);
++    break;
+   case AST_FOR_STATEMENT:
+-    return compile_for_statement(p_compiler, (ast_for_statement*)p_statement);
++    result = compile_for_statement(p_compiler, (ast_for_statement*)p_statement);
++    break;
+   case AST_CONTROL_FLOW_STATEMENT:
+-    return compile_control_flow_statement(p_compiler, (ast_control_flow_statement*)p_statement);
++    result = compile_control_flow_statement(p_compiler, (ast_control_flow_statement*)p_statement);
++    break;
+   case AST_RETURN_STATEMENT:
+-    return compile_return_statement(p_compiler, (ast_return_statement*)p_statement);
++    result = compile_return_statement(p_compiler, (ast_return_statement*)p_statement);
++    break;
+   case AST_LET_DECLARATION:
+-    return compile_let_declration(p_compiler, (ast_let_declaration*)p_statement);
++    result = compile_let_declration(p_compiler, (ast_let_declaration*)p_statement);
++    break;
+   case AST_FUNCTION_DECLARATION:
+-    return compile_function_declaration(p_compiler, (ast_function_declaration*)p_statement);
++    result = compile_function_declaration(p_compiler, (ast_function_declaration*)p_statement);
++    break;
+   case AST_EOF_STATEMENT:
+-    return compile_eof_statement(p_compiler, (ast_eof_statement*)p_statement);
++    result = compile_eof_statement(p_compiler, (ast_eof_statement*)p_statement);
++    break;
+   default:
+     CRASH_MSG(false, "unimplemented statement.");
++    result = false;
+   }
+-  return false;
++  register_allocator_reset_temps(regalloc, regalloc->local_top);
++  return result;
+ }
+ 
+ static bool compile_expression(compiler* p_compiler,
+@@ -661,6 +685,20 @@ static bool write_local(compiler* p_compiler, _register p_local, expression_resu
+   return materialize_value(p_compiler, p_local, p_value.value, p_author);
+ }
+ 
++// guarantee the value lives in p_dest (move between registers, load constants/globals/upvalues)
++static bool materialize_into(compiler* p_compiler, location* p_location, _register p_dest, ast_node* p_author) {
++  if (p_location->kind == LOCATION_KIND_REGISTER && p_location->index == p_dest.index) {
++    return true;
++  }
++  if (!materialize_value(p_compiler, p_dest, *p_location, p_author)) {
++    return false;
++  }
++  p_location->index = p_dest.index;
++  p_location->kind = LOCATION_KIND_REGISTER;
++  p_location->error = LOCATION_OK;
++  return true;
++}
++
+ static bool
+ materialize_into_if_not_register(compiler* p_compiler, location* p_location, _register p_dest, ast_node* p_author) {
+   if (p_location->kind == LOCATION_KIND_REGISTER) {
+@@ -832,10 +870,12 @@ static _register* resolve_local(compile_context* p_context, hashed_string* p_ide
+   while (sindex == NULL && depth != 0) {
+     scope* scp = &p_context->scopes.data[--depth];
+ 
++    // the table value IS the register slot (scope_registers_set stores reg.index directly),
++    // do not index it through the scope's parallel registers array again
+     sindex = scope_registers_get(&scp->registers_table, *p_identifier);
+     // TODO: report that we skipped if we couldn't resolve other local with same name.
+-    if (sindex != NULL && (p_context->register_allocator.registers.data[scp->registers.data[*sindex]].flags &
+-                           REGISTER_FLAG_UNINITIALIZED) != 0) {
++    if (sindex != NULL &&
++        (p_context->register_allocator.registers.data[*sindex].flags & REGISTER_FLAG_UNINITIALIZED) != 0) {
+       // let x; { let x = x; /* skip the inner */ }
+       sindex = NULL;
+     }
+@@ -844,7 +884,7 @@ static _register* resolve_local(compile_context* p_context, hashed_string* p_ide
+     return NULL;
+   }
+   *p_owning = &p_context->scopes.data[depth];
+-  return &p_context->register_allocator.registers.data[(*p_owning)->registers.data[*sindex]];
++  return &p_context->register_allocator.registers.data[*sindex];
+ }
+ 
+ static location declare_variable(compiler* p_compiler, const variable_declaration p_declration, ast_node* p_node) {
+@@ -961,10 +1001,15 @@ store_local(compiler* p_compiler, location p_local_location, expression_result p
+ 
+ static upvalue add_upvalue(compiler* p_compiler, compile_context* p_ctx, upvalue p_upvalue, ast_node* p_author) {
+   allocators* alloc = p_compiler->alloc;
++  // the array stores SEMANTIC indices (captured local's slot, or parent's upvalue position),
++  // but the returned index must be the position in THIS context's upvalues array, because
++  // callers use it to index the array (store_upvalue / load paths).
+   for (uint32_t i = 0; i < p_ctx->upvalues.count; ++i) {
+     upvalue up = p_ctx->upvalues.data[i];
+     if (up.index == p_upvalue.index && up.flags == p_upvalue.flags) {
+-      return up;
++      p_upvalue.index = (ok_index)i;
++      p_upvalue.errors = UPVALUE_OK;
++      return p_upvalue;
+     }
+   }
+   if (p_ctx->upvalues.count >= UPVALUES_MAX) {
+@@ -976,11 +1021,15 @@ static upvalue add_upvalue(compiler* p_compiler, compile_context* p_ctx, upvalue
+         ok_create_string_view("too many upvalues in a single function.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+         ok_create_string_view_from_string(note));
+     string_deinit(&note, alloc);
++    return p_upvalue;
+   }
+   if (!upvalues_append(&p_ctx->upvalues, p_upvalue)) {
+-    p_upvalue.error = UPVALUE_ALLOCATION_FAILED;
++    p_upvalue.errors = UPVALUE_ALLOCATION_FAILED;
+     report_oom(p_compiler, p_author);
++    return p_upvalue;
+   }
++  p_upvalue.index = (ok_index)(p_ctx->upvalues.count - 1);
++  p_upvalue.errors = UPVALUE_OK;
+   return p_upvalue;
+ }
+ 
+@@ -1026,7 +1075,12 @@ static bool store_upvalue(compiler* p_compiler, location p_upvalue, expression_r
+                    ok_create_string_view("did you forget to declare it 'mut'?", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+     return false;
+   }
+-  return write_upvalue(p_compiler, up, p_value, p_author);
++  // the operand must be the position in this function's upvalue array (the location index),
++  // NOT the stored entry's semantic index (the captured local's slot)
++  return write_upvalue(p_compiler,
++                       (upvalue){.index = p_upvalue.index, .flags = up.flags, .errors = UPVALUE_OK},
++                       p_value,
++                       p_author);
+ }
+ 
+ static location resolve_variable(compiler* p_compiler, const ok_string_view p_identifier, ast_node* p_author) {
+@@ -1200,7 +1254,8 @@ static bool emit_incomplete_jump(compiler* p_compiler, opcode p_op, uint32_t* p_
+ static bool emit_loop(compiler* p_compiler, const uint32_t p_loop_start, ast_node* p_author) {
+   allocators* alloc = p_compiler->alloc;
+   chunk* chunk = current_chunk(p_compiler);
+-  const uint32_t loop_length = chunk->code.count - p_loop_start;
++  // OP_LOOP reads its offset from ip-after-instruction, which is (this word index + 1)
++  const uint32_t loop_length = (chunk->code.count + 1) - p_loop_start;
+   if (loop_length > JUMP_MAX) {
+     string note = asprint(p_compiler->alloc, "limit is: %d words.", JUMP_MAX);
+     error_at_noted(p_compiler,
+@@ -1235,7 +1290,9 @@ static bool emit_incomplete_jump_if_set(
+ 
+ static bool
+ patch_jump(compiler* p_compiler, bool p_is_loop, uint32_t p_jump_instruction, uint32_t p_jump_end, ast_node* p_author) {
+-  const uint32_t jmp = p_is_loop ? p_jump_instruction - p_jump_end : p_jump_end - p_jump_instruction;
++  // offsets are relative to the word after the 1-word jump instruction
++  const uint32_t jmp =
++      p_is_loop ? (p_jump_instruction + 1) - p_jump_end : p_jump_end - (p_jump_instruction + 1);
+   if (jmp > JUMP_MAX) {
+     string note = asprint(p_compiler->alloc, "limit is: %d words.", JUMP_MAX);
+     error_at_noted(p_compiler,
+@@ -1254,7 +1311,9 @@ patch_jump(compiler* p_compiler, bool p_is_loop, uint32_t p_jump_instruction, ui
+ 
+ static bool patch_jump_if(
+     compiler* p_compiler, bool p_is_loop, uint32_t p_jump_instruction, uint32_t p_jump_end, ast_node* p_author) {
+-  const uint32_t jmp = p_is_loop ? p_jump_instruction - p_jump_end : p_jump_end - p_jump_instruction;
++  // offsets are relative to the word after the 2-word jump instruction
++  const uint32_t jmp =
++      p_is_loop ? (p_jump_instruction + 2) - p_jump_end : p_jump_end - (p_jump_instruction + 2);
+   if (jmp > JUMP_MAX) {
+     string note = asprint(p_compiler->alloc, "limit is: %d words.", JUMP_MAX);
+     error_at_noted(p_compiler,
+@@ -1264,14 +1323,17 @@ static bool patch_jump_if(
+     string_deinit(&note, p_compiler->alloc);
+     return false;
+   }
+-  // TODO: make this portable?!
+-  word2* jump = (word2*)(current_chunk(p_compiler)->code.data + p_jump_instruction);
+-  opcode op = op_of(*jump);
+-  bool p = p_of(*jump);
+-  uint16_t B = B_of(*jump);
+-  uint16_t C = C_of(*jump);
+-  bool Q = Q_of(*jump);
+-  *jump = encode_OPPABCQ(op, p, jmp, B, C, Q);
++  // portable re-join of the two words (no word2* cast: endian/alignment safe)
++  word* words = current_chunk(p_compiler)->code.data + p_jump_instruction;
++  word2 joined = ((word2)words[0]) | ((word2)words[1] << 32u);
++  const opcode op = op_of(words[0]);
++  const bool p = p_of(words[0]);
++  const uint16_t B = B_of(joined);
++  const uint16_t C = C_of(joined);
++  const bool Q = Q_of(joined);
++  word2 patched = encode_OPPABCQ(op, p, jmp, B, C, Q);
++  words[0] = (word)(patched & UINT64_C(0xffffffff));
++  words[1] = (word)(patched >> 32u);
+   return true;
+ }
+ 
+@@ -1281,7 +1343,9 @@ static bool patch_jump_if_set(compiler* p_compiler,
+                               uint32_t p_jump_end,
+                               _register p_target,
+                               ast_node* p_author) {
+-  const uint32_t jmp = p_is_loop ? p_jump_instruction - p_jump_end : p_jump_end - p_jump_instruction;
++  // offsets are relative to the word after the 2-word jump instruction
++  const uint32_t jmp =
++      p_is_loop ? (p_jump_instruction + 2) - p_jump_end : p_jump_end - (p_jump_instruction + 2);
+   if (jmp > JUMP_MAX) {
+     string note = asprint(p_compiler->alloc, "limit is: %d words.", JUMP_MAX);
+     error_at_noted(p_compiler,
+@@ -1291,13 +1355,17 @@ static bool patch_jump_if_set(compiler* p_compiler,
+     string_deinit(&note, p_compiler->alloc);
+     return false;
+   }
+-  word2* jump = (word2*)(current_chunk(p_compiler)->code.data + p_jump_instruction);
+-  opcode op = op_of(*jump);
+-  bool p = p_of(*jump);
+-  uint16_t B = B_of(*jump);
+-  uint16_t C = C_of(*jump);
+-  bool Q = Q_of(*jump);
+-  *jump = encode_OPPABCQ(op, p, jmp, B, p_target.index, Q);
++  // portable re-join of the two words (no word2* cast: endian/alignment safe)
++  word* words = current_chunk(p_compiler)->code.data + p_jump_instruction;
++  word2 joined = ((word2)words[0]) | ((word2)words[1] << 32u);
++  const opcode op = op_of(words[0]);
++  const bool p = p_of(words[0]);
++  const uint16_t B = B_of(joined);
++  const uint16_t C = C_of(joined);
++  const bool Q = Q_of(joined);
++  word2 patched = encode_OPPABCQ(op, p, jmp, B, p_target.index, Q);
++  words[0] = (word)(patched & UINT64_C(0xffffffff));
++  words[1] = (word)(patched >> 32u);
+   return true;
+ }
+ 
+@@ -1417,7 +1485,7 @@ bool compile_while_statement(compiler* p_compiler, ast_while_statement* p_while)
+   if (!patch_loop_context(p_compiler, &CTX, (ast_node*)p_while)) {
+     return false;
+   }
+-  CRASH(!loop_stack_pop(&ctx->loop_stack));
++  ASSERT(loop_stack_pop(&ctx->loop_stack));
+ #undef CTX
+   return true;
+ }
+@@ -1669,8 +1737,9 @@ static bool compile_prefix_unary_expression(compiler* p_compiler,
+   }
+   if (p_dest.index > aprime_MAX || rhs.value.index > bprime_MAX) {
+     if (!emit_word2(p_compiler,
+-                    encode_OPPABCQ(op, is_constant, p_dest.index, rhs.value.index, 0, 0),
++                    encode_OPPABCQ(op_long, is_constant, p_dest.index, rhs.value.index, 0, 0),
+                     (ast_node*)p_expression)) {
++      report_oom(p_compiler, (ast_node*)p_expression);
+       return false;
+     }
+   } else {
+@@ -1701,10 +1770,12 @@ static bool compile_logical_operator(compiler* p_compiler,
+   if (!materialize_into_if_not_register(p_compiler, &lhs.value, p_dest, (ast_node*)p_logical)) {
+     return false;
+   }
++  // the condition register is wherever the lhs actually lives (constants were moved to p_dest)
++  _register condition = {.index = lhs.value.index, .flags = REGISTER_FLAG_NONE, .errors = REGISTER_OK};
+ 
+   uint32_t jmp;
+   if (!emit_incomplete_jump_if_set(
+-          p_compiler, p_logical->_operator == OPERATOR_LOG_OR, p_dest, &jmp, (ast_node*)p_logical)) {
++          p_compiler, p_logical->_operator == OPERATOR_LOG_OR, condition, &jmp, (ast_node*)p_logical)) {
+     return false;
+   }
+   if (!compile_expression(p_compiler, p_logical->right, p_dest, 1, &rhs)) {
+@@ -1735,12 +1806,13 @@ static bool emit_binop(compiler* p_compiler,
+   if (is_long) {
+     if (!emit_word2(
+             p_compiler,
+-            encode_OPPABCQ(p_op, p_is_rhs_constant, p_result.index, p_lhs.index, p_rhs.index, p_is_lhs_constant),
++            encode_OPPABCQ(p_long_op, p_is_rhs_constant, p_result.index, p_lhs.index, p_rhs.index, p_is_lhs_constant),
+             p_author)) {
++      report_oom(p_compiler, p_author);
+       return false;
+     }
+   } else if (!emit_word(p_compiler,
+-                        encode_oppabc(p_long_op, p_is_rhs_constant, p_result.index, p_lhs.index, p_rhs.index),
++                        encode_oppabc(p_op, p_is_rhs_constant, p_result.index, p_lhs.index, p_rhs.index),
+                         p_author)) {
+     report_oom(p_compiler, p_author);
+     return false;
+@@ -1993,7 +2065,8 @@ static bool compile_expressions_list(
+     if (!compile_expression(p_compiler, arg, argreg, 1, &result)) {
+       return false;
+     }
+-    if (!materialize_into_if_not_register(p_compiler, &result.value, argreg, p_author)) {
++    // arguments must be materialized into the window register, even register-valued ones
++    if (!materialize_into(p_compiler, &result.value, argreg, p_author)) {
+       return false;
+     }
+     if (i == 0) {
+@@ -2016,24 +2089,29 @@ bool compile_call_expression(compiler* p_compiler,
+   if (!compile_expression(p_compiler, p_call->callable, p_dest, 1, &callable)) {
+     return false;
+   }
+-  if (!materialize_into_if_not_register(p_compiler, &callable.value, p_dest, (ast_node*)p_call)) {
++  // the call window is [p_dest, p_dest + argc]: the callable MUST be moved into p_dest
++  // even when it already lives in another register (e.g. a local or the function's own name)
++  if (!materialize_into(p_compiler, &callable.value, p_dest, (ast_node*)p_call)) {
+     return false;
+   }
+   _register args;
++  args.index = 0;
++  args.flags = REGISTER_FLAG_NONE;
++  args.errors = REGISTER_OK;
+   if (!compile_expressions_list(p_compiler, &p_call->arguments, A_MAX, &args, (ast_node*)p_call)) {
+     return false;
+   }
+-  bool is_long = p_call->arguments.count > 0 && args.index > a_MAX || p_call->arguments.count > b_MAX;
++  const uint32_t argc = p_call->arguments.count;
++  bool is_long = p_dest.index > a_MAX || (argc > 0 && args.index > a_MAX) || argc > b_MAX;
+   if (is_long) {
+     if (!emit_word2(p_compiler,
+-                    encode_OPPABCQ(OP_CALL_LONG, false, p_dest.index, p_call->arguments.count, 2, 0),
++                    encode_OPPABCQ(OP_CALL_LONG, false, p_dest.index, argc, 2, 0),
+                     (ast_node*)p_call)) {
+       report_oom(p_compiler, (ast_node*)p_call);
+       return false;
+     }
+   } else {
+-    if (!emit_word(
+-            p_compiler, encode_oppabc(OP_CALL, false, p_dest.index, p_call->arguments.count, 2), (ast_node*)p_call)) {
++    if (!emit_word(p_compiler, encode_oppabc(OP_CALL, false, p_dest.index, argc, 2), (ast_node*)p_call)) {
+       report_oom(p_compiler, (ast_node*)p_call);
+       return false;
+     }
+@@ -2202,9 +2280,11 @@ static bool compile_function_impl(compiler* p_compiler,
+ 
+   compile_context* function_ctx = current_context(p_compiler);
+   object_function* proto = function_ctx->function.function;
++  proto->registers = function_ctx->register_allocator.registers_count; // frame size for the VM
+   gc_guard_up(alloc->gc, OBJECT_AS_VALUE(proto));
+ 
+-  if (!upvalue_descriptor_array_grow(&proto->upvalues, function_ctx->upvalues.count)) {
++  if (function_ctx->upvalues.count > 0 &&
++      !upvalue_descriptor_array_grow(&proto->upvalues, function_ctx->upvalues.count)) {
+     end_context(p_compiler);
+     report_oom(p_compiler, p_author);
+     gc_guard_down(alloc->gc);
+@@ -2219,9 +2299,9 @@ static bool compile_function_impl(compiler* p_compiler,
+ 
+ #if defined(OK_DEBUG_DUMP_CODE) // this is really useful
+   disassembler disassembler;
+-  disassembler_specs specs = {.chunk = &funct->chunk, .globals_store = p_compiler->globals_store};
++  disassembler_specs specs = {.chunk = &proto->chunk, .globals_store = p_compiler->globals_store};
+   disassembler_init(&disassembler, specs);
+-  debug_disassemble_chunk(&disassembler, funct->name->string.chars);
++  debug_disassemble_chunk(&disassembler, proto->name->string.chars);
+   disassembler_deinit(&disassembler);
+ #endif // defined (OK_DEBUG_DUMP_CODE)
+ 
+diff --git a/src/okdebug.c b/src/okdebug.c
+index 89aeba3..1e392f4 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -99,347 +99,62 @@ bool debug_disassemble_chunk(disassembler* p_disassembler, const char* p_name) {
+   return true;
+ }
+ 
+-uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_offset) {
+-  const chunk* chunk = p_disassembler->chunk;
+-  printf("%04d ", p_offset);
+-
+-  ok_line_info_repeated* info = chunk_find_line_info(chunk, p_offset);
+-  if (info && p_offset == 0) {
+-    printf("%4d:%-4d ", info->line_info.line, info->line_info.offset);
+-  }
+-  if (p_offset > 0) {
+-    ok_line_info_repeated* prev_info = chunk_find_line_info(chunk, p_offset - 1);
+-    ok_line_info_repeated* info = chunk_find_line_info(chunk, p_offset);
+-    if (info && prev_info) {
+-      if (info->line_info.line == prev_info->line_info.line) {
+-        if (info->line_info.offset == prev_info->line_info.offset) {
+-          printf("   |");
+-          printf(" |   ");
+-        } else {
+-          printf("   |");
+-          printf(" %-4d ", info->line_info.offset);
+-        }
+-      } else {
+-        if (info->line_info.offset == prev_info->line_info.offset) {
+-          printf("%4d: |", info->line_info.line);
+-        } else {
+-          printf("%4d:%-4d ", info->line_info.line, info->line_info.offset);
+-        }
+-      }
+-    }
+-  }
+-  word w = chunk->code.data[p_offset++];
+-  switch (op_of(w)) {
+-  case OP_NOP: {
+-    disassemble(p_disassembler, ok_create_cstring_view("NOP", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH), NULL, 0);
+-    break;
+-  }
+-  case OP_MOVE: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("MOVE", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{aprime_of(w), FIELD_PRESERVED}, {bprime_of(w), FIELD_PRESERVED}},
+-                2);
+-    break;
+-  }
+-  case OP_MOVE_LONG: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("MOVE_LONG", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{A_of(w2), FIELD_PRESERVED}, {B_of(w2), FIELD_PRESERVED}},
+-                2);
+-    break;
+-  }
+-  case OP_LOAD_CONSTANT: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("LOAD_CONSTANT", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{aprime_of(w), FIELD_PRESERVED}, {bprime_of(w), FIELD_CONSTANT}},
+-                2);
+-    break;
+-  }
+-  case OP_LOAD_CONSTANT_LONG: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("LOAD_CONSTANT_LONG", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{A_of(w2), FIELD_PRESERVED}, {B_of(w2), FIELD_CONSTANT}},
+-                2);
+-    break;
+-  }
+-  case OP_JUMP: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("JUMP", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[1]){{Alarge_of(w), FIELD_PRESERVED}},
+-                1);
+-    break;
+-  }
+-  case OP_LOOP: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("LOOP", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[1]){{Alarge_of(w), FIELD_PRESERVED}},
+-                1);
+-    break;
+-  }
+-  case OP_JUMP_IF: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("JUMP_IF", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[3]){{p_of(w), FIELD_BOOLEAN}, {A_of(w2), FIELD_PRESERVED}, {B_of(w2), FIELD_PRESERVED}},
+-                3);
+-    break;
+-  }
+-  case OP_JUMP_IF_SET: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("JUMP_IF_SET", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[4]){{p_of(w), FIELD_BOOLEAN},
+-                           {A_of(w2), FIELD_PRESERVED},
+-                           {B_of(w2), FIELD_PRESERVED},
+-                           {C_of(w2), FIELD_PRESERVED}},
+-                4);
+-    break;
+-  }
+-  case OP_LOAD_NULL: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("LOAD_NULL", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{A_of(w2), FIELD_PRESERVED}, {B_of(w2), FIELD_PRESERVED}},
+-                2);
+-    break;
+-  }
+-  case OP_LOAD_FALSE: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("LOAD_FALSE", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[1]){{Alarge_of(w), FIELD_PRESERVED}},
+-                1);
+-    break;
+-  }
+-  case OP_LOAD_TRUE: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("LOAD_TRUE", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[1]){{Alarge_of(w), FIELD_PRESERVED}},
+-                1);
+-    break;
+-  }
+-  case OP_LOAD_GLOBAL: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("LOAD_GLOBAL", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{aprime_of(w), FIELD_PRESERVED}, {bprime_of(w), FIELD_GLOBAL}},
+-                2);
+-    break;
+-  }
+-  case OP_LOAD_GLOBAL_LONG: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("LOAD_GLOBAL_LONG", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{A_of(w2), FIELD_PRESERVED}, {B_of(w2), FIELD_GLOBAL}},
+-                2);
+-    break;
+-  }
+-  case OP_STORE_GLOBAL: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("STORE_GLOBAL", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{aprime_of(w), FIELD_PRESERVED}, {bprime_of(w), p_of(w) ? FIELD_CONSTANT : FIELD_PRESERVED}},
+-                2);
+-    break;
+-  }
+-  case OP_STORE_GLOBAL_LONG: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("STORE_GLOBAL_LONG", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{A_of(w2), FIELD_PRESERVED}, {B_of(w2), p_of(w) ? FIELD_CONSTANT : FIELD_PRESERVED}},
+-                2);
+-    break;
+-  }
+-  case OP_LOAD_UPVALUE: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("LOAD_UPVALUE", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{aprime_of(w), FIELD_PRESERVED}, {bprime_of(w), FIELD_PRESERVED}},
+-                2);
+-    break;
+-  }
+-  case OP_LOAD_UPVALUE_LONG: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("LOAD_UPVALUE_LONG", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{A_of(w2), FIELD_PRESERVED}, {B_of(w2), FIELD_PRESERVED}},
+-                2);
+-    break;
+-  }
+-  case OP_STORE_UPVALUE: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("STORE_UPVALUE", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{aprime_of(w), FIELD_PRESERVED}, {bprime_of(w), p_of(w) ? FIELD_CONSTANT : FIELD_PRESERVED}},
+-                2);
+-    break;
+-  }
+-  case OP_STORE_UPVALUE_LONG: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("STORE_UPVALUE_LONG", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{A_of(w2), FIELD_PRESERVED}, {B_of(w2), p_of(w) ? FIELD_CONSTANT : FIELD_PRESERVED}},
+-                2);
+-    break;
+-  }
+-  case OP_CLOSE_UPVALUES: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("CLOSE_UPVALUES", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[1]){{Alarge_of(w), FIELD_PRESERVED}},
+-                1);
+-    break;
+-  }
+-  case OP_CALL: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("CALL", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[4]){{p_of(w), FIELD_BOOLEAN},
+-                           {a_of(w), FIELD_PRESERVED},
+-                           {b_of(w), FIELD_PRESERVED},
+-                           {c_of(w), FIELD_PRESERVED}},
+-                4);
+-    break;
+-  }
+-  case OP_CALL_LONG: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("CALL_LONG", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[4]){{p_of(w), FIELD_BOOLEAN},
+-                           {a_of(w2), FIELD_PRESERVED},
+-                           {b_of(w2), FIELD_PRESERVED},
+-                           {c_of(w2), FIELD_PRESERVED}},
+-                4);
+-    break;
+-  }
+-  case OP_RETURN: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("RETURN", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{aprime_of(w), FIELD_PRESERVED}, {bprime_of(w), FIELD_PRESERVED}},
+-                2);
+-    break;
+-  }
+-  case OP_RETURN_LONG: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("RETURN_LONG", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{A_of(w2), FIELD_PRESERVED}, {B_of(w2), FIELD_PRESERVED}},
+-                2);
+-    break;
+-  }
+-  case OP_RETURN_1: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("RETURN_1", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[1]){{Alarge_of(w), p_of(w) ? FIELD_NULL : FIELD_PRESERVED}},
+-                1);
+-    break;
+-  }
+-  case OP_CLOSURE: {
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("CLOSURE", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{aprime_of(w), FIELD_PRESERVED}, {bprime_of(w), FIELD_KPROTO}},
+-                2);
+-    break;
+-  }
+-  case OP_CLOSURE_LONG: {
+-    word2 w2 = join_words(w, chunk->code.data[p_offset++]);
+-    disassemble(p_disassembler,
+-                ok_create_cstring_view("CLOSURE_LONG", OK_CSTRING_VIEW_LAZY_CALCULATE_LENGTH),
+-                (field[2]){{A_of(w2), FIELD_PRESERVED}, {B_of(w2), FIELD_KPROTO}},
+-                2);
+-    break;
+-  }
++// Placeholder instruction printer: decodes instruction width and raw operand slots.
++// The real per-opcode disassembler will be written once the format in okchunk.h is
++// proven by the test suite (see notes in okchunk.h).
++static bool op_is_two_words(opcode p_op) {
++  switch (p_op) {
++  case OP_MOVE_LONG:
++  case OP_LOAD_CONSTANT_LONG:
++  case OP_JUMP_IF:
++  case OP_JUMP_IF_SET:
++  case OP_LOAD_NULL:
++  case OP_LOAD_GLOBAL_LONG:
++  case OP_STORE_GLOBAL_LONG:
++  case OP_LOAD_UPVALUE_LONG:
++  case OP_STORE_UPVALUE_LONG:
++  case OP_CALL_LONG:
++  case OP_RETURN_LONG:
++  case OP_CLOSURE_LONG:
++  case OP_NOT_LONG:
++  case OP_NEGATE_LONG:
++  case OP_ADD_LONG:
++  case OP_SUBTRACT_LONG:
++  case OP_MULTIPLY_LONG:
++  case OP_DIVIDE_LONG:
++  case OP_EQUALS_LONG:
++  case OP_NOT_EQUAL_LONG:
++  case OP_GREATER_LONG:
++  case OP_LESS_LONG:
++  case OP_GREATER_EQUAL_LONG:
++  case OP_LESS_EQUAL_LONG:
++    return true;
++  default:
++    return false;
+   }
+-  return p_offset;
+-}
+-
+-uint32_t op_code_instruction(const char* p_opname, const uint32_t p_offset) {
+-  printf("%-16s\n", p_opname);
+-  return p_offset + OP_CODE_WIDTH;
+-}
+-
+-uint32_t constant_instruction(const char* p_opname, const uint32_t p_offset, const chunk* p_chunk) {
+-  uint8_t constant = p_chunk->code.data[p_offset + OP_CODE_WIDTH];
+-  printf("%-16s %4d '", p_opname, constant);
+-  value_debug_print(p_chunk->constants.data[constant]);
+-  printf("'\n");
+-  return p_offset + OP_CODE_WIDTH + OP_CONSTANT_OPERANDS_WIDTH;
+-}
+-
+-uint32_t constant_long_instruction(const char* p_opname, const uint32_t p_offset, const chunk* p_chunk) {
+-  const uint32_t constant = decode_int(p_offset + p_chunk->code.data + OP_CODE_WIDTH, OP_CONSTANT_LONG_OPERANDS_WIDTH);
+-  printf("%-16s %4d '", p_opname, constant);
+-  value_debug_print(p_chunk->constants.data[constant]);
+-  printf("'\n");
+-  return p_offset + OP_CODE_WIDTH + OP_CONSTANT_LONG_OPERANDS_WIDTH;
+-}
+-
+-uint32_t global_instruction(const char* p_opname, const uint32_t p_offset, const disassembler* p_disassembler) {
+-  // TODO get the identifier from debug info
+-  const uint8_t index = p_disassembler->chunk->code.data[p_offset + OP_CODE_WIDTH];
+-  printf("%-16s %4d\n", p_opname, index);
+-  return p_offset + OP_CODE_WIDTH + OP_XX_GLOBAL_OPERANDS_WIDTH;
+-}
+-
+-uint32_t global_long_instruction(const char* p_opname, const uint32_t p_offset, const disassembler* p_disassembler) {
+-  const uint32_t index =
+-      decode_int(p_offset + p_disassembler->chunk->code.data + OP_CODE_WIDTH, OP_XX_GLOBAL_LONG_OPERANDS_WIDTH);
+-  printf("%-16s %4d\n", p_opname, index);
+-  return p_offset + OP_CODE_WIDTH + OP_XX_GLOBAL_LONG_OPERANDS_WIDTH;
+-}
+-
+-uint32_t local_instruction(const char* p_opname, const uint32_t p_offset, const chunk* p_chunk) {
+-  const byte slot = p_chunk->code.data[p_offset + OP_CODE_WIDTH];
+-  printf("%-16s %4d\n", p_opname, slot);
+-  return p_offset + OP_CODE_WIDTH + OP_XX_LOCAL_OPERANDS_WIDTH;
+-}
+-
+-uint32_t local_long_instruction(const char* p_opname, const uint32_t p_offset, const chunk* p_chunk) {
+-  const uint32_t slot = decode_int(p_offset + p_chunk->code.data + OP_CODE_WIDTH, OP_XX_LOCAL_LONG_OPERANDS_WIDTH);
+-  printf("%-16s %4d\n", p_opname, slot);
+-  return p_offset + OP_CODE_WIDTH + OP_XX_LOCAL_LONG_OPERANDS_WIDTH;
+-}
+-
+-uint32_t jump_instruction(const char* p_opname, const uint32_t p_offset, const chunk* p_chunk) {
+-  uint32_t jmp = decode_int(p_chunk->code.data + p_offset + OP_CODE_WIDTH, OP_XX_JUMP_OPERANDS_WIDTH);
+-  printf("%-16s %4d -> %d\n", p_opname, p_offset, p_offset + OP_CODE_WIDTH + jmp);
+-  return p_offset + OP_CODE_WIDTH + OP_XX_JUMP_OPERANDS_WIDTH;
+-}
+-
+-uint32_t loop_instruction(const char* p_opname, const uint32_t p_offset, const chunk* p_chunk) {
+-  uint32_t loop = decode_int(p_chunk->code.data + p_offset + OP_CODE_WIDTH, OP_LOOP_OPERANDS_WIDTH);
+-  printf("%-16s %4d -> %d\n", p_opname, p_offset, p_offset + OP_CODE_WIDTH + OP_LOOP_OPERANDS_WIDTH - loop);
+-  return p_offset + OP_CODE_WIDTH + OP_LOOP_OPERANDS_WIDTH;
+-}
+-
+-uint32_t call_instruction(const char* p_opname, const uint32_t p_offset, const chunk* p_chunk) {
+-  const byte argc = p_chunk->code.data[p_offset + OP_CODE_WIDTH];
+-  printf("%-16s %4d\n", p_opname, argc);
+-  return p_offset + OP_CODE_WIDTH + OP_CALL_OPERANDS_WIDTH;
+ }
+ 
+-uint32_t upvalue_instruction(const char* p_opname, const uint32_t p_offset, const chunk* p_chunk) {
+-  const byte up = p_chunk->code.data[p_offset + OP_XX_UPVALUE_OPERANDS_WIDTH];
+-  printf("%-16s %4d\n", p_opname, up);
+-  return p_offset + OP_CODE_WIDTH + OP_XX_UPVALUE_OPERANDS_WIDTH;
+-}
++uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_offset) {
++  const chunk* chunk = p_disassembler->chunk;
++  if (p_offset >= chunk->code.count) {
++    return chunk->code.count;
++  }
++  const word instruction = chunk->code.data[p_offset];
++  const opcode op = op_of(instruction);
++  const uint32_t words = op_is_two_words(op) ? 2 : 1;
+ 
+-uint32_t upvalue_long_instruction(const char* p_opname, const uint32_t p_offset, const chunk* p_chunk) {
+-  const uint32_t up = decode_int(p_chunk->code.data + p_offset + OP_CODE_WIDTH, OP_XX_UPVALUE_LONG_OPERANDS_WIDTH);
+-  printf("%-16s %4d\n", p_opname, up);
+-  return p_offset + OP_CODE_WIDTH + OP_XX_UPVALUE_LONG_OPERANDS_WIDTH;
+-}
++  printf("%04d ", p_offset);
++  for (uint32_t i = 0; i < words; ++i) {
++    printf("%08x ", chunk->code.data[p_offset + i]);
++  }
++  const uint16_t p = p_of(instruction);
++  const uint16_t ap = aprime_of(instruction);
++  const uint16_t bp = bprime_of(instruction);
++  printf("op=%03u p=%u a'=%-4u b'=%-4u\n", (unsigned)op, p, ap, bp);
+ 
+-uint32_t closure_instruction(const char* p_opname, uint32_t p_offset, const chunk* p_chunk) {
+-  p_offset += OP_CODE_WIDTH;
+-  uint32_t constant = decode_int(p_chunk->code.data + p_offset, OP_CONSTANT_LONG_OPERANDS_WIDTH);
+-  p_offset += OP_CONSTANT_LONG_OPERANDS_WIDTH;
+-  printf("%-16s %4d ", p_opname, constant);
+-  value val = p_chunk->constants.data[constant];
+-  value_debug_print(val);
+-  puts("");
+-  object_function* fu = VALUE_AS_FUNCTION(val);
+-  for (uint32_t i = 0; i < fu->upvalues; ++i) {
+-    p_offset++;
+-    bool is_local = (bool)p_chunk->code.data[p_offset];                            // one byte is_local;
+-    uint32_t index = decode_int(p_chunk->code.data + p_offset, UINT24_BYTE_COUNT); // 3 bytes index
+-    printf("%04d           |  %s %d\n", p_offset - 2, is_local ? "local" : "upvalue", index);
+-    p_offset += 3;
++  const ok_line_info_repeated* info = chunk_find_line_info(chunk, p_offset);
++  if (info != NULL) {
++    printf("     line %d\n", info->line_info.line);
+   }
+-  return p_offset;
++  return p_offset + words;
+ }
+diff --git a/src/okgc.c b/src/okgc.c
+index 006ee29..29c3d55 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -121,17 +121,18 @@ static bool mark_value(gc* p_gc, value p_value) {
+ 
+ static bool mark_vm(gc* p_gc) {
+   vm* vm = p_gc->vm;
+-  for (uint32_t i = 0; i < vm->stack.top; ++i) {
+-    if (!mark_value(p_gc, vm->stack.array.data[i])) {
++  execution_state* exe = vm->current_execution_state;
++  for (uint32_t i = 0; i < exe->registers.top; ++i) {
++    if (!mark_value(p_gc, exe->registers.array.data[i])) {
+       return false;
+     }
+   }
+-  for (uint32_t i = 0; i < vm->call_stack.count; ++i) {
+-    if (!mark_object(p_gc, (object*)vm->call_stack.data[i].closure)) {
++  for (uint32_t i = 0; i < exe->call_stack.count; ++i) {
++    if (!mark_object(p_gc, (object*)exe->call_stack.data[i].closure)) {
+       return false;
+     }
+   }
+-  for (object_upvalue* up = vm->open_upvalues; up != NULL; up = up->next) {
++  for (object_upvalue* up = exe->open_upvalues; up != NULL; up = up->next) {
+     if (!mark_object(p_gc, (object*)up)) {
+       return false;
+     }
+@@ -141,8 +142,8 @@ static bool mark_vm(gc* p_gc) {
+ 
+ static bool mark_compiler(gc* p_gc) {
+   compiler* compiler = p_gc->compiler;
+-  for (uint32_t i = 0; i < compiler->functions.count; i++) {
+-    if (!mark_object(p_gc, (object*)compiler->functions.data[i].function.function)) {
++  for (uint32_t i = 0; i < compiler->contexts.count; i++) {
++    if (!mark_object(p_gc, (object*)compiler->contexts.data[i].function.function)) {
+       return false;
+     }
+   }
+@@ -215,7 +216,7 @@ static bool sweep(gc* p_gc) {
+   return true;
+ }
+ 
+-bool collect(gc* p_gc) {
++static bool collect(gc* p_gc) {
+ #ifdef OK_LOG_GC
+   size_t previous = p_gc->allocated_bytes;
+   printf("--- gc ---\n");
+diff --git a/src/okglobals_store.c b/src/okglobals_store.c
+index a2d6a24..739adc2 100644
+--- a/src/okglobals_store.c
++++ b/src/okglobals_store.c
+@@ -25,11 +25,13 @@ TABLE_DEFINE(globals_table,
+ void globals_store_init(globals_store* p_globals, allocators* p_alloc) {
+   p_globals->alloc = p_alloc;
+   global_values_init(&p_globals->global_values, p_alloc);
++  global_descriptors_init(&p_globals->global_descriptors, p_alloc);
+   globals_table_init(&p_globals->table, p_alloc);
+ }
+ 
+ void globals_store_deinit(globals_store* p_globals) {
+   globals_table_deinit(&p_globals->table);
++  global_descriptors_deinit(&p_globals->global_descriptors, p_globals->alloc);
+   global_values_deinit(&p_globals->global_values, p_globals->alloc);
+ }
+ 
+@@ -56,7 +58,8 @@ global_id globals_store_add(globals_store* p_store, const ok_string_view p_ident
+     glob_id.errors = GLOBAL_ALLOCATION_FAILED;
+     return glob_id;
+   }
+-  global global = {p_store->global_values.count, p_flags, GLOBAL_OK};
++  // the value slot is the position just appended (count - 1): count was already incremented
++  global global = {p_store->global_values.count - 1, p_flags, GLOBAL_OK};
+   if (!global_descriptors_append(&p_store->global_descriptors, global)) {
+     hashed_string_deinit(&hs, alloc);
+     global_values_pop(&p_store->global_values);
+diff --git a/src/okglobals_store.h b/src/okglobals_store.h
+index 6388f41..3062294 100644
+--- a/src/okglobals_store.h
++++ b/src/okglobals_store.h
+@@ -20,7 +20,7 @@ typedef enum {
+ } global_error;
+ 
+ #define GLOBAL_MAX INDEX_MAX
+-#define IS_GLOBAL_VALID(g) (g.errors != GLOBAL_OK)
++#define IS_GLOBAL_VALID(g) ((g).errors == GLOBAL_OK)
+ 
+ typedef enum {
+   GLOBAL_FLAG_NONE = 0,
+diff --git a/src/okobject.c b/src/okobject.c
+index e81e4f6..08d71cc 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -51,11 +51,12 @@ object_string* create_object_string(const ok_string_view p_string, object_specs*
+ 
+ static void object_function_init(object_function* p_object_function,
+                                  object_string* p_name,
+-                                 uint8_t p_arity,
++                                 uint16_t p_arity,
+                                  object_specs* p_specs) {
+   object_init(&p_object_function->object, OBJ_FUNCTION);
+   p_object_function->name = p_name;
+   p_object_function->arity = p_arity;
++  p_object_function->registers = 0; // compiler sets this when the function is complete
+   upvalue_descriptor_array_init(&p_object_function->upvalues, p_specs->alloc);
+   chunk_init(&p_object_function->chunk, p_specs->alloc);
+ }
+@@ -68,7 +69,7 @@ static void object_function_deinit(object_function* p_object_function, object_sp
+   object_deinit(&p_object_function->object);
+ }
+ 
+-object_function* create_object_function(object_string* p_name, uint8_t p_arity, object_specs* p_specs) {
++object_function* create_object_function(object_string* p_name, uint16_t p_arity, object_specs* p_specs) {
+   object_function* object_fu = (object_function*)p_specs->alloc->allocate(p_specs->alloc, sizeof(object_function));
+   if (object_fu == NULL) {
+     return NULL;
+@@ -79,6 +80,7 @@ object_function* create_object_function(object_string* p_name, uint8_t p_arity,
+ }
+ 
+ ARRAY_DEFINE_DEFAULT(upvalue_array, object_upvalue*, ARRAY_DEFAULT_TYPE_DEINIT)
++ARRAY_DEFINE(upvalue_descriptor_array, upvalue_descriptor, uint16_t, UINT16_MAX, ARRAY_DEFAULT_TYPE_DEINIT)
+ 
+ static void object_closure_init(object_closure* p_closure, object_function* p_function, object_specs* p_specs) {
+   object_init(&p_closure->object, OBJ_CLOSURE);
+@@ -181,7 +183,7 @@ create_object_native_value(void* p_user_data, ok_native_destructor p_destructor,
+ 
+ void object_native_function_init(object_native_function* p_native_function,
+                                  ok_string_view p_name,
+-                                 uint8_t p_arity,
++                                 uint16_t p_arity,
+                                  ok_native_fn p_cb,
+                                  object_specs* p_specs) {
+   object_init(&p_native_function->object, OBJ_NATIVE_FUNCTION);
+@@ -198,7 +200,7 @@ void object_native_function_deinit(object_native_function* p_native_function, ob
+ }
+ 
+ object_native_function*
+-create_object_native_function(ok_string_view p_name, uint8_t p_arity, ok_native_fn p_cb, object_specs* p_specs) {
++create_object_native_function(ok_string_view p_name, uint16_t p_arity, ok_native_fn p_cb, object_specs* p_specs) {
+   object_native_function* native_function =
+       (object_native_function*)p_specs->alloc->allocate(p_specs->alloc, sizeof(object_native_function));
+   if (native_function == NULL) {
+diff --git a/src/okoperator.c b/src/okoperator.c
+index 29f14fb..2613d30 100644
+--- a/src/okoperator.c
++++ b/src/okoperator.c
+@@ -7,41 +7,41 @@ operator_type operator_type_from_token_type(const token_type p_token_type, bool
+   case TOKEN_MINUS:
+     return p_is_prefix ? OPERATOR_PRE_MINUS : OPERATOR_BIN_MINUS;
+   case TOKEN_ASTERISK:
+-    return p_is_prefix ? OPERATOR_ASTERISK : ;
++    return OPERATOR_BIN_ASTERISK;
+   case TOKEN_SLASH:
+-    return OPERATOR_SLASH;
++    return OPERATOR_BIN_SLASH;
+   case TOKEN_MODULO:
+-    return OPERATOR_MODULO;
++    return OPERATOR_BIN_MODULO;
+   case TOKEN_CARET:
+-    return OPERATOR_CARET;
++    return OPERATOR_BIN_CARET;
+   case TOKEN_BANG:
+-    return OPERATOR_BANG;
++    return OPERATOR_PRE_BANG;
+   case TOKEN_EQUAL:
+-    return OPERATOR_EQUAL;
++    return OPERATOR_BIN_EQUALS;
+   case TOKEN_BANG_EQUAL:
+-    return OPERATOR_BANG_EQUAL;
++    return OPERATOR_BIN_BANG_EQUAL;
+   case TOKEN_GREATER:
+-    return OPERATOR_GREATER;
++    return OPERATOR_BIN_GREATER;
+   case TOKEN_GREATER_EQUAL:
+-    return OPERATOR_GREATER_EQUAL;
++    return OPERATOR_BIN_GREATER_EQUAL;
+   case TOKEN_LESS:
+-    return OPERATOR_LESS;
++    return OPERATOR_BIN_LESS;
+   case TOKEN_LESS_EQUAL:
+-    return OPERATOR_LESS_EQUAL;
++    return OPERATOR_BIN_LESS_EQUAL;
+   case TOKEN_LEFT_PAREN:
+-    return OPERATOR_CALL;
++    return OPERATOR_POS_CALL;
+   case TOKEN_LEFT_BRACKET:
+-    return OPERATOR_SUBSCRIPT;
++    return OPERATOR_POS_SUBSCRIPT;
+   case TOKEN_AMPERSAND:
+-    return OPERATOR_AMPERSAND;
++    return OPERATOR_BIN_AMPERSAND;
+   case TOKEN_BAR:
+-    return OPERATOR_BAR;
++    return OPERATOR_BIN_BAR;
+   case TOKEN_TILED:
+-    return OPERATOR_TILED;
++    return OPERATOR_BIN_TILED;
+   case TOKEN_PLUS_PLUS:
+-    return OPERATOR_PLUS_PLUS;
++    return p_is_prefix ? OPERATOR_PRE_PLUS_PLUS : OPERATOR_POS_PLUS_PLUS;
+   case TOKEN_MINUS_MINUS:
+-    return OPERATOR_MINUS_MINUS;
++    return p_is_prefix ? OPERATOR_PRE_MINUS_MINUS : OPERATOR_POS_MINUS_MINUS;
+   case TOKEN_PLUS_EQUAL:
+     return OPERATOR_PLUS_EQUAL;
+   case TOKEN_MINUS_EQUAL:
+@@ -69,11 +69,11 @@ operator_type operator_type_from_token_type(const token_type p_token_type, bool
+   case TOKEN_SHIFT_RIGHT_EQUAL:
+     return OPERATOR_SHIFT_RIGHT_EQUAL;
+   case TOKEN_NOT:
+-    return OPERATOR_NOT;
++    return OPERATOR_PRE_NOT;
+   case TOKEN_AND:
+-    return OPERATOR_AND;
++    return OPERATOR_LOG_AND;
+   case TOKEN_OR:
+-    return OPERATOR_OR;
++    return OPERATOR_LOG_OR;
+   default:
+     return OPERATOR_UNKNOWN;
+   }
+diff --git a/src/okoperator.h b/src/okoperator.h
+index b437325..af12982 100644
+--- a/src/okoperator.h
++++ b/src/okoperator.h
+@@ -13,7 +13,7 @@
+   X(OPERATOR_BIN_SLASH, "/")                                                                                           \
+   X(OPERATOR_BIN_MODULO, "%")                                                                                          \
+   X(OPERATOR_BIN_CARET, "^")                                                                                           \
+-  X(OPERATOR_BIN_BANG, "!")                                                                                            \
++  X(OPERATOR_PRE_BANG, "!")                                                                                            \
+   X(OPERATOR_BIN_EQUALS, "==")                                                                                         \
+   X(OPERATOR_BIN_BANG_EQUAL, "!=")                                                                                     \
+   X(OPERATOR_BIN_GREATER, ">")                                                                                         \
+@@ -29,19 +29,19 @@
+   X(OPERATOR_PRE_MINUS_MINUS, "--")                                                                                    \
+   X(OPERATOR_POS_PLUS_PLUS, "++")                                                                                      \
+   X(OPERATOR_POS_MINUS_MINUS, "--")                                                                                    \
+-  X(OPERATOR_BIN_PLUS_EQUAL, "+=")                                                                                     \
+-  X(OPERATOR_BIN_MINUS_EQUAL, "-=")                                                                                    \
+-  X(OPERATOR_BIN_ASTERISK_EQUAL, "*=")                                                                                 \
+-  X(OPERATOR_BIN_SLASH_EQUAL, "/=")                                                                                    \
+-  X(OPERATOR_BIN_MODULO_EQUAL, "%=")                                                                                   \
+-  X(OPERATOR_BIN_CARET_EQUAL, "^=")                                                                                    \
+-  X(OPERATOR_BIN_AMPERSAND_EQUAL, "&=")                                                                                \
+-  X(OPERATOR_BIN_BAR_EQUAL, "|=")                                                                                      \
+-  X(OPERATOR_BIN_TILED_EQUAL, "~=")                                                                                    \
+-  X(OPERATOR_BIN_SHIFT_LEFT, "<<")                                                                                     \
+-  X(OPERATOR_BIN_SHIFT_RIGHT, ">>")                                                                                    \
+-  X(OPERATOR_BIN_SHIFT_LEFT_EQUAL, "<<=")                                                                              \
+-  X(OPERATOR_BIN_SHIFT_RIGHT_EQUAL, ">>=")                                                                             \
++  X(OPERATOR_PLUS_EQUAL, "+=")                                                                                     \
++  X(OPERATOR_MINUS_EQUAL, "-=")                                                                                    \
++  X(OPERATOR_ASTERISK_EQUAL, "*=")                                                                                 \
++  X(OPERATOR_SLASH_EQUAL, "/=")                                                                                    \
++  X(OPERATOR_MODULO_EQUAL, "%=")                                                                                   \
++  X(OPERATOR_CARET_EQUAL, "^=")                                                                                    \
++  X(OPERATOR_AMPERSAND_EQUAL, "&=")                                                                                \
++  X(OPERATOR_BAR_EQUAL, "|=")                                                                                      \
++  X(OPERATOR_TILED_EQUAL, "~=")                                                                                    \
++  X(OPERATOR_SHIFT_LEFT, "<<")                                                                                     \
++  X(OPERATOR_SHIFT_RIGHT, ">>")                                                                                    \
++  X(OPERATOR_SHIFT_LEFT_EQUAL, "<<=")                                                                              \
++  X(OPERATOR_SHIFT_RIGHT_EQUAL, ">>=")                                                                             \
+   X(OPERATOR_PRE_NOT, "not")                                                                                           \
+   X(OPERATOR_LOG_OR, "or")                                                                                             \
+   X(OPERATOR_LOG_AND, "and")
+diff --git a/src/okparser.c b/src/okparser.c
+index a7ec7b2..5f7318e 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -327,7 +327,7 @@ ast_expression* parse_unary_prefix(parser* p_parser, token p_trigger) {
+     return NULL;
+   }
+   ast_specs s = {alloc};
+-  ast_prefix_unary_expression_init(prefix, p_trigger, operator_type_from_token_type(p_trigger.type), opperand, &s);
++  ast_prefix_unary_expression_init(prefix, p_trigger, operator_type_from_token_type(p_trigger.type, true), opperand, &s);
+   return (ast_expression*)prefix;
+ }
+ 
+@@ -515,7 +515,7 @@ ast_expression* parse_binary_infix(
+     return NULL;
+   }
+   ast_specs s = {alloc};
+-  ast_infix_binary_expression_init(infix, p_trigger, operator_type_from_token_type(p_trigger.type), p_left, right, &s);
++  ast_infix_binary_expression_init(infix, p_trigger, operator_type_from_token_type(p_trigger.type, false), p_left, right, &s);
+   return (ast_expression*)infix;
+ }
+ 
+diff --git a/src/okvalue.c b/src/okvalue.c
+index d3c3493..1f1d664 100644
+--- a/src/okvalue.c
++++ b/src/okvalue.c
+@@ -6,7 +6,7 @@
+ 
+ void value_debug_print(value p_value) {
+   if (IS_VALUE_NUMBER(p_value)) {
+-    printf("%f", VALUE_AS_NUMBER(p_value));
++    printf("%g", VALUE_AS_NUMBER(p_value));
+   } else if (IS_VALUE_BOOL(p_value)) {
+     printf("%s", VALUE_AS_BOOL(p_value) ? "true" : "false");
+   } else if (IS_VALUE_OBJECT(p_value)) {
+diff --git a/src/okvm.c b/src/okvm.c
+index abd58f0..2d666c2 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -21,7 +21,7 @@
+ static void runtime_error(vm* p_vm, const char* p_fmt, ...);
+ static bool call_value(vm* p_vm,
+                        execution_state* p_exe,
+-                       registers* p_reg,
++                       register_file* p_reg,
+                        uint32_t p_base,
+                        uint16_t p_callee,
+                        uint16_t p_argc,
+@@ -30,7 +30,7 @@ static object_upvalue* capture_upvalue(vm* p_vm, execution_state* p_exe, uint32_
+ static void close_upvalues(execution_state* p_exe, uint32_t p_uptill);
+ static interpret_result run_until(vm* p_vm, uint32_t p_call_depth);
+ static interpret_result create_closure(
+-    vm* p_vm, execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_src);
++    vm* p_vm, execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_src);
+ void interpret_result_deinit(interpret_result* p_interpret_result) {
+ }
+ 
+@@ -46,7 +46,7 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->current_execution_state->native_has_error = false;
+   p_vm->current_execution_state->native_call_depth = 0;
+   string_init(&p_vm->current_execution_state->native_error_message, NULL, 0, false, p_vm->alloc);
+-  registers_init_warm(&p_vm->current_execution_state->registers, STACK_SIZE, p_specs.alloc); // super temp
++  register_file_init_warm(&p_vm->current_execution_state->registers, STACK_SIZE, p_specs.alloc); // super temp
+   call_stack_init(&p_vm->current_execution_state->call_stack, p_specs.alloc);
+ }
+ 
+@@ -57,7 +57,7 @@ void vm_deinit(vm* p_vm) {
+   p_vm->ok = NULL;
+   // TODO: temp
+   call_stack_deinit(&p_vm->current_execution_state->call_stack, p_vm->alloc);
+-  registers_deinit(&p_vm->current_execution_state->registers);
++  register_file_deinit(&p_vm->current_execution_state->registers);
+   p_vm->current_execution_state->open_upvalues = NULL;
+   p_vm->current_execution_state->native_call_depth = 0;
+   p_vm->current_execution_state->native_has_error = false;
+@@ -77,7 +77,7 @@ bool vm_native_error(vm* p_vm, ok_string_view p_message) {
+ 
+ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+   execution_state* exe = p_vm->current_execution_state;
+-  registers* reg = &exe->registers;
++  register_file* reg = &exe->registers;
+   p_vm->source = p_specs.source; // TODO: having it this way means only one source per vm. but it's ok will fix soon.
+   value vfn = OBJECT_AS_VALUE(p_specs.function);
+   gc_guard_up(p_vm->alloc->gc, vfn); // TODO array based gc guard
+@@ -100,7 +100,7 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+ 
+ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc) {
+   execution_state* exe = p_vm->current_execution_state;
+-  registers* reg = &exe->registers;
++  register_file* reg = &exe->registers;
+   const uint32_t call_depth = exe->call_stack.count;
+   const uint32_t base = reg->top - p_argc - 1;
+   if (!call_value(p_vm, exe, reg, base, base, p_argc, 1)) {
+@@ -119,10 +119,18 @@ static inline bool is_falsy(value p_value) {
+   return (IS_VALUE_STRICTLY_BOOL(p_value) && !VALUE_AS_BOOL(p_value)) || IS_VALUE_STRICTLY_NULL(p_value);
+ }
+ 
++// p_is_constant selects between constant pool (k[index]) and frame register (r[index])
++static inline value resolve_operand(call_frame* p_frame, register_file* p_reg, uint16_t p_index, bool p_is_constant) {
++  if (p_is_constant) {
++    return p_frame->closure->function->chunk.constants.data[p_index];
++  }
++  return p_reg->array.data[p_frame->registers_base + p_index];
++}
++
+ static interpret_result
+-perform_not(execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_on) {
++perform_not(execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_on) {
+   const uint32_t base = p_frame->registers_base;
+-  value on = p_reg->array.data[base + p_on];
++  value on = p_on;
+   if (IS_VALUE_NUMBER(on)) {
+     goto invalid;
+   }
+@@ -148,13 +156,13 @@ perform_not(execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint1
+ }
+ 
+ static interpret_result
+-perform_negate(execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_on) {
++perform_negate(execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_on) {
+   const uint32_t base = p_frame->registers_base;
+-  value on = p_reg->array.data[base + p_on];
++  value on = p_on;
+   if (IS_VALUE_NUMBER(on)) {
+-    on |= ~SIGN_BIT; // ultra fast
++    on ^= SIGN_BIT; // ultra fast
+   } else if (IS_VALUE_INT(on)) {
+-    on |= ~INT_PAYLOAD_SIGN; // ultra fast
++    on = INT_AS_VALUE(-VALUE_AS_INT(on));
+   } else if (IS_VALUE_OBJECT(on)) {
+     goto invalid;
+     // TODO
+@@ -175,10 +183,10 @@ perform_negate(execution_state* p_exe, registers* p_reg, call_frame* p_frame, ui
+ }
+ 
+ static interpret_result perform_add(
+-    execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_lhs, uint16_t p_rhs) {
++    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+-  value lhs = p_reg->array.data[base + p_lhs];
+-  value rhs = p_reg->array.data[base + p_rhs];
++  value lhs = p_lhs;
++  value rhs = p_rhs;
+   if (IS_VALUE_NUMBER(lhs)) {
+     if (IS_VALUE_NUMBER(rhs)) {
+       lhs = NUMBER_AS_VALUE(VALUE_AS_NUMBER(lhs) + VALUE_AS_NUMBER(rhs));
+@@ -225,10 +233,10 @@ static interpret_result perform_add(
+ }
+ 
+ static interpret_result perform_subtract(
+-    execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_lhs, uint16_t p_rhs) {
++    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+-  value lhs = p_reg->array.data[base + p_lhs];
+-  value rhs = p_reg->array.data[base + p_rhs];
++  value lhs = p_lhs;
++  value rhs = p_rhs;
+   if (IS_VALUE_NUMBER(lhs)) {
+     if (IS_VALUE_NUMBER(rhs)) {
+       lhs = NUMBER_AS_VALUE(VALUE_AS_NUMBER(lhs) - VALUE_AS_NUMBER(rhs));
+@@ -275,10 +283,10 @@ static interpret_result perform_subtract(
+ }
+ 
+ static interpret_result perform_multiply(
+-    execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_lhs, uint16_t p_rhs) {
++    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+-  value lhs = p_reg->array.data[base + p_lhs];
+-  value rhs = p_reg->array.data[base + p_rhs];
++  value lhs = p_lhs;
++  value rhs = p_rhs;
+   if (IS_VALUE_NUMBER(lhs)) {
+     if (IS_VALUE_NUMBER(rhs)) {
+       lhs = NUMBER_AS_VALUE(VALUE_AS_NUMBER(lhs) * VALUE_AS_NUMBER(rhs));
+@@ -325,10 +333,10 @@ static interpret_result perform_multiply(
+ }
+ 
+ static interpret_result perform_divide(
+-    execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_lhs, uint16_t p_rhs) {
++    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+-  value lhs = p_reg->array.data[base + p_lhs];
+-  value rhs = p_reg->array.data[base + p_rhs];
++  value lhs = p_lhs;
++  value rhs = p_rhs;
+   if (IS_VALUE_NUMBER(lhs)) {
+     if (IS_VALUE_NUMBER(rhs)) {
+       if (VALUE_AS_NUMBER(rhs) == 0.0f) {
+@@ -396,10 +404,10 @@ division_by_zero: {
+ }
+ 
+ static interpret_result perform_equal(
+-    execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_lhs, uint16_t p_rhs) {
++    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+-  value lhs = p_reg->array.data[base + p_lhs];
+-  value rhs = p_reg->array.data[base + p_rhs];
++  value lhs = p_lhs;
++  value rhs = p_rhs;
+   if (IS_VALUE_NUMBER(lhs)) {
+     if (IS_VALUE_NUMBER(rhs)) {
+       lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) == VALUE_AS_NUMBER(rhs));
+@@ -452,10 +460,10 @@ static interpret_result perform_equal(
+ }
+ 
+ static interpret_result perform_not_equal(
+-    execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_lhs, uint16_t p_rhs) {
++    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+-  value lhs = p_reg->array.data[base + p_lhs];
+-  value rhs = p_reg->array.data[base + p_rhs];
++  value lhs = p_lhs;
++  value rhs = p_rhs;
+   if (IS_VALUE_NUMBER(lhs)) {
+     if (IS_VALUE_NUMBER(rhs)) {
+       lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) != VALUE_AS_NUMBER(rhs));
+@@ -508,10 +516,10 @@ static interpret_result perform_not_equal(
+ }
+ 
+ static interpret_result perform_greater(
+-    execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_lhs, uint16_t p_rhs) {
++    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+-  value lhs = p_reg->array.data[base + p_lhs];
+-  value rhs = p_reg->array.data[base + p_rhs];
++  value lhs = p_lhs;
++  value rhs = p_rhs;
+   if (IS_VALUE_NUMBER(lhs)) {
+     if (IS_VALUE_NUMBER(rhs)) {
+       lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) > VALUE_AS_NUMBER(rhs));
+@@ -564,10 +572,10 @@ static interpret_result perform_greater(
+ }
+ 
+ static interpret_result perform_less(
+-    execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_lhs, uint16_t p_rhs) {
++    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+-  value lhs = p_reg->array.data[base + p_lhs];
+-  value rhs = p_reg->array.data[base + p_rhs];
++  value lhs = p_lhs;
++  value rhs = p_rhs;
+   if (IS_VALUE_NUMBER(lhs)) {
+     if (IS_VALUE_NUMBER(rhs)) {
+       lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) < VALUE_AS_NUMBER(rhs));
+@@ -620,10 +628,10 @@ static interpret_result perform_less(
+ }
+ 
+ static interpret_result perform_greater_equal(
+-    execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_lhs, uint16_t p_rhs) {
++    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+-  value lhs = p_reg->array.data[base + p_lhs];
+-  value rhs = p_reg->array.data[base + p_rhs];
++  value lhs = p_lhs;
++  value rhs = p_rhs;
+   if (IS_VALUE_NUMBER(lhs)) {
+     if (IS_VALUE_NUMBER(rhs)) {
+       lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) >= VALUE_AS_NUMBER(rhs));
+@@ -676,10 +684,10 @@ static interpret_result perform_greater_equal(
+ }
+ 
+ static interpret_result perform_less_equal(
+-    execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_lhs, uint16_t p_rhs) {
++    execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+-  value lhs = p_reg->array.data[base + p_lhs];
+-  value rhs = p_reg->array.data[base + p_rhs];
++  value lhs = p_lhs;
++  value rhs = p_rhs;
+   if (IS_VALUE_NUMBER(lhs)) {
+     if (IS_VALUE_NUMBER(rhs)) {
+       lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) <= VALUE_AS_NUMBER(rhs));
+@@ -731,14 +739,14 @@ static interpret_result perform_less_equal(
+   }
+ }
+ 
+-static inline void cleanup_frame(execution_state* p_exe, registers* p_registers, call_frame* p_frame) {
++static inline void cleanup_frame(execution_state* p_exe, register_file* p_registers, call_frame* p_frame) {
+   close_upvalues(p_exe, p_frame->registers_base);
+   p_registers->top = p_frame->registers_base;
+   call_stack_remove(&p_exe->call_stack, p_exe->call_stack.count - 1, p_exe->call_stack.count - 1);
+ }
+ 
+ static inline uint16_t
+-return_n_from_frame(registers* p_registers, call_frame* p_frame, uint16_t p_base, uint32_t p_count) {
++return_n_from_frame(register_file* p_registers, call_frame* p_frame, uint16_t p_base, uint32_t p_count) {
+   const uint32_t base = p_frame->registers_base + p_base;
+   if (p_count == RETURN_COUNT_DYNAMIC) {
+     p_count = p_registers->top - base;
+@@ -750,32 +758,32 @@ return_n_from_frame(registers* p_registers, call_frame* p_frame, uint16_t p_base
+     count = p_frame->return_count;
+   }
+   for (; i < count; ++i) {
+-    p_registers[p_frame->return_base + i] = p_registers[base + i];
++    p_registers->array.data[p_frame->return_base + i] = p_registers->array.data[base + i];
+   }
+   return i;
+ }
+ 
+ static inline uint16_t
+-return_1_from_frame(execution_state* p_exe, registers* p_registers, call_frame* p_frame, uint16_t p_base) {
++return_1_from_frame(execution_state* p_exe, register_file* p_registers, call_frame* p_frame, uint16_t p_base) {
+   const uint32_t base = p_frame->registers_base + p_base;
+   if (p_frame->return_count < 1) {
+     cleanup_frame(p_exe, p_registers, p_frame);
+     return 0;
+   }
+-  p_registers[p_frame->return_base] = p_registers[base];
++  p_registers->array.data[p_frame->return_base] = p_registers->array.data[base];
+   cleanup_frame(p_exe, p_registers, p_frame);
+   return 1;
+ }
+ 
+ static uint16_t
+-return_from_frame(execution_state* p_exe, registers* p_registers, call_frame* p_frame, uint16_t p_a, uint16_t p_b) {
++return_from_frame(execution_state* p_exe, register_file* p_registers, call_frame* p_frame, uint16_t p_a, uint16_t p_b) {
+   const uint32_t count = p_b == 0 ? RETURN_COUNT_DYNAMIC : p_b;
+   const uint16_t result = return_n_from_frame(p_registers, p_frame, p_a, count);
+   cleanup_frame(p_exe, p_registers, p_frame);
+   return result;
+ }
+ 
+-static inline interpret_result top_level_return(registers* p_registers, call_frame* p_frame, uint16_t p_returned) {
++static inline interpret_result top_level_return(register_file* p_registers, call_frame* p_frame, uint16_t p_returned) {
+ #if defined(OK_TRACE_EXECUTION)
+   printf("[ ");
+   for (value* reg = p_registers->array.data; reg < p_registers->array.data + p_registers->top; ++reg) {
+@@ -795,11 +803,11 @@ static inline interpret_result top_level_return(registers* p_registers, call_fra
+ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+   execution_state* exe = p_vm->current_execution_state;
+   call_frame* frame = &exe->call_stack.data[exe->call_stack.count - 1];
+-  registers* reg = &exe->registers;
++  register_file* reg = &exe->registers;
+ #define REG_AT(n) exe->registers.array.data[frame->registers_base + n]
+   register word* ip = frame->ip;
+-#define READ_WORD() (*frame->ip++)
+-#define JOIN_WORD(instruction) ((word2)instruction << 32u) | READ_WORD();
++#define READ_WORD() (*ip++)
++#define JOIN_WORD(instruction) (((word2)READ_WORD() << 32u) | (word2)(instruction))
+ 
+   for (;;) {
+ #if defined(OK_TRACE_EXECUTION)
+@@ -808,13 +816,13 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     disassembler_init(&disassembler, specs);
+ 
+     printf("[ ");
+-    for (value* reg = p_registers->array.data; reg < p_registers->array.data + p_registers->top; ++reg) {
++    for (value* r = exe->registers.array.data; r < exe->registers.array.data + exe->registers.top; ++r) {
+       printf("[");
+-      value_debug_print(*reg);
++      value_debug_print(*r);
+       printf("]");
+     }
+     printf("]\n");
+-    debug_disassemble_instruction(&disassembler, (uint32_t)(frame->ip - frame->closure->function->chunk.code.data));
++    debug_disassemble_instruction(&disassembler, (uint32_t)(ip - frame->closure->function->chunk.code.data));
+ #endif // defined(OK_TRACE_EXECUTION)
+ 
+     word instruction = READ_WORD();
+@@ -861,8 +869,8 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const bool p = p_of(words);
+-      const bool truthy = !p & is_falsy(REG_AT(B));
+-      ip += truthy * A;
++      const bool jump = p ^ is_falsy(REG_AT(B));
++      ip += jump * A;
+       break;
+     }
+     case OP_JUMP_IF_SET: {
+@@ -871,8 +879,8 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       const bool p = p_of(words);
+-      const bool truthy = !p & is_falsy(REG_AT(B));
+-      if (truthy) {
++      const bool jump = p ^ is_falsy(REG_AT(B));
++      if (jump) {
+         ip += A;
+         REG_AT(C) = REG_AT(B);
+       }
+@@ -913,44 +921,49 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       break;
+     }
+     case OP_STORE_GLOBAL: {
++      const bool p = p_of(instruction);
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+-      p_vm->globals_store->global_values.data[ap] = REG_AT(bp);
++      p_vm->globals_store->global_values.data[ap] = resolve_operand(frame, reg, bp, p);
+       break;
+     }
+     case OP_STORE_GLOBAL_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+-      p_vm->globals_store->global_values.data[A] = REG_AT(B);
++      p_vm->globals_store->global_values.data[A] = resolve_operand(frame, reg, B, p);
+       break;
+     }
+     case OP_LOAD_UPVALUE: {
+       uint16_t ap = aprime_of(instruction);
+       uint16_t bp = bprime_of(instruction);
+       REG_AT(ap) =
+-          *object_upvalue_get_value(frame->closure->upvalues.data[bp], reg->array.data + frame->registers_base);
++          *object_upvalue_get_value(frame->closure->upvalues.data[bp], reg->array.data); // upvalue locations are absolute in the register file, not frame relative
+       break;
+     }
+     case OP_LOAD_UPVALUE_LONG: {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+-      REG_AT(A) = *object_upvalue_get_value(frame->closure->upvalues.data[B], reg->array.data + frame->registers_base);
++      REG_AT(A) = *object_upvalue_get_value(frame->closure->upvalues.data[B], reg->array.data); // upvalue locations are absolute in the register file, not frame relative
+       break;
+     }
+     case OP_STORE_UPVALUE: {
+-      uint16_t ap = aprime_of(instruction);
+-      uint16_t bp = bprime_of(instruction);
+-      *object_upvalue_get_value(frame->closure->upvalues.data[ap], reg->array.data + frame->registers_base) =
+-          REG_AT(bp);
++      const bool p = p_of(instruction);
++      const uint16_t ap = aprime_of(instruction);
++      const uint16_t bp = bprime_of(instruction);
++      *object_upvalue_get_value(frame->closure->upvalues.data[ap], reg->array.data) =
++          resolve_operand(frame, reg, bp, p);
+       break;
+     }
+     case OP_STORE_UPVALUE_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+-      *object_upvalue_get_value(frame->closure->upvalues.data[A], reg->array.data + frame->registers_base) = REG_AT(B);
++      *object_upvalue_get_value(frame->closure->upvalues.data[A], reg->array.data) =
++          resolve_operand(frame, reg, B, p);
+       break;
+     }
+     case OP_CLOSE_UPVALUES: {
+@@ -981,6 +994,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
++      break;
+     }
+     case OP_CALL_LONG: {
+       const word2 words = JOIN_WORD(instruction);
+@@ -1006,6 +1020,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
++      break;
+     }
+     case OP_RETURN: {
+       const uint16_t ap = aprime_of(instruction);
+@@ -1031,7 +1046,11 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       break;
+     }
+     case OP_RETURN_1: {
++      const bool p = p_of(instruction);
+       const uint16_t A = Alarge_of(instruction);
++      if (p) {
++        REG_AT(A) = NULL_AS_VALUE(); // implicit return: value is null
++      }
+       const uint16_t returned = return_1_from_frame(exe, reg, frame, A);
+       if (exe->call_stack.count == p_call_depth) {
+         return top_level_return(reg, frame, returned);
+@@ -1060,9 +1079,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       break;
+     }
+     case OP_NOT: {
++      const bool p = p_of(instruction);
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+-      interpret_result res = perform_not(exe, reg, frame, ap, bp);
++      interpret_result res = perform_not(exe, reg, frame, ap, resolve_operand(frame, reg, bp, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1070,18 +1090,20 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_NOT_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+-      interpret_result res = perform_not(exe, reg, frame, A, B);
++      interpret_result res = perform_not(exe, reg, frame, A, resolve_operand(frame, reg, B, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_NEGATE: {
++      const bool p = p_of(instruction);
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+-      interpret_result res = perform_negate(exe, reg, frame, ap, bp);
++      interpret_result res = perform_negate(exe, reg, frame, ap, resolve_operand(frame, reg, bp, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1089,19 +1111,22 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_NEGATE_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+-      interpret_result res = perform_negate(exe, reg, frame, A, B);
++      interpret_result res = perform_negate(exe, reg, frame, A, resolve_operand(frame, reg, B, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_ADD: {
++      const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      interpret_result res = perform_add(exe, reg, frame, a, b, c);
++      interpret_result res =
++          perform_add(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1109,20 +1134,25 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_ADD_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      interpret_result res = perform_add(exe, reg, frame, A, B, C);
++      interpret_result res =
++          perform_add(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_SUBTRACT: {
++      const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      interpret_result res = perform_subtract(exe, reg, frame, a, b, c);
++      interpret_result res =
++          perform_subtract(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1130,20 +1160,25 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_SUBTRACT_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      interpret_result res = perform_subtract(exe, reg, frame, A, B, C);
++      interpret_result res =
++          perform_subtract(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_MULTIPLY: {
++      const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      interpret_result res = perform_multiply(exe, reg, frame, a, b, c);
++      interpret_result res =
++          perform_multiply(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1151,20 +1186,25 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_MULTIPLY_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      interpret_result res = perform_multiply(exe, reg, frame, A, B, C);
++      interpret_result res =
++          perform_multiply(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_DIVIDE: {
++      const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      interpret_result res = perform_divide(exe, reg, frame, a, b, c);
++      interpret_result res =
++          perform_divide(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1172,20 +1212,25 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_DIVIDE_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      interpret_result res = perform_divide(exe, reg, frame, A, B, C);
++      interpret_result res =
++          perform_divide(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_EQUALS: {
++      const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      interpret_result res = perform_equal(exe, reg, frame, a, b, c);
++      interpret_result res =
++          perform_equal(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1193,20 +1238,25 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_EQUALS_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      interpret_result res = perform_equal(exe, reg, frame, A, B, C);
++      interpret_result res =
++          perform_equal(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_NOT_EQUAL: {
++      const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      interpret_result res = perform_not_equal(exe, reg, frame, a, b, c);
++      interpret_result res =
++          perform_not_equal(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1214,20 +1264,25 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_NOT_EQUAL_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      interpret_result res = perform_not_equal(exe, reg, frame, A, B, C);
++      interpret_result res =
++          perform_not_equal(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_GREATER: {
++      const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      interpret_result res = perform_greater(exe, reg, frame, a, b, c);
++      interpret_result res =
++          perform_greater(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1235,20 +1290,25 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_GREATER_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      interpret_result res = perform_greater(exe, reg, frame, A, B, C);
++      interpret_result res =
++          perform_greater(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_LESS: {
++      const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      interpret_result res = perform_less(exe, reg, frame, a, b, c);
++      interpret_result res =
++          perform_less(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1256,20 +1316,25 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_LESS_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      interpret_result res = perform_less(exe, reg, frame, A, B, C);
++      interpret_result res =
++          perform_less(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_GREATER_EQUAL: {
++      const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      interpret_result res = perform_greater_equal(exe, reg, frame, a, b, c);
++      interpret_result res =
++          perform_greater_equal(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1277,20 +1342,25 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_GREATER_EQUAL_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      interpret_result res = perform_greater_equal(exe, reg, frame, A, B, C);
++      interpret_result res =
++          perform_greater_equal(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_LESS_EQUAL: {
++      const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      interpret_result res = perform_less_equal(exe, reg, frame, a, b, c);
++      interpret_result res =
++          perform_less_equal(exe, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+@@ -1298,17 +1368,21 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_LESS_EQUAL_LONG: {
+       const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      interpret_result res = perform_less_equal(exe, reg, frame, A, B, C);
++      interpret_result res =
++          perform_less_equal(exe, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+         return res;
+       }
+       break;
+     }
+     case OP_PRINT: {
+-      value_debug_print(REG_AT(Alarge_of(instruction)));
++      const bool p = p_of(instruction);
++      value_debug_print(resolve_operand(frame, reg, Alarge_of(instruction), p));
+       puts("");
+       break;
+     }
+@@ -1371,7 +1445,7 @@ void runtime_error(vm* p_vm, const char* p_fmt, ...) {
+ 
+ static inline bool call(vm* p_vm,
+                         execution_state* p_exe,
+-                        registers* p_reg,
++                        register_file* p_reg,
+                         object_closure* p_closure,
+                         uint32_t p_callee,
+                         uint16_t p_argc,
+@@ -1380,6 +1454,21 @@ static inline bool call(vm* p_vm,
+     runtime_error(p_vm, "invalid call: expected %d arguments, got: %d.", p_closure->function->arity, p_argc);
+     return false;
+   }
++  const uint32_t frame_top = p_callee + p_closure->function->registers;
++  if (frame_top > p_reg->array.capacity) {
++    // grow with headroom so we do not realloc on every nested call
++    const uint32_t target = frame_top + (frame_top >> 1u);
++    const uint32_t new_capacity = target > UINT16_MAX + 1u ? UINT16_MAX + 1u : target;
++    if (!register_array_grow(&p_reg->array, new_capacity)) {
++      runtime_error(p_vm, "out of memory: failed to grow register file.");
++      return false;
++    }
++    // fresh registers must read as null: realloc'd memory is garbage
++    for (uint32_t i = p_reg->array.count; i < new_capacity; ++i) {
++      p_reg->array.data[i] = NULL_AS_VALUE();
++    }
++  }
++  p_reg->top = frame_top;
+   call_frame frame;
+   frame.closure = p_closure;
+   frame.ip = p_closure->function->chunk.code.data;
+@@ -1392,7 +1481,7 @@ static inline bool call(vm* p_vm,
+ 
+ static inline bool call_native(vm* p_vm,
+                                execution_state* p_exe,
+-                               registers* p_reg,
++                               register_file* p_reg,
+                                object_native_function* p_native,
+                                uint32_t p_callee,
+                                uint16_t p_argc,
+@@ -1418,7 +1507,7 @@ static inline bool call_native(vm* p_vm,
+   p_exe->native_has_error = false;
+   string_deinit(&p_exe->native_error_message, p_vm->alloc);
+   call_frame* frame = &p_exe->call_stack.data[p_exe->call_stack.count - 1];
+-  registers* reg = &p_exe->registers;
++  register_file* reg = &p_exe->registers;
+   reg->top = p_callee;
+   reg->array.data[frame->return_base] = result;
+   gc_guard_down(p_vm->alloc->gc);
+@@ -1427,7 +1516,7 @@ static inline bool call_native(vm* p_vm,
+ 
+ static bool call_value(vm* p_vm,
+                        execution_state* p_exe,
+-                       registers* p_reg,
++                       register_file* p_reg,
+                        uint32_t p_base,
+                        uint16_t p_callee,
+                        uint16_t p_argc,
+@@ -1452,7 +1541,7 @@ invalid_call:
+ }
+ 
+ static interpret_result create_closure(
+-    vm* p_vm, execution_state* p_exe, registers* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_src) {
++    vm* p_vm, execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_src) {
+   object_function* function = VALUE_AS_FUNCTION(p_frame->closure->function->chunk.constants.data[p_src]);
+   object_specs s = {p_vm->alloc, p_vm->objects_store};
+   object_closure* closure = create_object_closure(function, &s);
+@@ -1462,7 +1551,11 @@ static interpret_result create_closure(
+     return result;
+   }
+   p_reg->array.data[p_frame->registers_base + p_dest] = OBJECT_AS_VALUE(closure);
+-  upvalue_array_grow(&closure->upvalues, function->upvalues.count);
++  if (function->upvalues.count > 0 && !upvalue_array_grow(&closure->upvalues, function->upvalues.count)) {
++    runtime_error(p_vm, "out of memory: failed to allocate closure upvalues.");
++    interpret_result result = {.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++    return result;
++  }
+   for (uint32_t i = 0; i < function->upvalues.count; ++i) {
+     const upvalue_descriptor desc = function->upvalues.data[i];
+     bool status = true;
+@@ -1480,6 +1573,11 @@ static interpret_result create_closure(
+     } else {
+       status = upvalue_array_append(&closure->upvalues, p_frame->closure->upvalues.data[desc.index]);
+     }
++    if (!status) {
++      runtime_error(p_vm, "out of memory: failed to allocate closure upvalue.");
++      interpret_result result = {.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++      return result;
++    }
+   }
+   interpret_result good;
+   good.status = RUNTIME_OK;
+@@ -1522,21 +1620,27 @@ static void close_upvalues(execution_state* p_exe, uint32_t p_uptill) {
+ ARRAY_DEFINE_DEFAULT(register_array, value, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(call_stack, call_frame, ARRAY_DEFAULT_TYPE_DEINIT);
+ 
+-void registers_init(registers* p_registers, allocators* p_alloc) {
++void register_file_init(register_file* p_registers, allocators* p_alloc) {
+   p_registers->top = 0;
+   register_array_init(&p_registers->array, p_alloc);
+ }
+ 
+-bool registers_init_warm(registers* p_registers, uint32_t p_initial_capacity, allocators* p_alloc) {
+-  registers_init(p_registers, p_alloc);
++bool register_file_init_warm(register_file* p_registers, uint32_t p_initial_capacity, allocators* p_alloc) {
++  register_file_init(p_registers, p_alloc);
+   if (p_initial_capacity > 0) { // so we dont trigger free in the reallocate function.
+-    return register_array_grow(&p_registers->array, p_initial_capacity);
++    if (!register_array_grow(&p_registers->array, p_initial_capacity)) {
++      return false;
++    }
++    // registers must read as null, realloc'd memory is garbage
++    for (uint32_t i = 0; i < p_initial_capacity; ++i) {
++      p_registers->array.data[i] = NULL_AS_VALUE();
++    }
+   }
+   return false;
+ }
+ 
+-void registers_deinit(registers* p_registers) {
++void register_file_deinit(register_file* p_registers) {
+   allocators* alloc = p_registers->array.alloc;
+   register_array_deinit(&p_registers->array, alloc);
+-  registers_init(p_registers, alloc);
++  register_file_init(p_registers, alloc);
+ }
+diff --git a/src/okvm.h b/src/okvm.h
+index a3c8770..f23789c 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -11,11 +11,11 @@ ARRAY_DECLARE_DEFAULT(register_array, value)
+ typedef struct {
+   uint32_t top;
+   register_array array;
+-} registers;
++} register_file;
+ 
+-void registers_init(registers* p_registers, allocators* p_alloc);
+-bool registers_init_warm(registers* p_registers, uint32_t p_initial_capacity, allocators* p_alloc);
+-void registers_deinit(registers* p_registers);
++void register_file_init(register_file* p_registers, allocators* p_alloc);
++bool register_file_init_warm(register_file* p_registers, uint32_t p_initial_capacity, allocators* p_alloc);
++void register_file_deinit(register_file* p_registers);
+ 
+ enum { RETURN_COUNT_DYNAMIC = UINT32_MAX };
+ typedef struct {
+@@ -30,7 +30,7 @@ ARRAY_DECLARE_DEFAULT(call_stack, call_frame)
+ 
+ typedef struct {
+   call_stack call_stack;
+-  registers registers;
++  register_file registers;
+   object_upvalue* open_upvalues;
+   string native_error_message;
+   bool native_has_error;

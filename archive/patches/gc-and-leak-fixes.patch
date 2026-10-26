@@ -1,0 +1,200 @@
+diff --git a/src/ok.c b/src/ok.c
+index 28c9692..03ff0c1 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -123,11 +123,12 @@ ok_value ok_value_string(ok* p_ok, ok_string_view p_string) {
+ }
+ 
+ bool ok_value_is_null(ok_value p_value) {
+-  return IS_VALUE_NULL(p_value);
++  // strict checks: raw doubles alias the non-strict tag bits (see okvalue.h)
++  return IS_VALUE_STRICTLY_NULL(p_value);
+ }
+ 
+ bool ok_value_is_bool(ok_value p_value) {
+-  return IS_VALUE_BOOL(p_value);
++  return IS_VALUE_STRICTLY_BOOL(p_value);
+ }
+ 
+ bool ok_value_is_number(ok_value p_value) {
+@@ -135,7 +136,7 @@ bool ok_value_is_number(ok_value p_value) {
+ }
+ 
+ bool ok_value_is_object(ok_value p_value) {
+-  return IS_VALUE_OBJECT(p_value);
++  return IS_VALUE_STRICTLY_OBJECT(p_value);
+ }
+ 
+ bool ok_value_is_string(ok_value p_value) {
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index cdf6257..d568cda 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -134,6 +134,13 @@ static void loop_context_deinit(loop_context* p_context, allocators* p_alloc) {
+   loop_context_init(p_context, p_alloc);
+ }
+ 
++static inline void pop_loop_context(compile_context* p_ctx, allocators* p_alloc) {
++  // loop_stack_pop only decrements count; the popped loop_context owns the
++  // continues/breaks arrays and must be deinit'd or they leak.
++  loop_context_deinit(&p_ctx->loop_stack.data[p_ctx->loop_stack.count - 1], p_alloc);
++  ASSERT(loop_stack_pop(&p_ctx->loop_stack));
++}
++
+ static void compile_context_init(compile_context* p_context,
+                                  object_function* p_obj_function,
+                                  function_type p_type,
+@@ -246,6 +253,9 @@ static bool end_scope(compiler* p_compiler, ast_node* p_author) {
+     status = false;
+   }
+   register_allocator_reset_locals(&ctx->register_allocator, scp->registers_checkpoint);
++  // scopes_pop only decrements count; the popped scope owns its registers_table
++  // (with hashed_string keys) and registers array and must be deinit'd or they leak.
++  scope_deinit(scp, p_compiler->alloc);
+   ASSERT(scopes_pop(&ctx->scopes));
+   return status;
+ }
+@@ -279,6 +289,9 @@ begin_context(compiler* p_compiler, ok_string_view p_name, function_type p_type,
+ }
+ 
+ static inline void end_context(compiler* p_compiler) {
++  // compile_contexts_pop only decrements count; the popped context owns its
++  // scopes/loop_stack/upvalues/register metadata and must be deinit'd or they leak.
++  compile_context_deinit(&p_compiler->contexts.data[p_compiler->contexts.count - 1], p_compiler->alloc);
+   ASSERT(compile_contexts_pop(&p_compiler->contexts));
+ }
+ 
+@@ -1485,7 +1498,7 @@ bool compile_while_statement(compiler* p_compiler, ast_while_statement* p_while)
+   if (!patch_loop_context(p_compiler, &CTX, (ast_node*)p_while)) {
+     return false;
+   }
+-  ASSERT(loop_stack_pop(&ctx->loop_stack));
++  pop_loop_context(ctx, alloc);
+ #undef CTX
+   return true;
+ }
+@@ -1504,7 +1517,7 @@ bool compile_for_statement(compiler* p_compiler, ast_for_statement* p_for) {
+   }
+ #define CTX ctx->loop_stack.data[ctx->loop_stack.count - 1]
+   if (!begin_scope(p_compiler, (ast_node*)p_for)) {
+-    ASSERT(loop_stack_pop(&ctx->loop_stack));
++    pop_loop_context(ctx, alloc);
+     return false;
+   }
+   chunk* chunk = current_chunk(p_compiler);
+@@ -1570,11 +1583,11 @@ bool compile_for_statement(compiler* p_compiler, ast_for_statement* p_for) {
+   if (!patch_loop_context(p_compiler, &CTX, (ast_node*)p_for)) {
+     return false;
+   }
+-  ASSERT(loop_stack_pop(&ctx->loop_stack));
++  pop_loop_context(ctx, alloc);
+   ASSERT(end_scope(p_compiler, (ast_node*)p_for));
+   return true;
+ fail:
+-  ASSERT(loop_stack_pop(&ctx->loop_stack));
++  pop_loop_context(ctx, alloc);
+   ASSERT(end_scope(p_compiler, (ast_node*)p_for));
+   return false;
+ 
+@@ -2305,6 +2318,9 @@ static bool compile_function_impl(compiler* p_compiler,
+   disassembler_deinit(&disassembler);
+ #endif // defined (OK_DEBUG_DUMP_CODE)
+ 
++  // the descriptors were copied into proto->upvalues above, the compile-side
++  // context is pure compile-time state: release it before popping (leak fix).
++  compile_context_deinit(function_ctx, p_compiler->alloc);
+   ASSERT(compile_contexts_pop(&p_compiler->contexts));
+ 
+   constant kproto = add_constant(p_compiler, OBJECT_AS_VALUE(proto), p_author);
+diff --git a/src/okgc.c b/src/okgc.c
+index 29c3d55..9f5e738 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -45,7 +45,8 @@ void gc_deinit(gc* p_gc) {
+ }
+ 
+ bool gc_guard_up(gc* p_gc, value p_value) {
+-  if (!IS_VALUE_NULL(p_gc->guarded)) {
++  // strict check: raw doubles can alias the non-strict null tag bits (see okvalue.h)
++  if (!IS_VALUE_STRICTLY_NULL(p_gc->guarded)) {
+     return false;
+   }
+   p_gc->guarded = p_value;
+@@ -113,7 +114,11 @@ static bool mark_object(gc* p_gc, object* p_object) {
+ }
+ 
+ static bool mark_value(gc* p_gc, value p_value) {
+-  if (IS_VALUE_OBJECT(p_value) && !mark_object(p_gc, VALUE_AS_OBJECT(p_value))) {
++  // strict check is required here: marked values come from registers, constants,
++  // globals and closed upvalues, and raw doubles whose payload bits alias the
++  // tag space (e.g. 19.0, 23.0, 27.0...) would otherwise be treated as object
++  // pointers and crash the marker (found via OK_AGGRESSIVE_GC on *_long tests).
++  if (IS_VALUE_STRICTLY_OBJECT(p_value) && !mark_object(p_gc, VALUE_AS_OBJECT(p_value))) {
+     return false;
+   }
+   return true;
+diff --git a/src/okobject.h b/src/okobject.h
+index e831869..a7f5c4d 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -52,7 +52,8 @@ bool object_is_marked(object* p_object);
+ void object_set_marked(object* p_object, bool p_marked);
+ 
+ static inline bool value_is_object_type(value p_value, object_type p_type) {
+-  return IS_VALUE_OBJECT(p_value) && OBJECT_TYPE(p_value) == p_type;
++  // strict check: raw doubles alias the non-strict tag bits (see okvalue.h)
++  return IS_VALUE_STRICTLY_OBJECT(p_value) && OBJECT_TYPE(p_value) == p_type;
+ }
+ 
+ typedef struct {
+diff --git a/src/okvm.c b/src/okvm.c
+index 2d666c2..480906a 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -89,6 +89,10 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+     return res;
+   }
+   reg->array.data[reg->top] = OBJECT_AS_VALUE(closure); // call register
++  // mark_vm roots registers in [0, top): the slot we just wrote is AT top, so
++  // until call() raises top to frame_top the closure would be unrooted and any
++  // allocation inside call() (e.g. register file growth) could sweep it.
++  reg->top += 1;
+   gc_guard_down(p_vm->alloc->gc);
+   if (!call_value(p_vm, p_vm->current_execution_state, reg, 0, 0, 0, 0)) {
+     interpret_result result = {.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
+@@ -1459,12 +1463,17 @@ static inline bool call(vm* p_vm,
+     // grow with headroom so we do not realloc on every nested call
+     const uint32_t target = frame_top + (frame_top >> 1u);
+     const uint32_t new_capacity = target > UINT16_MAX + 1u ? UINT16_MAX + 1u : target;
++    // the register file is written directly (data[i] = ...), never appended to,
++    // so array.count stays 0 and is NOT the initialized watermark. everything in
++    // [0, capacity) is: either nulled by register_file_init_warm or by a previous
++    // grow. null-filling from 0 here would wipe the caller's live registers.
++    const uint32_t initialized_uptill = p_reg->array.capacity;
+     if (!register_array_grow(&p_reg->array, new_capacity)) {
+       runtime_error(p_vm, "out of memory: failed to grow register file.");
+       return false;
+     }
+     // fresh registers must read as null: realloc'd memory is garbage
+-    for (uint32_t i = p_reg->array.count; i < new_capacity; ++i) {
++    for (uint32_t i = initialized_uptill; i < new_capacity; ++i) {
+       p_reg->array.data[i] = NULL_AS_VALUE();
+     }
+   }
+@@ -1506,10 +1515,14 @@ static inline bool call_native(vm* p_vm,
+   gc_guard_up(p_vm->alloc->gc, result);
+   p_exe->native_has_error = false;
+   string_deinit(&p_exe->native_error_message, p_vm->alloc);
+-  call_frame* frame = &p_exe->call_stack.data[p_exe->call_stack.count - 1];
++  // natives do not push a call frame: when invoked via ok_call the call stack is
++  // empty (data[count - 1] would be a wild pointer), and when invoked from
++  // bytecode the caller frame's return_base is not where this call's result
++  // belongs. per OP_CALL semantics (r[a]... = r[a](r[a+1]...)) the result goes
++  // to the call window start, which is the callee slot.
+   register_file* reg = &p_exe->registers;
+   reg->top = p_callee;
+-  reg->array.data[frame->return_base] = result;
++  reg->array.data[p_callee] = result;
+   gc_guard_down(p_vm->alloc->gc);
+   return true;
+ }

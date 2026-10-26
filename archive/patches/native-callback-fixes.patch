@@ -1,0 +1,288 @@
+diff --git a/src/okvm.c b/src/okvm.c
+index 2288d8c..82a1726
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -34,6 +34,26 @@ static interpret_result create_closure(
+ void interpret_result_deinit(interpret_result* p_interpret_result) {
+ }
+ 
++// the flag must stay visible to enclosing call_native frames while a native
++// is still unwinding (native_call_depth > 0); only the outermost C entry
++// point (depth == 0) consumes it so a subsequent ok_call starts clean.
++static inline void vm_consume_pending_error(execution_state* p_exe) {
++  if (p_exe->native_call_depth == 0) {
++    p_exe->error_pending = false;
++  }
++}
++
++// a runtime error fired somewhere under the current C entry point. callers
++// that RESUME interpretation after the error point (call_native returning to
++// an OP_CALL handler) must check this and fail instead: runtime_error already
++// reset the call stack + watermark, and continuing would run bytecode against
++// a wild frame pointer (dorg3 segfault right after the "invalid call" report).
++static interpret_result vm_error(execution_state* p_exe) {
++  vm_consume_pending_error(p_exe);
++  interpret_result result = {.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++  return result;
++}
++
+ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->alloc = p_specs.alloc;
+   p_vm->objects_store = p_specs.objects_store;
+@@ -44,6 +64,7 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->current_execution_state = p_vm->alloc->allocate(p_vm->alloc, sizeof(execution_state));
+   p_vm->current_execution_state->open_upvalues = NULL;
+   p_vm->current_execution_state->native_has_error = false;
++  p_vm->current_execution_state->error_pending = false;
+   p_vm->current_execution_state->native_call_depth = 0;
+   string_init(&p_vm->current_execution_state->native_error_message, NULL, 0, false, p_vm->alloc);
+   register_file_init_warm(&p_vm->current_execution_state->registers, STACK_SIZE, p_specs.alloc); // super temp
+@@ -61,6 +82,7 @@ void vm_deinit(vm* p_vm) {
+   p_vm->current_execution_state->open_upvalues = NULL;
+   p_vm->current_execution_state->native_call_depth = 0;
+   p_vm->current_execution_state->native_has_error = false;
++  p_vm->current_execution_state->error_pending = false;
+   string_deinit(&p_vm->current_execution_state->native_error_message, p_vm->alloc);
+   p_vm->alloc->release(p_vm->alloc, p_vm->current_execution_state);
+ }
+@@ -95,10 +117,12 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+   reg->top += 1;
+   gc_guard_down(p_vm->alloc->gc);
+   if (!call_value(p_vm, p_vm->current_execution_state, reg, 0, 0, 0, 0)) {
+-    interpret_result result = {.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
+-    return result;
++    return vm_error(p_vm->current_execution_state);
+   }
+   interpret_result interpret_result = run_until(p_vm, 0);
++  if (interpret_result.status != RUNTIME_OK) {
++    vm_consume_pending_error(p_vm->current_execution_state);
++  }
+   return interpret_result;
+ }
+ 
+@@ -107,16 +131,29 @@ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc) {
+   register_file* reg = &exe->registers;
+   const uint32_t call_depth = exe->call_stack.count;
+   const uint32_t base = reg->top - p_argc - 1;
+-  if (!call_value(p_vm, exe, reg, base, base, p_argc, 1)) {
+-    interpret_result result = {.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
+-    return result;
++  // p_callee is an index RELATIVE to p_base (compare OP_CALL: frame base +
++  // register index). passing `base` here double-based the callee slot: with a
++  // non-empty call stack — a native calling back into the VM, e.g. dorg3's
++  // array_foreach -> ok_call(closure) mid-frame — base > 0 and call_value read
++  // data[base + base], a garbage register, instead of the closure staged at
++  // data[base]. every ok_call until now ran from C on an empty call stack
++  // (base == 0), where 0 + 0 was accidentally correct.
++  if (!call_value(p_vm, exe, reg, base, 0, p_argc, 1)) {
++    return vm_error(exe);
+   }
+   if (exe->call_stack.count == call_depth) {
+     interpret_result result = {.status = RUNTIME_OK,
+                                .top_level_return = reg->array.data[base]}; // TODO multiple returns
+     return result;
+   }
+-  return run_until(p_vm, call_depth);
++  interpret_result result = run_until(p_vm, call_depth);
++  if (result.status != RUNTIME_OK) {
++    // only the outermost C entry point may consume a pending error: inner
++    // ok_calls (from inside a native) must leave it visible so the enclosing
++    // call_native can fail the OP_CALL instead of resuming on a reset state.
++    vm_consume_pending_error(exe);
++  }
++  return result;
+ }
+ 
+ static inline bool is_falsy(value p_value) {
+@@ -1469,6 +1506,10 @@ void runtime_error(vm* p_vm, const char* p_fmt, ...) {
+ 
+   exe->registers.top = 0;
+   exe->call_stack.count = 0;
++  // mark the error as pending: interpretation MUST NOT resume after this
++  // point without propagating the failure (call_native checks this when a
++  // native returns; vm_call/vm_interpret consume it at the C boundary).
++  exe->error_pending = true;
+ }
+ 
+ static inline bool call(vm* p_vm,
+@@ -1505,6 +1546,23 @@ static inline bool call(vm* p_vm,
+       p_reg->array.data[i] = NULL_AS_VALUE();
+     }
+   }
++  // the callee's window past the staged args is NOT written by the call: those
++  // slots keep bits from earlier frames that used the same region. mark_vm
++  // roots [0, top) and top just rose to frame_top, so a collection before the
++  // callee assigns its locals would walk those stale pointers as objects —
++  // use-after-free when the object was already swept (aggressive GC / ASan;
++  // plain builds read the allocator's free-list memory and corrupt the mark).
++  // null everything the callee has not received yet so [0, top) only ever
++  // holds live values or tagged nulls.
++  {
++    uint32_t first_unwritten = p_callee + p_argc + 1;
++    if (first_unwritten > frame_top) {
++      first_unwritten = frame_top;
++    }
++    for (uint32_t i = first_unwritten; i < frame_top; ++i) {
++      p_reg->array.data[i] = NULL_AS_VALUE();
++    }
++  }
+   p_reg->top = frame_top;
+   call_frame frame;
+   frame.closure = p_closure;
+@@ -1532,8 +1590,18 @@ static inline bool call_native(vm* p_vm,
+     return false;
+   }
+   p_exe->native_call_depth++;
++  // the native receives a pointer into the register file. if it calls back
++  // into the VM (dorg3: array_foreach -> ok_call(closure)) and the callee's
++  // frame needs more registers than the current capacity, call() grows the
++  // file with realloc and that pointer would dangle for the rest of the
++  // native's execution — array_foreach iteration 2+ would read freed memory
++  // when re-fetching its closure argument. stage a copy instead.
++  value args_stash[UINT8_MAX];
++  if (p_argc > 0) {
++    memcpy(args_stash, p_reg->array.data + p_callee + 1, p_argc * sizeof(value));
++  }
+   // TODO: allow multiple
+-  value result = p_native->function(p_vm->ok, p_argc, p_reg->array.data + p_callee + 1);
++  value result = p_native->function(p_vm->ok, p_argc, args_stash);
+   p_exe->native_call_depth--;
+   if (p_exe->native_has_error) {
+     runtime_error(p_vm, "%s", p_exe->native_error_message.chars);
+@@ -1541,6 +1609,15 @@ static inline bool call_native(vm* p_vm,
+     string_deinit(&p_exe->native_error_message, p_vm->alloc);
+     return false;
+   }
++  if (p_exe->error_pending) {
++    // a runtime error fired inside the native (e.g. its ok_call on a script
++    // closure failed). runtime_error already reset the state and printed the
++    // report; returning true here would make the OP_CALL handler reload
++    // `frame` from an empty call stack (data[count - 1] with count == 0) and
++    // segfault — the crash dorg3 showed right after the error report. fail
++    // the call so the error propagates up to the C entry point instead.
++    return false;
++  }
+   gc_guard_up(p_vm->alloc->gc, result);
+   p_exe->native_has_error = false;
+   string_deinit(&p_exe->native_error_message, p_vm->alloc);
+diff --git a/src/okvm.h b/src/okvm.h
+index f23789c..f12b83f
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -34,6 +34,10 @@ typedef struct {
+   object_upvalue* open_upvalues;
+   string native_error_message;
+   bool native_has_error;
++  // set by runtime_error; checked by call_native (a native returning after an
++  // inner error must fail its OP_CALL) and consumed at the outermost C entry
++  // point (vm_call/vm_interpret with native_call_depth == 0).
++  bool error_pending;
+   uint32_t native_call_depth;
+ } execution_state;
+ 
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index 5b4f6dd..63a7ed6
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -37,6 +37,31 @@ static ok_value native_fail(ok* p_ok, uint8_t argc, const ok_value* argv) {
+   return ok_value_null();
+ }
+ 
++// regression (2026-10-25, dorg3 "invalid call: value is not callable" + SIGSEGV):
++// a native that calls BACK into the VM while the script's call stack is live.
++// pre-fix this crashed two ways: vm_call double-based the callee slot (read
++// data[base + base] instead of data[base] -> "value is not callable" whenever
++// ok_call ran with top > 0), and when the inner call errored, call_native
++// returned success and the interpreter resumed on a cleared call stack
++// (frame reload from data[count - 1] with count == 0 -> segfault right after
++// the error report).
++static ok_value native_apply(ok* p_ok, uint8_t argc, const ok_value* argv) {
++  assert(argc == 2);
++  assert(ok_value_is_object(argv[0]));
++  assert(ok_value_is_number(argv[1]));
++
++  ok_value arg = argv[1];
++  ok_value result = ok_value_null();
++
++  if (!ok_call(p_ok, argv[0], 1, &arg, &result)) {
++    // inner runtime error: propagate by returning; the VM's error_pending
++    // flag makes call_native fail the OP_CALL so the error reaches the host.
++    return ok_value_null();
++  }
++
++  return result;
++}
++
+ static void native_destructor(void* ptr) {
+   assert(ptr != nullptr);
+ 
+@@ -130,6 +155,9 @@ int main() {
+   assert(ok_global_define_native_function(
+       vm, ok_create_string_view("host_fail", OK_STRING_VIEW_CALCULATE_LENGTH, true), 0, native_fail));
+ 
++  assert(ok_global_define_native_function(
++      vm, ok_create_string_view("host_apply", OK_STRING_VIEW_CALCULATE_LENGTH, true), 2, native_apply));
++
+   int* userdata = new int(44);
+ 
+   ok_value native_value = ok_native_value_new(vm, userdata, native_destructor);
+@@ -179,6 +207,15 @@ int main() {
+ 
+     let object_value = host_get_object(host_object);
+     if object_value != 44? print "bad: object";
++
++    // native -> VM callback while <main>'s frame is on the call stack (the
++    // array_foreach pattern from dorg3). exercises ok_call with top > 0.
++    glob fu double_it(x) {
++      return x * 2;
++    }
++
++    let applied = host_apply(double_it, 21);
++    if applied != 42? print "bad: apply";
+   )";
+ 
+   ok_source source = {
+@@ -276,6 +313,43 @@ int main() {
+ 
+   assert(result == OK_RUNTIME_ERROR);
+ 
++  // error propagation THROUGH a native callback: the closure errors inside
++  // the native's ok_call; call_native must fail the OP_CALL (not resume on a
++  // cleared call stack) so ok_run reports OK_RUNTIME_ERROR instead of dying.
++  const char* callback_error_code = R"(
++    glob fu boom(x) {
++      return x + "not a number";
++    }
++
++    host_apply(boom, 1);
++  )";
++
++  ok_source callback_error_source = {
++      .from = OK_FROM_FILE,
++      .code = callback_error_code,
++      .path = "embed",
++  };
++
++  result = ok_run(vm, callback_error_source);
++
++  assert(result == OK_RUNTIME_ERROR);
++
++  // and the VM must still be usable afterwards for a clean C-side call:
++  assert(ok_global_get(vm, ok_create_string_view("host_add", OK_STRING_VIEW_CALCULATE_LENGTH, true), &debug_global));
++
++  assert(ok_value_is_object(debug_global));
++
++  ok_value recover_args[] = {
++      ok_value_number(1),
++      ok_value_number(2),
++  };
++
++  ok_value recover_result = ok_value_null();
++
++  assert(ok_call(vm, debug_global, 2, recover_args, &recover_result));
++
++  assert(ok_value_as_number(recover_result) == 3);
++
+   ok_free(vm);
+ 
+   assert(g_destructor_calls == 1);

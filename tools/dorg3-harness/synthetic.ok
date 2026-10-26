@@ -1,0 +1,28 @@
+// minimal mimic of dorg3.ok structure around lines 1-420:
+// glob lets -> plain fu decls -> glob fu init() -> fu draw(8 params) right after
+glob let g_c_arena_bound_x = 1280;
+glob let g_c_arena_bound_y = 720;
+glob let mut g_score = 0;
+glob let mut g_state = 0;
+
+fu joystick_update(p_delta) {
+  return 1;
+}
+
+fu keyboard_update(p_delta) {
+  return 1;
+}
+
+// gets called on start
+glob fu init() {
+  print "init body ran";
+  return true;
+}
+
+fu draw(p_tex, p_pos_x, p_pos_y, p_ref_height, p_tex_width, p_tex_height, p_rot, p_col) {
+  return 0;
+}
+
+fu dorg_end(p_dead) {
+  g_state = 1;
+}
