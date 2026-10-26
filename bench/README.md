@@ -1,6 +1,6 @@
-# Oklang / Lua / Python benchmark suite (v2)
+# Oklang / Lua / Python benchmark suite (v3)
 
-This suite compares the register-based Oklang VM to Lua and Python, and optionally compares the older stack VM on the legacy subset. It uses the Oklang language features established by the existing tests: numeric `for`, arrays, indexed reads/writes, `for-in`, `push`, and compound assignment. It does not use game-specific C API functions.
+This suite compares the register-based Oklang VM to Lua and Python, and optionally compares the older stack VM on the legacy subset. Version 3 adds the variable-index and global-container array-assignment pairs plus a Lua numeric-index-loop comparator for `for-in`. It uses the Oklang language features established by the existing tests: numeric `for`, arrays, indexed reads/writes, `for-in`, `push`, and compound assignment. It does not use game-specific C API functions.
 
 ## What is included
 
@@ -27,7 +27,8 @@ The old stack VM is deliberately skipped for these because it does not implement
 | `numeric_for_sum` | Numeric for with accumulator; compare against arithmetic_sum which uses while. | 10,000,000 | `49999995000000` |
 | `numeric_for_step` | Numeric for with non-unit step; 5 million iterations. | 5,000,000 | `24999995000000` |
 | `array_index_sum` | Repeated numeric indexing and reads from a prebuilt array/list. | 1,000,000 passes (8 million elements) | `36000000` |
-| `array_for_in_sum` | Array iteration / for-in traversal; 8 million visited elements. | 1,000,000 passes (8 million elements) | `36000000` |
+| `array_for_in_sum` | Array iteration / for-in traversal; Lua uses `ipairs`. | 1,000,000 passes (8 million elements) | `36000000` |
+| `array_for_in_sum_indexed` | Oklang `for-in` vs Lua numeric index loop vs Python list iteration; 8 million visited elements. | 1,000,000 passes (8 million elements) | `36000000` |
 | `array_push_growth` | Array allocation and dynamic growth through repeated append/push. | 200,000 | `399999` |
 | `array_literal_alloc` | Array literal construction/allocation inside a loop plus element reads. | 200,000 | `40000400000` |
 | `assign_add_plain` | + assignment baseline. Iterations: 5,000,000. Lua uses its equivalent plain assignment because Lua has no compound assignment syntax. | 5,000,000 | `5000000` |
@@ -38,8 +39,12 @@ The old stack VM is deliberately skipped for these because it does not implement
 | `assign_mul_compound` | *= compound assignment; compare Oklang and Python against the plain form. Iterations: 2,000,000. Lua uses its equivalent plain assignment because Lua has no compound assignment syntax. | 2,000,000 | `~1.2214` |
 | `assign_div_plain` | / assignment baseline. Iterations: 2,000,000. Lua uses its equivalent plain assignment because Lua has no compound assignment syntax. | 2,000,000 | `~0.81873` |
 | `assign_div_compound` | /= compound assignment; compare Oklang and Python against the plain form. Iterations: 2,000,000. Lua uses its equivalent plain assignment because Lua has no compound assignment syntax. | 2,000,000 | `~0.81873` |
-| `array_subscript_add_plain` | Array-element add: plain assignment. Lua uses plain assignment for both paired cases. | 2,000,000 | `2000000` |
-| `array_subscript_add_compound` | Array-element add: compound assignment. Lua uses plain assignment for both paired cases. | 2,000,000 | `2000000` |
+| `array_subscript_add_plain` | Array-element add with literal index `0`: plain assignment. Lua uses plain assignment for both paired cases. | 2,000,000 | `2000000` |
+| `array_subscript_add_compound` | Array-element add with literal index `0`; compound assignment. Lua uses plain assignment for both paired cases. | 2,000,000 | `2000000` |
+| `array_subscript_variable_add_plain` | Array-element add with local variable index `i`; register-index operand path. | 2,000,000 | `2000000` |
+| `array_subscript_variable_add_compound` | Same variable-index case using `a[i] += 1`. | 2,000,000 | `2000000` |
+| `global_array_subscript_add_plain` | Array-element add through global container `g`, using literal index `0`. | 2,000,000 | `2000000` |
+| `global_array_subscript_add_compound` | Same global-container case using `g[0] += 1`. | 2,000,000 | `2000000` |
 
 ## Run it
 
@@ -73,7 +78,7 @@ For each operator, there are separate Oklang/Python benchmarks for the plain for
 - `x = x * factor` vs `x *= factor`
 - `x = x / factor` vs `x /= factor`
 
-The same pair exists for a fixed array element: `a[0] = a[0] + 1` vs `a[0] += 1`. Lua has no compound-assignment syntax, so its paired benchmark files intentionally execute the equivalent plain-assignment expression in both cases. The Lua timing is a control, not a compound-assignment implementation.
+Array-subscript pairs now cover three paths: a literal local-array index (`a[0]`), a local-variable index (`a[i]`, intended to exercise register-index operands), and a literal index into a global array (`g[0]`, exercising the global-container load path). The variable index is held fixed at runtime to avoid adding index-cycling overhead; the source uses a local identifier rather than a literal index. Lua has no compound-assignment syntax, so its paired benchmark files intentionally execute the equivalent plain-assignment expression in both cases. The Lua timing is a control, not a compound-assignment implementation.
 
 The multiplication/division benchmarks use a factor of `1.0000001` over two million iterations to avoid immediately collapsing to zero or overflowing. Treat printed float text as approximate; the resulting value should be very close across runtimes.
 

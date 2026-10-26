@@ -14,7 +14,7 @@ if [[ ! -x "$OK_REGISTER" ]]; then echo "error: register-VM executable is not ex
 if [[ -n "$OK_STACK" && ! -x "$OK_STACK" ]]; then echo "error: stack-VM executable is not executable: $OK_STACK" >&2; exit 1; fi
 
 legacy_benchmarks=(loop_counter arithmetic_sum branch_toggle local_pressure global_access function_calls closure_upvalue recursion_fib)
-new_benchmarks=(numeric_for_counter numeric_for_sum numeric_for_step array_index_sum array_for_in_sum array_push_growth array_literal_alloc assign_add_plain assign_add_compound assign_sub_plain assign_sub_compound assign_mul_plain assign_mul_compound assign_div_plain assign_div_compound array_subscript_add_plain array_subscript_add_compound)
+new_benchmarks=(numeric_for_counter numeric_for_sum numeric_for_step array_index_sum array_for_in_sum array_for_in_sum_indexed array_push_growth array_literal_alloc assign_add_plain assign_add_compound assign_sub_plain assign_sub_compound assign_mul_plain assign_mul_compound assign_div_plain assign_div_compound array_subscript_add_plain array_subscript_add_compound array_subscript_variable_add_plain array_subscript_variable_add_compound global_array_subscript_add_plain global_array_subscript_add_compound)
 
 run_one() {
   local name="$1"
