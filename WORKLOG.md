@@ -312,3 +312,25 @@ Stage Summary:
 - v0.0.5 feature set complete pending Q's review: arrays, defaults, numeric-for (+ the frozen-limit semantics that were the selling point), disassembler, assign peephole.
 - the disassembler paid for itself within the hour it landed: one theory refuted, one real bottleneck found AND fixed, two semantic landmines mapped before they shipped.
 - parked + logged: compound-assign peephole, MOVE staging before ARRAY_GET/CALL (register-window design question), C-for retirement (D14, iteration-protocol round).
+
+---
+
+## session 12 — buffer day: bench verification, compound-assign settled, v0.0.5 ruling
+
+Task: verify the owner's bench suite + the LLM results read, settle compound-assign vs plain with bytecode evidence, rule on tagging and the prepone question (var returns), respond on move staging.
+
+Work Log:
+- pulled 267aa53. suite verdict: good, not stupid — hyperfine --shell=none + warmup + runs, ok/lua/py triples, ok-reg-fresh/ok-reg-old binaries shipped in-repo, honest README caveats (output not auto-compared, startup included in timings).
+- ran the owner's exact Nix binaries in sandbox via the loader trick (glibc 2.42 vs sandbox; `/lib64/ld-linux-x86-64.so.2 ./ok-reg-fresh`). sandbox source happens to sit at the same 4c76455.
+- CORRECTION (the round's finding): the array-subscript result was read backwards. compound is ~3.96% faster on Q's machine (92.7 vs 96.5ms) and ~7% on the second machine (84.5 vs 91.2ms, 5 runs). `ok --dump` on ok-reg-fresh proves it: plain `a[0]=a[0]+1` = 5 dispatches/iter (two container stagings — the rvalue subscript and the lvalue each materialize `a`), compound = 4 (single resolution). delta ≈ 1.9ns/iter ≈ exactly one MOVE. single-evaluation semantics paying off, not a codegen defect.
+- scalar pair: IDENTICAL bytecode (`ADD r1 = r1 + k`) — "no difference" is the round-11 peephole converging both paths into the same instruction. best possible outcome. session-8 "+= accounting" question closed: sugar for names, real for subscripts.
+- evidence committed: bench/compound-assign-disassembly.md (both dumps + verdict + parked follow-up).
+- missing benches identified (proposed only): variable-index subscript pair (current pairs use constant 0 — exercises only the const-operand arms), global-container subscript pair, lua index-loop comparator for for-in (results_read's own rec #5).
+- tagging ruling: master 55e1293 is the v0.0.5 point; tag BEFORE any buffer-day experiment so the known-good state is captured. annotated message drafted in-chat.
+- prepone ruling: var returns / varargs = NO. D6 already contains the mitigation the owner feared missing — static result arity keeps RETURN_1 the default emission for 1-result functions; the genuine cost is compiler surface (semantic-pass arity checks, `let (x,y) = f()` destructuring, RET A,n codegen, dynamic-callee rule) = a feature round with zero game value ("not writing a printf").
+- game needs audit: dorg3.ok's string work was all host natives (str_concat, to_str_no_decimal, number_from_str, save_to_file) — nothing missing in the lang for the new game. buffer-day pick: dogfood a game-shaped script first; optional code = container-elision peephole (the parked MOVE-staging item, now precisely designed: skip container materialization when it's a simple local the index/RHS provably cannot reseat — same guard family as assign_operand_read_timing).
+- move staging ruling: PRESERVE (owner's instinct confirmed with fresh evidence — the staging MOVEs are the keep-alive that makes `a[f()] = g()` and single-eval safe, and they're why compound wins). optimize below the convention (elide provably-redundant stagings), never through it.
+
+Stage Summary:
+- bench suite verified; one misread corrected with bytecode proof committed to the repo.
+- v0.0.5 ready to tag at 55e1293; buffer-day plan: dogfood > small peephole > start the game early. no feature prepone.
