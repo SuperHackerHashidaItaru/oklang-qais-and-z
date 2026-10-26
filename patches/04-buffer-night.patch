@@ -1,0 +1,1287 @@
+diff --git a/src/okast.c b/src/okast.c
+index ae25042..b6bfc8b 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -24,7 +24,7 @@
+   X(AST_CALL_EXPRESSION, ast_call_expression)                                                                          \
+   X(AST_ASSIGN_EXPRESSION, ast_assign_expression)                                                                      \
+   X(AST_COMPOUND_ASSIGN_EXPRESSION, ast_compound_assign_expression)                                                    \
+-  /*X(AST_CONDITIONAL_EXPRESSION, ast_conditional_expression)*/                                                        \
++  X(AST_CONDITIONAL_EXPRESSION, ast_conditional_expression)                                                        \
+   X(AST_BOOLEAN_EXPRESSION, ast_boolean_expression)                                                                    \
+   X(AST_NULL_EXPRESSION, ast_null_expression)                                                                          \
+   /*X(AST_ACCESS_EXPRESSION, ast_access_expression)*/                                                                  \
+@@ -172,11 +172,9 @@ string ast_binding_asprint(const ast_binding* p_binding) {
+ string ast_declaration_modifiers_asprint(ast_declaration_modifiers_t p_modifiers, allocators* p_alloc) {
+   return (p_modifiers & DECLARATION_NONE) != 0 ? create_static_string("", 0)
+                                                : asprint(p_alloc,
+-                                                         "%s%s%s%s",
++                                                         "%s%s",
+                                                          (p_modifiers & DECLARATION_GLOB) != 0 ? "glob " : "",
+-                                                         (p_modifiers & DECLARATION_STATIC) != 0 ? "static " : "",
+-                                                         (p_modifiers & DECLARATION_EXPORT) != 0 ? "export " : "",
+-                                                         (p_modifiers & DECLARATION_ASYNC) != 0 ? "async" : "");
++                                                         (p_modifiers & DECLARATION_EXPORT) != 0 ? "export" : "");
+ }
+ 
+ void ast_declaration_init(ast_declaration* p_declaration,
+@@ -570,6 +568,60 @@ string ast_assign_expression_asprint(const ast_assign_expression* p_assign) {
+   return ret;
+ }
+ 
++void ast_conditional_expression_init(ast_conditional_expression* p_conditional,
++                                     const token p_token,
++                                     ast_expression* p_condition,
++                                     ast_expression* p_then_arm,
++                                     ast_expression* p_otherwise_arm,
++                                     ast_specs* p_specs) {
++  ast_expression_init(&p_conditional->expression, AST_CONDITIONAL_EXPRESSION, p_token, p_specs);
++  p_conditional->condition = p_condition;
++  p_conditional->then_arm = p_then_arm;
++  p_conditional->otherwise_arm = p_otherwise_arm;
++}
++
++void ast_conditional_expression_deinit(ast_conditional_expression* p_conditional) {
++  allocators* alloc = p_conditional->expression.node.alloc;
++  ast_dispatch_deinit((ast_node*)p_conditional->condition);
++  ast_dispatch_deinit((ast_node*)p_conditional->then_arm);
++  ast_dispatch_deinit((ast_node*)p_conditional->otherwise_arm);
++  alloc->release(alloc, p_conditional->condition);
++  alloc->release(alloc, p_conditional->then_arm);
++  alloc->release(alloc, p_conditional->otherwise_arm);
++  p_conditional->condition = NULL;
++  p_conditional->then_arm = NULL;
++  p_conditional->otherwise_arm = NULL;
++  ast_expression_deinit(&p_conditional->expression);
++}
++
++bool ast_conditional_expression_print(const ast_conditional_expression* p_conditional) {
++  bool ret = ast_dispatch_print((ast_node*)p_conditional->condition);
++  ret &= printf(" then ") > 0;
++  ret &= ast_dispatch_print((ast_node*)p_conditional->then_arm);
++  ret &= printf(" otherwise ") > 0;
++  ret &= ast_dispatch_print((ast_node*)p_conditional->otherwise_arm);
++  return ret;
++}
++
++string ast_conditional_expression_asprint(const ast_conditional_expression* p_conditional) {
++  allocators* alloc = p_conditional->expression.node.alloc;
++  string ret = create_static_string(NULL, 0);
++  string condition_str = ast_dispatch_asprint((ast_node*)p_conditional->condition);
++  string then_str = ast_dispatch_asprint((ast_node*)p_conditional->then_arm);
++  string otherwise_str = ast_dispatch_asprint((ast_node*)p_conditional->otherwise_arm);
++  if (condition_str.chars != NULL && then_str.chars != NULL && otherwise_str.chars != NULL) {
++    ret = asprint(p_conditional->expression.node.alloc,
++                  "%s then %s otherwise %s",
++                  condition_str.chars,
++                  then_str.chars,
++                  otherwise_str.chars);
++  }
++  string_deinit(&condition_str, alloc);
++  string_deinit(&then_str, alloc);
++  string_deinit(&otherwise_str, alloc);
++  return ret;
++}
++
+ static void bindings_list_deinit_element(ast_binding** p_elem, allocators* p_alloc) {
+   ast_binding_deinit(*p_elem);
+   p_alloc->release(p_alloc, *p_elem);
+diff --git a/src/okast.h b/src/okast.h
+index b8e89dc..c9fcd3e 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -148,11 +148,9 @@ typedef enum {
+   DECLARATION_NONE = 0,
+   DECLARATION_ERROR = 1,
+   DECLARATION_GLOB = 1 << 1,
+-  DECLARATION_STATIC = 1 << 2,
+-  DECLARATION_ASYNC = 1 << 3,
+-  DECLARATION_EXPORT = 1 << 4,
++  DECLARATION_EXPORT = 1 << 2,
+ } ast_declaration_modifiers;
+-#define DECLARATION_COUNT 5
++#define DECLARATION_COUNT 3
+ 
+ typedef uint8_t ast_declaration_modifiers_t;
+ string ast_declaration_modifiers_asprint(ast_declaration_modifiers_t p_modifiers, allocators* p_alloc);
+@@ -296,6 +294,25 @@ void ast_assign_expression_deinit(ast_assign_expression* p_assign);
+ bool ast_assign_expression_print(const ast_assign_expression* p_assign);
+ string ast_assign_expression_asprint(const ast_assign_expression* p_assign);
+ 
++// `p_condition then p_then_arm otherwise p_otherwise_arm` — the conditional
++// (ternary) expression. both arms compile into the caller's result register.
++typedef struct {
++  ast_expression expression;
++  ast_expression* condition;
++  ast_expression* then_arm;
++  ast_expression* otherwise_arm;
++} ast_conditional_expression;
++
++void ast_conditional_expression_init(ast_conditional_expression* p_conditional,
++                                     const token p_token,
++                                     ast_expression* p_condition,
++                                     ast_expression* p_then_arm,
++                                     ast_expression* p_otherwise_arm,
++                                     ast_specs* p_specs);
++void ast_conditional_expression_deinit(ast_conditional_expression* p_conditional);
++bool ast_conditional_expression_print(const ast_conditional_expression* p_conditional);
++string ast_conditional_expression_asprint(const ast_conditional_expression* p_conditional);
++
+ ARRAY_DECLARE_DEFAULT(ast_bindings_list, ast_binding*)
+ 
+ typedef struct {
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 3302479..0cef758 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -414,6 +414,11 @@ static bool compile_assign_expression(compiler* p_compiler,
+                                       _register p_dest,
+                                       uint32_t p_requested_count,
+                                       expression_result* p_out);
++static bool compile_conditional_expression(compiler* p_compiler,
++                                           ast_conditional_expression* p_conditional,
++                                           _register p_dest,
++                                           uint32_t p_requested_count,
++                                           expression_result* p_out);
+ static bool compile_call_expression(compiler* p_compiler,
+                                     ast_call_expression* p_call,
+                                     _register p_dest,
+@@ -659,6 +664,10 @@ static bool compile_expression(compiler* p_compiler,
+     result =
+         compile_assign_expression(p_compiler, (ast_assign_expression*)p_expression, p_dest, p_requested_count, p_out);
+     break;
++  case AST_CONDITIONAL_EXPRESSION:
++    result = compile_conditional_expression(
++        p_compiler, (ast_conditional_expression*)p_expression, p_dest, p_requested_count, p_out);
++    break;
+   case AST_BOOLEAN_EXPRESSION:
+     result =
+         compile_boolean_expression(p_compiler, (ast_boolean_expression*)p_expression, p_dest, p_requested_count, p_out);
+@@ -1180,7 +1189,58 @@ static location resolve_variable(compiler* p_compiler, const ok_string_view p_id
+   return invalid;
+ }
+ 
+-static lvalue resolve_lvalue(compiler* p_compiler, ast_expression* p_lvalue_expr) {
++// conservative purity check used by the container-elision guard in
++// resolve_lvalue: an expression is inert when evaluating it cannot change any
++// local's value. literals and identifiers trivially qualify; pure reads
++// (subscripts, binops, unary) propagate inertness; array literals allocate but
++// never reseat locals (the gc is non-moving, a local's reference survives a
++// collection unchanged); lambda literals are inert because creating a closure
++// runs no body — only calling it can mutate, and any call anywhere fails the
++// check anyway. calls and assignments are the reseating writers we guard
++// against: a call may mutate a captured local, an assignment (compound or not)
++// may target the container itself.
++static bool expression_is_inert(const ast_expression* p_expression) {
++  switch (p_expression->node.node_type) {
++  case AST_IDENTIFIER_EXPRESSION:
++  case AST_NUMBER_EXPRESSION:
++  case AST_STRING_EXPRESSION:
++  case AST_BOOLEAN_EXPRESSION:
++  case AST_NULL_EXPRESSION:
++  case AST_FUNCTION_EXPRESSION:
++    return true;
++  case AST_PREFIX_UNARY_EXPRESSION:
++    return expression_is_inert(((const ast_prefix_unary_expression*)p_expression)->right);
++  case AST_INFIX_BINARY_EXPRESSION: {
++    const ast_infix_binary_expression* infix = (const ast_infix_binary_expression*)p_expression;
++    return expression_is_inert(infix->left) && expression_is_inert(infix->right);
++  }
++  case AST_SUBSCRIPT_EXPRESSION: {
++    const ast_subscript_expression* subscript = (const ast_subscript_expression*)p_expression;
++    return expression_is_inert(subscript->left) && expression_is_inert(subscript->index);
++  }
++  case AST_ARRAY_EXPRESSION: {
++    const ast_array_expression* array = (const ast_array_expression*)p_expression;
++    for (uint32_t i = 0; i < array->elements.count; ++i) {
++      if (!expression_is_inert(array->elements.data[i])) {
++        return false;
++      }
++    }
++    return true;
++  }
++  case AST_CONDITIONAL_EXPRESSION: {
++    const ast_conditional_expression* conditional = (const ast_conditional_expression*)p_expression;
++    return expression_is_inert(conditional->condition) && expression_is_inert(conditional->then_arm) &&
++           expression_is_inert(conditional->otherwise_arm);
++  }
++  default:
++    return false; // calls, assignments, anything unknown: assume it can write
++  }
++}
++
++// p_pending_rhs is the expression that will be compiled after this lvalue is
++// resolved (the right side of an assignment), or NULL for pure reads: the
++// subscript read path resolves and immediately emits its GET.
++static lvalue resolve_lvalue(compiler* p_compiler, ast_expression* p_lvalue_expr, const ast_expression* p_pending_rhs) {
+   register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
+   switch (p_lvalue_expr->node.node_type) {
+   case AST_IDENTIFIER_EXPRESSION: {
+@@ -1209,10 +1269,32 @@ static lvalue resolve_lvalue(compiler* p_compiler, ast_expression* p_lvalue_expr
+     if (!compile_expression(p_compiler, sub->left, base, 1, &base_result)) {
+       return (lvalue){LVALUE_INVALID};
+     }
+-    // the base must live in its own register: the operand pair (base, index) is
+-    // what GET/SET address, and both must be stable across the rhs compile.
+-    if (!materialize_into(p_compiler, &base_result.value, base, author)) {
+-      return (lvalue){LVALUE_INVALID};
++    // container elision (the compound-assign disassembly follow-up): when the
++    // container compiled to a plain local's register — compilation emitted
++    // nothing, identifiers resolve to their own slots — and nothing that will
++    // be compiled before the GET/SET can reseat it, reference the local's
++    // register directly and drop the staging move. reseating writers inside
++    // the index or the pending rhs: assignments, and calls (a closure may
++    // mutate a captured local; the scope's captures_any flag cannot be trusted
++    // at this point, a lambda compiled later in the function captures just the
++    // same). the elided base also relies on the caller-side invariant that no
++    // assignment expression is ever compiled with a live local as its result
++    // register — the same invariant the assign/binop peephole already depends
++    // on (p_dest is the devnull or a temp, never a local).
++    const bool elide_container = base_result.value.kind == LOCATION_KIND_REGISTER &&
++                                 base_result.value.index != base.index && expression_is_inert(sub->index) &&
++                                 (p_pending_rhs == NULL || expression_is_inert(p_pending_rhs));
++    location base_location;
++    if (elide_container) {
++      register_allocator_rollback_temp(regalloc); // hand the staging temp back
++      base_location = base_result.value;
++    } else {
++      // the base must live in its own register: the operand pair (base, index) is
++      // what GET/SET address, and both must be stable across the rhs compile.
++      if (!materialize_into(p_compiler, &base_result.value, base, author)) {
++        return (lvalue){LVALUE_INVALID};
++      }
++      base_location = (location){base.index, LOCATION_KIND_REGISTER, LOCATION_OK};
+     }
+     _register index;
+     if (!register_allocator_allocate_temp(regalloc, &index)) {
+@@ -1229,7 +1311,7 @@ static lvalue resolve_lvalue(compiler* p_compiler, ast_expression* p_lvalue_expr
+     }
+     lvalue lv;
+     lv.kind = LVALUE_SUBSCRIPT;
+-    lv.subscript.base = (location){base.index, LOCATION_KIND_REGISTER, LOCATION_OK};
++    lv.subscript.base = base_location;
+     lv.subscript.index = index_result.value; // register (== the index temp) or constant
+     return lv;
+   }
+@@ -1938,6 +2020,78 @@ static bool compile_logical_operator(compiler* p_compiler,
+   return patch_jump_if_set(p_compiler, false, jmp, current_chunk(p_compiler)->code.count, p_dest, (ast_node*)p_logical);
+ }
+ 
++// `condition then a otherwise b`. zero new opcodes: the shape is the if
++// statement's, folded into an expression. the condition evaluates into its own
++// temp; both arms compile into the caller's p_dest — the same result register —
++// which is exactly the invariant the calling convention already guarantees
++// (callers allocate result registers, compile_expression targets them). a
++// conditional is never an lvalue; is_lvalue's whitelist keeps it that way.
++static bool compile_conditional_expression(compiler* p_compiler,
++                                           ast_conditional_expression* p_conditional,
++                                           _register p_dest,
++                                           uint32_t p_requested_count,
++                                           expression_result* p_out) {
++  CRASH_MSG(p_requested_count <= 1, "unimplemented multi-result.");
++  register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
++  ast_node* author = (ast_node*)p_conditional;
++
++  _register condition;
++  if (!register_allocator_allocate_temp(regalloc, &condition)) {
++    report_oom(p_compiler, author);
++    return false;
++  }
++  expression_result condition_result;
++  if (!compile_expression(p_compiler, p_conditional->condition, condition, 1, &condition_result)) {
++    return false;
++  }
++  // force into the temp: an identifier condition resolves to its own register
++  // without emitting anything, and the jump would read an unwritten temp.
++  if (!materialize_into(p_compiler, &condition_result.value, condition, author)) {
++    return false;
++  }
++
++  // falsy (false/null, the vm's is_falsy) jumps to the otherwise arm
++  uint32_t jump_to_otherwise;
++  if (!emit_incomplete_jump_if(p_compiler, false, condition, &jump_to_otherwise, author)) {
++    return false;
++  }
++
++  expression_result arm_result;
++  if (!compile_expression(p_compiler, p_conditional->then_arm, p_dest, 1, &arm_result)) {
++    return false;
++  }
++  // arms may resolve to constants or their own registers without emitting
++  // anything (numbers, identifiers, in-place compound assigns): land them in
++  // the result register so the taken arm always writes p_dest.
++  if (!materialize_into(p_compiler, &arm_result.value, p_dest, author)) {
++    return false;
++  }
++
++  uint32_t jump_to_end;
++  if (!emit_incomplete_jump(p_compiler, OP_JUMP, &jump_to_end, author)) {
++    return false;
++  }
++
++  if (!patch_jump_if(p_compiler, false, jump_to_otherwise, current_chunk(p_compiler)->code.count, author)) {
++    return false;
++  }
++  if (!compile_expression(p_compiler, p_conditional->otherwise_arm, p_dest, 1, &arm_result)) {
++    return false;
++  }
++  if (!materialize_into(p_compiler, &arm_result.value, p_dest, author)) {
++    return false;
++  }
++  if (!patch_jump(p_compiler, false, jump_to_end, current_chunk(p_compiler)->code.count, author)) {
++    return false;
++  }
++
++  p_out->type = EXPRESSION_VALUE;
++  p_out->value = (location){p_dest.index, LOCATION_KIND_REGISTER, LOCATION_OK};
++  p_out->lvalue = (lvalue){LVALUE_INVALID};
++  p_out->count = 1;
++  return true;
++}
++
+ static bool emit_binop(compiler* p_compiler,
+                        opcode p_op,
+                        opcode p_long_op,
+@@ -2169,7 +2323,7 @@ static bool compile_assign_expression(compiler* p_compiler,
+                                       uint32_t p_requested_count,
+                                       expression_result* p_out) {
+   CRASH_MSG(p_requested_count <= 1, "unimplemented multi-assign.");
+-  lvalue lv = resolve_lvalue(p_compiler, p_assign->left);
++  lvalue lv = resolve_lvalue(p_compiler, p_assign->left, p_assign->right);
+   if (lv.kind == LVALUE_INVALID) {
+     return false;
+   }
+@@ -2184,6 +2338,20 @@ static bool compile_assign_expression(compiler* p_compiler,
+   // keep the scratch-then-store path. store_lvalue still runs afterwards:
+   // the mutability gate and the (now no-op) self move check both still apply.
+   _register rhs_dest = p_dest;
++  if (lv.kind == LVALUE_SUBSCRIPT) {
++    // the rhs compiles into its own temp ABOVE the lvalue's staged base/index.
++    // a call rhs opens the callee's register window at its destination, and the
++    // callee's frame ([dest, dest + fu->registers)) null-fills every slot above
++    // it — the staged base/index temps sit above p_dest, so compiling the rhs
++    // there let the callee erase them (arr[0] = reseat(), where reseat captures
++    // and reseats arr, died with "expected an array"). found by the elision-gate
++    // regression hunt; compound assigns were always safe because their cur/rhs
++    // temps are allocated after the staging.
++    if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &rhs_dest)) {
++      report_oom(p_compiler, (ast_node*)p_assign);
++      return false;
++    }
++  }
+   if (lv.kind == LVALUE_VARIABLE && lv.variable.kind == LOCATION_KIND_REGISTER && p_assign->right != NULL &&
+       p_assign->right->node.node_type == AST_INFIX_BINARY_EXPRESSION) {
+     ast_infix_binary_expression* bin = (ast_infix_binary_expression*)p_assign->right;
+@@ -2356,7 +2524,8 @@ static bool compile_subscript_expression(compiler* p_compiler,
+   // read path goes through the same resolve_lvalue as writes: base and index are
+   // evaluated identically in both, and a[i] compiles side effects even when its
+   // value is discarded (matching compile_call_expression's behavior at count 0).
+-  lvalue lv = resolve_lvalue(p_compiler, (ast_expression*)p_subscript);
++  // no pending rhs: only the index can disqualify container elision here.
++  lvalue lv = resolve_lvalue(p_compiler, (ast_expression*)p_subscript, NULL);
+   if (lv.kind == LVALUE_INVALID) {
+     return false;
+   }
+@@ -2407,7 +2576,7 @@ static bool compile_compound_assign_expression(compiler* p_compiler,
+ 
+   // resolve the target once: base/index (subscripts) are evaluated here and never
+   // again, so a[f()] += g() calls f exactly once.
+-  lvalue lv = resolve_lvalue(p_compiler, p_compound->left);
++  lvalue lv = resolve_lvalue(p_compiler, p_compound->left, p_compound->right);
+   if (lv.kind == LVALUE_INVALID) {
+     return false;
+   }
+diff --git a/src/oklexer.c b/src/oklexer.c
+index 7e31a1e..e074820 100644
+--- a/src/oklexer.c
++++ b/src/oklexer.c
+@@ -180,15 +180,8 @@ static token_type lookup_identifier(lexer* p_lexer) {
+   case 'a': {
+     if (p_lexer->current - p_lexer->start > 1) {
+       switch (p_lexer->start[1]) {
+-      case 's': {
+-        if (p_lexer->current - p_lexer->start > 2) {
+-          switch (p_lexer->start[2]) {
+-          case 'y':
+-            return check_keyword(p_lexer, 3, 2, "nc", TOKEN_ASYNC);
+-          }
+-        }
++      case 's':
+         return check_keyword(p_lexer, 2, 0, "", TOKEN_AS);
+-      }
+       case 'n':
+         return check_keyword(p_lexer, 2, 1, "d", TOKEN_AND);
+       }
+@@ -242,6 +235,8 @@ static token_type lookup_identifier(lexer* p_lexer) {
+             return check_keyword(p_lexer, 3, 1, "s", TOKEN_THIS);
+           case 'r':
+             return check_keyword(p_lexer, 3, 2, "ow", TOKEN_THROW);
++          case 'e':
++            return check_keyword(p_lexer, 3, 1, "n", TOKEN_THEN);
+           }
+         }
+         break;
+@@ -266,8 +261,6 @@ static token_type lookup_identifier(lexer* p_lexer) {
+       switch (p_lexer->start[1]) {
+       case 'u':
+         return check_keyword(p_lexer, 2, 3, "per", TOKEN_SUPER);
+-      case 't':
+-        return check_keyword(p_lexer, 2, 4, "atic", TOKEN_STATIC);
+       }
+     }
+     break;
+@@ -275,10 +268,8 @@ static token_type lookup_identifier(lexer* p_lexer) {
+   case 'o': {
+     if (p_lexer->current - p_lexer->start > 1) {
+       switch (p_lexer->start[1]) {
+-      case 'p':
+-        return check_keyword(p_lexer, 2, 6, "erator", TOKEN_OPERATOR);
+-      case 'k':
+-        return check_keyword(p_lexer, 2, 0, "", TOKEN_OK);
++      case 't':
++        return check_keyword(p_lexer, 2, 7, "herwise", TOKEN_OTHERWISE);
+       case 'r':
+         return check_keyword(p_lexer, 2, 0, "", TOKEN_OR);
+       }
+@@ -354,16 +345,9 @@ start:
+                         : match(p_lexer, '>') ? match(p_lexer, '=') ? TOKEN_SHIFT_RIGHT_EQUAL : TOKEN_SHIFT_RIGHT
+                                               : TOKEN_GREATER);
+   case '+':
+-    return create_token(p_lexer,
+-                        match(p_lexer, '=')   ? TOKEN_PLUS_EQUAL
+-                        : match(p_lexer, '+') ? TOKEN_PLUS_PLUS
+-                                              : TOKEN_PLUS);
++    return create_token(p_lexer, match(p_lexer, '=') ? TOKEN_PLUS_EQUAL : TOKEN_PLUS);
+   case '-':
+-    return create_token(p_lexer,
+-                        match(p_lexer, '=')   ? TOKEN_MINUS_EQUAL
+-                        : match(p_lexer, '-') ? TOKEN_MINUS_MINUS
+-                        : match(p_lexer, '>') ? TOKEN_ARROW
+-                                              : TOKEN_MINUS);
++    return create_token(p_lexer, match(p_lexer, '=') ? TOKEN_MINUS_EQUAL : TOKEN_MINUS);
+   case '*':
+     return create_token(p_lexer, match(p_lexer, '=') ? TOKEN_ASTERISK_EQUAL : TOKEN_ASTERISK);
+   case '^':
+diff --git a/src/okoperator.c b/src/okoperator.c
+index 2613d30..84e9cc2 100644
+--- a/src/okoperator.c
++++ b/src/okoperator.c
+@@ -38,10 +38,6 @@ operator_type operator_type_from_token_type(const token_type p_token_type, bool
+     return OPERATOR_BIN_BAR;
+   case TOKEN_TILED:
+     return OPERATOR_BIN_TILED;
+-  case TOKEN_PLUS_PLUS:
+-    return p_is_prefix ? OPERATOR_PRE_PLUS_PLUS : OPERATOR_POS_PLUS_PLUS;
+-  case TOKEN_MINUS_MINUS:
+-    return p_is_prefix ? OPERATOR_PRE_MINUS_MINUS : OPERATOR_POS_MINUS_MINUS;
+   case TOKEN_PLUS_EQUAL:
+     return OPERATOR_PLUS_EQUAL;
+   case TOKEN_MINUS_EQUAL:
+diff --git a/src/okoperator.h b/src/okoperator.h
+index af12982..f200086 100644
+--- a/src/okoperator.h
++++ b/src/okoperator.h
+@@ -25,10 +25,6 @@
+   X(OPERATOR_BIN_AMPERSAND, "&")                                                                                       \
+   X(OPERATOR_BIN_BAR, "|")                                                                                             \
+   X(OPERATOR_BIN_TILED, "~")                                                                                           \
+-  X(OPERATOR_PRE_PLUS_PLUS, "++")                                                                                      \
+-  X(OPERATOR_PRE_MINUS_MINUS, "--")                                                                                    \
+-  X(OPERATOR_POS_PLUS_PLUS, "++")                                                                                      \
+-  X(OPERATOR_POS_MINUS_MINUS, "--")                                                                                    \
+   X(OPERATOR_PLUS_EQUAL, "+=")                                                                                     \
+   X(OPERATOR_MINUS_EQUAL, "-=")                                                                                    \
+   X(OPERATOR_ASTERISK_EQUAL, "*=")                                                                                 \
+@@ -101,25 +97,14 @@ typedef enum {
+   OPERATOR_PRE_NOT,
+   OPERATOR_PRE_BANG,
+   OPERATOR_RANGE_PRE_VALUE_END = OPERATOR_PRE_BANG,
+-
+-  // prefix that can only operate on lvalue
+-  OPERATOR_RANGE_PRE_LVALUE_BEGIN,
+-  OPERATOR_PRE_PLUS_PLUS = OPERATOR_RANGE_PRE_LVALUE_BEGIN,
+-  OPERATOR_PRE_MINUS_MINUS,
+-  OPERATOR_RANGE_PRE_LVALUE_END = OPERATOR_PRE_MINUS_MINUS,
+-  OPERATOR_RANGE_PRE_END = OPERATOR_RANGE_PRE_LVALUE_END,
++  OPERATOR_RANGE_PRE_END = OPERATOR_RANGE_PRE_VALUE_END,
+ 
+   OPERATOR_RANGE_POS_BEGIN,
+   OPERATOR_RANGE_POS_VALUE_BEGIN = OPERATOR_RANGE_POS_BEGIN,
+   OPERATOR_POS_CALL = OPERATOR_RANGE_POS_VALUE_BEGIN,
+   OPERATOR_POS_SUBSCRIPT,
+   OPERATOR_RANGE_POS_VALUE_END = OPERATOR_POS_SUBSCRIPT,
+-
+-  OPERATOR_RANGE_POS_LVALUE_BEGIN,
+-  OPERATOR_POS_PLUS_PLUS,
+-  OPERATOR_POS_MINUS_MINUS,
+-  OPERATOR_RANGE_POS_LVALUE_END = OPERATOR_POS_MINUS_MINUS,
+-  OPERATOR_RANGE_POS_END = OPERATOR_RANGE_POS_LVALUE_END,
++  OPERATOR_RANGE_POS_END = OPERATOR_RANGE_POS_VALUE_END,
+ 
+   OPERATOR_RANGE_LOGICAL_BEGIN,
+   OPERATOR_LOG_OR = OPERATOR_RANGE_LOGICAL_BEGIN,
+diff --git a/src/okparser.c b/src/okparser.c
+index 7ee6c9e..a03c503 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -61,9 +61,8 @@ static ast_expression* parse_binary_infix(
+     parser* p_parser, ast_expression* p_left, precedence p_precedence, bool is_right_associative, token p_trigger);
+ static ast_expression* parse_assign_expression(
+     parser* p_parser, ast_expression* p_left, precedence p_precedence, bool is_right_associative, token p_trigger);
+-// static ast_expression* parse_conditional(parser* p_parser, ast_expression* p_left, precedence p_precedence, bool
+-// is_right_associative, token p_trigger); static ast_expression* parse_as(parser* p_parser, ast_expression* p_left,
+-// precedence p_precedence, bool is_right_associative, token p_trigger);
++static ast_expression* parse_conditional_expression(
++    parser* p_parser, ast_expression* p_left, precedence p_precedence, bool is_right_associative, token p_trigger);
+ 
+ // static ast_expression* parse_unary_postfix(parser* p_parser, ast_expression* p_left, precedence p_precedence, bool
+ //  is_right_associative, token p_trigger);
+@@ -95,8 +94,6 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_CARET] = {NULL, parse_binary_infix, PREC_BITWISE_XOR},
+     [TOKEN_AMPERSAND] = {NULL, parse_binary_infix, PREC_AND},
+     [TOKEN_BAR] = {NULL, parse_binary_infix, PREC_OR},
+-    //[TOKEN_PLUS_PLUS] = { parse_unary_prefix, parse_unary_postfix, PREC_POSTFIX },
+-    //[TOKEN_MINUS_MINUS] = { parse_unary_prefix, parse_unary_postfix, PREC_POSTFIX },
+     [TOKEN_PLUS_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+     [TOKEN_MINUS_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+     [TOKEN_ASTERISK_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+@@ -109,7 +106,6 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_SHIFT_RIGHT_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+     [TOKEN_COMMA] = {NULL, NULL, PREC_NONE},
+     [TOKEN_COLON] = {NULL, NULL, PREC_NONE},
+-    //[TOKEN_QUESTION] = { NULL, parse_conditional, PREC_NONE },
+     [TOKEN_BANG] = {parse_unary_prefix, NULL, PREC_PREFIX},
+     [TOKEN_BANG_EQUAL] = {NULL, parse_binary_infix, PREC_EQUALITY},
+     [TOKEN_EQUAL] = {NULL, parse_binary_infix, PREC_EQUALITY},
+@@ -123,7 +119,6 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_RIGHT_BRACE] = {NULL, NULL, PREC_NONE},
+     [TOKEN_LEFT_BRACKET] = {parse_array_literal, parse_subscript, PREC_SUBSCRIPT},
+     [TOKEN_RIGHT_BRACKET] = {NULL, NULL, PREC_NONE},
+-    [TOKEN_ARROW] = {NULL, NULL, PREC_NONE},
+     [TOKEN_IDENTIFIER] = {parse_identifier, NULL, PREC_NONE},
+     [TOKEN_NUMBER] = {parse_number, NULL, PREC_NONE},
+     [TOKEN_STRING] = {parse_string, NULL, PREC_NONE},
+@@ -138,6 +133,8 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_CONTINUE] = {NULL, NULL, PREC_NONE},
+     [TOKEN_IF] = {NULL, NULL, PREC_NONE},
+     [TOKEN_ELSE] = {NULL, NULL, PREC_NONE},
++    [TOKEN_THEN] = {NULL, parse_conditional_expression, PREC_CONDITIONAL},
++    [TOKEN_OTHERWISE] = {NULL, NULL, PREC_NONE},
+     [TOKEN_AND] = {NULL, parse_binary_infix, PREC_AND},
+     [TOKEN_OR] = {NULL, parse_binary_infix, PREC_OR},
+     [TOKEN_CLASS] = {NULL, NULL, PREC_NONE},
+@@ -149,13 +146,9 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_FALSE] = {parse_boolean, NULL, PREC_NONE},
+     [TOKEN_RETURN] = {NULL, NULL, PREC_NONE},
+     [TOKEN_NOT] = {parse_unary_prefix, NULL, PREC_PREFIX},
+-    [TOKEN_OK] = {NULL, NULL, PREC_NONE},
+-    [TOKEN_OPERATOR] = {NULL, NULL, PREC_NONE},
+     [TOKEN_GLOB] = {NULL, NULL, PREC_NONE},
+     [TOKEN_EXPORT] = {NULL, NULL, PREC_NONE},
+     [TOKEN_MUT] = {NULL, NULL, PREC_NONE},
+-    [TOKEN_STATIC] = {NULL, NULL, PREC_NONE},
+-    [TOKEN_ASYNC] = {NULL, NULL, PREC_NONE},
+     [TOKEN_TRY] = {NULL, NULL, PREC_NONE},
+     [TOKEN_CATCH] = {NULL, NULL, PREC_NONE},
+     [TOKEN_THROW] = {NULL, NULL, PREC_NONE},
+@@ -568,6 +561,61 @@ fail:
+   return NULL;
+ }
+ 
++// `p_left then <then_arm> otherwise <otherwise_arm>` — the conditional
++// expression. the then arm parses at PREC_CONDITIONAL so it stops at
++// `otherwise`; the otherwise arm parses one level lower (PREC_CONDITIONAL - 1)
++// making the operator right associative: a then b otherwise c then d otherwise e
++// is a then b otherwise (c then d otherwise e). assignments inside an arm need
++// parentheses, matching how the middle of the C ternary behaves.
++ast_expression* parse_conditional_expression(
++    parser* p_parser, ast_expression* p_left, precedence p_precedence, bool is_right_associative, token p_trigger) {
++  (void)p_precedence;
++  (void)is_right_associative;
++  allocators* alloc = p_parser->alloc;
++  advance(p_parser); // past 'then': parse_expression dispatches on previous
++  ast_expression* then_arm = parse_expression(p_parser, PREC_CONDITIONAL);
++  if (then_arm == NULL) {
++    goto fail;
++  }
++  if (p_parser->current.type != TOKEN_OTHERWISE) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("expected 'otherwise' to complete the conditional.", OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    ast_dispatch_deinit((ast_node*)then_arm);
++    alloc->release(alloc, then_arm);
++    goto fail;
++  }
++  advance(p_parser); // consume 'otherwise'
++  advance(p_parser); // past it: previous becomes the arm's first token
++  ast_expression* otherwise_arm = parse_expression(p_parser, PREC_CONDITIONAL - 1);
++  if (otherwise_arm == NULL) {
++    ast_dispatch_deinit((ast_node*)then_arm);
++    alloc->release(alloc, then_arm);
++    goto fail;
++  }
++  ast_conditional_expression* conditional =
++      (ast_conditional_expression*)alloc->allocate(alloc, sizeof(ast_conditional_expression));
++  if (conditional == NULL) {
++    error_at(p_parser,
++             p_trigger,
++             ok_create_string_view("failed to allocate memory for conditional node.", OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    ast_dispatch_deinit((ast_node*)then_arm);
++    alloc->release(alloc, then_arm);
++    ast_dispatch_deinit((ast_node*)otherwise_arm);
++    alloc->release(alloc, otherwise_arm);
++    goto fail;
++  }
++  ast_specs s = {alloc};
++  ast_conditional_expression_init(conditional, p_trigger, p_left, then_arm, otherwise_arm, &s);
++  return (ast_expression*)conditional;
++fail:
++  ast_dispatch_deinit((ast_node*)p_left);
++  alloc->release(alloc, p_left);
++  return NULL;
++}
++
+ ast_expression* parse_call(
+     parser* p_parser, ast_expression* p_left, precedence p_precedence, bool is_right_associative, token p_trigger) {
+   allocators* alloc = p_parser->alloc;
+@@ -722,7 +770,12 @@ ast_statement* parse_statement(parser* p_parser) {
+   case TOKEN_TRY:
+   case TOKEN_CATCH:
+   case TOKEN_FINALIZE:
+-    assert(0);
++    // planned error-model statements, not implemented yet: parse to a clean
++    // error instead of the old assert + release-build fallthrough.
++    error_at(p_parser,
++             p_parser->previous,
++             ok_create_string_view("error handling is not implemented yet.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL;
+   case TOKEN_SEMICOLON:
+     return (ast_statement*)parse_empty_statement(p_parser);
+   case TOKEN_EOF:
+@@ -736,10 +789,6 @@ static ast_declaration_modifiers_t parse_declaration_modifier(token p_token) {
+   switch (p_token.type) {
+   case TOKEN_GLOB:
+     return DECLARATION_GLOB;
+-  case TOKEN_STATIC:
+-    return DECLARATION_STATIC;
+-  case TOKEN_ASYNC:
+-    return DECLARATION_ASYNC;
+   case TOKEN_EXPORT:
+     return DECLARATION_EXPORT;
+   default:
+@@ -965,7 +1014,7 @@ ast_function_declaration* parse_function_declaration(parser* p_parser,
+                                                      ast_declaration_modifiers_t p_declaration_modifiers) {
+   allocators* alloc = p_parser->alloc;
+   token fu_tok = p_parser->previous;
+-  const ast_declaration_modifiers_t fu_allowed_decl_mods = DECLARATION_GLOB | DECLARATION_EXPORT | DECLARATION_ASYNC;
++  const ast_declaration_modifiers_t fu_allowed_decl_mods = DECLARATION_GLOB | DECLARATION_EXPORT;
+   if ((p_declaration_modifiers & ~fu_allowed_decl_mods) != 0) {
+     string mods_str = ast_declaration_modifiers_asprint(p_declaration_modifiers, alloc);
+     string message = asprint(alloc,
+diff --git a/src/oktoken.h b/src/oktoken.h
+index 9b95a09..366559f 100644
+--- a/src/oktoken.h
++++ b/src/oktoken.h
+@@ -5,6 +5,11 @@
+ 
+ #include "ok/ok_source.h"
+ 
++// dead tokens removed 2026-10-27 (cpp-era leftovers): ++/-- (rejected by
++// decision), -> (old lambda syntax), ok/operator/static/async (stackless-coro
++// and class-modifier era; re-add with the features that need them).
++// then/otherwise added for the conditional (ternary) expression.
++
+ #define TOKEN_LIST_X(X)                                                                                                \
+   X(TOKEN_ERROR, "error")                                                                                              \
+   X(TOKEN_ILLEGAL, "illegal")                                                                                          \
+@@ -19,8 +24,6 @@
+   X(TOKEN_AMPERSAND, "&")                                                                                              \
+   X(TOKEN_BAR, "|")                                                                                                    \
+   X(TOKEN_TILED, "~")                                                                                                  \
+-  X(TOKEN_PLUS_PLUS, "++")                                                                                             \
+-  X(TOKEN_MINUS_MINUS, "--")                                                                                           \
+   X(TOKEN_PLUS_EQUAL, "+=")                                                                                            \
+   X(TOKEN_MINUS_EQUAL, "-=")                                                                                           \
+   X(TOKEN_ASTERISK_EQUAL, "*=")                                                                                        \
+@@ -52,7 +55,6 @@
+   X(TOKEN_RIGHT_BRACE, "}")                                                                                            \
+   X(TOKEN_LEFT_BRACKET, "[")                                                                                           \
+   X(TOKEN_RIGHT_BRACKET, "]")                                                                                          \
+-  X(TOKEN_ARROW, "->")                                                                                                 \
+   X(TOKEN_IDENTIFIER, "identifier")                                                                                    \
+   X(TOKEN_NUMBER, "number")                                                                                            \
+   X(TOKEN_STRING, "string")                                                                                            \
+@@ -67,6 +69,8 @@
+   X(TOKEN_CONTINUE, "continue")                                                                                        \
+   X(TOKEN_IF, "if")                                                                                                    \
+   X(TOKEN_ELSE, "else")                                                                                                \
++  X(TOKEN_THEN, "then")                                                                                                \
++  X(TOKEN_OTHERWISE, "otherwise")                                                                                      \
+   X(TOKEN_AND, "and")                                                                                                  \
+   X(TOKEN_OR, "or")                                                                                                    \
+   X(TOKEN_CLASS, "class")                                                                                              \
+@@ -78,13 +82,9 @@
+   X(TOKEN_FALSE, "false")                                                                                              \
+   X(TOKEN_RETURN, "return")                                                                                            \
+   X(TOKEN_NOT, "not")                                                                                                  \
+-  X(TOKEN_OK, "ok")                                                                                                    \
+-  X(TOKEN_OPERATOR, "operator")                                                                                        \
+   X(TOKEN_GLOB, "glob")                                                                                                \
+   X(TOKEN_EXPORT, "export")                                                                                            \
+   X(TOKEN_MUT, "mut")                                                                                                  \
+-  X(TOKEN_STATIC, "static")                                                                                            \
+-  X(TOKEN_ASYNC, "async")                                                                                              \
+   X(TOKEN_TRY, "try")                                                                                                  \
+   X(TOKEN_CATCH, "catch")                                                                                              \
+   X(TOKEN_THROW, "throw")                                                                                              \
+@@ -104,8 +104,6 @@ typedef enum {
+   TOKEN_AMPERSAND,
+   TOKEN_BAR,
+   TOKEN_TILED,
+-  TOKEN_PLUS_PLUS,
+-  TOKEN_MINUS_MINUS,
+   TOKEN_PLUS_EQUAL,
+   TOKEN_MINUS_EQUAL,
+   TOKEN_ASTERISK_EQUAL,
+@@ -137,7 +135,6 @@ typedef enum {
+   TOKEN_RIGHT_BRACE,
+   TOKEN_LEFT_BRACKET,
+   TOKEN_RIGHT_BRACKET,
+-  TOKEN_ARROW,
+ 
+   TOKEN_IDENTIFIER,
+   TOKEN_NUMBER,
+@@ -154,6 +151,8 @@ typedef enum {
+   TOKEN_CONTINUE,
+   TOKEN_IF,
+   TOKEN_ELSE,
++  TOKEN_THEN,
++  TOKEN_OTHERWISE,
+   TOKEN_AND,
+   TOKEN_OR,
+   TOKEN_CLASS,
+@@ -165,13 +164,9 @@ typedef enum {
+   TOKEN_FALSE,
+   TOKEN_RETURN,
+   TOKEN_NOT,
+-  TOKEN_OK,
+-  TOKEN_OPERATOR,
+   TOKEN_GLOB,
+   TOKEN_EXPORT,
+   TOKEN_MUT,
+-  TOKEN_STATIC,
+-  TOKEN_ASYNC,
+   TOKEN_TRY,
+   TOKEN_CATCH,
+   TOKEN_THROW,
+diff --git a/src/okvm.c b/src/okvm.c
+index 6e76884..ee28697 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -254,8 +254,45 @@ perform_add(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest
+       goto invalid;
+     }
+   } else if (IS_VALUE_OBJECT(lhs)) {
+-    goto invalid;
+-    // TODO
++    if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(rhs)) {
++      // string concatenation: both operands must be strings, no implicit
++      // coercion ("a" + 1 stays an error; host-side to_str natives exist for
++      // formatting). build the combined bytes over a raw scratch buffer first:
++      // it is plain memory, invisible to the gc, so allocations inside the
++      // object creation can collect freely. create_object_string copies the
++      // view into its own dynamic buffer and the result is published into the
++      // destination register with no allocation in between — the post-
++      // store-append window that killed array NEW does not exist here (no
++      // append_n phase, nothing allocates between creation and publication).
++      const object_string* left = VALUE_AS_STRING(p_lhs);
++      const object_string* right = VALUE_AS_STRING(p_rhs);
++      const uint64_t left_length = string_get_length(&left->string);
++      const uint64_t right_length = string_get_length(&right->string);
++      char* scratch = (char*)p_vm->alloc->allocate(p_vm->alloc, left_length + right_length);
++      if (scratch == NULL) {
++        runtime_error(p_vm, "out of memory: failed to concatenate strings.");
++        interpret_result res;
++        res.status = RUNTIME_ERROR;
++        res.top_level_return = NULL_AS_VALUE();
++        return res;
++      }
++      memcpy(scratch, left->string.chars, left_length);
++      memcpy(scratch + left_length, right->string.chars, right_length);
++      object_specs specs = {p_vm->alloc, p_vm->objects_store};
++      object_string* concatenated =
++          create_object_string(ok_create_string_view(scratch, left_length + right_length, false), &specs);
++      p_vm->alloc->release(p_vm->alloc, scratch);
++      if (concatenated == NULL) {
++        runtime_error(p_vm, "out of memory: failed to concatenate strings.");
++        interpret_result res;
++        res.status = RUNTIME_ERROR;
++        res.top_level_return = NULL_AS_VALUE();
++        return res;
++      }
++      lhs = OBJECT_AS_VALUE(concatenated);
++    } else {
++      goto invalid;
++    }
+   } else {
+   invalid: {
+     runtime_error(p_vm, "invalid operands for binary '+'.");
+@@ -469,9 +506,13 @@ perform_equal(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_de
+     }
+   } else if (IS_VALUE_OBJECT(lhs)) {
+     if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(rhs)) {
+-      lhs = BOOL_AS_VALUE(strncmp(VALUE_AS_STRING(p_lhs)->string.chars,
+-                                  VALUE_AS_STRING(p_rhs)->string.chars,
+-                                  string_get_length(&VALUE_AS_STRING(p_lhs)->string)) == 0);
++      // value equality: equal content, not common prefix. strncmp with only
++      // the lhs length made "ab" == "abc" true.
++      const object_string* left = VALUE_AS_STRING(p_lhs);
++      const object_string* right = VALUE_AS_STRING(p_rhs);
++      const uint64_t left_length = string_get_length(&left->string);
++      lhs = BOOL_AS_VALUE(left_length == string_get_length(&right->string) &&
++                          memcmp(left->string.chars, right->string.chars, left_length) == 0);
+     } else {
+       goto invalid;
+       // TODO others
+@@ -522,9 +563,12 @@ perform_not_equal(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t
+     }
+   } else if (IS_VALUE_OBJECT(lhs)) {
+     if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(rhs)) {
+-      lhs = BOOL_AS_VALUE(!(strncmp(VALUE_AS_STRING(p_lhs)->string.chars,
+-                                    VALUE_AS_STRING(p_rhs)->string.chars,
+-                                    string_get_length(&VALUE_AS_STRING(p_lhs)->string)) == 0));
++      // value equality, same length+memcmp shape as perform_equal
++      const object_string* left = VALUE_AS_STRING(p_lhs);
++      const object_string* right = VALUE_AS_STRING(p_rhs);
++      const uint64_t left_length = string_get_length(&left->string);
++      lhs = BOOL_AS_VALUE(!(left_length == string_get_length(&right->string) &&
++                            memcmp(left->string.chars, right->string.chars, left_length) == 0));
+     } else {
+       goto invalid;
+       // TODO others
+diff --git a/tests/e2e/tests/arrays/regressions/assign_call_rhs_window.ok b/tests/e2e/tests/arrays/regressions/assign_call_rhs_window.ok
+new file mode 100644
+index 0000000..d8a861d
+--- /dev/null
++++ b/tests/e2e/tests/arrays/regressions/assign_call_rhs_window.ok
+@@ -0,0 +1,33 @@
++// regression: a call on the rhs of a subscript assignment opens the callee's
++// register window at the rhs destination; the callee's frame null-fills every
++// slot above it. when the rhs compiled into p_dest (below the lvalue's staged
++// base/index temps), the callee erased the staging: arr[0] = reseat() died with
++// "expected an array" the moment reseat had enough registers to reach up.
++// the fix compiles the rhs into a temp above the staging. compound assigns
++// were always safe (their cur/rhs temps allocate after the staging).
++let mut arr = [1, 2];
++let alias = arr;
++fu reseat() { arr = [9, 9]; return 3; }
++arr[0] = reseat();
++print(alias[0]); // expect: 3
++print(arr[0]); // expect: 9
++// small callees (1 register) never reached the staging, but large ones do:
++fu wide() {
++  let a = 1; let b = 2; let c = 3; let d = 4;
++  let e = [a, b, c, d];
++  return e[0] + e[3];
++}
++let mut nums = [0, 0];
++nums[1] = wide();
++print(nums[0]); // expect: 0
++print(nums[1]); // expect: 5
++// nested: subscript assign as the rhs of another subscript assign
++let mut outer = [[0, 0], [0, 0]];
++outer[0][1] = (outer[1][0] = 7);
++print(outer[0][1]); // expect: 7
++print(outer[1][0]); // expect: 7
++// globals as containers
++glob let mut g = [1, 2];
++fu greseat() { g = [8, 8]; return 4; }
++g[0] = greseat();
++print(g[0]); // expect: 8
+diff --git a/tests/e2e/tests/arrays/regressions/container_elision_gates.ok b/tests/e2e/tests/arrays/regressions/container_elision_gates.ok
+new file mode 100644
+index 0000000..50a3da6
+--- /dev/null
++++ b/tests/e2e/tests/arrays/regressions/container_elision_gates.ok
+@@ -0,0 +1,41 @@
++// the container-elision gates: when the container is a plain local, subscript
++// reads and writes reference the local's register directly (no staging move)
++// only when nothing between resolve and use can reseat it. these pin the
++// corners where staging MUST stay, so the elision can never change semantics.
++// rhs assignment reseats the container: the store goes to the ORIGINAL array
++let mut a = [1, 2];
++let b = a;
++a[0] = (a = 5);
++print(b[0]); // expect: 5
++print(a); // expect: 5
++// a call in the rhs may mutate a captured container: store still hits the original
++let mut arr = [1, 2];
++let alias = arr;
++fu reseat() { arr = [9, 9]; return 3; }
++arr[0] = reseat();
++print(alias[0]); // expect: 3
++print(arr[0]); // expect: 9
++// a call in the INDEX may reseat the container: staged base survives
++let mut d = [1, 2];
++let dalias = d;
++fu idx() { d = [8, 8]; return 0; }
++d[idx()] = 42;
++print(dalias[0]); // expect: 42
++print(dalias[1]); // expect: 2
++print(d[0]); // expect: 8
++// inert indexes and rhs values: elision fires, results identical
++let mut n = [10, 20, 30];
++let i = 2;
++n[i] = n[i] + 5;
++print(n[2]); // expect: 35
++n[0] += n[1];
++print(n[0]); // expect: 30
++// nested subscript reads inside the rhs of a subscript write
++let m = [[1, 2], [3, 4]];
++let mut out = [0, 0];
++out[0] = m[1][0] + m[0][1];
++print(out[0]); // expect: 5
++// lambda literal in the rhs is inert (creating a closure runs no body)
++let mut fs = [null, null];
++fs[0] = fu() { return 99; };
++print(fs[0]()); // expect: 99
+diff --git a/tests/e2e/tests/arrays/regressions/eval_order.ok b/tests/e2e/tests/arrays/regressions/eval_order.ok
+new file mode 100644
+index 0000000..43d3923
+--- /dev/null
++++ b/tests/e2e/tests/arrays/regressions/eval_order.ok
+@@ -0,0 +1,25 @@
++// evaluation order for subscript assignment: base, then index, then rhs.
++// observable through a shared counter the probes multiply into.
++let mut order = 0;
++fu base() { order = order * 10 + 1; return [0, 0]; }
++fu index() { order = order * 10 + 2; return 1; }
++fu value() { order = order * 10 + 3; return 77; }
++let slot = base();
++slot[index()] = value();
++print(order); // expect: 123
++print(slot[1]); // expect: 77
++// compound: base, index, current read, rhs — f exactly once, g after
++let mut order2 = 0;
++fu f() { order2 = order2 * 10 + 1; return 0; }
++fu g() { order2 = order2 * 10 + 2; return 7; }
++let mut c = [0, 0];
++c[f()] += g();
++print(order2); // expect: 12
++print(c[0]); // expect: 7
++// reading: base then index
++let mut order3 = 0;
++fu rb() { order3 = order3 * 10 + 1; return [[5, 6], [7, 8]]; }
++fu ri() { order3 = order3 * 10 + 2; return 1; }
++let grid = rb();
++print(grid[ri()][1]); // expect: 8
++print(order3); // expect: 12
+diff --git a/tests/e2e/tests/control/truthiness.ok b/tests/e2e/tests/control/truthiness.ok
+new file mode 100644
+index 0000000..cb39314
+--- /dev/null
++++ b/tests/e2e/tests/control/truthiness.ok
+@@ -0,0 +1,25 @@
++// falsy is exactly: false and null. everything else is truthy (0, "", arrays).
++print(0 then "t" otherwise "f"); // expect: t
++print(0.0 then "t" otherwise "f"); // expect: t
++print("" then "t" otherwise "f"); // expect: t
++print([1] then "t" otherwise "f"); // expect: t
++print([] then "t" otherwise "f"); // expect: t
++print(null then "t" otherwise "f"); // expect: f
++print(false then "t" otherwise "f"); // expect: f
++// same doctrine through if (pins is_falsy in both directions)
++if 0 ? { print("a"); } else { print("b"); } // expect: a
++if "" ? { print("a"); } else { print("b"); } // expect: a
++if [] ? { print("a"); } else { print("b"); } // expect: a
++if null ? { print("a"); } else { print("b"); } // expect: b
++// and through while
++let mut n = 0;
++while n < 3 ? { n += 1; }
++print(n); // expect: 3
++// through and/or (value semantics, short circuit)
++print(null and 1); // expect: null
++print(false and 1); // expect: false
++print(0 and 1); // expect: 1
++print(1 and null); // expect: null
++print(1 or null); // expect: 1
++print(null or 0); // expect: 0
++print((false or "") == ""); // expect: true
+diff --git a/tests/e2e/tests/operators/logical.ok b/tests/e2e/tests/operators/logical.ok
+new file mode 100644
+index 0000000..392d967
+--- /dev/null
++++ b/tests/e2e/tests/operators/logical.ok
+@@ -0,0 +1,46 @@
++// and/or are short-circuit VALUE operators (lua style): they return one of
++// their operands, not a boolean, and the right side only runs when needed.
++print(true and true); // expect: true
++print(true and false); // expect: false
++print(false and true); // expect: false
++print(false and false); // expect: false
++print(true or true); // expect: true
++print(true or false); // expect: true
++print(false or true); // expect: true
++print(false or false); // expect: false
++// value semantics: the returned value is the deciding operand
++print(1 and 2); // expect: 2
++print(0 and 2); // expect: 2
++print(null and 2); // expect: null
++print(false and 2); // expect: false
++print(1 or 2); // expect: 1
++print(null or 2); // expect: 2
++print(false or 2); // expect: 2
++// short circuit: the right side must not run
++let mut runs = 0;
++fu bump(v) { runs += 1; return v; }
++print(false and bump(1)); // expect: false
++print(runs); // expect: 0
++print(true or bump(1)); // expect: true
++print(runs); // expect: 0
++print(true and bump(5)); // expect: 5
++print(runs); // expect: 1
++print(false or bump(6)); // expect: 6
++print(runs); // expect: 2
++// the classic guard: safe when x is null
++fu clamp(x) { return x != null and x > 0 then x otherwise 0; }
++print(clamp(5)); // expect: 5
++print(clamp(-5)); // expect: 0
++print(clamp(null)); // expect: 0
++// precedence: not > and > or, comparison binds tighter than both
++print(not true and false); // expect: false
++print(not (true and false)); // expect: true
++print(true or false and false); // expect: true
++print((true or false) and false); // expect: false
++print(1 < 2 and 2 < 3); // expect: true
++print(1 > 2 or 2 > 3); // expect: false
++// chains
++print(1 and 2 and 3); // expect: 3
++print(null and 2 and 3); // expect: null
++// 0 is truthy, so the chain stops at 0
++print(null or 0 or 7); // expect: 0
+diff --git a/tests/e2e/tests/operators/ternary/arms.ok b/tests/e2e/tests/operators/ternary/arms.ok
+new file mode 100644
+index 0000000..4c80d38
+--- /dev/null
++++ b/tests/e2e/tests/operators/ternary/arms.ok
+@@ -0,0 +1,39 @@
++// assignment arms need parentheses (then arm stops at `=` otherwise)
++let mut y = 0;
++print(true then (y = 5) otherwise (y = 6)); // expect: 5
++print(y); // expect: 5
++print(false then (y = 7) otherwise (y = 8)); // expect: 8
++print(y); // expect: 8
++// compound-assign arm
++let mut z = 1;
++print(true then (z += 10) otherwise (z += 100)); // expect: 11
++print(z); // expect: 11
++// the conditional's value is the assignment's value
++let mut w = 0;
++let r = true then (w = 42) otherwise (w = 43);
++print(r); // expect: 42
++print(w); // expect: 42
++// as a call argument
++fu add(a, b) { return a + b; }
++print(add(true then 10 otherwise 20, false then 100 otherwise 200)); // expect: 210
++// as a subscript index and inside subscripts
++let arr = [10, 20, 30, 40];
++print(arr[true then 0 otherwise 3]); // expect: 10
++print(arr[1 + (false then 0 otherwise 2)]); // expect: 40
++print(arr[true then 1 otherwise 2] + arr[false then 1 otherwise 2]); // expect: 50
++// in a while condition and body
++let mut i = 0;
++let mut seen = 0;
++while (i < 4) ? {
++  seen = seen * 10 + (i > 2 then 9 otherwise 1);
++  i += 1;
++}
++print(seen); // expect: 1119
++// closures as arms: both arms compile, only one closes over nothing harmful
++fu make(flag) { return flag then fu() { return 1; } otherwise fu() { return 2; }; }
++print(make(true)()); // expect: 1
++print(make(false)()); // expect: 2
++// conditional result is not an lvalue (assignment to it must fail to compile is
++// covered by errors/; here we only chain reads)
++let v = (true then 1 otherwise 2) + (false then 10 otherwise 20);
++print(v); // expect: 21
+diff --git a/tests/e2e/tests/operators/ternary/basic.ok b/tests/e2e/tests/operators/ternary/basic.ok
+new file mode 100644
+index 0000000..edd9687
+--- /dev/null
++++ b/tests/e2e/tests/operators/ternary/basic.ok
+@@ -0,0 +1,10 @@
++print(true then 1 otherwise 2); // expect: 1
++print(false then 1 otherwise 2); // expect: 2
++let x = 5;
++print(x > 3 then "big" otherwise "small"); // expect: big
++print(x < 3 then "big" otherwise "small"); // expect: small
++print(x == 5 then x * 2 otherwise x - 1); // expect: 10
++let y = x > 0 then x + 1 otherwise 0 - x;
++print(y); // expect: 6
++print((1 > 2) then true otherwise false); // expect: false
++print(not true then 0 otherwise 1); // expect: 1
+diff --git a/tests/e2e/tests/operators/ternary/errors/missing_otherwise.ok b/tests/e2e/tests/operators/ternary/errors/missing_otherwise.ok
+new file mode 100644
+index 0000000..722e62b
+--- /dev/null
++++ b/tests/e2e/tests/operators/ternary/errors/missing_otherwise.ok
+@@ -0,0 +1 @@
++let x = true then 1; // expect error
+diff --git a/tests/e2e/tests/operators/ternary/nesting.ok b/tests/e2e/tests/operators/ternary/nesting.ok
+new file mode 100644
+index 0000000..5869518
+--- /dev/null
++++ b/tests/e2e/tests/operators/ternary/nesting.ok
+@@ -0,0 +1,19 @@
++// right associativity: a then b otherwise c then d otherwise e
++// parses as a then b otherwise (c then d otherwise e)
++let n = 2;
++print(n == 1 then "one" otherwise n == 2 then "two" otherwise "many"); // expect: two
++let m = 7;
++print(m == 1 then "one" otherwise m == 2 then "two" otherwise "many"); // expect: many
++let k = 1;
++print(k == 1 then "one" otherwise k == 2 then "two" otherwise "many"); // expect: one
++// nested in the then arm needs no parens (arm stops at otherwise)
++print(true then (false then 1 otherwise 2) otherwise 3); // expect: 2
++print(false then 1 otherwise (true then 4 otherwise 5)); // expect: 4
++// chained comparisons pick the first match
++fu grade(s) {
++  return s >= 90 then "a" otherwise s >= 80 then "b" otherwise s >= 70 then "c" otherwise "f";
++}
++print(grade(95)); // expect: a
++print(grade(85)); // expect: b
++print(grade(72)); // expect: c
++print(grade(10)); // expect: f
+diff --git a/tests/e2e/tests/operators/ternary/side_effects.ok b/tests/e2e/tests/operators/ternary/side_effects.ok
+new file mode 100644
+index 0000000..1b30eb6
+--- /dev/null
++++ b/tests/e2e/tests/operators/ternary/side_effects.ok
+@@ -0,0 +1,22 @@
++// only the taken arm runs
++let mut calls = 0;
++fu th() { calls += 1; return 10; }
++fu ot() { calls += 1; return 20; }
++print(true then th() otherwise ot()); // expect: 10
++print(calls); // expect: 1
++print(false then th() otherwise ot()); // expect: 20
++print(calls); // expect: 2
++// the condition evaluates exactly once, before either arm
++let mut order = 0;
++fu cond() { order = order * 10 + 1; return true; }
++fu a1() { order = order * 10 + 2; return 0; }
++fu b1() { order = order * 10 + 3; return 0; }
++print(cond() then a1() otherwise b1()); // expect: 0
++print(order); // expect: 12
++// arms inside loops keep working across iterations (modulo parses but has no
++// opcode yet — pre-existing gap, not ternary; parity via or-chain instead)
++let mut sum = 0;
++for let i = 0 : 6? {
++  sum += (i == 0 or i == 2 or i == 4) then i otherwise 0 - i;
++}
++print(sum); // expect: -3
+diff --git a/tests/e2e/tests/operators/ternary/terminator.ok b/tests/e2e/tests/operators/ternary/terminator.ok
+new file mode 100644
+index 0000000..7c989a8
+--- /dev/null
++++ b/tests/e2e/tests/operators/ternary/terminator.ok
+@@ -0,0 +1,15 @@
++// the conditional in statement position: the value is discarded, both arms compile
++true then 1 otherwise 2;
++false then 1 otherwise 2;
++print("done"); // expect: done
++// in a condition position, where the ? terminator applies: the condition is
++// the ternary's RESULT, so use boolean-valued arms to steer the branch
++if true then false otherwise true ? { print("a"); } else { print("b"); } // expect: b
++if false then false otherwise true ? { print("a"); } else { print("b"); } // expect: a
++if false then true otherwise false ? { print("a"); } else { print("b"); } // expect: b
++if true then true otherwise false ? { print("a"); } else { print("b"); } // expect: a
++// a number-valued ternary condition follows the truthiness doctrine
++if false then 1 otherwise 2 ? { print("n"); } else { print("z"); } // expect: n
++let mut x = 0;
++while x < (true then 2 otherwise 99) ? { x += 1; }
++print(x); // expect: 2
+diff --git a/tests/e2e/tests/strings/concat.ok b/tests/e2e/tests/strings/concat.ok
+new file mode 100644
+index 0000000..a23b9ea
+--- /dev/null
++++ b/tests/e2e/tests/strings/concat.ok
+@@ -0,0 +1,34 @@
++print("a" + "b"); // expect: ab
++print("foo" + "" + "bar"); // expect: foobar
++print(("" + "") == ""); // expect: true
++let mut s = "x";
++s += "y";
++print(s); // expect: xy
++s = s + "!" + "?";
++print(s); // expect: xy!?
++// concat produces fresh strings: the operands are untouched
++let a = "left";
++let b = "right";
++let c = a + b;
++print(a); // expect: left
++print(b); // expect: right
++print(c); // expect: leftright
++// runtime-built strings work the same as literals
++let mut built = "";
++for let i = 0 : 3? {
++  built += "ab";
++}
++print(built == "ababab"); // expect: true
++print(built + "!"); // expect: ababab!
++// inside larger expressions
++print("n = " + "42"); // expect: n = 42
++print(("a" + "b") == "ab"); // expect: true
++// strings as array elements, concat reads them back
++let arr = ["x", "y", "z"];
++print(arr[0] + arr[2]); // expect: xz
++// compound assign on an array element
++let mut words = ["con", "cat"];
++words[0] += words[1];
++print(words[0]); // expect: concat
++// string in a conditional arm
++print(true then "yes" + "!" otherwise "no"); // expect: yes!
+diff --git a/tests/e2e/tests/strings/equality.ok b/tests/e2e/tests/strings/equality.ok
+new file mode 100644
+index 0000000..e133e92
+--- /dev/null
++++ b/tests/e2e/tests/strings/equality.ok
+@@ -0,0 +1,22 @@
++print("ab" == "ab"); // expect: true
++print("ab" == "abc"); // expect: false
++print("abc" == "ab"); // expect: false
++print("" == ""); // expect: true
++print("ab" != "ab"); // expect: false
++print("ab" != "abc"); // expect: true
++// equal content built at runtime compares equal (value semantics, not identity)
++print(("a" + "b") == "ab"); // expect: true
++print(("a" + "b") != "ac"); // expect: true
++let mut grown = "ab";
++grown += "c";
++print(grown == "abc"); // expect: true
++print(grown == "ab"); // expect: false
++// strings do not equal numbers or null (mixed equality stays identity)
++print("1" == 1); // expect: false
++print("" == null); // expect: false
++print("null" == null); // expect: false
++// in conditions
++if "ab" == "ab" ? { print("eq"); } else { print("ne"); } // expect: eq
++if "ab" == "abc" ? { print("eq"); } else { print("ne"); } // expect: ne
++let pick = "x" == "x" then 1 otherwise 2;
++print(pick); // expect: 1
+diff --git a/tests/e2e/tests/strings/errors/concat_number.ok b/tests/e2e/tests/strings/errors/concat_number.ok
+new file mode 100644
+index 0000000..28ec95d
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/concat_number.ok
+@@ -0,0 +1 @@
++print("a" + 1); // expect error
+diff --git a/tests/e2e/tests/strings/errors/number_concat.ok b/tests/e2e/tests/strings/errors/number_concat.ok
+new file mode 100644
+index 0000000..46c0376
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/number_concat.ok
+@@ -0,0 +1 @@
++print(1 + "a"); // expect error

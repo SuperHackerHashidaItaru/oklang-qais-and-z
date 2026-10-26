@@ -334,3 +334,26 @@ Work Log:
 Stage Summary:
 - bench suite verified; one misread corrected with bytecode proof committed to the repo.
 - v0.0.5 ready to tag at 55e1293; buffer-day plan: dogfood > small peephole > start the game early. no feature prepone.
+
+---
+
+## session 12.5 — buffer night: ternary + strings + elision + a real bug found
+
+Task: night round before the freeze (1am 27/10). Implements the owner's asks: staging-move elision, ternary with then/otherwise keywords, dead lexer token purge, string concat via + (owner-approved), plus the e2e test-suite strengthening the owner requested.
+
+Work Log:
+- pulled the owner's new benches (variable-index, global-container, lua-indexed for-in comparator). results confirm compound>plain everywhere and reframe the for-in win as ipairs overhead (492->218ms when lua uses an index loop; ok 267ms = 1.23x, honest number now).
+- implemented ternary c then a otherwise b: zero new opcodes (JUMP_IF falsy + JUMP, if-statement shape folded into an expression); PREC_CONDITIONAL slot was pre-dug; right-assoc via PREC_CONDITIONAL-1 else-arm (assignment's trick); arms share the caller's result register (the owner's invariant). two landmines fixed en route: parse_expression dispatches on previous (arms need advance past their keyword), and no-emission arms/conditions need FORCING materialize_into (if_not_register skips any register -> stale garbage).
+- strings: + concat in perform_add (string+string only, no coercion, gc-safe: raw scratch buffer + create_object_string copy, no post-append window); FIXED perform_equal/not_equal prefix bug — strncmp(a,b,len_lhs) made "ab" == "abc" TRUE (live on master, would've bitten the game's string compares). lambda-literal inertness documented in expression_is_inert.
+- lexer purge (owner ask): removed ++/--/->/ok/operator/static/async + DECLARATION_STATIC/ASYNC + OPERATOR_*_PLUS_PLUS enums; try/catch/throw/finalize now clean-error instead of assert(0)+release fallthrough; bitwise family KEPT (D3 planned); ? is the condition terminator (discovery: not a ternary!).
+- container elision: resolve_lvalue gains p_pending_rhs; local-container subscripts reference the local's register directly when index+rhs are inert (expression_is_inert: calls/assigns fail; lambdas pass — creation runs no body; captures_any untrustable due to forward refs). a[0]=a[0]+1: 5->3 dispatches, a[0]+=1: 4->3.
+- REAL BUG FOUND + FIXED (pre-existing, on master + ok-reg-fresh): arr[0] = reseat() where reseat captures+reseats arr died "expected an array" — subscript-assign rhs compiled into p_dest BELOW the staged base/index temps; the callee frame [dest, dest+fu->registers) null-fills everything above the args, erasing the staging. compound assigns were always safe (cur/rhs temps allocate after staging). fix: subscript-assign rhs compiles into a fresh temp above the staging. found by writing the elision-gate regression tests — the tests did their job before the feature even landed.
+- tests: 15 new e2e files. ternary x6 (incl. errors), strings x4, operators/logical.ok (and/or had ZERO coverage — short-circuit value ops now pinned), control/truthiness.ok (falsy = exactly false/null, pinned through if/while/and/or), arrays/regressions x3 (window bug, elision gates, eval order). 200/200 x gcc/aggressive/asan/asan-aggr.
+- findings reported not fixed: % parses but has no opcode (compile-aborts — pre-existing); e2e runner can't pin empty-line expects; unit tests need Unity/cmake (unaffected units this round).
+- sandbox timing honesty: identical-bytecode control showed ±8-9% machine noise; dispatch counts are the evidence, owner's hyperfine rig arbitrates. build_ok.sh has no -O (noted).
+- deliverables: download/04-buffer-night.patch (vs 55e1293, 1287 lines) + download/REVIEW-GUIDE-round12.md; mirrored to repo patches/. oklang branch: buffer-night @ 9630c91.
+
+Stage Summary:
+- all five buffer-night items landed green: ternary, string concat, equality fix, token purge, elision — plus one genuine pre-existing VM-adjacent compiler bug fixed with a regression pinning it.
+- v0.0.5 feature set grew by ternary + string concat + equality correctness on the freeze's eve; test suite 185 -> 200.
+- open for owner: % opcode gap ruling, tag timing (now vs after this patch), hyperfine read of the elision.
