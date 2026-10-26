@@ -1,0 +1,3 @@
+let mut arr = [1, 2];
+fu reseat() { arr = [9, 9]; return 3; }
+print arr[0] = reseat();   // → "expected an array" — ON MASTER

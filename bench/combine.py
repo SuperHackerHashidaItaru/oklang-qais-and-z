@@ -1,6 +1,6 @@
 import os
 
-EXT = ".md"
+EXT = ".json"
 SRC = "./results/"
 
 def combine_text_files(target_directory, output_file_path):
