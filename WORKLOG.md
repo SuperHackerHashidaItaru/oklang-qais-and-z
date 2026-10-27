@@ -357,3 +357,22 @@ Stage Summary:
 - all five buffer-night items landed green: ternary, string concat, equality fix, token purge, elision — plus one genuine pre-existing VM-adjacent compiler bug fixed with a regression pinning it.
 - v0.0.5 feature set grew by ternary + string concat + equality correctness on the freeze's eve; test suite 185 -> 200.
 - open for owner: % opcode gap ruling, tag timing (now vs after this patch), hyperfine read of the elision.
+
+## session 12.75 — night cap: modulo + the numeric-for gap experiment
+
+Task: the owner's 27/10 ~3am round. two isolated patches (his framing: "if it backfired we don't lose modulo"): (1) modulo now that the f64-globally rule is established, (2) the cheap first option on the Lua numeric-for gap (~30 LOC, killable). plus the night-wide review guide for his bulk review.
+
+Work Log:
+- pulled both repos: collab 7e0429b (his new bench runs, single ok-reg binary now), codeberg master 4633dc9 (my 04 yolo'd in, + his two comment tweaks). read the fresh numbers he permitted me to see: numeric-for family 2.05-2.09x vs lua (sum 157.4/75.5, counter 157.4/76.1, step 81.7/39.9) while everything else 1.2-1.6x — the gap target confirmed.
+- sandbox: branch night-13 off 4633dc9; added a release(-O2) variant to build_ok.sh (+ -lm now) and a min/median timing driver (time_ok.py).
+- 05-modulo (ec4e02b): OP_MODULUS(+_LONG) mirroring perform_divide; semantics = TRUNCATED remainder (C/fmod: -7 % 3 == -1, where lua/python floor to 2) — rationale: the dormant int48 arm is C's % by definition, fmod is its f64 twin, one rule both domains; flagged for owner ratification. found + fixed en route: TOKEN_MODULO_EQUAL's pratt row pointed at parse_binary_infix (x %= 3 hit the infix range assert), and my own error message "binary '%'" ate itself through vfprintf (now '%%'). tests: modulo.ok (sign/precedence/compound/parity dogfood) + 2 error files.
+- 06-forloop (3789e48): read the -O2 codegen first — FOR_LOOP paid 3 per-trip tag-check chains. the patch: FOR_PREP normalizes the triple in place to number-tagged doubles; FOR_LOOP's p flag carries the compiler's immutability proof (plain let / for-in hidden counter) — raw double reads, no tag checks on the back edge; let mut keeps the gate. proof obligations: immutability enforced on every store path (pinned by immutable_counter.ok), limit/step nameless, call windows open at temps >= local_top, upvalues never write the slot. patch_jump_if preserves p (verified).
+- verification: 203/203 x plain/release/aggressive/asan/asan-aggr both patches; mut_reseat, capture (escaped-closure counter read), mut_counter_non_number all green; dump shows "imm" on numeric + for-in back edges; -S asm confirms the imm path is the intended ~20-instruction tag-check-free block (movsd raw loads).
+- honest numbers: ~0-5% on my box (counter flat, step -4%) — the removed work was predicted branches OoO already hid. his rig showed FOR_LOOP ops disproportionately expensive (7.9 vs 5.2 ns/op), so his hyperfine rerun arbitrates; revert 3789e48 alone if flat. remaining gap menu priced in the guide: computed goto (~60-80 LOC), 1-word FOR_LOOP encoding (serial word2 fetch, patch_jump_if surgery), PGO, lua-style trip count (f64-honesty conflict).
+- deliverables: patches/05-modulo.patch + 06-forloop-imm-fastpath.patch (vs 4633dc9, stacked, independently revertible), REVIEW-GUIDE-night13.md (whole-night bulk guide incl. the -lm CMake one-liner + 5-minute re-checks for the yolo'd 04), patches/README.md history updated.
+- checked: v0.0.5 still NOT on the codeberg remote (latest v0.0.4); master moved past 55e1293 — lean: tag after 05+06 so ternary/strings/modulo make the release. his call.
+
+Stage Summary:
+- both night-cap patches landed green and isolated exactly as asked; the gap experiment is honest-modest on my box, rig-arbitrated next round.
+- the night's full arc now: 12.5 (ternary/strings/elision/window) + 12.75 (modulo/forloop) — one review guide covers all of it.
+- open for owner: trunc-vs-floor ratification, v0.0.5 tag point, bench rerun + read, dogfood day (today).

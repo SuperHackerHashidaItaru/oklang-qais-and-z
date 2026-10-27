@@ -1,0 +1,268 @@
+diff --git a/src/okchunk.h b/src/okchunk.h
+index e6ffa09..9eaf4e9 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -167,6 +167,9 @@ typedef enum {
+   OP_MULTIPLY_LONG,      // 2w:   (p, A, B, C, q) -> r[A] = (q then k[B] otherwise r[B]) * (p then k[C] otherwise r[C]); ip += w
+   OP_DIVIDE,             // w:    (p, a, b, c)    -> r[a] = r[b] / (p then k[c] otherwise r[c])
+   OP_DIVIDE_LONG,        // 2w:   (p, A, B, C, q) -> r[A] = (q then k[B] otherwise r[B]) / (p then k[C] otherwise r[C]); ip += w
++  OP_MODULUS,            // w:    (p, a, b, c)    -> r[a] = r[b] % (p then k[c] otherwise r[c]); truncated remainder
++                         //                          (C/fmod: sign follows the dividend; rhs 0 is a runtime error like '/')
++  OP_MODULUS_LONG,       // 2w:   (p, A, B, C, q) -> r[A] = (q then k[B] otherwise r[B]) % (p then k[C] otherwise r[C]); ip += w
+   OP_EQUALS,             // w:    (p, a, b, c)    -> r[a] = r[b] == (p then k[c] otherwise r[c])
+   OP_EQUALS_LONG,        // 2w:   (p, A, B, C, q) -> r[A] = (q then k[B] otherwise r[B]) == (p then k[C] otherwise r[C]); ip += w
+   OP_NOT_EQUAL,          // w:    (p, a, b, c)    -> r[a] = r[b] != (p then k[c] otherwise r[c])
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 0cef758..7a6972a 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -2212,6 +2212,19 @@ static bool compile_binary_value_operator(compiler* p_compiler,
+ 
+     break;
+   }
++  case OPERATOR_BIN_MODULO: {
++    result = emit_binop(p_compiler,
++                        OP_MODULUS,
++                        OP_MODULUS_LONG,
++                        p_dest,
++                        lhs.value,
++                        rhs.value,
++                        is_lhs_constant,
++                        is_rhs_constant,
++                        (ast_node*)p_binexpr);
++
++    break;
++  }
+   case OPERATOR_BIN_EQUALS: {
+     result = emit_binop(p_compiler,
+                         OP_EQUALS,
+@@ -2567,6 +2580,10 @@ static bool compile_compound_assign_expression(compiler* p_compiler,
+     op = OP_DIVIDE;
+     op_long = OP_DIVIDE_LONG;
+     break;
++  case OPERATOR_MODULO_EQUAL:
++    op = OP_MODULUS;
++    op_long = OP_MODULUS_LONG;
++    break;
+   default:
+     error_at(p_compiler,
+              author,
+diff --git a/src/okdebug.c b/src/okdebug.c
+index 66fad64..cc979af 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -50,6 +50,8 @@ static const char* const OPCODE_NAMES[] = {
+     "MULTIPLY_LONG",
+     "DIVIDE",
+     "DIVIDE_LONG",
++    "MODULUS",
++    "MODULUS_LONG",
+     "EQUALS",
+     "EQUALS_LONG",
+     "NOT_EQUAL",
+@@ -91,6 +93,9 @@ static const char* binop_symbol(const opcode p_op) {
+   case OP_DIVIDE:
+   case OP_DIVIDE_LONG:
+     return "/";
++  case OP_MODULUS:
++  case OP_MODULUS_LONG:
++    return "%";
+   case OP_EQUALS:
+   case OP_EQUALS_LONG:
+     return "==";
+@@ -154,6 +159,7 @@ static bool op_is_two_words(opcode p_op) {
+   case OP_SUBTRACT_LONG:
+   case OP_MULTIPLY_LONG:
+   case OP_DIVIDE_LONG:
++  case OP_MODULUS_LONG:
+   case OP_EQUALS_LONG:
+   case OP_NOT_EQUAL_LONG:
+   case OP_GREATER_LONG:
+diff --git a/src/okparser.c b/src/okparser.c
+index a03c503..e1f09a2 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -98,7 +98,7 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_MINUS_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+     [TOKEN_ASTERISK_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+     [TOKEN_SLASH_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+-    [TOKEN_MODULO_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
++    [TOKEN_MODULO_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+     [TOKEN_CARET_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+     [TOKEN_AMPERSAND_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+     [TOKEN_BAR_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+diff --git a/src/okvm.c b/src/okvm.c
+index ee28697..7636a5e 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -1,3 +1,4 @@
++#include <math.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -475,6 +476,80 @@ division_by_zero: {
+ }
+ }
+ 
++static interpret_result
++perform_modulo(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++  // truncated division remainder (C99 fmod): the result's sign follows the
++  // dividend, so -7 % 3 is -1, where lua/python floor to 2. deliberate: the
++  // dormant int48 path is C's % by definition, and fmod is its f64 twin — one
++  // rule, two domains, no mixed-semantics seam. rhs 0 errors like '/' does.
++  const uint32_t base = p_frame->registers_base;
++  value lhs = p_lhs;
++  value rhs = p_rhs;
++  if (IS_VALUE_NUMBER(lhs)) {
++    if (IS_VALUE_NUMBER(rhs)) {
++      if (VALUE_AS_NUMBER(rhs) == 0.0f) {
++        goto modulo_by_zero;
++      }
++      lhs = NUMBER_AS_VALUE(fmod(VALUE_AS_NUMBER(lhs), VALUE_AS_NUMBER(rhs)));
++    } else if (IS_VALUE_INT(rhs)) {
++      if (VALUE_AS_INT(rhs) == 0) {
++        goto modulo_by_zero;
++      }
++      lhs = NUMBER_AS_VALUE(fmod(VALUE_AS_NUMBER(lhs), (double)VALUE_AS_INT(rhs)));
++    } else if (IS_VALUE_OBJECT(rhs)) {
++      goto invalid;
++      // TODO
++      // not sure if we should allow this for objects or they have to be strictly lhs.
++      // TBD after we add classes.
++    } else {
++      goto invalid;
++    }
++  } else if (IS_VALUE_INT(lhs)) {
++    if (IS_VALUE_INT(rhs)) {
++      if (VALUE_AS_INT(rhs) == 0) {
++        goto modulo_by_zero;
++      }
++      lhs = INT_AS_VALUE(VALUE_AS_INT(lhs) % VALUE_AS_INT(rhs));
++    } else if (IS_VALUE_NUMBER(rhs)) {
++      if (VALUE_AS_NUMBER(rhs) == 0.0f) {
++        goto modulo_by_zero;
++      }
++      lhs = NUMBER_AS_VALUE(fmod((double)VALUE_AS_INT(lhs), VALUE_AS_NUMBER(rhs)));
++    } else if (IS_VALUE_OBJECT(rhs)) {
++      goto invalid;
++      // TODO
++      // not sure if we should allow this for objects or they have to be strictly lhs.
++      // TBD after we add classes.
++    } else {
++      goto invalid;
++    }
++  } else if (IS_VALUE_OBJECT(lhs)) {
++    goto invalid;
++    // TODO
++  } else {
++  invalid: {
++    runtime_error(p_vm, "invalid operands for binary '%%'.");
++    interpret_result res;
++    res.status = RUNTIME_ERROR;
++    res.top_level_return = NULL_AS_VALUE();
++    return res;
++  }
++  }
++  {
++    p_reg->array.data[base + p_dest] = lhs;
++    interpret_result res;
++    res.status = RUNTIME_OK;
++    return res;
++  }
++modulo_by_zero: {
++  runtime_error(p_vm, "modulo by zero.");
++  interpret_result res;
++  res.status = RUNTIME_ERROR;
++  res.top_level_return = NULL_AS_VALUE();
++  return res;
++}
++}
++
+ static interpret_result
+ perform_equal(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+@@ -1397,6 +1472,31 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       }
+       break;
+     }
++    case OP_MODULUS: {
++      const bool p = p_of(instruction);
++      const uint8_t a = a_of(instruction);
++      const uint8_t b = b_of(instruction);
++      const uint8_t c = c_of(instruction);
++      interpret_result res = perform_modulo(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++      if (res.status != RUNTIME_OK) {
++        return res;
++      }
++      break;
++    }
++    case OP_MODULUS_LONG: {
++      const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      const uint16_t C = C_of(words);
++      interpret_result res =
++          perform_modulo(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++      if (res.status != RUNTIME_OK) {
++        return res;
++      }
++      break;
++    }
+     case OP_EQUALS: {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+diff --git a/tests/e2e/tests/operators/errors/modulo_invalid.ok b/tests/e2e/tests/operators/errors/modulo_invalid.ok
+new file mode 100644
+index 0000000..499a505
+--- /dev/null
++++ b/tests/e2e/tests/operators/errors/modulo_invalid.ok
+@@ -0,0 +1 @@
++print("a" % 2); // expect error
+diff --git a/tests/e2e/tests/operators/errors/modulo_zero.ok b/tests/e2e/tests/operators/errors/modulo_zero.ok
+new file mode 100644
+index 0000000..8562f54
+--- /dev/null
++++ b/tests/e2e/tests/operators/errors/modulo_zero.ok
+@@ -0,0 +1 @@
++print(5 % 0); // expect error
+diff --git a/tests/e2e/tests/operators/modulo.ok b/tests/e2e/tests/operators/modulo.ok
+new file mode 100644
+index 0000000..6706c9f
+--- /dev/null
++++ b/tests/e2e/tests/operators/modulo.ok
+@@ -0,0 +1,33 @@
++// truncated remainder (C/fmod): the sign follows the dividend, not the floor.
++// -7 % 3 == -1 where lua/python give 2 — pinned here so the choice is visible.
++print(7 % 3); // expect: 1
++print(7.5 % 2); // expect: 1.5
++print(-7 % 3); // expect: -1
++print(7 % -3); // expect: 1
++print(-7.5 % 2); // expect: -1.5
++print(0 % 5); // expect: 0
++print(5.3 % 2.1); // expect: 1.1
++
++// precedence: % sits with * and / (PREC_PRODUCT), left-associative
++print(10 % 4 + 1); // expect: 3
++print(2 + 10 % 4); // expect: 4
++print(2 * 5 % 3); // expect: 1
++print(100 % 30 % 7); // expect: 3
++
++// compound assign: names in place, single evaluation
++let mut x = 10;
++x %= 3;
++print(x); // expect: 1
++let mut y = 100;
++y %= 30;
++y %= 7;
++print(y); // expect: 3
++
++// dogfood: parity in a numeric-for
++let mut evens = 0;
++for let i = 0 : 10? {
++  if i % 2 == 0? {
++    evens = evens + 1;
++  }
++}
++print(evens); // expect: 5
