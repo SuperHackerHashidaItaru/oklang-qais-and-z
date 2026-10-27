@@ -2,6 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Accept runtime and output directories via arguments, with defaults
+RUN_DIR="${1:-$ROOT}"
+OUT_DIR="${2:-$ROOT/results}"
+
 OK_REGISTER="${OK_REGISTER:-$PWD/ok}"
 OK_STACK="${OK_STACK:-}"
 RUNS="${RUNS:-10}"
@@ -23,20 +28,20 @@ run_one() {
   echo "===== $name ====="
   local -a commands=()
   local -a names=()
-  local -a hf_args=(--shell=none --warmup "$WARMUP" --runs "$RUNS"
-    --export-json "$ROOT/results/$name.json"
-    --export-markdown "$ROOT/results/$name.md")
+  local -a hf_args=(--shell=none --warmup "$WARMUP" --runs "$RUNS" 
+    --export-json "$OUT_DIR/$name.json"
+    --export-markdown "$OUT_DIR/$name.md")
   local command
 
   if [[ "$include_stack" == yes && -n "$OK_STACK" ]]; then
-    printf -v command '%q %q' "$OK_STACK" "$ROOT/$name.ok"
+    printf -v command '%q %q' "$OK_STACK" "$RUN_DIR/$name.ok"
     commands+=("$command"); names+=("ok-stack")
   fi
-  printf -v command '%q %q' "$OK_REGISTER" "$ROOT/$name.ok"
+  printf -v command '%q %q' "$OK_REGISTER" "$RUN_DIR/$name.ok"
   commands+=("$command"); names+=("ok-register")
-  printf -v command '%q %q' "$(command -v lua)" "$ROOT/$name.lua"
+  printf -v command '%q %q' "$(command -v lua)" "$RUN_DIR/$name.lua"
   commands+=("$command"); names+=("lua")
-  printf -v command '%q %q' "$(command -v python3)" "$ROOT/$name.py"
+  printf -v command '%q %q' "$(command -v python3)" "$RUN_DIR/$name.py"
   commands+=("$command"); names+=("python3")
 
   local i
@@ -46,10 +51,11 @@ run_one() {
   hyperfine "${hf_args[@]}"
 }
 
-mkdir -p "$ROOT/results"
+mkdir -p "$OUT_DIR"
 for name in "${legacy_benchmarks[@]}"; do run_one "$name" yes; done
 for name in "${new_benchmarks[@]}"; do run_one "$name" no; done
 
 echo
-echo "Done. Reports are in: $ROOT/results"
+echo "Done. Reports are in: $OUT_DIR"
 echo "Note: the stack VM is intentionally omitted from array, numeric-for, and compound-assignment tests."
+

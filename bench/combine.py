@@ -1,17 +1,19 @@
 import os
+import argparse
 
-EXT = ".md"
-SRC = "./results/"
-
-def combine_text_files(target_directory, output_file_path):
+def combine_text_files(target_directory, output_file_path, extension):
     """
-    Recursively scans target_directory for .txt files and combines them 
-    into output_file_path with file name headers.
+    Recursively scans target_directory for files matching the given extension 
+    and combines them into output_file_path with file name headers.
     """
-    # Convert paths to absolute paths to prevent reading the output file if it's placed inside the same directory
+    # Normalize extension to ensure it starts with a dot
+    if not extension.startswith('.'):
+        extension = f".{extension}"
+        
+    extension = extension.lower()
     abs_output_path = os.path.abspath(output_file_path)
     
-    print(f"Scanning '{target_directory}' for text files...")
+    print(f"Scanning '{target_directory}' for '{extension}' files...")
     
     # Open the output file in write mode with UTF-8 encoding
     with open(abs_output_path, 'w', encoding='utf-8') as outfile:
@@ -20,8 +22,8 @@ def combine_text_files(target_directory, output_file_path):
         # os.walk automatically traverses directories recursively
         for root, dirs, files in os.walk(target_directory):
             for file in files:
-                # Target text files (case-insensitive check)
-                if file.lower().endswith(EXT):
+                # Target files (case-insensitive check)
+                if file.lower().endswith(extension):
                     full_path = os.path.join(root, file)
                     
                     # Skip the output file if it happens to be in the scan path
@@ -47,10 +49,24 @@ def combine_text_files(target_directory, output_file_path):
                         outfile.write(f"[ERROR: Could not read this file. Details: {e}]\n\n")
                         print(f"Error reading {rel_path}: {e}")
                         
-    print(f"\nDone! Successfully combined {file_count} text files into '{output_file_path}'.")
+    print(f"\nDone! Successfully combined {file_count} files into '{output_file_path}'.")
 
 if __name__ == "__main__":
-    OUTPUT_FILE = f"combined_output{EXT}"
+    parser = argparse.ArgumentParser(description="Combine multiple text files into a single document.")
     
-    combine_text_files(SRC, OUTPUT_FILE)
+    # Define flags with your existing defaults
+    parser.add_argument("-e", "--ext", default=".md", help="File extension to search for (e.g., .md, .txt). Default: .md")
+    parser.add_argument("-s", "--src", default="./results/", help="Source directory to scan. Default: ./results/")
+    parser.add_argument("-o", "--out", default=None, help="Output file path. Default: combined_output<ext>")
+    
+    args = parser.parse_args()
+    
+    # If no output path is explicitly provided, name it based on the chosen extension
+    if args.out is None:
+        clean_ext = args.ext if args.ext.startswith('.') else f".{args.ext}"
+        output_file = f"combined_output{clean_ext}"
+    else:
+        output_file = args.out
+        
+    combine_text_files(args.src, output_file, args.ext)
 
