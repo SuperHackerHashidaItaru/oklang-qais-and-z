@@ -376,3 +376,20 @@ Stage Summary:
 - both night-cap patches landed green and isolated exactly as asked; the gap experiment is honest-modest on my box, rig-arbitrated next round.
 - the night's full arc now: 12.5 (ternary/strings/elision/window) + 12.75 (modulo/forloop) — one review guide covers all of it.
 - open for owner: trunc-vs-floor ratification, v0.0.5 tag point, bench rerun + read, dogfood day (today).
+
+## session 12.9 — the second sip: floor ruling, bench read, CI, README drafts
+
+Task: owner's ~3:30am wrap round. four asks: read the new bench runs (the other LLM's webui froze), flip modulo to floor (his ruling, python/lua aligned, fmod via stdlib later), a GH-mirror CI workflow reporting to codeberg's statuses endpoint, and README template + draft (his voice eventually, my draft now). plus anything-else contributions.
+
+Work Log:
+- pulled: codeberg master 442ad31 = 05+06 applied verbatim + his -lm (target_link_libraries(ok PUBLIC m)). collab 93cadc7 = new bench runs, single ok-reg (242072 bytes; ok-reg-old deleted in the consolidation).
+- THE BENCH READ (the round's deliverable): 06 verdict = real but modest, KEEP. for-family: numeric sum/counter −6.0%, step −5.4% (ratios 2.05-2.09x → 1.93-1.97x), for-in sum/indexed −2.0/−3.5% (same back edge, diluted by ARRAY_GET). honesty anchor: every while-loop control ALSO moved 0 to −9% (loop_counter flat, local_pressure −9.1%, assign −5.2%) = ±5% cross-session noise floor this run; the for-family signal sits at the band's edge but moves as a family, matches sandbox direction, matches removed work. two protocol notes delivered: restore the two-binary same-session A/B for optimization rounds (the ok-reg consolidation removed it), pin CMAKE_BUILD_TYPE=Release in run-benchmarks.sh (binary size changed between runs — flags confound). remaining ~1.9x = serial 2-word fetch + shared-switch dispatch; post-jam menu unchanged.
+- 07-floor-modulo (34ed328): floor_mod helper (fmod + conditional divisor addition), int48 arm same adjustment, okchunk.h + tests updated (-7 % 3 == 2, 7 % -3 == -2, tiles[pos % 3] wraparound dogfood). future-seam note recorded: pair with floor division when it lands (a == floor(a/b)*b + a%b invariant). 203/203 x plain/release/aggressive/asan/asan-aggr.
+- 08-github-ci (4fa8a18): .github/workflows/ci.yml — plain + asan matrix on the GH mirror, submodules: recursive (unity!), cmake Release + OK_BUILD_TESTS, ctest, e2e runner, embedding test; aggregated report job POSTs to codeberg statuses api (context ci/github-actions, target_url = run logs), push events only, silent skip when CODEBERG_TOKEN unset. paths/targets verified against the tree (build/ok, tests/e2e/oktest-e2e-runner, oktest_embedding); yaml validates; caveat recorded: no cmake in sandbox, first live run arbitrates.
+- README deliverables in docs/drafts/: README-TEMPLATE.md (15-section what/when table, anti-patterns, lead-with-the-example rule, update cadence) + README-DRAFT.md (full draft keeping his voice — "intended to be used in my other projects" kept verbatim; features list current; roadmap; --dump mention). the draft demonstrates the template's own rule on itself: first example was written untested and FAILED (then/otherwise, not else; no number coercion) — kept visible with the verified replacement (run in sandbox, output pinned).
+- guide addendum appended to REVIEW-GUIDE-night13.md: bench read table, 07/08 walkthroughs, CI setup steps (push mirror + CODEBERG_TOKEN), v0.0.5 tag recommendation (apply 07+08 then tag).
+
+Stage Summary:
+- the night's full arc: 12.5 (features+bugfixes) → 12.75 (modulo+06) → 12.9 (floor ruling, bench verdict, CI, README path). all patches isolated and revertible; master carries 05+06; 07+08 await his hand.
+- bench protocol improved for future rounds (A/B binaries, pinned flags) — the noise floor finding makes cross-session reads weaker than we thought.
+- open for owner: apply 07+08, tag v0.0.5, CI first-run tweaks, README in his own sound, then the dogfood day.

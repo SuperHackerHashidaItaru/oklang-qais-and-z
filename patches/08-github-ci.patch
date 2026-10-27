@@ -1,0 +1,102 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..9ff5d8d
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,96 @@
++# oklang CI — runs on the GitHub mirror (free runners), reports back to Codeberg.
++#
++# setup this file presupposes (one-time, owner side):
++#   1. the GitHub repo is a push mirror of codeberg.org/qais/oklang
++#      (gitea: repo settings -> mirrors -> add push mirror, or a manual
++#      `git push --mirror` from a clone with both remotes). this file must be
++#      on the mirrored branch for actions to see it.
++#   2. a codeberg token with repository write scope (settings ->
++#      applications -> access tokens), added as the `CODEBERG_TOKEN` secret
++#      in the GitHub mirror (settings -> secrets and variables -> actions).
++#      without the secret the tests still run and are visible on github,
++#      only the codeberg status posting is skipped.
++#
++# the status lands on the same commit sha (mirrors share shas) at
++# codeberg.org/qais/oklang — commit page / branch list, context
++# `ci/github-actions`, clicking it opens this repository's run logs.
++
++name: ci
++
++on:
++  push:
++    branches: ['**']
++  pull_request:
++  workflow_dispatch:
++
++# a newer push to the same branch replaces the older run
++concurrency:
++  group: ci-${{ github.ref }}
++  cancel-in-progress: true
++
++permissions:
++  contents: read
++
++jobs:
++  build-test:
++    name: ${{ matrix.name }}
++    runs-on: ubuntu-latest
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - name: plain
++            cmake-flags: ''
++          - name: asan
++            cmake-flags: '-DOK_ENABLE_SANITIZERS=ON'
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          # vendor/unity is a submodule — tests cannot build without it
++          submodules: recursive
++
++      - name: configure
++        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOK_BUILD_TESTS=ON ${{ matrix.cmake-flags }}
++
++      - name: build
++        run: cmake --build build --parallel
++
++      - name: unit tests
++        run: ctest --test-dir build --output-on-failure
++
++      # the e2e runner is not registered with add_test: invoked directly,
++      # same commands as the README
++      - name: e2e tests
++        working-directory: build
++        run: ./tests/e2e/oktest-e2e-runner ./ok ../tests/e2e/tests/
++
++      - name: embedding test
++        run: ./build/tests/integration/embedding/oktest_embedding
++
++  # single aggregated status for codeberg: one context, one click to the logs.
++  # push events only — pull_request shas may not exist on the codeberg side.
++  report:
++    name: report to codeberg
++    runs-on: ubuntu-latest
++    needs: [build-test]
++    if: ${{ always() && github.event_name == 'push' }}
++    steps:
++      - name: post commit status
++        env:
++          CB_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
++          RESULT: ${{ needs.build-test.result }}
++        run: |
++          # no token configured: keep the run green, skip the cross-post
++          if [ -z "$CB_TOKEN" ]; then
++            echo 'CODEBERG_TOKEN not set — skipping status posting'
++            exit 0
++          fi
++          case "$RESULT" in
++            success) state='success'; desc='ci green (plain + asan)' ;;
++            *)       state='failure'; desc="ci $RESULT (plain + asan)" ;;
++          esac
++          curl -sf -X POST \
++            -H "Authorization: token $CB_TOKEN" \
++            -H 'Content-Type: application/json' \
++            -d "{\"state\":\"$state\",\"target_url\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",\"description\":\"$desc\",\"context\":\"ci/github-actions\"}" \
++            "https://codeberg.org/api/v1/repos/qais/oklang/statuses/${{ github.sha }}"

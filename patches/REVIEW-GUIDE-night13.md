@@ -140,3 +140,105 @@ the numeric-for family (and the flat-controls sanity) together next round.
   nothing produces INT tags today; PREP normalization actually re-tags the
   loop triple away). One arm to add whenever int48 wakes up.
 - e2e runner still can't pin empty-line expects (round-12 note, unchanged).
+
+---
+
+# Addendum — the ~3:30am round (patches 07 + 08, bench read)
+
+You applied 05+06 (`442ad31`, with the `-lm` as `target_link_libraries(ok PUBLIC m)`
+— nice, PUBLIC is the right scope). Two more patches are stacked on that, plus
+the bench read you asked for (the other LLM's webui froze; mine didn't).
+
+## The bench read (new runs, `93cadc7`)
+
+**The verdict on 06: real but modest. Keep it (it's already in master).**
+
+| bench | old → new (ok, ms) | ratio old → new |
+|---|---|---|
+| numeric_for_sum | 157.4 → 148.0 (−6.0%) | 2.09× → 1.93× |
+| numeric_for_counter | 157.4 → 147.9 (−6.0%) | 2.07× → 1.97× |
+| numeric_for_step | 81.7 → 77.3 (−5.4%) | 2.05× → 1.93× |
+| array_for_in_sum | 301.4 → 295.3 (−2.0%) | for-in rides the same back edge, diluted by ARRAY_GET |
+| array_for_in_sum_indexed | 297.9 → 287.5 (−3.5%) | 〃 |
+
+**Why I trust the direction but not the decimals:** every while-loop bench
+(bytecode untouched by 06) also moved — loop_counter flat (−0.4%), assign_add
+−5.2%, arithmetic_sum −5.6%, local_pressure −9.1%, global_access −5.6%,
+branch_toggle −2.1%, closure/push flat. Unchanged code scattering 0 to −9%
+between sessions = a ±5% cross-session noise/confound floor in this run
+(wider error bars than last time, lua drifting +1–3% too). The for-family's
+−5~6% sits at that band's edge BUT: it moves as a family (3 numeric + 2
+for-in), the direction matches my sandbox, and it matches the removed work
+exactly. Signal, sized ~5%.
+
+**Two bench-protocol notes for the next optimization round:**
+
+1. the run consolidated to a single `ok-reg` and deleted `ok-reg-old` — the
+   two-binary same-session A/B was the right design and is worth restoring
+   for optimization landings (cross-session comparisons fight the ±5% floor).
+2. `ok-reg` changed size noticeably between runs (254408 → 242072 bytes) —
+   if the build flags changed between sessions, absolute cross-session
+   deltas carry that confound. pinning `CMAKE_BUILD_TYPE=Release` in
+   `run-benchmarks.sh` (and recording it in the results) kills the class.
+
+**Where the remaining ~1.9× lives** (unchanged analysis): the serial chain —
+2-word fetch, shared-switch dispatch — plus Lua's FORLOOP being a single
+1-word op. That's the post-jam menu: computed-goto dispatch (~60–80 LOC),
+1-word FOR_LOOP when B ≤ 255, PGO flags. Not tonight.
+
+## `07-floor-modulo` — your ruling, implemented
+
+Floored, python/lua aligned: `-7 % 3 == 2`, `7 % -3 == -2`, and the payoff
+line — `x % n` for positive `n` always lands in `[0, n)`, negative indices
+included (`tiles[-1 % 3]` is the last element; pinned in the test).
+Implementation: `floor_mod` helper (fmod + one conditional addition of the
+divisor), the int48 arm applies the identical adjustment — one rule, both
+domains. C's truncated remainder stays host-side (`fmod`) for whoever needs
+it, std-lib surface later.
+
+**One future-seam note, now written down:** when integer/floor division
+lands, keep it paired with this so `a == floor(a / b) * b + a % b` holds —
+python's invariant, and the reason floor-mod + real-division is coherent
+today but floor-mod + trunc-int-division tomorrow would not be.
+
+Tests updated to the floored expectations; 203/203 × plain/release/aggressive/
+asan/asan-aggr.
+
+## `08-github-ci` — CI on the mirror, status back to codeberg
+
+`.github/workflows/ci.yml`: plain + asan matrix (cmake Release + tests,
+ctest, e2e runner, embedding test), then one aggregated job that POSTs a
+commit status to `codeberg.org/api/v1/repos/qais/oklang/statuses/{sha}` —
+same sha, mirrors share them. Context `ci/github-actions`, target_url = the
+GH run's logs, so a click from a codeberg commit lands on the failure output.
+
+**One-time setup, your side:**
+
+1. the GH repo must be a push mirror of codeberg (gitea: settings → mirrors
+   → add push mirror; or manual `git push --mirror` from a dual-remote clone).
+   If it already is — nothing to do.
+2. codeberg token with repository write scope → GH secret `CODEBERG_TOKEN`
+   in the mirror repo. Without it, CI still runs and is visible on GH; only
+   the cross-post is skipped (by design, the run stays green).
+
+**Details that were load-bearing:** `submodules: recursive` on checkout
+(Unity is a submodule — without it the tests build dies), `concurrency`
+cancels superseded runs per branch, statuses post on push events only
+(PR shas may not exist on the CB side), `fail-fast: false` so both legs
+always run.
+
+**Caveat, honestly:** my sandbox has no cmake — the yaml validates and every
+path/target name was checked against the tree (`build/ok`,
+`build/tests/e2e/oktest-e2e-runner`, `build/tests/integration/embedding/oktest_embedding`,
+README-identical invocations), but the first live run on GH is the real test.
+Expect possible one-line tweaks (e.g. if the e2e runner exit convention
+differs from CI's shell expectations).
+
+## Also in this round
+
+- README template + my draft: `docs/drafts/README-TEMPLATE.md` (what/when
+  per section, anti-patterns) and `docs/drafts/README-DRAFT.md` (raw material
+  in a neutral voice — including a deliberately-kept broken example with its
+  verified fix, which is the template's own rule demonstrated on myself).
+- v0.0.5 tag: still not on the remote. recommendation: apply 07+08, then tag
+  — ternary, strings, modulo, elision, imm fastpath all make the release.

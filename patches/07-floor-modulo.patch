@@ -1,0 +1,116 @@
+diff --git a/src/okchunk.h b/src/okchunk.h
+index 7a5d830..ee361ac 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -167,8 +167,8 @@ typedef enum {
+   OP_MULTIPLY_LONG,      // 2w:   (p, A, B, C, q) -> r[A] = (q then k[B] otherwise r[B]) * (p then k[C] otherwise r[C]); ip += w
+   OP_DIVIDE,             // w:    (p, a, b, c)    -> r[a] = r[b] / (p then k[c] otherwise r[c])
+   OP_DIVIDE_LONG,        // 2w:   (p, A, B, C, q) -> r[A] = (q then k[B] otherwise r[B]) / (p then k[C] otherwise r[C]); ip += w
+-  OP_MODULUS,            // w:    (p, a, b, c)    -> r[a] = r[b] % (p then k[c] otherwise r[c]); truncated remainder
+-                         //                          (C/fmod: sign follows the dividend; rhs 0 is a runtime error like '/')
++  OP_MODULUS,            // w:    (p, a, b, c)    -> r[a] = r[b] % (p then k[c] otherwise r[c]); floored remainder
++                         //                          (python/lua: sign follows the divisor, -7 % 3 == 2; rhs 0 is a runtime error like '/')
+   OP_MODULUS_LONG,       // 2w:   (p, A, B, C, q) -> r[A] = (q then k[B] otherwise r[B]) % (p then k[C] otherwise r[C]); ip += w
+   OP_EQUALS,             // w:    (p, a, b, c)    -> r[a] = r[b] == (p then k[c] otherwise r[c])
+   OP_EQUALS_LONG,        // 2w:   (p, A, B, C, q) -> r[A] = (q then k[B] otherwise r[B]) == (p then k[C] otherwise r[C]); ip += w
+diff --git a/src/okvm.c b/src/okvm.c
+index 2784c05..f56c97c 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -476,12 +476,26 @@ division_by_zero: {
+ }
+ }
+ 
++// floored modulo over doubles: fmod gives the truncated remainder; when it
++// and the divisor disagree on sign, one addition of the divisor lands on the
++// floor. keeps the python/lua invariant a == floor(a / b) * b + a % b.
++static double floor_mod(double p_lhs, double p_rhs) {
++  const double remainder = fmod(p_lhs, p_rhs);
++  if (remainder != 0.0 && ((remainder < 0.0) != (p_rhs < 0.0))) {
++    return remainder + p_rhs;
++  }
++  return remainder;
++}
++
+ static interpret_result
+ perform_modulo(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+-  // truncated division remainder (C99 fmod): the result's sign follows the
+-  // dividend, so -7 % 3 is -1, where lua/python floor to 2. deliberate: the
+-  // dormant int48 path is C's % by definition, and fmod is its f64 twin — one
+-  // rule, two domains, no mixed-semantics seam. rhs 0 errors like '/' does.
++  // floored modulo (python/lua): the result's sign follows the divisor, so
++  // -7 % 3 == 2 and 7 % -3 == -2 — the wraparound-friendly rule (x % n for
++  // positive n always lands in [0, n), negative indices included, which is
++  // what a game script wants out of a modulo). C's truncated remainder stays
++  // available host-side (fmod) for the rare caller that needs it. the int48
++  // arm applies the same adjustment, so both domains share one rule. rhs 0
++  // errors like '/' does.
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+   value rhs = p_rhs;
+@@ -490,12 +504,12 @@ perform_modulo(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_d
+       if (VALUE_AS_NUMBER(rhs) == 0.0f) {
+         goto modulo_by_zero;
+       }
+-      lhs = NUMBER_AS_VALUE(fmod(VALUE_AS_NUMBER(lhs), VALUE_AS_NUMBER(rhs)));
++      lhs = NUMBER_AS_VALUE(floor_mod(VALUE_AS_NUMBER(lhs), VALUE_AS_NUMBER(rhs)));
+     } else if (IS_VALUE_INT(rhs)) {
+       if (VALUE_AS_INT(rhs) == 0) {
+         goto modulo_by_zero;
+       }
+-      lhs = NUMBER_AS_VALUE(fmod(VALUE_AS_NUMBER(lhs), (double)VALUE_AS_INT(rhs)));
++      lhs = NUMBER_AS_VALUE(floor_mod(VALUE_AS_NUMBER(lhs), (double)VALUE_AS_INT(rhs)));
+     } else if (IS_VALUE_OBJECT(rhs)) {
+       goto invalid;
+       // TODO
+@@ -509,12 +523,16 @@ perform_modulo(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_d
+       if (VALUE_AS_INT(rhs) == 0) {
+         goto modulo_by_zero;
+       }
+-      lhs = INT_AS_VALUE(VALUE_AS_INT(lhs) % VALUE_AS_INT(rhs));
++      int64_t remainder = VALUE_AS_INT(lhs) % VALUE_AS_INT(rhs);
++      if (remainder != 0 && ((remainder < 0) != (VALUE_AS_INT(rhs) < 0))) {
++        remainder += VALUE_AS_INT(rhs); // |remainder| < |rhs|: cannot leave the int48 domain
++      }
++      lhs = INT_AS_VALUE(remainder);
+     } else if (IS_VALUE_NUMBER(rhs)) {
+       if (VALUE_AS_NUMBER(rhs) == 0.0f) {
+         goto modulo_by_zero;
+       }
+-      lhs = NUMBER_AS_VALUE(fmod((double)VALUE_AS_INT(lhs), VALUE_AS_NUMBER(rhs)));
++      lhs = NUMBER_AS_VALUE(floor_mod((double)VALUE_AS_INT(lhs), VALUE_AS_NUMBER(rhs)));
+     } else if (IS_VALUE_OBJECT(rhs)) {
+       goto invalid;
+       // TODO
+diff --git a/tests/e2e/tests/operators/modulo.ok b/tests/e2e/tests/operators/modulo.ok
+index 6706c9f..ffd7370 100644
+--- a/tests/e2e/tests/operators/modulo.ok
++++ b/tests/e2e/tests/operators/modulo.ok
+@@ -1,12 +1,13 @@
+-// truncated remainder (C/fmod): the sign follows the dividend, not the floor.
+-// -7 % 3 == -1 where lua/python give 2 — pinned here so the choice is visible.
++// floored remainder (python/lua): the sign follows the divisor, so the result
++// of x % n for positive n always lands in [0, n) — negative indices included.
+ print(7 % 3); // expect: 1
+ print(7.5 % 2); // expect: 1.5
+-print(-7 % 3); // expect: -1
+-print(7 % -3); // expect: 1
+-print(-7.5 % 2); // expect: -1.5
++print(-7 % 3); // expect: 2
++print(7 % -3); // expect: -2
++print(-7.5 % 2); // expect: 0.5
+ print(0 % 5); // expect: 0
+ print(5.3 % 2.1); // expect: 1.1
++print(-1 % 5); // expect: 4
+ 
+ // precedence: % sits with * and / (PREC_PRODUCT), left-associative
+ print(10 % 4 + 1); // expect: 3
+@@ -31,3 +32,8 @@ for let i = 0 : 10? {
+   }
+ }
+ print(evens); // expect: 5
++
++// dogfood: wraparound with a negative offset — the floor payoff
++let tiles = ["a", "b", "c"];
++let mut pos = 0 - 1;
++print(tiles[pos % 3]); // expect: c
