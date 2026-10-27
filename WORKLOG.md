@@ -393,3 +393,19 @@ Stage Summary:
 - the night's full arc: 12.5 (features+bugfixes) → 12.75 (modulo+06) → 12.9 (floor ruling, bench verdict, CI, README path). all patches isolated and revertible; master carries 05+06; 07+08 await his hand.
 - bench protocol improved for future rounds (A/B binaries, pinned flags) — the noise floor finding makes cross-session reads weaker than we thought.
 - open for owner: apply 07+08, tag v0.0.5, CI first-run tweaks, README in his own sound, then the dogfood day.
+
+## session 12.95 — closing the buffer day: v0.0.5 bench read, README review, sign-off
+
+Task: owner wrapped the buffer day — tagged v0.0.5, wrote his own README ("check it! give me your opinion"), ran new benches (5 warmups + 15 runs, release pinned, aggr-gc/asan off), added codecov (~53%). asks: read the benches (json too big for his other LLM's webui), opinion on the README. then he is off to the game (dorg engine + binding layer as template, then dogfeeding).
+
+Work Log:
+- pulled: codeberg c28d92d (13 unsquashed commits: floor modulo applied in 4ea8a03, README + CI + codecov + formatter run) + v0.0.5 tag; collab 4d08852 (bench restructure: benchmarks/ + results/ split, combined json deleted, combine.py now a generic md-combiner, run-benchmarks.sh takes RUN_DIR/OUT_DIR + env).
+- verified the benched binary IS v0.0.5: bench/ok-reg runs in my sandbox via the system loader — floor modulo live (-7 % 3 -> 2, 7 % -3 -> -2).
+- THE READ (deliverable: BENCH-NOTES-v0.0.5.md at repo root): validated all 30 outputs numerically against documented expected values (30/30; 21 "mismatches" were %g scientific notation), exits all 0, startup floor 0.4ms. cross-run: no regressions, noise floor shrank from ±5-9% to ~±2-3% typical — protocol reads single-digit effects now. stack-vs-register 1.12-1.97x, geomean 1.59x. fused numeric-for = 0.56x of the equivalent while (1.79x) measured WITHIN one run — cleanest 06 confirmation yet. for-in 0.58x of lua's ipairs, and 0.77x of own manual indexing while lua's ipairs is 1.79x of ITS indexing. compound assign: no penalty (add -1.6%, sub -0.3%, mul +0.6%, div -2.9%), matches python/lua drift bands; subscript compounds save 1.9-6.0% from single index evaluation (python -7%/-21.8% same direction — more to save there). ok/lua geomean 1.24x (wins arrays/globals/push 0.58-0.78x, ties calls/closures/fib 1.09-1.18x, loses dispatch-dense 1.36-2.04x, branch_toggle worst). ok/python 5.8x. memory lua-class; push growth 4.0MB vs lua 7.2MB. analysis script persisted: scripts/bench_read_v005.py.
+- README review: example output verified BYTE-EXACT against the benched binary (incl. trailing space after "birds: "); "3 flavors of for" claim verified real (loops/for/ = C-style, checked before flagging); embedding example's API calls match the integration test patterns. verdict: genuinely good, his voice landed (see reply). nits: release badge renders RED (tag push != GH release object; fix = gh release create v0.0.5), mixed quotes in the birds array read as a typo.
+- coverage takes: "array new long" = the is_long emit arms (nothing in the suite crosses the ~255 a_MAX/b_MAX thresholds; fix = generated >255-element literal / >255-locals test, flips compiler arms + VM long-opcode handlers); "parser fuzzing paths" = error/sync branches (errors/ dir walks them partially; standard fix = tiny fuzz harness, assert clean-parse-or-clean-error-never-crash). both post-jam.
+
+Stage Summary:
+- the buffer-day arc is closed: 12 -> 12.5 -> 12.75 -> 12.9 -> 12.95. v0.0.5 tagged, baselined, and validated. the register rewrite is vindicated with the owner's own machine's numbers.
+- open for owner (all post-halloween, none block the game): gh release create v0.0.5 for the badge, generated long-form test, parser fuzz harness, optional output-check in run-benchmarks.sh, FAST/python-runs knob for suite wall time.
+- next: dorg engine template + binding layer, then dorg feeding. the language is in good shape for it.
