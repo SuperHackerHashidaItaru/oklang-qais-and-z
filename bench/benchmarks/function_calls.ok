@@ -3,7 +3,7 @@ fu bump(p_value) {
 }
 let mut value = 0;
 let mut i = 0;
-while i < 1000000? {
+while i < 1000000 {
   value = bump(value);
   i = i + 1;
 }

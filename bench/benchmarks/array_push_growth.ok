@@ -1,6 +1,6 @@
 let mut a = [];
 let mut i = 0;
-while i < 200000? {
+while i < 200000 {
   push(a, i);
   i = i + 1;
 }

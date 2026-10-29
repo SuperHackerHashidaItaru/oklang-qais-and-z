@@ -7,7 +7,7 @@ let mut e = 0;
 let mut f = 0;
 let mut g = 0;
 let mut h = 0;
-while i < 1000000? {
+while i < 1000000 {
   a = a + 1; b = b + 2; c = c + 3; d = d + 4;
   e = e + 5; f = f + 6; g = g + 7; h = h + 8;
   i = i + 1;

@@ -1,7 +1,7 @@
 let factor = 1.0000001;
 let mut x = 1;
 let mut i = 0;
-while i < 2000000? {
+while i < 2000000 {
   x = x / factor;
   i = i + 1;
 }

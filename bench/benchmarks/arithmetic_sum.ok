@@ -1,6 +1,6 @@
 let mut i = 0;
 let mut sum = 0;
-while i < 10000000? {
+while i < 10000000 {
   sum = sum + i;
   i = i + 1;
 }

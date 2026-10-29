@@ -8,7 +8,7 @@ fu make_counter() {
 let next = make_counter();
 let mut i = 0;
 let mut result = 0;
-while i < 500000? {
+while i < 500000 {
   result = next();
   i = i + 1;
 }

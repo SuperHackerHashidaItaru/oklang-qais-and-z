@@ -2,8 +2,8 @@ let mut i = 0;
 let mut left = 0;
 let mut right = 0;
 let mut flag = false;
-while i < 5000000? {
-  if flag? {
+while i < 5000000 {
+  if flag {
     left = left + 1;
     flag = false;
   } else {
