@@ -8,14 +8,16 @@ name: benches
 # track the language, not the last laptop.
 
 on:
+  push:
+    branches:
+      - master
+      - main
   workflow_dispatch:
     inputs:
       oklang_ref:
         description: 'oklang ref to bench (codeberg)'
         required: false
         default: 'master'
-  schedule:
-    - cron: '0 4 * * 1' # mondays 04:00 UTC
 
 permissions:
   contents: write
