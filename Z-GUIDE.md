@@ -33,30 +33,36 @@ didn't get abandoned.
 
 ## the project in 60 seconds
 
-oklang is an embeddable scripting language in C99: register-based VM
-(v0.0.4, the stack VM is retired), nan-boxed values with a deliberate
-strict/non-strict duality (strict macros gate, lenient chains walk — see
-the _STRICT doctrine in DECISIONS-DELTA), f64-only numbers with int48
-underneath and no public int type, closures/upvalues, mark-sweep GC,
-lua-shaped hosting (ok_create/ok_run/ok_call from a C++ host, dorg3 binds
-86 natives through a bridge). builds: gcc 14.2 in the sandbox (no cmake —
-use `/home/z/my-project/scripts/build_ok.sh`, variants: plain/aggressive/
-asan/asan+aggressive), plus user-side cmake, emscripten (60fps web), nix.
-tests: e2e suite with `// expect:` lines, runner at
-`/home/z/my-project/scripts/run_e2e.sh`, currently 110/110, plus the
-dorg3 harness soak in `tools/dorg3-harness/`.
+oklang is an embeddable scripting language in C99: register-based VM,
+nan-boxed values with a deliberate strict/non-strict duality (strict macros
+gate, lenient chains walk — see the _STRICT doctrine in DECISIONS-DELTA),
+f64-only numbers, closures/upvalues, mark-sweep GC with a rooting API
+(ok_root/ok_unroot, traced natives, array + print-hook public APIs — that
+IS v0.1.0). lua-shaped hosting (dorg3 binds natives through a bridge;
+the embedding test is the shape reference). builds: gcc 14.2 in the
+sandbox (no cmake — use `/home/z/my-project/scripts/build_ok.sh`, variants:
+plain/aggressive/asan/asan+aggressive; e2e runner compiled separately:
+`g++ -std=c++23 -O2 tests/e2e/src/main.cpp -o build-gcc/e2e`), plus
+user-side cmake, emscripten, nix.
+tests: e2e suite with `// expect:` lines, **211 tests, gate = plain/asan/
+asan-aggr all green** (repo runner prints `summary: [N OK], [N NOTOK],
+[N SKIP]`), plus the embedding integration test ×3 configs.
 
-source of truth: `https://codeberg.org/qais/oklang`, master at v0.0.4
-(1697066). the `register` branch is history — deletion pending Q's
-confidence, don't touch it. sandbox branch `arrays-draft` sits on master,
-ready for the arrays implementation.
+source of truth: `https://codeberg.org/qais/oklang`, master at `9ad153c`,
+**tagged v0.1.0**. the `register` branch is history — deletion pending Q's
+confidence, don't touch it.
 
-current phase [perishable — refresh at round end] (oct 26, evening):
-arrays + default args IMPLEMENTED on sandbox branch arrays-draft (commits
-63be373, 723fa83); patches in repo patches/ awaiting Q's hand-application.
-remaining before freeze (EOD oct 27): Q applies + tests both patches, then
-numeric-for (draft in docs/drafts/NUMERIC-FOR.md — 4 open questions for Q).
-game oct 29–31, 100% oklang, next integration oracle. e2e count now 160.
+current phase [perishable — refresh at round end] (oct 31):
+post-v0.1.0. Q ruled: website postponed until post-1.0 (full minimal web
+framework, own repo, THEN sites — no duct tape). focus = the language.
+the plan to 1.0.0 lives in `docs/drafts/ROADMAP-v1.md` (awaiting his
+accept): 0.2.0 maps → 0.3.0 spans (MR+varargs) → 0.4.0 errors → 0.5.0
+classes+types → 0.6.0 coros → 0.7.0 modules → 0.8.0 utf8+std → 0.9.0
+hardening+tooling → 1.0.0 freeze. first feature drafted:
+`docs/drafts/MAPS.md`. Q owes: gh release objects (v0.1.0 + v0.0.5
+backfill), tree-sitter repo tag, the CI account move (token comes with
+it). collab repo cleaned this session (18): patches archived, workflow
+disabled pending the account move.
 
 ## first 60 seconds of every round
 

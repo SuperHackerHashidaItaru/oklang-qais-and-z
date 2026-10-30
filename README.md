@@ -7,10 +7,11 @@ sometimes resets with it. it is the durable memory: round logs, decisions,
 specs, drafts, and the recovery protocol for when local state goes boom.
 
 **this repo contains no oklang source code.** the language lives at
-`https://codeberg.org/qais/oklang` (master, tagged v0.0.4 = register VM).
-the first game lives at `github.com/QaisAlsaid/dorg3`. this repo is only
-the process/documentation/drafting layer that makes the collaboration
-survive round boundaries.
+`https://codeberg.org/qais/oklang` (master, tagged **v0.1.0** = the
+embedding API: roots, traced natives, arrays, print hook). the first game
+lives at `github.com/QaisAlsaid/dorg3`. this repo is only the
+process/documentation/drafting layer that makes the collaboration survive
+round boundaries.
 
 ## map
 
@@ -21,19 +22,39 @@ survive round boundaries.
   entries.
 - `recovery/RECOVERY-PROTOCOL.md` — what to do when Z's local data is
   gone or Z is acting strange. contains the exact `resync` dance.
-- `docs/permanent/` — the oct25 wave: project state, roadmap, decisions
-  (D1–D16), rewrite postmortem. these are the standing documents.
-- `docs/specs/` — the oct24 wave: implementation-grade specs (arrays,
-  numeric-for, maps-v2, pipeline-isolation, debugger-v0, halloween roadmap).
-  superseded where oct26 says so.
-- `docs/drafts/` — the oct26 wave: ARRAYS-V2, DEFAULT-ARGS,
-  DECISIONS-DELTA. **status: awaiting Q's veto/accept pass.** drafts are
-  not law until accepted in chat and folded into the permanent docs.
-- `archive/patches/` — the historical patch sets (all applied + pushed to
-  codeberg by Q). paper trail only.
-- `tools/dorg3-harness/` — the no-raylib dorg3 integration harness
-  (repro/repro2/repro3 + stubs). runnable any time the VM changes; retired
-  as *authority* per D1 amendment, kept as regression pin.
+- **`docs/drafts/ROADMAP-v1.md` — the 0.1.0 → 1.0.0 plan (DRAFT, awaiting
+  Q's accept).** the compass doc: phases, standing lanes, versioning +
+  naming policy, the 1.0 checklist, open rulings register.
+- `docs/drafts/MAPS.md` — the 0.2.0 first-feature draft (read with the
+  roadmap). `docs/drafts/WEBSITE-PLATFORM.md` — the parked post-1.0 web
+  platform conversation. `docs/drafts/DECISIONS-DELTA.md` — oct26 rulings
+  still awaiting their fold into DECISIONS.md (next docs wave).
+- `docs/permanent/` — the standing documents: DECISIONS (D1–D16 + delta
+  pending), ROADMAP (oct25 ladder — superseded by ROADMAP-v1 on accept),
+  PROJECT_STATE, REWRITE_POSTMORTEM, POSTMORTEM-aggressive-gc.
+- `docs/specs/` — implementation-grade specs that still feed future work:
+  maps-v2 (core algorithm, appendix to MAPS.md), pipeline-isolation
+  (0.7.0 modules), debugger-v0.
+- `patches/` — **staging area only**: deliverables awaiting Q's review.
+  empty right now (everything through 16 is applied). applied patches and
+  their review guides live in `archive/patches/` + `archive/review-guides/`.
+- `bench/` — the benchmark suite, results, combine tooling. feeds the
+  benches workflow when it comes back online.
+- `tools/dorg3-harness/` — the no-raylib dorg3 integration harness.
+  retired as *authority* per D1 amendment, kept as regression pin.
+- `dorg3/` — the shipped-game review (session 13.0).
+
+## repo status notes
+
+- `.github/workflows/benches.yml.disabled` — the bench workflow is parked:
+  this repo is private and GH gives private repos no free runners. Q plans
+  an account move; when that happens (Q supplies the token), rename back
+  to `benches.yml` and do the first manual dispatch — it closes the
+  v0.0.5-era results staleness and re-baselines outputs after the `%g`
+  change.
+- the oklang repo itself stays **minimal** — no website, no site tooling,
+  ever. the future web framework gets its own repo post-1.0 (Q's ruling,
+  session 17).
 
 ## ground rules
 
