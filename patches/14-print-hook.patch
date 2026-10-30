@@ -1,0 +1,154 @@
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index 00dae21..55fa5ff 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -100,6 +100,16 @@ bool ok_array_set(ok_value p_value, uint32_t p_index, ok_value p_new_value);
+ // (ok_root, a traced native value, registers, or a global).
+ bool ok_array_push(ok* p_ok, ok_value p_array, ok_value p_value);
+ 
++/* output */
++
++// print statements route through p_cb when set; the default (NULL) keeps the
++// CLI behavior: formatted stdout + newline. the callback receives the raw
++// value -- format with the ok_value_as_* family. the CLI's exact formatting
++// is %g for numbers, true/false/null, raw string bytes, and per-type tags
++// for other objects; the trailing newline is the host's business.
++typedef void (*ok_print_fn)(void* p_ctx, ok_value p_value);
++void ok_set_print(ok* p_ok, ok_print_fn p_cb, void* p_ctx);
++
+ /* gc interop (embedder side) */
+ 
+ // only valid inside an ok_native_tracer callback: marks p_value (and
+diff --git a/src/ok.c b/src/ok.c
+index 6069c00..8ceea41 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -314,6 +314,11 @@ void ok_debug_dump_bytecode(ok* p_ok, bool p_enabled, bool p_skip_run) {
+   p_ok->dump_skip_run = p_skip_run;
+ }
+ 
++void ok_set_print(ok* p_ok, ok_print_fn p_cb, void* p_ctx) {
++  p_ok->vm.print_cb = p_cb;
++  p_ok->vm.print_ctx = p_ctx;
++}
++
+ void ok_free(ok* p_ok) {
+   vm_deinit(&p_ok->vm);
+   compiler_deinit(&p_ok->compiler);
+diff --git a/src/okvm.c b/src/okvm.c
+index 9d7e032..51885a4 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -63,6 +63,8 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->globals_store = p_specs.globals_store;
+   p_vm->source = NULL;
+   p_vm->ok = p_specs.ok;
++  p_vm->print_cb = NULL;
++  p_vm->print_ctx = NULL;
+   // TODO: temp
+   p_vm->current_execution_state = p_vm->alloc->allocate(p_vm->alloc, sizeof(execution_state));
+   p_vm->current_execution_state->open_upvalues = NULL;
+@@ -2181,8 +2183,17 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     }
+     case OP_PRINT: {
+       const bool p = p_of(instruction);
+-      value_debug_print(resolve_operand(frame, reg, Alarge_of(instruction), p));
+-      puts("");
++      const value printed = resolve_operand(frame, reg, Alarge_of(instruction), p);
++      // embedders own formatting through the hook (the site captures stdout,
++      // dorg3 can route to its console). the value is rooted through its
++      // register for this whole operation, so a host callback that allocates
++      // (building its own string, say) is safe.
++      if (p_vm->print_cb != NULL) {
++        p_vm->print_cb(p_vm->print_ctx, printed);
++      } else {
++        value_debug_print(printed);
++        puts("");
++      }
+       break;
+     }
+     }
+diff --git a/src/okvm.h b/src/okvm.h
+index 312fe6a..58b8160 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -50,6 +50,9 @@ struct vm {
+   globals_store* globals_store;
+   allocators* alloc;
+   ok* ok;
++  // print routing (ok_set_print): NULL keeps the CLI's formatted stdout.
++  ok_print_fn print_cb;
++  void* print_ctx;
+ };
+ 
+ typedef enum {
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index a424c52..1e890df 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -4,6 +4,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <string>
+ #include <vector>
+ 
+ static int g_destructor_calls = 0;
+@@ -527,6 +528,57 @@ int main() {
+   assert(ok_array_len(squares) == 18);                            // script push -> host len
+   assert(ok_value_as_number(ok_array_get(squares, 17)) == 7);
+ 
++  // ---- print capture ----
++
++  std::vector<std::string> printed_lines;
++  ok_set_print(vm,
++               [](void* p_ctx, ok_value p_value) {
++                 auto* sink = static_cast<std::vector<std::string>*>(p_ctx);
++                 char buffer[64];
++                 if (ok_value_is_number(p_value)) {
++                   std::snprintf(buffer, sizeof(buffer), "%g", ok_value_as_number(p_value));
++                   sink->emplace_back(buffer);
++                 } else if (ok_value_is_string(p_value)) {
++                   ok_cstring_view text = ok_value_as_string(p_value);
++                   sink->emplace_back(text.chars, std::strlen(text.chars));
++                   ok_cstring_view_deinit(&text);
++                 } else if (ok_value_is_bool(p_value)) {
++                   sink->emplace_back(ok_value_as_bool(p_value) ? "true" : "false");
++                 } else if (ok_value_is_null(p_value)) {
++                   sink->emplace_back("null");
++                 } else {
++                   sink->emplace_back("<object>");
++                 }
++               },
++               &printed_lines);
++
++  const char* print_code = R"(
++    print 4;
++    print 1.5;
++    print "hello from oklang";
++    print true;
++    print null;
++    print [1, 2, 3];
++  )";
++
++  ok_source print_source = {
++      .from = OK_FROM_FILE,
++      .code = print_code,
++      .path = "print",
++  };
++
++  result = ok_run(vm, print_source);
++  assert(result == OK);
++  ok_set_print(vm, nullptr, nullptr);
++
++  assert(printed_lines.size() == 6);
++  assert(printed_lines[0] == "4");
++  assert(printed_lines[1] == "1.5");
++  assert(printed_lines[2] == "hello from oklang");
++  assert(printed_lines[3] == "true");
++  assert(printed_lines[4] == "null");
++  assert(printed_lines[5] == "<object>");
++
+   ok_free(vm);
+ 
+   assert(g_destructor_calls == 1);

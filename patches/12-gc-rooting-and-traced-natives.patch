@@ -1,0 +1,534 @@
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index 947a9d5..32c5ab8 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -61,9 +61,37 @@ bool ok_global_define_native_function(ok* p_ok, ok_string_view p_name, uint8_t p
+ bool ok_native_error(ok* p_ok, ok_string_view p_message);
+ 
+ typedef void (*ok_native_destructor)(void* p_data);
+-ok_value ok_native_value_new(ok* p_ok, void* p_user_data, ok_native_destructor p_destructor);
++
++// called during garbage collection while your native value is being traced:
++// mark every ok_value that p_user_data still references via ok_gc_mark_value.
++// must not allocate (no ok_run / ok_value_string / ok_array_push / ...), the
++// collector is mid-walk. return false to propagate a marking failure.
++typedef bool (*ok_native_tracer)(ok* p_ok, void* p_user_data);
++
++// p_tracer may be NULL: an untraced native value holds no ok_values the
++// collector needs to see (the pre-0.1.0 behavior of every native value).
++ok_value ok_native_value_new(ok* p_ok,
++                             void* p_user_data,
++                             ok_native_destructor p_destructor,
++                             ok_native_tracer p_tracer);
+ 
+ void* ok_value_as_native_value(ok_value p_value);
++bool ok_value_is_native_value(ok_value p_value);
++
++/* gc interop (embedder side) */
++
++// only valid inside an ok_native_tracer callback: marks p_value (and
++// everything reachable from it) as live for the collection in progress.
++// any other call site fails and does nothing.
++bool ok_gc_mark_value(ok* p_ok, ok_value p_value);
++
++// strong references owned by the embedder that outlive any single ok_call /
++// ok_run. any value is accepted; rooting null fails. ids are recycled: an id
++// is valid until its ok_unroot returns true -- a stale id may address a slot
++// that was handed out again and would unroot that value instead.
++#define OK_ROOT_INVALID 0u
++uint32_t ok_root(ok* p_ok, ok_value p_value);
++bool ok_unroot(ok* p_ok, uint32_t p_root);
+ 
+ /* debug */
+ 
+diff --git a/src/ok.c b/src/ok.c
+index 26b84ab..6785b1e 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -438,9 +438,12 @@ bool ok_native_error(ok* p_ok, ok_string_view p_message) {
+   return vm_native_error(&p_ok->vm, p_message);
+ }
+ 
+-ok_value ok_native_value_new(ok* p_ok, void* p_user_data, ok_native_destructor p_destructor) {
++ok_value ok_native_value_new(ok* p_ok,
++                             void* p_user_data,
++                             ok_native_destructor p_destructor,
++                             ok_native_tracer p_tracer) {
+   object_specs s = {.alloc = &p_ok->alloc, .store = &p_ok->objects_store};
+-  object_native_value* native = create_object_native_value(p_user_data, p_destructor, &s);
++  object_native_value* native = create_object_native_value(p_user_data, p_destructor, p_tracer, &s);
+   if (native == NULL) {
+     return NULL_AS_VALUE();
+   }
+@@ -461,3 +464,23 @@ void* ok_value_as_native_value(ok_value p_value) {
+   object_native_value* native = (object_native_value*)obj;
+   return native->user_data;
+ }
++
++bool ok_value_is_native_value(ok_value p_value) {
++  return IS_VALUE_NATIVE_VALUE(p_value);
++}
++
++bool ok_gc_mark_value(ok* p_ok, ok_value p_value) {
++  return gc_mark_value_user(&p_ok->gc, p_value);
++}
++
++uint32_t ok_root(ok* p_ok, ok_value p_value) {
++  // null is the roots' free-slot marker, so rooting it cannot be supported.
++  if (IS_VALUE_STRICTLY_NULL(p_value)) {
++    return OK_ROOT_INVALID;
++  }
++  return gc_root(&p_ok->gc, p_value);
++}
++
++bool ok_unroot(ok* p_ok, uint32_t p_root) {
++  return gc_unroot(&p_ok->gc, p_root);
++}
+diff --git a/src/okgc.c b/src/okgc.c
+index 67533a6..7ee3e90 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -17,6 +17,11 @@
+ #define GC_GROWTH_FACTOR 2
+ 
+ ARRAY_DEFINE_DEFAULT(grays, object*, ARRAY_DEFAULT_TYPE_DEINIT)
++ARRAY_DEFINE_DEFAULT(gc_root_freelist, uint32_t, ARRAY_DEFAULT_TYPE_DEINIT)
++
++static bool collect(gc* p_gc);
++static bool trace(gc* p_gc);
++static bool mark_value(gc* p_gc, value p_value);
+ 
+ void gc_init(gc* p_gc, object_store* p_heap, allocators* p_alloc) {
+   p_gc->compiler = NULL;
+@@ -28,15 +33,21 @@ void gc_init(gc* p_gc, object_store* p_heap, allocators* p_alloc) {
+   p_gc->allocated_bytes = 0;
+   p_gc->next = 1024 * 1024; // 1mb
+   grays_init(&p_gc->grays, &p_gc->raw_alloc_wrapper);
++  // raw allocator on purpose: rooting must never itself trigger the collector.
++  value_array_init(&p_gc->roots, &p_gc->raw_alloc_wrapper);
++  gc_root_freelist_init(&p_gc->root_freelist, &p_gc->raw_alloc_wrapper);
+   for (uint32_t i = 0; i < OK_GC_GUARD_CAPACITY; ++i) {
+     p_gc->guarded[i] = NULL_AS_VALUE();
+   }
+   p_gc->guard_count = 0;
+   p_gc->is_paused = false;
++  p_gc->is_tracing = false;
+ }
+ 
+ void gc_deinit(gc* p_gc) {
+   grays_deinit(&p_gc->grays, &p_gc->raw_alloc_wrapper);
++  value_array_deinit(&p_gc->roots, &p_gc->raw_alloc_wrapper);
++  gc_root_freelist_deinit(&p_gc->root_freelist, &p_gc->raw_alloc_wrapper);
+   for (uint32_t i = 0; i < OK_GC_GUARD_CAPACITY; ++i) {
+     p_gc->guarded[i] = NULL_AS_VALUE();
+   }
+@@ -48,6 +59,7 @@ void gc_deinit(gc* p_gc) {
+   p_gc->allocated_bytes = 0;
+   p_gc->next = 1024 * 1024; // 1mb
+   p_gc->is_paused = true;
++  p_gc->is_tracing = false;
+ }
+ 
+ bool gc_guard_up(gc* p_gc, value p_value) {
+@@ -68,6 +80,41 @@ void gc_guard_down(gc* p_gc) {
+   }
+ }
+ 
++uint32_t gc_root(gc* p_gc, value p_value) {
++  // caller rejects strictly-null values: a null slot is the free marker.
++  if (p_gc->root_freelist.count > 0) {
++    const uint32_t slot = p_gc->root_freelist.data[p_gc->root_freelist.count - 1];
++    gc_root_freelist_pop(&p_gc->root_freelist);
++    p_gc->roots.data[slot] = p_value;
++    return slot + 1;
++  }
++  // the roots array uses the raw allocator: appending cannot collect, so
++  // p_value cannot be swept between entry and publication.
++  if (!value_array_append(&p_gc->roots, p_value)) {
++    return 0;
++  }
++  return p_gc->roots.count;
++}
++
++bool gc_unroot(gc* p_gc, uint32_t p_root) {
++  if (p_root == 0 || p_root > p_gc->roots.count) {
++    return false;
++  }
++  value* slot = &p_gc->roots.data[p_root - 1];
++  if (IS_VALUE_STRICTLY_NULL(*slot)) {
++    return false; // already freed (double unroot)
++  }
++  *slot = NULL_AS_VALUE();
++  return gc_root_freelist_append(&p_gc->root_freelist, p_root - 1);
++}
++
++bool gc_mark_value_user(gc* p_gc, value p_value) {
++  if (!p_gc->is_tracing) {
++    return false;
++  }
++  return mark_value(p_gc, p_value);
++}
++
+ void gc_pause(gc* p_gc) {
+   p_gc->is_paused = true;
+ }
+@@ -88,9 +135,6 @@ void gc_watch_globals(gc* p_gc, globals_store* p_globals) {
+   p_gc->globals_store = p_globals;
+ }
+ 
+-static bool collect(gc* p_gc);
+-static bool trace(gc* p_gc);
+-
+ bool gc_collect(gc* p_gc, size_t p_predict, size_t p_old) {
+   p_gc->allocated_bytes += p_predict - p_old;
+ 
+@@ -190,6 +234,12 @@ static bool mark(gc* p_gc) {
+       return false;
+     }
+   }
++  for (uint32_t i = 0; i < p_gc->roots.count; ++i) {
++    // freed slots hold tagged null and mark_value's strict check skips them.
++    if (!mark_value(p_gc, p_gc->roots.data[i])) {
++      return false;
++    }
++  }
+   return true;
+ }
+ 
+@@ -297,6 +347,19 @@ static bool trace_object(gc* p_gc, object* p_object) {
+     }
+     break;
+   }
++  case OBJ_NATIVE_VALUE: {
++    // the embedder's structure is opaque to the collector: the tracer walks
++    // it and reports every ok_value it still holds through ok_gc_mark_value.
++    // (pre-0.1.0 these values were untraceable, so any ok_value stashed in a
++    // host structure could be swept mid-use -- the dorg3 fork-array hole.)
++    object_native_value* native = (object_native_value*)p_object;
++    if (native->tracer != NULL && p_gc->vm != NULL) {
++      if (!native->tracer(p_gc->vm->ok, native->user_data)) {
++        return false;
++      }
++    }
++    break;
++  }
+   case OBJ_ARRAY: {
+     if (!mark_value_array(p_gc, &((object_array*)p_object)->values)) {
+       return false;
+@@ -308,15 +371,14 @@ static bool trace_object(gc* p_gc, object* p_object) {
+ }
+ 
+ static bool trace(gc* p_gc) {
+-  while (p_gc->grays.count > 0) {
++  bool res = true;
++  p_gc->is_tracing = true;
++  while (res && p_gc->grays.count > 0) {
+     uint32_t index = p_gc->grays.count - 1;
+     object* obj = p_gc->grays.data[index];
+-    if (!trace_object(p_gc, obj)) {
+-      return false;
+-    }
+-    if (!grays_remove(&p_gc->grays, index, index)) {
+-      return false;
+-    }
++    res = trace_object(p_gc, obj);
++    res = res && grays_remove(&p_gc->grays, index, index);
+   }
+-  return true;
++  p_gc->is_tracing = false;
++  return res;
+ }
+diff --git a/src/okgc.h b/src/okgc.h
+index e69646e..9d8c17c 100644
+--- a/src/okgc.h
++++ b/src/okgc.h
+@@ -10,6 +10,7 @@
+ #ifdef OK_GC_EXPOSE
+ #include "okarray.h"
+ ARRAY_DECLARE_DEFAULT(grays, object*)
++ARRAY_DECLARE_DEFAULT(gc_root_freelist, uint32_t)
+ #define OK_GC_GUARD_CAPACITY 16
+ struct gc {
+   size_t allocated_bytes;
+@@ -19,11 +20,18 @@ struct gc {
+   object_store* object_store;
+   globals_store* globals_store;
+   grays grays;
++  // embedder-owned strong references (ok_root). unlike the guard stack these
++  // are long lived and unordered, so: growable, null-slot + freelist recycling.
++  value_array roots;
++  gc_root_freelist root_freelist;
+   value guarded[OK_GC_GUARD_CAPACITY];
+   uint32_t guard_count;
+   allocators* alloc;
+   allocators raw_alloc_wrapper;
+   bool is_paused;
++  // true only while trace() drains the gray stack: the window in which
++  // ok_gc_mark_value (from ok_native_tracer callbacks) is legal.
++  bool is_tracing;
+ };
+ #endif // OK_GC_EXPOSE
+ 
+@@ -33,6 +41,14 @@ void gc_deinit(gc* p_gc);
+ bool gc_collect(gc* p_gc, const size_t p_predict, const size_t p_old);
+ bool gc_guard_up(gc* p_gc, value p_value);
+ void gc_guard_down(gc* p_gc);
++
++// embedder rooting: ids are slot + 1, 0 is invalid, slots recycle via freelist.
++uint32_t gc_root(gc* p_gc, value p_value);
++bool gc_unroot(gc* p_gc, uint32_t p_root);
++
++// ok_gc_mark_value's engine: refuses to run outside a trace (stray gray
++// entries would be walked by the next collect against swept objects).
++bool gc_mark_value_user(gc* p_gc, value p_value);
+ void gc_pause(gc* p_gc);
+ void gc_resume(gc* p_gc);
+ 
+diff --git a/src/okobject.c b/src/okobject.c
+index 1906b33..2516946 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -156,10 +156,12 @@ object_upvalue* create_object_upvalue(uint32_t p_location, object_specs* p_specs
+ void object_native_value_init(object_native_value* p_native_value,
+                               void* p_user_data,
+                               ok_native_destructor p_destructor,
++                              ok_native_tracer p_tracer,
+                               object_specs* p_specs) {
+   object_init(&p_native_value->object, OBJ_NATIVE_VALUE);
+   p_native_value->user_data = p_user_data;
+   p_native_value->destructor = p_destructor;
++  p_native_value->tracer = p_tracer;
+ }
+ 
+ void object_native_value_deinit(object_native_value* p_native_value, object_specs* p_specs) {
+@@ -170,14 +172,16 @@ void object_native_value_deinit(object_native_value* p_native_value, object_spec
+   object_deinit(&p_native_value->object);
+ }
+ 
+-object_native_value*
+-create_object_native_value(void* p_user_data, ok_native_destructor p_destructor, object_specs* p_specs) {
++object_native_value* create_object_native_value(void* p_user_data,
++                                                ok_native_destructor p_destructor,
++                                                ok_native_tracer p_tracer,
++                                                object_specs* p_specs) {
+   object_native_value* native_value =
+       (object_native_value*)p_specs->alloc->allocate(p_specs->alloc, sizeof(object_native_value));
+   if (native_value == NULL) {
+     return NULL;
+   }
+-  object_native_value_init(native_value, p_user_data, p_destructor, p_specs);
++  object_native_value_init(native_value, p_user_data, p_destructor, p_tracer, p_specs);
+   object_store_append(p_specs->store, (object*)native_value);
+   return native_value;
+ }
+diff --git a/src/okobject.h b/src/okobject.h
+index dd2ca97..9c2397d 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -113,10 +113,13 @@ typedef struct {
+   object object;
+   void* user_data;
+   ok_native_destructor destructor;
++  ok_native_tracer tracer; // NULL: opaque to the collector (no ok_values inside)
+ } object_native_value;
+ 
+-object_native_value*
+-create_object_native_value(void* p_user_data, ok_native_destructor p_destructor, object_specs* p_specs);
++object_native_value* create_object_native_value(void* p_user_data,
++                                                ok_native_destructor p_destructor,
++                                                ok_native_tracer p_tracer,
++                                                object_specs* p_specs);
+ 
+ typedef struct {
+   object object;
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index fc310a5..6d62743 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -4,6 +4,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <vector>
+ 
+ static int g_destructor_calls = 0;
+ 
+@@ -72,6 +73,39 @@ static void native_destructor(void* ptr) {
+   g_destructor_calls++;
+ }
+ 
++// ---- rooting + traced natives: the dorg3 host-stash pattern, now supported ----
++
++struct string_bag {
++  std::vector<ok_value> items;
++  int* destructor_calls;
++};
++
++static bool string_bag_trace(ok* p_ok, void* p_data) {
++  auto* bag = static_cast<string_bag*>(p_data);
++  for (ok_value item : bag->items) {
++    if (!ok_gc_mark_value(p_ok, item)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++static void string_bag_destructor(void* p_data) {
++  auto* bag = static_cast<string_bag*>(p_data);
++  (*bag->destructor_calls)++;
++  delete bag;
++}
++
++static ok_value native_bag_item(ok* p_ok, uint8_t argc, const ok_value* argv) {
++  (void)p_ok;
++  assert(argc == 2);
++  auto* bag = static_cast<string_bag*>(ok_value_as_native_value(argv[0]));
++  assert(bag != nullptr);
++  const uint32_t index = static_cast<uint32_t>(ok_value_as_number(argv[1]));
++  assert(index < bag->items.size());
++  return bag->items[index];
++}
++
+ static ok_value native_get_opaque(ok* p_ok, uint8_t argc, const ok_value* argv) {
+   (void)p_ok;
+ 
+@@ -160,7 +194,7 @@ int main() {
+ 
+   int* userdata = new int(44);
+ 
+-  ok_value native_value = ok_native_value_new(vm, userdata, native_destructor);
++  ok_value native_value = ok_native_value_new(vm, userdata, native_destructor, nullptr);
+ 
+   assert(ok_value_is_object(native_value));
+   assert(ok_value_as_native_value(native_value) == userdata);
+@@ -195,18 +229,18 @@ int main() {
+     }
+ 
+     let a = host_add(22, 22);
+-    if a != 44? print "bad: add";
++    if a != 44 { print "bad: add"; }
+ 
+-    if host_number != 44? print "bad: number";
++    if host_number != 44 { print "bad: number"; }
+ 
+     host_mutable = 99;
+-    if host_mutable != 99? print "bad: mutable";
++    if host_mutable != 99 { print "bad: mutable"; }
+ 
+     let echoed = host_echo("hello");
+-    if echoed != "hello"? print "bad: echo";
++    if echoed != "hello" { print "bad: echo"; }
+ 
+     let object_value = host_get_object(host_object);
+-    if object_value != 44? print "bad: object";
++    if object_value != 44 { print "bad: object"; }
+ 
+     // native -> vm callback while main's frame is on the call stack (the
+     // array_foreach pattern from dorg3). exercises ok_call with top > 0.
+@@ -215,7 +249,7 @@ int main() {
+     }
+ 
+     let applied = host_apply(double_it, 21);
+-    if applied != 42? print "bad: apply";
++    if applied != 42 { print "bad: apply"; }
+   )";
+ 
+   ok_source source = {
+@@ -350,9 +384,96 @@ int main() {
+ 
+   assert(ok_value_as_number(recover_result) == 3);
+ 
++  // ---- roots + traced native values ----
++
++  // null is the free-slot marker, so rooting it is rejected.
++  assert(ok_root(vm, ok_value_null()) == OK_ROOT_INVALID);
++
++  ok_value rooted_string = ok_value_string(vm, ok_create_string_view("rooted", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  const uint32_t root_id = ok_root(vm, rooted_string);
++  assert(root_id != OK_ROOT_INVALID);
++  assert(ok_unroot(vm, root_id));
++  assert(!ok_unroot(vm, root_id)); // double unroot is rejected
++  const uint32_t recycled_id = ok_root(vm, rooted_string);
++  assert(recycled_id == root_id); // freelist recycles LIFO
++  assert(ok_unroot(vm, recycled_id));
++  // contract demonstration: rooted_string is no longer reachable from any
++  // root, so the very next allocation may sweep it. do not touch the value
++  // after its unroot -- negative checks use a value we know is alive.
++  assert(!ok_value_is_native_value(ok_value_number(42)));
++
++  int bag_destructor_calls = 0;
++  auto* bag = new string_bag{{}, &bag_destructor_calls};
++
++  ok_value bag_value = ok_native_value_new(vm, bag, string_bag_destructor, string_bag_trace);
++  assert(ok_value_is_object(bag_value));
++  assert(ok_value_is_native_value(bag_value));
++  assert(ok_value_as_native_value(bag_value) == bag);
++
++  // root BEFORE populating: from here on, every collection walks the vector's
++  // current contents through string_bag_trace.
++  const uint32_t bag_root = ok_root(vm, bag_value);
++  assert(bag_root != OK_ROOT_INVALID);
++
++  assert(ok_global_define_native_function(
++      vm, ok_create_string_view("bag_item", OK_STRING_VIEW_CALCULATE_LENGTH, true), 2, native_bag_item));
++
++  for (int i = 0; i < 8; ++i) {
++    char buffer[32];
++    std::snprintf(buffer, sizeof(buffer), "bag item %d", i);
++    // each creation allocates: under aggressive collection the earlier items
++    // stay alive only through the rooted bag's tracer.
++    bag->items.push_back(ok_value_string(vm, ok_create_string_view(buffer, OK_STRING_VIEW_CALCULATE_LENGTH, true)));
++  }
++
++  // allocation churn with the bag reachable only via the root + tracer.
++  const char* churn_code = R"(
++    glob fu churn(n) {
++      let mut sink = "";
++      for let i = 0 : n {
++        sink = sink + "chunk " + i as str;
++      }
++      return sink;
++    }
++
++    let s = churn(300);
++    if s == "" {
++      print "bad: churn";
++    }
++  )";
++
++  ok_source churn_source = {
++      .from = OK_FROM_FILE,
++      .code = churn_code,
++      .path = "churn",
++  };
++
++  result = ok_run(vm, churn_source);
++  assert(result == OK);
++
++  // the strings survived the churn: read one back out through the VM.
++  ok_value bag_item = ok_value_null();
++  assert(ok_global_get(vm, ok_create_string_view("bag_item", OK_STRING_VIEW_CALCULATE_LENGTH, true), &bag_item));
++
++  ok_value bag_args[] = {
++      bag_value,
++      ok_value_number(3),
++  };
++
++  ok_value bag_result = ok_value_null();
++  assert(ok_call(vm, bag_item, 2, bag_args, &bag_result));
++  assert(ok_value_is_string(bag_result));
++
++  ok_cstring_view bag_text = ok_value_as_string(bag_result);
++  assert(std::strcmp(bag_text.chars, "bag item 3") == 0);
++  ok_cstring_view_deinit(&bag_text);
++
++  assert(ok_unroot(vm, bag_root));
++
+   ok_free(vm);
+ 
+   assert(g_destructor_calls == 1);
++  assert(bag_destructor_calls == 1);
+ 
+   std::puts("embedding API: OK");
+   return 0;

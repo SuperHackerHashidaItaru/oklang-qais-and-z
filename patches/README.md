@@ -47,6 +47,27 @@ order (each patch is stacked on the previous):
 5. `11-as-operator-e2e-tests.patch` — the 5 `operators/as/` tests that 09's
    entry claimed but never actually shipped (your 206 vs my 211).
    conversion matrix + error cases; `as` had zero coverage before.
+6. `12-gc-rooting-and-traced-natives.patch` — vs `bc272e3` (master after the
+   no-question merge). the rooting api: `ok_native_tracer` callback +
+   `ok_gc_mark_value` (trace-phase-gated via `gc.is_tracing`), `ok_root`/
+   `ok_unroot` with a recycled-id freelist, roots marked in `mark()`,
+   `trace_object` OBJ_NATIVE_VALUE case. **breaking**: `ok_native_value_new`
+   takes a 4th tracer arg (dorg3 ports with `, nullptr`). also fixes the
+   embed test's stale `?` syntax — it was red on master (§2 of the guide).
+   embed test grows the string-bag traced-native + root-recycling sections.
+7. `13-array-public-api.patch` — stacked on 12. `ok_array_new/get/set/push/
+   len` + `ok_value_is_array`, with the OP_ARRAY_NEW guard pattern adapted
+   to host-held (invisible) values. the fork-array workaround's replacement.
+8. `14-print-hook.patch` — stacked on 13. `ok_set_print(ok*, cb, ctx)`: print
+   routes the raw value to the host, CLI default byte-identical. the
+   playground's stdout capture.
+9. `15-ci-aggressive-lane.patch` — independent (yaml only). adds the
+   aggressive-asan matrix entry to ci.yml — the lane that catches the
+   167-NOTOK class.
+
+   12–15 verified: e2e 211/211 x plain/asan/asan-aggr, embed test x3, fresh
+   sequential apply on bc272e3 + rebuild + full gate. contracts and the
+   unexposed-features audit: `REVIEW-GUIDE-round15.md`.
 
 `REVIEW-GUIDE-night13.md` (+ its addendum) — the whole-night bulk-review
 guide: per-patch where-to-look, the 06 proof obligations, the bench read

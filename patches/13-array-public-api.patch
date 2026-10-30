@@ -1,0 +1,175 @@
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index 32c5ab8..00dae21 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -78,6 +78,28 @@ ok_value ok_native_value_new(ok* p_ok,
+ void* ok_value_as_native_value(ok_value p_value);
+ bool ok_value_is_native_value(ok_value p_value);
+ 
++/* arrays */
++
++// builds a new array from p_count host values. p_items may be NULL when
++// p_count is 0. returns a null value on allocation failure.
++ok_value ok_array_new(ok* p_ok, const ok_value* p_items, uint32_t p_count);
++
++bool ok_value_is_array(ok_value p_value);
++
++// 0 for anything that is not an array.
++uint32_t ok_array_len(ok_value p_value);
++
++// out of bounds (or not an array): null.
++ok_value ok_array_get(ok_value p_value, uint32_t p_index);
++
++// out of bounds (or not an array): false, no store happens.
++bool ok_array_set(ok_value p_value, uint32_t p_index, ok_value p_new_value);
++
++// appends. the array and the value are guarded against the collector for the
++// duration of the call; keeping either alive afterwards is the host's job
++// (ok_root, a traced native value, registers, or a global).
++bool ok_array_push(ok* p_ok, ok_value p_array, ok_value p_value);
++
+ /* gc interop (embedder side) */
+ 
+ // only valid inside an ok_native_tracer callback: marks p_value (and
+diff --git a/src/ok.c b/src/ok.c
+index 6785b1e..6069c00 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -484,3 +484,69 @@ uint32_t ok_root(ok* p_ok, ok_value p_value) {
+ bool ok_unroot(ok* p_ok, uint32_t p_root) {
+   return gc_unroot(&p_ok->gc, p_root);
+ }
++
++ok_value ok_array_new(ok* p_ok, const ok_value* p_items, uint32_t p_count) {
++  object_specs s = {.alloc = &p_ok->alloc, .store = &p_ok->objects_store};
++  object_array* arr = create_object_array(&s);
++  if (arr == NULL) {
++    return NULL_AS_VALUE();
++  }
++  // mirror OP_ARRAY_NEW: between creation and publication the array is linked
++  // in the store yet unreachable, and every append grows through the gc-aware
++  // allocator (collects). the items are host locals, equally invisible: guard
++  // the array for the whole loop and each item across its own append. guard
++  // depth peaks at 2 (capacity 16), mirroring the VM's unchecked pattern.
++  gc_guard_up(&p_ok->gc, OBJECT_AS_VALUE(arr));
++  for (uint32_t i = 0; i < p_count; ++i) {
++    gc_guard_up(&p_ok->gc, p_items[i]);
++    const bool appended = value_array_append(&arr->values, p_items[i]);
++    gc_guard_down(&p_ok->gc);
++    if (!appended) {
++      gc_guard_down(&p_ok->gc);
++      return NULL_AS_VALUE();
++    }
++  }
++  gc_guard_down(&p_ok->gc);
++  return OBJECT_AS_VALUE(arr);
++}
++
++bool ok_value_is_array(ok_value p_value) {
++  return IS_VALUE_ARRAY(p_value);
++}
++
++uint32_t ok_array_len(ok_value p_value) {
++  if (!IS_VALUE_ARRAY(p_value)) {
++    return 0;
++  }
++  return VALUE_AS_ARRAY(p_value)->values.count;
++}
++
++ok_value ok_array_get(ok_value p_value, uint32_t p_index) {
++  if (!IS_VALUE_ARRAY(p_value) || p_index >= VALUE_AS_ARRAY(p_value)->values.count) {
++    return NULL_AS_VALUE();
++  }
++  return VALUE_AS_ARRAY(p_value)->values.data[p_index];
++}
++
++bool ok_array_set(ok_value p_value, uint32_t p_index, ok_value p_new_value) {
++  if (!IS_VALUE_ARRAY(p_value) || p_index >= VALUE_AS_ARRAY(p_value)->values.count) {
++    return false;
++  }
++  VALUE_AS_ARRAY(p_value)->values.data[p_index] = p_new_value;
++  return true;
++}
++
++bool ok_array_push(ok* p_ok, ok_value p_array, ok_value p_value) {
++  if (!IS_VALUE_ARRAY(p_array)) {
++    return false;
++  }
++  // unlike the ' push' core native (whose arguments are rooted through the
++  // caller's register window), a host-held array and value are invisible to
++  // the collector: both need the guard while the append may grow (collect).
++  gc_guard_up(&p_ok->gc, p_array);
++  gc_guard_up(&p_ok->gc, p_value);
++  const bool appended = value_array_append(&VALUE_AS_ARRAY(p_array)->values, p_value);
++  gc_guard_down(&p_ok->gc);
++  gc_guard_down(&p_ok->gc);
++  return appended;
++}
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index 6d62743..a424c52 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -470,6 +470,63 @@ int main() {
+ 
+   assert(ok_unroot(vm, bag_root));
+ 
++  // ---- arrays from the host side ----
++
++  ok_value empty_array = ok_array_new(vm, nullptr, 0);
++  assert(ok_value_is_array(empty_array));
++  assert(ok_array_len(empty_array) == 0);
++  assert(ok_value_is_null(ok_array_get(empty_array, 0)));
++  assert(!ok_array_set(empty_array, 0, ok_value_number(1)));
++
++  // 16 items on purpose: the values buffer must grow mid-construction, which
++  // collects under the aggressive build -- the guards must hold.
++  ok_value items[16];
++  for (uint32_t i = 0; i < 16; ++i) {
++    items[i] = ok_value_number((double)(i * i));
++  }
++  ok_value squares = ok_array_new(vm, items, 16);
++  assert(ok_value_is_array(squares));
++  assert(ok_array_len(squares) == 16);
++  assert(ok_value_as_number(ok_array_get(squares, 7)) == 49);
++  assert(ok_value_is_null(ok_array_get(squares, 16))); // oob is null
++  assert(!ok_value_is_array(ok_value_number(42)));
++  assert(ok_array_len(ok_value_number(42)) == 0);
++
++  assert(ok_array_set(squares, 0, ok_value_number(100)));
++  assert(ok_value_as_number(ok_array_get(squares, 0)) == 100);
++  assert(!ok_array_set(squares, 99, ok_value_number(1))); // oob rejected
++
++  // hand it to the script and read back what the script did to it.
++  assert(ok_global_define(vm, ok_create_string_view("host_array", OK_STRING_VIEW_CALCULATE_LENGTH, true), squares, false));
++
++  assert(ok_array_push(vm, squares, ok_value_string(vm, ok_create_string_view("tail", OK_STRING_VIEW_CALCULATE_LENGTH, true))));
++  assert(ok_array_len(squares) == 17);
++  assert(ok_value_is_string(ok_array_get(squares, 16)));
++
++  const char* array_code = R"(
++    if host_array[0] != 100 {
++      print "bad: host->script array read";
++    }
++    if len(host_array) != 17 {
++      print "bad: script sees host push";
++    }
++    host_array[1] = 12345;
++    push(host_array, 7);
++  )";
++
++  ok_source array_source = {
++      .from = OK_FROM_FILE,
++      .code = array_code,
++      .path = "array",
++  };
++
++  result = ok_run(vm, array_source);
++  assert(result == OK);
++
++  assert(ok_value_as_number(ok_array_get(squares, 1)) == 12345); // script -> host write
++  assert(ok_array_len(squares) == 18);                            // script push -> host len
++  assert(ok_value_as_number(ok_array_get(squares, 17)) == 7);
++
+   ok_free(vm);
+ 
+   assert(g_destructor_calls == 1);

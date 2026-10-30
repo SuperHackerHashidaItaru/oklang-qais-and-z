@@ -1,0 +1,15 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 08b9490..d0b424c 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -26,6 +26,10 @@ jobs:
+             cmake-flags: '-DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14'
+           - name: asan
+             cmake-flags: '-DCMAKE_BUILD_TYPE=Release -DOK_ENABLE_SANITIZERS=ON -DCMAKE_CXX_COMPILER=g++-14'
++          # the standing local gate, finally in CI: this lane caught the
++          # ok_run staging sweep (167 NOTOK) that plain+asan both missed.
++          - name: aggressive-asan
++            cmake-flags: '-DCMAKE_BUILD_TYPE=Release -DOK_ENABLE_SANITIZERS=ON -DOK_AGGRESSIVE_GC=ON -DCMAKE_CXX_COMPILER=g++-14'
+           - name: coverage
+             cmake-flags: '-DCMAKE_BUILD_TYPE=Coverage -DCMAKE_CXX_COMPILER=g++-14'
+     steps:
