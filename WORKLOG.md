@@ -447,3 +447,22 @@ Stage Summary:
 - the branch was ~90% done and the design is sound: 7 contained defects, 6 mechanical + 1 semantic decision. after the patch: e2e 210/211, all four design items functionally complete.
 - branch landing order: decide glob-vs-prelude, apply 09, README `?` sweep, clang-format, re-run benches. then master is post-1.0-grade syntax for game work.
 - next (chat): language timeline (imports/errors/classes ordering now informed by dorg3 script pain + this branch) and the game question.
+
+## session 13.2 — the asan+aggr failure i shipped past: gc guard stack + ok_run rooting
+
+Task: owner applied patch 09 — plain build green, but his standing gate (asan + aggressive gc, the real C++ runner) caught what my 13.1 protocol regression missed: [39 OK], [167 NOTOK], SEGV-null at run_until:1373 on the first fetch / UAF in mark_object during create_object_closure. "it did not used to be here!" — correct, and it is my miss: 13.1 shipped on plain gcc with a hand-rolled python runner instead of the matrix. also: his ruling on glob-let-len (past assumption; for-in loads ' len' directly; current behavior is correct), and the game question re-asked ("by halloween" was never real — he knew when he asked, lol).
+
+Work Log:
+- owned the process failure, then restored the gate before anything else: real runner + plain/asan/asan-aggr matrix. it stays — every patch from here ships with all three numbers.
+- reproduced exactly: [39 OK], [172 NOTOK] locally (his 167 + the 5 as/ tests patch 09's README claimed but never shipped). both crash shapes confirmed — his SEGV and my ASan UAF are the same corpse; quarantine luck decides which fires.
+- root cause: the branch inserted ok_get_top_level_values between compiler_compile and vm_interpret. each of its 7 ok_global_get lookups allocates a fresh hashed key string (globals_store_get:82), and under OK_AGGRESSIVE_GC every allocation collects — while the compiled top-level function is reachable only from a C local (compiler contexts are empty after compile; mark roots are registers/call-stack/upvalues/globals/guard). swept. vm_interpret then guards the freed pointer: still in quarantine → UAF in mark; already recycled into a zeroed allocation → chunk.code.data reads 0 → ip == NULL → SEGV at the first READ_WORD. master was safe only because its ok_run had no allocating step between compile and vm_interpret's guard.
+- clean signature found: all 39 pre-fix passers are expect-error tests — everything that reached bytecode died, everything that bailed at parse/compile lived.
+- fix (patch 10): ok_run guards compile_result.function across the whole gap (and checks the return — an unrootable function must not run); the single guard value became a 16-deep stack, retiring vm_interpret's "TODO array based gc guard". nested pairs now compose instead of colliding (the compile-phase pairs in begin_context / compile_function_decl / ok_global_define survive today only by being carefully sequential); underflow-down is a no-op instead of releasing someone else's guard; mark() walks all live slots.
+- shadow_len_does_not_invalidate_for_in.ok rewritten to the ruled semantics: for-in iterates under a user glob let len, len(arr) still calls the builtin. (the old expect: 67 encoded master's plain-global len; printing the native embeds a raw pointer, so the test asserts behavior, not formatting.)
+- verification: 211/211 x plain/asan/asan-aggr in-sandbox, AND on a fresh 0a88601 → 09 → 10 → 11 clone (plain and asan+aggr). patch 11 ships the 5 operators/as/ tests. pedantic-warning build clean in the touched files (ok.c's raw_decls missing-field-initializers warnings are pre-existing branch code).
+- artifacts: patches/10, patches/11, patches/POSTMORTEM-aggressive-gc.md (both stacks, mechanism, follow-ups: cached global ids would kill the 7 transient allocs per run; optional warning for glob-let names swallowed by the hidden scope; the embedding rooting protocol — this crash is the internal twin of the dorg3 host-stash hole, and imports will multiply these handoffs).
+
+Stage Summary:
+- the branch is clean under the full gate: 211/211 everywhere on a fresh stack. landing order: apply 10 + 11, README '?' sweep, clang-format, re-run benches, merge.
+- protocol debt paid: the gate is the gate again.
+- next (chat): language timeline — this bug is the argument for rooting discipline riding with imports (each import adds a compile→load→run handoff window exactly like today's), then errors, then classes. and the game: not by halloween; honest-scope when the energy shows up.

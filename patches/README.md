@@ -29,6 +29,25 @@ order (each patch is stacked on the previous):
    locals-first + add a warning). plus new `operators/as/` tests (the
    operator had zero coverage).
 
+4. `10-gc-guard-stack-and-okrun-rooting.patch` — stacked on 09. fixes the
+   asan+aggr mass failure your gate caught ([39 OK], [167 NOTOK]): the
+   branch's `ok_get_top_level_values` allocates between compile and
+   vm_interpret (a fresh hashed key string per `globals_store_get`),
+   aggressive gc swept the compiled function that was reachable only from
+   a C local, and vm_interpret guarded a corpse → UAF in mark, or a
+   recycled-zeroed chunk → SEGV on `ip == NULL` at the first fetch.
+   master was safe only because it had no allocating step in that window.
+   fix: ok_run guards the function across the gap + the guard slot became
+   a 16-deep stack (retires vm_interpret's `TODO array based gc guard`;
+   nested pairs compose, underflow-down is a no-op). also updates
+   `shadow_len_does_not_invalidate_for_in.ok` to your ruling (for-in reads
+   `' len'` directly; `len(arr)` still the builtin).
+   e2e 211/211 x plain/asan/asan-aggr, verified again on a fresh
+   0a88601+09+10+11 clone. full story: `POSTMORTEM-aggressive-gc.md`.
+5. `11-as-operator-e2e-tests.patch` — the 5 `operators/as/` tests that 09's
+   entry claimed but never actually shipped (your 206 vs my 211).
+   conversion matrix + error cases; `as` had zero coverage before.
+
 `REVIEW-GUIDE-night13.md` (+ its addendum) — the whole-night bulk-review
 guide: per-patch where-to-look, the 06 proof obligations, the bench read
 with its noise-floor analysis, the CI setup steps, open items.
