@@ -27,17 +27,19 @@ jobs:
     steps:
       - name: checkout collab
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends lua5.4 hyperfine
+          sudo apt-get install -y --no-install-recommends lua5.4 hyperfine g++-14
           sudo ln -sf /usr/bin/lua5.4 /usr/local/bin/lua
           lua -v
           hyperfine --version
 
       - name: clone oklang
-        run: git clone --depth 1 --branch "${OKLANG_REF}" https://codeberg.org/qais/oklang.git /tmp/oklang
+        run: git clone --depth 1 --branch "${OKLANG_REF}" https://codeberg.org /tmp/oklang
         env:
           OKLANG_REF: ${{ inputs.oklang_ref || 'master' }}
 
@@ -84,11 +86,12 @@ jobs:
       - name: commit results
         run: |
           git config user.name "bench-bot"
-          git config user.email "bench-bot@users.noreply.github.com"
+          git config user.email "bench-bot@://github.com"
           git add bench/results/
           if git diff --cached --quiet; then
             echo "no result changes, nothing to commit"
           else
             git commit -m "bench: automated run (oklang ${OKLANG_SHA:0:7})"
-            git push
+            git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@://github.com{{ github.repository }}.git HEAD:${{ github.ref }}
           fi
+
