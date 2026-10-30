@@ -1,0 +1,199 @@
+diff --git a/src/okchunk.h b/src/okchunk.h
+index ed1dfde..aba91b1 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -249,9 +249,9 @@ ARRAY_DECLARE_DEFAULT(identifiers, string)
+ #define bprime_LOFFSET (aprime_LOFFSET + 12u)
+ 
+ #define A_LARGE_MASK UINT32_C(0x00ffff00)
+-#define e_LARGE_MASK UINT32_C(0x00000010)
++#define e_LARGE_MASK UINT32_C(0x07000000) // 3 bit width (returned enum is 0..6)
+ #define A_LARGE_LOFFSET a_LOFFSET
+-#define e_LARGE_LOFFSET b_LOFFSET
++#define e_LARGE_LOFFSET c_LOFFSET
+ 
+ // 2 words
+ 
+@@ -315,7 +315,7 @@ static inline word encode_oppA(const opcode p_op, const bool p_p, const uint16_t
+          (((uint32_t)p_A) << A_LARGE_LOFFSET) & A_LARGE_MASK;
+ }
+ 
+-static inline word encode_oppAe(const opcode p_op, const bool p_p, const uint16_t p_A, const bool p_e) {
++static inline word encode_oppAe(const opcode p_op, const bool p_p, const uint16_t p_A, const uint8_t p_e) {
+   return ((uint32_t)p_op << op_LOFFSET) & op_MASK | (((uint32_t)p_p) << p_LOFFSET) & p_MASK |
+          (((uint32_t)p_A) << A_LARGE_LOFFSET) & A_LARGE_MASK | (((uint32_t)p_e) << e_LARGE_LOFFSET) & e_LARGE_MASK;
+ }
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index fe90580..2b6668d 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -290,7 +290,8 @@ add_local(compiler* p_compiler, const variable_declaration p_declration, bool p_
+   // full flag set must be computed before any allocation: the metadata array copies the
+   // register at append time inside allocate_local, later changes to the local copy will drift.
+   register_flags flags =
+-      REGISTER_FLAG_LOCAL | REGISTER_FLAG_UNINITIALIZED |
++      REGISTER_FLAG_LOCAL |
++      (p_initialized ? REGISTER_FLAG_NONE : REGISTER_FLAG_UNINITIALIZED) |
+       ((p_declration.flags & VARIABLE_DECLARATION_FLAGS_MUTABLE) != 0 ? REGISTER_FLAG_MUTABLE : REGISTER_FLAG_NONE);
+   _register reg = {0, flags, REGISTER_OK};
+   allocators* alloc = p_compiler->alloc;
+@@ -324,7 +325,7 @@ add_local(compiler* p_compiler, const variable_declaration p_declration, bool p_
+       }
+     }
+     reg.flags |=
+-        REGISTER_FLAG_UNINITIALIZED |
++        (p_initialized ? REGISTER_FLAG_NONE : REGISTER_FLAG_UNINITIALIZED) |
+         ((p_declration.flags & VARIABLE_DECLARATION_FLAGS_MUTABLE) != 0 ? REGISTER_FLAG_MUTABLE : REGISTER_FLAG_NONE);
+ 
+     if (!uint16_array_append(&scp->registers, reg.index)) {
+@@ -497,20 +498,26 @@ compile_result compiler_compile(compiler* p_compiler, compile_specs p_specs) {
+   if (!IS_REGISTER_VALID(add_local(p_compiler, decl, true, (ast_node*)p_specs.root))) {
+     goto ret;
+   }
+-  // if (!begin_scope(p_compiler, (ast_node*)p_specs.root)) { // hidden scope
+-  //   goto ret;
+-  // }
+-  // for (uint32_t i = 0; i < p_specs.top_level_declarations.count; ++i) {
+-  //   if (!IS_REGISTER_VALID(add_local(p_compiler, p_specs.top_level_declarations.data[i], true, p_specs.root))) {
+-  //     goto ret;
+-  //   }
+-  // }
+-  //
++  if (!begin_scope(p_compiler, (ast_node*)p_specs.root)) { // hidden scope
++    goto ret;
++  }
++  for (uint32_t i = 0; i < p_specs.top_level_declarations.count; ++i) {
++    if (!IS_REGISTER_VALID(
++            add_local(p_compiler, p_specs.top_level_declarations.data[i], true, (ast_node*)p_specs.root))) {
++      goto ret;
++    }
++  }
++
++  if (!begin_scope(p_compiler, (ast_node*)p_specs.root)) { // user top-level scope
++    goto ret;
++  }
++
+   bool res = compile_root(p_compiler, p_specs.root);
+   result.function = current_context(p_compiler)->function.function;
+   result.function->registers = current_context(p_compiler)->register_allocator.registers_count;
+   res &= emit_default_return(p_compiler, (ast_node*)p_specs.root);
+-  // res &= end_scope(p_compiler, (ast_node*)p_specs.root); // hidden scope
++  res &= end_scope(p_compiler, (ast_node*)p_specs.root); // user top-level scope
++  res &= end_scope(p_compiler, (ast_node*)p_specs.root); // hidden scope
+   res &= end_scope(p_compiler, (ast_node*)p_specs.root);
+   end_context(p_compiler);
+   if (p_compiler->had_error == false && res != false) {
+@@ -2181,9 +2188,7 @@ static bool compile_binary_value_operator(compiler* p_compiler,
+   }
+ 
+   const location_kind lhs_common_kind = LOCATION_KIND_CONSTANT;
+-  location_kind rhs_common_kind = (p_binexpr->_operator == OP_AS || p_binexpr->_operator == OP_AS_LONG)
+-                                      ? LOCATION_KIND_GLOBAL
+-                                      : LOCATION_KIND_CONSTANT;
++  location_kind rhs_common_kind = p_binexpr->_operator == OPERATOR_BIN_AS ? LOCATION_KIND_GLOBAL : LOCATION_KIND_CONSTANT;
+   bool is_long = p_dest.index > a_MAX || lhs.value.index > b_MAX || rhs.value.index > c_MAX;
+   bool is_lhs_p = false;
+   bool is_rhs_p = false;
+diff --git a/src/okdebug.c b/src/okdebug.c
+index 7f13c29..c544cfd 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -51,6 +51,8 @@ static const char* const OPCODE_NAMES[] = {
+     "DIVIDE",
+     "DIVIDE_LONG",
+     "MODULUS",
++    "AS",
++    "AS_LONG",
+     "MODULUS_LONG",
+     "EQUALS",
+     "EQUALS_LONG",
+@@ -64,8 +66,6 @@ static const char* const OPCODE_NAMES[] = {
+     "GREATER_EQUAL_LONG",
+     "LESS_EQUAL",
+     "LESS_EQUAL_LONG",
+-    "AS",
+-    "AS_LONG",
+     "PRINT",
+     "ARRAY_NEW",
+     "ARRAY_NEW_LONG",
+@@ -510,15 +510,25 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+         printf("r%u", B);
+       }
+       printf(" %s ", symbol);
++      // OP_AS reuses the p flag for a global operand (type tags), not a constant.
+       if (p) {
+-        print_constant_inline(chunk, C);
++        if (op == OP_AS_LONG) {
++          print_global_inline(p_disassembler, C);
++        } else {
++          print_constant_inline(chunk, C);
++        }
+       } else {
+         printf("r%u", C);
+       }
+     } else {
+       printf("r%u = r%u %s ", a, b, symbol);
++      // OP_AS reuses the p flag for a global operand (type tags), not a constant.
+       if (p) {
+-        print_constant_inline(chunk, c);
++        if (op == OP_AS) {
++          print_global_inline(p_disassembler, c);
++        } else {
++          print_constant_inline(chunk, c);
++        }
+       } else {
+         printf("r%u", c);
+       }
+diff --git a/src/okoperator.c b/src/okoperator.c
+index 84e9cc2..e46f8d5 100644
+--- a/src/okoperator.c
++++ b/src/okoperator.c
+@@ -28,6 +28,8 @@ operator_type operator_type_from_token_type(const token_type p_token_type, bool
+     return OPERATOR_BIN_LESS;
+   case TOKEN_LESS_EQUAL:
+     return OPERATOR_BIN_LESS_EQUAL;
++  case TOKEN_AS:
++    return OPERATOR_BIN_AS;
+   case TOKEN_LEFT_PAREN:
+     return OPERATOR_POS_CALL;
+   case TOKEN_LEFT_BRACKET:
+diff --git a/src/okparser.h b/src/okparser.h
+index aad2843..f6ed7c1 100644
+--- a/src/okparser.h
++++ b/src/okparser.h
+@@ -20,10 +20,10 @@ typedef enum {
+   PREC_EQUALITY,
+   PREC_COMPARISION,
+   PREC_SHIFT,
+-  PREC_AS,
+   PREC_SUM,
+   PREC_PRODUCT,
+   PREC_EXPONENT,
++  PREC_AS,
+   PREC_PREFIX,
+   PREC_POSTFIX,
+   PREC_CALL,
+diff --git a/src/okvm.c b/src/okvm.c
+index 7fd1331..9d7e032 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -985,7 +985,7 @@ static inline bool array_as_str(vm* p_vm, object* p_arr, value* p_result) {
+     return false;
+   }
+   *p_result = OBJECT_AS_VALUE(str);
+-  string_deinit(p_vm->alloc, &fstr); // here so obj str is rooted
++  string_deinit(&fstr, p_vm->alloc); // here so obj str is rooted
+   return true;
+ }
+ 
+@@ -1156,8 +1156,9 @@ static ok_value as_bool(vm* p_vm, value p_value, value* p_result) {
+     *p_result = p_value;
+   } else if (IS_VALUE_STRICTLY_NULL(p_value)) {
+     *p_result = BOOL_AS_VALUE(false);
++  } else {
++    *p_result = BOOL_AS_VALUE(true);
+   }
+-  *p_result = BOOL_AS_VALUE(true);
+   return true;
+ }
+ 

@@ -14,6 +14,21 @@ order (each patch is stacked on the previous):
    notes in the guide addendum. first live run is the real test (no cmake in
    my sandbox).
 
+3. `09-no-question-unbreak.patch` — vs `0a88601` (no-question branch tip,
+   NOT master). unbreaks the half-finished rewrite: swapped string_deinit
+   args (build), oppAe e-field mask/offset + bool-truncation (every return
+   was null — 65/206 failures alone), hidden-scope loop revived + user
+   top-level scope + `p_initialized` wiring (core names resolve, no
+   `redefining local` at top level), `TOKEN_AS` → `OPERATOR_BIN_AS` mapping
+   (`as` used to abort the compiler), as_bool missing else (`null as bool`
+   → true), PREC_AS moved between EXPONENT and PREFIX (rust cast level;
+   design.txt §1B requires it above SUM), opcode-name table order fix,
+   disassembler `as` global-operand print (the branch's own known issue).
+   e2e after: 210/211 — the 1 is the open `glob let len` semantics
+   decision (REVIEW-GUIDE-round14.md §4, recommendation: keep
+   locals-first + add a warning). plus new `operators/as/` tests (the
+   operator had zero coverage).
+
 `REVIEW-GUIDE-night13.md` (+ its addendum) — the whole-night bulk-review
 guide: per-patch where-to-look, the 06 proof obligations, the bench read
 with its noise-floor analysis, the CI setup steps, open items.
