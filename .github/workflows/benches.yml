@@ -1,47 +1,52 @@
 name: benches
 
-# closes the results-sync gap: rebuilds the oklang binary from source at a
-# pinned ref, runs the full bench suite with the owner's protocol
-# (5 warmups / 15 runs), combines the markdown, and commits results/ back.
-# the committed bench/ok-reg + ok-stack binaries stay as historical
-# artifacts; the workflow always benches a freshly built binary so results
-# track the language, not the last laptop.
-
 on:
   push:
     branches:
       - master
       - main
+    paths-ignore:
+      - "bench/results/**"
   workflow_dispatch:
     inputs:
       oklang_ref:
-        description: 'oklang ref to bench (codeberg)'
+        description: "oklang ref to bench (codeberg)"
         required: false
-        default: 'master'
+        default: "master"
 
 permissions:
   contents: write
+
+# Prevent two benchmark runs from publishing over each other.
+concurrency:
+  group: benchmark-results-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+
     steps:
       - name: checkout collab
         uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      - name: install deps
+      - name: install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends lua5.4 hyperfine g++-14
+          sudo apt-get install -y --no-install-recommends \
+            lua5.4 hyperfine g++-14 python3-matplotlib
           sudo ln -sf /usr/bin/lua5.4 /usr/local/bin/lua
           lua -v
+          python3 --version
           hyperfine --version
 
       - name: clone oklang
-        run: git clone --depth 1 --branch "${OKLANG_REF}" https://codeberg.org/qais/oklang.git /tmp/oklang
+        run: |
+          git clone --depth 1 --branch "${OKLANG_REF}" \
+            https://codeberg.org/qais/oklang.git /tmp/oklang
         env:
           OKLANG_REF: ${{ inputs.oklang_ref || 'master' }}
 
@@ -50,7 +55,9 @@ jobs:
 
       - name: build oklang (release)
         run: |
-          cmake -S /tmp/oklang -B /tmp/oklang/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14
+          cmake -S /tmp/oklang -B /tmp/oklang/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14
           cmake --build /tmp/oklang/build --parallel
           /tmp/oklang/build/ok --version 2>/dev/null || true
 
@@ -58,17 +65,25 @@ jobs:
         working-directory: bench
         env:
           OK_REGISTER: /tmp/oklang/build/ok
-          OK_STACK: '' # the committed stack-vm binary is a nix build; legacy subset runs ok/lua/python only
-          RUNS: '15'
-          WARMUP: '5'
-        run: ./run-benchmarks.sh benchmarks results
+          OK_STACK: ""
+          RUNS: "15"
+          WARMUP: "5"
+        run: ./run-benchmarks.sh benchmarks results/_staging
 
       - name: combine markdown
         working-directory: bench
-        run: python3 combine.py -s results -o results/combined.md -e .md
+        run: python3 combine.py -s results/_staging -o results/_staging/combined.md -e .md
+
+      - name: generate plots
+        working-directory: bench
+        run: python3 plot.py --input results/_staging
 
       - name: write run info
         working-directory: bench
+        env:
+          OKLANG_REF_INPUT: ${{ inputs.oklang_ref || 'master' }}
+          WARMUP: "5"
+          RUNS: "15"
         run: |
           {
             echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -78,22 +93,24 @@ jobs:
             echo "python: $(python3 --version 2>&1)"
             echo "hyperfine: $(hyperfine --version)"
             echo "protocol: warmup=${WARMUP} runs=${RUNS}"
-            echo "note: ok-register binary built from source at the ref above; ok-stack column absent (nix binary not runnable here)."
-          } > results/run-info.txt
-        env:
-          OKLANG_REF_INPUT: ${{ inputs.oklang_ref || 'master' }}
-          WARMUP: '5'
-          RUNS: '15'
+            echo "benchmark_count: $(find results/_staging -maxdepth 1 -name '*.json' | wc -l)"
+            echo "note: ok-register was built from source at the ref above."
+            echo "note: ok-stack is included only for benchmarks listed in stack-compatible.txt when OK_STACK is configured."
+          } > results/_staging/run-info.txt
+
+      - name: publish results and prune archive
+        working-directory: bench
+        run: python3 publish-results.py --results results --keep 3
 
       - name: commit results
         run: |
           git config user.name "bench-bot"
-          git config user.email "bench-bot@://github.com"
+          git config user.email "bench-bot@users.noreply.github.com"
           git add bench/results/
+
           if git diff --cached --quiet; then
             echo "no result changes, nothing to commit"
           else
             git commit -m "bench: automated run (oklang ${OKLANG_SHA:0:7})"
-            git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@://github.com{{ github.repository }}.git HEAD:${{ github.ref }}
+            git push
           fi
-

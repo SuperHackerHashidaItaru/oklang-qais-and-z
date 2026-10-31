@@ -1,0 +1,11 @@
+# Benchmarks supported by the optional stack VM.
+# One basename per line, without file extensions.
+# Add a benchmark here only if its .ok program works with OK_STACK.
+loop_counter
+arithmetic_sum
+branch_toggle
+local_pressure
+global_access
+function_calls
+closure_upvalue
+recursion_fib
