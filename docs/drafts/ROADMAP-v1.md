@@ -53,13 +53,16 @@ syntax ruling: destructuring shape (R4).
 
 ### 0.4.0 — ERRORS (the user-facing model)
 
-D7 sketch stands: errors as values, bytecode handler frames, **NO setjmp**
-(wasm-safe), pcall-shaped native surface now + try/catch sugar later, lazy
-tracebacks. lands BEFORE classes because class methods, stdlib API shape,
-and every native's error path (dorg3's three missing-return bugs were this
-class) hang off the philosophy. the coro⟷error interplay is SETTLED ON
-PAPER here (propagation across coroutine boundaries), even though coros
-ship later. touches ok_call — the surgical phase.
+D7 sketch stands: errors as values, bytecode handler frames, **NO setjmp /
+no longjmp** (Q's explicit ruling — don't inherit lua's bad parts; also
+wasm-safe), lazy tracebacks. OPEN, settled at the coro session: pcall-shape
+vs **try/catch from the start** (Q's current lean — only if it doesn't mess
+functionality; the known interaction is coro propagation, which is why the
+coro session owns the call). lands BEFORE classes because class methods,
+stdlib API shape, and every native's error path (dorg3's three
+missing-return bugs were this class) hang off the philosophy. the
+coro⟷error interplay is SETTLED ON PAPER here, even though coros ship
+later. touches ok_call — the surgical phase.
 
 ### 0.5.0 — CLASSES + THE TYPE SYSTEM (the 1.0 centerpiece)
 
@@ -75,36 +78,63 @@ every texture = 3 globals) dies here. may split 0.5.0 core / 0.5.x polish —
 it's the biggest phase. note: method tables are a 0.2.0-table customer —
 another reason maps precede classes.
 
-### 0.6.0 — COROUTINES (Q's favorite after classes)
+### 0.6.0 — COROUTINES (Vertigo) — Q's favorite after classes
 
 old ladder lean stands: stackful, lua-like — per-coro register file + call
 stack, resumer can be the C game loop (proven safe by the array_foreach
-callback work). open design round: yield-as-statement vs yield-as-call (Q's
-question), and the wasm story (stackful switching on emscripten needs
-asyncify or equivalent — decide with measurements, it shapes the embedding
-contract). the 0.4.0 error paper decides propagation.
+callback work). shape is basically LOCKED per Q; what remains is plumbing
++ design details at implementation time. wasm: NOT a blocker — the common
+game use case is single-function coroutines, and -sASYNCIFY exists for the
+rest; native is the primary consumer, wasm is one consumer. open design
+rounds: yield-as-statement vs yield-as-call (Q's question), error
+propagation (partially solved — the 0.4.0 paper finishes it).
 
 ### 0.7.0 — MODULES (language modules)
 
 D8/D9 stand: pipeline isolation + compile-time imports (`import x`,
 `import x as z`, `from x import y`), run-once top-level, module registry
 keyed by interned path (a 0.2.0-table customer), exports as slot arrays.
-the 13.2 lesson rides explicitly: every import adds a compile→load→run
-handoff window — the rooting discipline from patches 10/12 is the vaccine,
-and the aggressive-gc lane is the proof. **native modules via shared libs
-(dlopen) are POST-1.0** — they require a frozen ABI, which is definitionally
-a 1.0+ artifact.
+EXPORT SEMANTICS OPEN (Q's first instinct: implicit exports — flagged, no
+ruling yet). the 13.2 lesson rides explicitly: every import adds a
+compile→load→run handoff window — the rooting discipline from patches
+10/12 is the vaccine, and the aggressive-gc lane is the proof. **native
+modules via shared libs (dlopen) are POST-1.0** (Q agreed after the
+ABI argument) — they require a frozen ABI, which is definitionally a 1.0+
+artifact. **sandboxing lands in the same era** (see 0.9.0) — module loading
+and capability exposure are one design surface for an embedded language.
 
 ### 0.8.0 — STRINGS/UTF-8 + STDLIB GROWTH
 
 oct24 design stands: codepoint API, cached codepoint count, Go-style
-U+FFFD lossy decode, ascii identifiers v1. string builder lands here —
-explicit, Q's lean (optimization-shaped: chunk buffer + join, hidden from
-nobody). the SEMANTICS RULING (len/index = bytes vs runes, R8) is made
-EARLY — during the 0.2/0.3 era, as a D-number — because everything
-downstream (stdlib signatures, docs, benchmarks, map keys) assumes it;
-implementation waits for this phase. std's big push: it grew through every
-phase, now it completes ON the module system (std splits into modules as
+U+FFFD lossy decode, ascii identifiers v1. **two additions from Q's
+session-19 review: string ESCAPING (the vital one — `\` handling proper)
+and string INTERPOLATION (potential — design when the phase opens).**
+string builder lands here — explicit, Q's lean (optimization-shaped:
+chunk buffer + join, hidden from nobody). the SEMANTICS RULING
+(len/index = bytes vs runes, R8) is made EARLY — during the 0.2/0.3 era,
+as a D-number — because everything downstream (stdlib signatures, docs,
+benchmarks, map keys) assumes it; implementation waits for this phase.
+
+**stdlib shape (the Q question, answered in layers):**
+- **std-zero** — what exists today: the hidden-scope builtins (len, push,
+  pop, remove, print, and now get). tiny, forced, fine — it is the
+  language's prelude, not a library (every lua does this).
+- **oklang-written std** — pure-language modules (string helpers, sort,
+  etc.): shipped as .ok source, compiled at load exactly like user
+  modules. zero ABI exposure — it's just source.
+- **native-backed std** — things needing C (math beyond basics, io, time):
+  registered through the SAME module registry but STATICALLY LINKED, not
+  dlopen'd. the core↔std ABI is internal and versions together in one
+  repo/tarball — the stability contract only matters at the dlopen
+  boundary, which is post-1.0. this is exactly how python ships `math`.
+  no forced hidden state (they're importable modules), no exposed ABI,
+  nothing forced on users (import what you want; std-zero stays tiny).
+- **scheduler: NOT std.** coros ship primitives; the event loop is a
+  host/embedder concern (D12's event-loop lib is post-1.0). the language
+  never forces a policy. games bring their own loop.
+- scope verdict: lua-shaped-small core, grown by itch. "the stdlib is
+  complete when adding more feels like padding."
+std's big push completes ON the module system (std splits into modules as
 modules' first customer).
 
 ### 0.9.0 — HARDENING + TOOLING
@@ -112,9 +142,17 @@ modules' first customer).
 - parser: fuzz harness (clean-parse-or-clean-error, never crash — the
   12.95 flag), error recovery (multiple errors per compile, sync to
   statement boundary), message quality pass. arena/AST decisions if classes
-  or utf8 didn't already force them.
+  or utf8 didn't already force them. (observed in session 19's stress test:
+  diagnostic columns appear to be absolute file offsets, not line columns —
+  a QoI bug to fold into this phase's message-quality pass.)
+- **sandboxing** (Q's session-19 addition, pairs with 0.7.0 modules):
+  capability model for what an embedded oklang VM may touch — which
+  natives/modules a host exposes, load/IO gating, fuel limits (already
+  flagged for the /play era). an embedded language ships a contract about
+  what guest code CANNOT do.
 - tooling: the CLI stops being "literal ass" — `ok run/test/dump/version`
   candidates, runner UX (failure buckets, timeouts), REPL itch-decided.
+  docs tool: **okdocy** (Q's name, adopted).
 - cheap compiler passes: constant folding + propagation on statically
   resolved operands, compare+jump fusion (kills boolean materialization in
   condition position — this IS Q's "branch no materialize"; hard, optional,
@@ -122,11 +160,11 @@ modules' first customer).
   (semantics ruled early — R7).
 - bench expansion; everything measured against the workflow baselines.
 
-### 1.0.0 — THE FREEZE
+### 1.0.0 — THE FREEZE (Celestial)
 
-nothing new ships here. the checklist (§6) gets walked, docs get written,
-API gets audited, release gets cut. then the post-1.0 era opens with the
-web framework as the first big consumer.
+nothing new ships here. the checklist (§6) gets walked, docs get written
+(okdocy's debut), API gets audited, release gets cut. then the post-1.0
+era opens with the web framework as the first big consumer.
 
 ## 3. standing lanes (ride any minor)
 
@@ -185,26 +223,18 @@ objects, the original itch).
 - each minor: tag + `gh release create` + curated CHANGELOG.md entry
   (starts at 0.2.0). backfill: v0.1.0 + v0.0.5 release objects still owed.
 
-**release naming** (Q's question, answered):
-- who names releases: distros/OSes — Ubuntu (adjective+animal, alphabetical:
-  Jammy, Noble), Debian (Toy Story characters, in order — Perens worked at
-  Pixar), NixOS (animals), macOS (California places). languages: almost
-  none name releases — they name **features, proposals, eras**: Python 3000,
-  the walrus operator, structural pattern matching; C++0x; JS "Harmony";
-  Java's Project Loom/Panama/Valhalla umbrella codenames; Rust's editions
-  are years, not names.
-- why the split: a language version is a compatibility contract keyed by
-  tooling; a distro version is a marketing event. names carry zero
-  machine-readable meaning, and 0.1.1 doesn't deserve a name.
-- verdict: **codename the PHASES now** (commit prefixes + doc titles —
-  they're referenced forever, so they stick; pre-1.0 they carry zero legacy
-  risk because there's no external surface). **release names post-1.0,
-  only when consumers exist to remember them** (Q's buried-name instinct is
-  correct — a name needs rememberers). if/when we do: a fixed dictionary
-  drawn in order, the Debian/Ubuntu rule shape, so names never repeat or
-  collide. the theme is Q's department, obviously — dorg/puer/porgs/
-  slanderina/ballerina is a track record.
-- until picked, this doc says "the maps phase", "the classes phase".
+**release naming** (RULED by Q, session 19 — codenames are on, for fun,
+semver stays canonical): every MINOR gets a codename pre-1.0 (minor is our
+major), only MAJORS post-1.0. names needn't always mean something — the
+language is personal. current book: **v0.1.0 = Credence**, **coros =
+Vertigo** (moonlapse vertigo), **v1.0.0 = Celestial** ("the celestial
+touch from grey to black, a fathomless void enclosing. unwritten secrets
+beneath the cobwebs. i can not endure" — the amen corner). the theme is
+Opeth for now, may continue or not. (history note: distros name releases
+— ubuntu's adjective+animal, debian's toy-story characters, nixos animals;
+languages name features/proposals/eras — python 3000, the walrus, C++0x,
+JS Harmony, java's Loom/Panama/Valhalla. Q's scheme splits the difference:
+contract keyed by semver, personality keyed by codename. it works.)
 
 **process (immediate, cheap):** dev branch + protected master on codeberg;
 CI once the account-move happens (see §7); benches workflow re-enabled then.

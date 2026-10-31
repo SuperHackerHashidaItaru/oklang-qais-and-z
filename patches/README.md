@@ -4,16 +4,36 @@ deliverables awaiting Q's review + hand-application live here, newest last,
 stacked in apply order. **when Q applies + pushes, they move to
 `archive/patches/` and this dir empties.**
 
-right now this dir is EMPTY — everything through patch 16 has been applied
-and pushed (oklang patches 12+13+14 = `83dd40c` merged to master, now
-tagged v0.1.0; 16 landed in the tree-sitter repo). the per-patch notes and
-contracts live with the archived patches in `archive/patches/` and in
-`archive/review-guides/` (REVIEW-GUIDE-night13/round11/12/14/15). the
-aggressive-gc postmortem moved to `docs/permanent/`.
+1. `17-map-core-and-globals-store.patch` — vs v0.1.0 (Credence, `9ad153c`).
+   the 0.2.0 maps series, patch A of three (plan + rulings:
+   `docs/drafts/MAPS.md`). `src/okmap.h`: the new table core —
+   MAP_DECLARE/MAP_DEFINE macro (one algorithm, any key/value/probe types),
+   open addressing, linear probing, parallel key/hash/value arrays with
+   CACHED hashes (stored keys never re-hashed on grow), backward-shift
+   deletion (no tombstones), load factor 0.7, power-of-two capacity.
+   globals_store migrated to the first instantiation: raw string keys,
+   global_id values, string-view probes — **a lookup now allocates
+   nothing** (the old code built + freed a hashed_string per add/get);
+   hashed_string is dead code after this. `tests/unit/src/oktest_map.c`:
+   9 tests / 3 instantiations (real string shape; adversarial two-bucket
+   hash; identity hash for wraparound placement), the design doc's worked
+   example as a literal slot-layout test, 2000-op property test vs a shadow
+   model with periodic invariant checks, 1000-op adversarial property test.
+   verification: e2e 211/211 x plain/asan/asan-aggr, embed test x3,
+   oktest_map 9/9 x3 (sandbox via a minimal unity shim at
+   `scripts/unity_shim/` — not part of the patch; Q's cmake/unity build is
+   the real one). honest A/B vs v0.1.0 on a 2000-global compile stress
+   file: PARITY (63ms vs 65ms / 20 runs, -O2, outputs identical) — the
+   alloc kill is sub-noise at this scale; the win is structural (no
+   transient garbage in compile->run handoff windows). notes: GC untouched
+   by design (mark_globals_store walks values only); oktable.h STAYS
+   (scope tables migrate in patch C, the dead OK_DEBUG debug_table decl
+   with it); pre-existing okutils.h hash_combine -Wparentheses warning
+   noticed, not touched.
 
-next expected occupants: the maps series (draft in
-`docs/drafts/MAPS.md` — patch A table core, patch B surface, patch C
-hash-on-construct).
+next expected: patch B (surface maps: object_string hash field, map object,
+literals `{k: v}` / `{:}`, [] strict + `get()` lax, for-in-map opcodes,
+ok_map_* API) + patch C (scope tables + oktable.h deletion).
 
 ## history
 

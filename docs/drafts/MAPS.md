@@ -11,7 +11,8 @@ tracing details, and the patch plan). read with ROADMAP-v1.md §2.
 
 ```ok
 let m = {"a": 1, "b": 2};         // literal (expression position)
-let x = m["a"];                    // read: missing key -> null (R1, lean)
+let x = m["a"];                    // read: missing key -> ERROR (R1, ruled by Q)
+let y = get(m, "zz");              // the lax path: null when absent (builtin, mirrors len/remove)
 m["c"] = 3;                        // write: insert or overwrite
 m["a"] += 1;                       // compound: missing key -> error
 print(len(m));                     // live pair count
@@ -29,13 +30,15 @@ for k in m { print(k, m[k]); }     // keys-only form compiles too
 - `m as map` type check through the existing tag machinery — maps get a tag
   now, which is also the bridge to 0.5.0's proper types.
 
-**R1 argued** (missing key → null vs error): arrays OOB-error today, so why
-would maps miss-null? because they answer different questions. an array
-index is a **memory offset** — out of bounds is a programmer error, erroring
-is right. a map key is a **membership query** — "absent" is a valid answer,
-not a bug. the strictness Q wants lives in `has(m, k)` (std) and in
-compound-assign erroring on missing keys (which falls out of existing null
-arith errors naturally — `null + 1` already errors). lean: null.
+**R1 RULED by Q — [] errors, get() is the lax path.** my null lean was
+lua-shaped and loses on oklang's own stated values: silent-absence is
+silent coercion, and the surface owes the programmer CONSISTENCY, not
+implementation details — arrays error on [], so maps error on []. python
+(KeyError), C++ (map::at), rust (panic) agree; lua's nil-default and JS's
+undefined are the famous footguns. the config-shaped "absent = use default"
+case is served EXPLICITLY by `get(m, k)` (null when absent; a 3-arg default
+form if it itches). compound-assign on a missing key errors naturally via
+existing null-arith — same strictness, for free.
 
 **parser note** (real, new since the spec): bodies are brace-delimited now
 (`if true { ... }`), so `{` is overloaded. disambiguation is position-based
@@ -45,8 +48,13 @@ statement = empty block (useless, legal, tested). the fuzz corpus gets
 cases; the tree-sitter grammar needs the same disambiguation when this
 lands (patch note for Q's tree-sitter repo).
 
-syntax rulings for Q: colon in the literal (vs `=`); trailing comma
-(lean: allow).
+syntax RULED by Q: colon in the literal; `{:}` is the empty map (a bare `{}`
+statement stays an empty block / is rejected as a statement — ambiguous,
+zero users — while `{:}` keeps the useful empty-map feature alive; bindings
+are immutable so `let m = null` then assign-later needs mut, making the
+empty literal genuinely load-bearing). oklang is not swift — no lambdas
+without `()` — so the `{:` prefix disambiguates cheaply in the parser.
+trailing comma: allow. tree-sitter grammar updates in the same series.
 
 ## 2. the core — restated from the spec, with the tombstone story taught
 
@@ -126,20 +134,15 @@ separate chain?" two readings, both answered:
   pointer-chases — it's what we're deleting. linear probing is the whole
   point (cache lines + backward-shift deletes).
 - **separate implementations** (libc++'s private internal containers): no
-  for the table itself. **the macro generality STAYS** — `TABLE_DECLARE` /
-  `TABLE_DEFINE` keep instantiating per (key, value) type; only the
-  algorithm underneath them changes. so one algorithm, many instantiations:
-  - surface map object (ok_value keys → ok_value values)
-  - globals_store (hashed_string → global id) — migrate FIRST, it's the
-    runtime-hot one
-  - compiler scope tables (hashed_string → uint16_t register index) —
-    mechanical port in the same patch
-  - future: module registry (0.7.0), class method tables (0.5.0 — another
-    reason maps precede classes)
-  the one exception: the string INTERNING table (if/when it exists) keeps
-  its own specialized form — its keys are raw char* views during lookup,
-  before any string object exists. genuinely different key type; unify
-  where it's real, not where it's pious.
+  for the table's ALGORITHM — but the generality split is now FACT-BASED,
+  not taste (ruling below): the surface map object is value-native (ok_value
+  keys AND values, strict-null key = the empty slot — Q's instinct, adopted:
+  it deletes the hashed_string wrapper entirely); the internal name index
+  and the future string-interning table instantiate the SAME algorithm at
+  raw-string key type, because their keys are plain allocator strings and
+  their probes must not allocate. one algorithm, two macro flavors, zero
+  wrapper types. the thing that dies is the WRAPPER (hashed_string), not
+  the generality.
 
 ## 4. iteration — and why maps do NOT depend on multiple returns
 
@@ -198,33 +201,65 @@ ask for it eventually, and that's fine.
 
 ## 7. implementation plan (patches, the usual rhythm)
 
-- **patch A — the core**: `oktable.h` rewritten underneath the macro
-  interface (open addressing + parallel arrays + backward-shift delete;
-  users unchanged except the port). globals_store + scope tables + unit
-  tests migrate in the same patch. THE test: a property test — random
-  insert/remove/get sequences vs a reference model, plus an invariant
-  checker after every op (every entry findable from its home slot). full
-  gate: 211×3.
-- **patch B — the surface**: literal + index r/w + len + remove + the
-  for-in-map opcodes + errors + tag + object type + tracer + native API +
-  e2e files (literals, missing→null, compound-on-missing errors,
-  iteration, mutation, key-type errors, null-value storage, aliasing,
-  literal-in-call) + asan-aggr torture (rehash mid-fill under collection)
-  + the brace-disambiguation parser tests + tree-sitter grammar note.
-- **patch C — perf lane, same minor if it measures**: hash in
-  `object_string` header + FNV-1a on construct. side win: cached global
-  ids kill the 7 transient allocs per run flagged in the 13.2 postmortem —
-  measurable in startup.
-- **bench trio** (lands with B): insert-heavy, lookup-heavy, churn-heavy,
-  vs lua tables and python dicts. lua's table is the incumbent to read
-  honestly — it's a hybrid array+hash beast, so also bench the pure-array
-  cases against map-stored-as-array to show we're not regressing arrays.
+**patch A — DELIVERED (session 19): `17-map-core-and-globals-store.patch`**
+vs v0.1.0 (Credence). `src/okmap.h` (the core: MAP_DECLARE/MAP_DEFINE,
+linear probing, parallel key/hash/value arrays, cached hashes — stored keys
+are NEVER re-hashed on grow — backward-shift delete, lf 0.7, power-of-two
+capacity) + globals_store migrated to the first instantiation (raw string
+keys, global_id values, **string-view probes — a lookup allocates nothing,
+the old code built and freed a hashed_string per call**) + hashed_string
+deleted from its last user + `tests/unit/src/oktest_map.c` (9 tests, three
+instantiations: the real string shape, an adversarial two-bucket hash, an
+identity hash for wraparound placement; the doc's worked example as a
+literal test; 2000-op property test vs a shadow model with invariant
+checks; 1000-op adversarial property test with final slot-invariant walk)
++ test_map added to the unit CMakeLists. gate: e2e 211/211 x
+plain/asan/asan-aggr, embed x3, oktest_map 9/9 x3 (sandbox ran it via a
+minimal unity shim — Q's cmake/unity build is the real one). honest A/B:
+compile-heavy micro-bench (2000 globals + 2000 refs) shows PARITY with
+v0.1.0 at -O2 (63ms vs 65ms / 20 runs, outputs identical) — the transient-
+alloc kill is real but sub-noise at this scale; its value is structural
+(no transient garbage in the compile->run handoff window — the 13.2 bug
+class shrinks). the GC is untouched by design: mark_globals_store walks the
+values array only, never the table internals (verified before writing).
 
-## 8. open rulings for Q
+**patch B — the surface**: object_string gains a cached `hash` field
+(computed at creation — needed by value-keyed string lookups; this was
+formerly patch C's first half, moved here) + the map OBJECT (ok_value keys
+and values, strict-null key = empty slot) + literal `{k: v}` / empty `{:}` +
+index r/w ([] missing = error per R1; write = insert-or-overwrite) + `get()`
+builtin (the lax path) + len/remove + the for-in-map opcode pair + errors +
+tag + tracer (marks key AND value arrays) + native API ok_map_* mirroring
+patch 13 + e2e files (literals, missing-errors, get()-null,
+compound-on-missing, iteration, mutation, key-type errors, null-value
+storage, aliasing, literal-in-call, the {:} parser cases) + asan-aggr
+torture (rehash mid-fill under collection) + tree-sitter grammar delta
+(separate repo patch, same series).
 
-- R1 missing key → null (lean) vs error — §1 argues it
-- R2 -0.0 key normalization (lean: normalize + document)
-- R3 iteration order unspecified (lean: document unspecified now)
-- literal syntax: colon vs `=`, trailing comma (lean: colon, allow)
-- empty `{}` statement = empty block: allow or reject? (lean: reject —
-  zero users, and it kills a fuzz corner)
+**patch C — the cleanup**: compiler scope tables migrate to okmap.h +
+oktable.h deleted + the dead OK_DEBUG debug_table declaration removed +
+(here or in B) any startup-alloc leftovers. compile-time-only, zero runtime
+risk, pure churn — kept separate so patch A stays reviewable.
+
+**bench trio** (lands with B): insert-heavy, lookup-heavy, churn-heavy, vs
+lua tables and python dicts, on the real bench protocol (the micro-bench
+above is a sanity check, not a bench).
+
+## 8. rulings — ALL CLOSED (session 19)
+
+- R1 missing key via [] = ERROR; `get()` builtin is the lax null path — Q
+  ruled, Z conceded (§1)
+- R2 -0.0 key normalization: normalize + document — Q leaned with Z
+- R3 iteration order: unspecified v1, documented as such
+- literal syntax: colon; trailing comma allowed; empty map = `{:}`; bare
+  `{}` statement rejected
+- Q6 (value-native table): ADOPTED for the surface map object; the name
+  index + interning stay at raw-string keys through the same macro — the
+  deciding fact is that `string`/`hashed_string` are plain allocator
+  buffers, NOT GC objects, so making globals_store keys into values would
+  push the compiler's identifier churn through the GC and widen the exact
+  13.2 handoff window we just closed. one algorithm, two flavors, zero
+  wrappers (§3)
+- backward-shift deletion: Q read up on it independently and validated —
+  both known weak points don't bind (O(k) delete is expected-slow;
+  single-threaded language, no concurrent-shift concern)

@@ -1,0 +1,729 @@
+diff --git a/src/okglobals_store.c b/src/okglobals_store.c
+index 739adc2..f317dc9 100644
+--- a/src/okglobals_store.c
++++ b/src/okglobals_store.c
+@@ -1,74 +1,79 @@
+ #include "okglobals_store.h"
+ 
+-#define ARE_KEYS_EQUAL(lhs, rhs)                                                                                       \
+-  (string_get_length(&lhs.string) == string_get_length(&rhs.string) &&                                                 \
+-   strncmp(lhs.string.chars, rhs.string.chars, string_get_length(&lhs.string)) == 0)
+-#define GET_HASH(key) (key.hash)
++#include "okutils.h"
++
++// the name -> id index is the first okmap.h user: raw string keys (identifier
++// copies owned by the map), global_id values, and lookups probe with a plain
++// string view. unlike the old oktable version, a lookup allocates nothing —
++// the old code built and destroyed a fresh hashed_string probe per call.
++
++#define GL_KEY_IS_EMPTY(k) ((k).chars == NULL)
++#define GL_KEY_SET_EMPTY(k)                                                                                              \
++  do {                                                                                                                   \
++    (k)->chars = NULL;                                                                                                   \
++    (k)->info = 0;                                                                                                       \
++  } while (0)
++#define GL_PROBE_HASH(p) (default_hash_str(p))
++#define GL_PROBE_MATCHES(p, k)                                                                                           \
++  (ok_string_view_get_length(&(p)) == string_get_length(&(k)) &&                                                         \
++   memcmp((k).chars, (p).chars, ok_string_view_get_length(&(p))) == 0)
++#define GL_KEY_CLONE(p, a) (create_string_from_string_view((p), (a)))
++#define GL_KEY_DEINIT(k, a) (string_deinit((k), (a)))
++
++MAP_DEFINE(globals_map,
++           string,
++           global_id,
++           ok_string_view,
++           GL_KEY_IS_EMPTY,
++           GL_KEY_SET_EMPTY,
++           GL_PROBE_HASH,
++           GL_PROBE_MATCHES,
++           GL_KEY_CLONE,
++           GL_KEY_DEINIT,
++           ARRAY_DEFAULT_TYPE_DEINIT)
+ 
+ ARRAY_DEFINE(global_values, value, uint16_t, UINT16_MAX, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE(global_descriptors, global, uint16_t, UINT16_MAX, ARRAY_DEFAULT_TYPE_DEINIT)
+-TABLE_DEFINE(globals_table,
+-             uint16_t,
+-             uint16_t,
+-             UINT16_MAX,
+-             UINT16_MAX,
+-             hashed_string,
+-             global_id,
+-             hash_t,
+-             TABLE_DEFAULT_LOAD_NUM,
+-             TABLE_DEFAULT_LOAD_DEN,
+-             ARE_KEYS_EQUAL,
+-             hashed_string_deinit,
+-             ARRAY_DEFAULT_TYPE_DEINIT,
+-             GET_HASH)
+ 
+ void globals_store_init(globals_store* p_globals, allocators* p_alloc) {
+   p_globals->alloc = p_alloc;
+   global_values_init(&p_globals->global_values, p_alloc);
+   global_descriptors_init(&p_globals->global_descriptors, p_alloc);
+-  globals_table_init(&p_globals->table, p_alloc);
++  globals_map_init(&p_globals->map, p_alloc);
+ }
+ 
+ void globals_store_deinit(globals_store* p_globals) {
+-  globals_table_deinit(&p_globals->table);
++  globals_map_deinit(&p_globals->map);
+   global_descriptors_deinit(&p_globals->global_descriptors, p_globals->alloc);
+   global_values_deinit(&p_globals->global_values, p_globals->alloc);
+ }
+ 
+ global_id globals_store_add(globals_store* p_store, const ok_string_view p_identifier, global_flags p_flags) {
+-  allocators* alloc = p_store->alloc;
+   global_id glob_id = {.index = 0, .errors = GLOBAL_OK, .flags = GLOBAL_FLAG_NONE};
+-  hashed_string hs = create_hashed_string_hash(p_identifier, alloc);
+-
+   {
+-    global_id* glob = globals_table_get(&p_store->table, hs);
++    global_id* glob = globals_map_get(&p_store->map, p_identifier);
+     if (glob != NULL) {
+-      hashed_string_deinit(&hs, alloc);
+       return *glob;
+     }
+   }
+ 
+   if (p_store->global_values.count >= GLOBAL_MAX) {
+-    hashed_string_deinit(&hs, alloc);
+     glob_id.errors = GLOBAL_OVERFLOW;
+     return glob_id;
+   }
+   if (!global_values_append(&p_store->global_values, NULL_AS_VALUE())) {
+-    hashed_string_deinit(&hs, alloc);
+     glob_id.errors = GLOBAL_ALLOCATION_FAILED;
+     return glob_id;
+   }
+   // the value slot is the position just appended (count - 1): count was already incremented
+   global global = {p_store->global_values.count - 1, p_flags, GLOBAL_OK};
+   if (!global_descriptors_append(&p_store->global_descriptors, global)) {
+-    hashed_string_deinit(&hs, alloc);
+     global_values_pop(&p_store->global_values);
+     glob_id.errors = GLOBAL_ALLOCATION_FAILED;
+     return glob_id;
+   }
+   glob_id.index = p_store->global_descriptors.count - 1;
+-  if (!globals_table_set(&p_store->table, hs, glob_id)) {
+-    hashed_string_deinit(&hs, alloc);
++  if (!globals_map_set(&p_store->map, p_identifier, glob_id)) {
+     global_values_pop(&p_store->global_values);
+     global_descriptors_pop(&p_store->global_descriptors);
+     glob_id.errors = GLOBAL_ALLOCATION_FAILED;
+@@ -78,16 +83,10 @@ global_id globals_store_add(globals_store* p_store, const ok_string_view p_ident
+ }
+ 
+ global_id globals_store_get(globals_store* p_store, const ok_string_view p_identifier) {
+-  allocators* alloc = p_store->alloc;
+-  hashed_string hs = create_hashed_string_hash(p_identifier, alloc);
+-  {
+-    global_id* glob = globals_table_get(&p_store->table, hs);
+-    if (glob != NULL) {
+-      hashed_string_deinit(&hs, alloc);
+-      return *glob;
+-    }
++  global_id* glob = globals_map_get(&p_store->map, p_identifier);
++  if (glob != NULL) {
++    return *glob;
+   }
+-  hashed_string_deinit(&hs, alloc);
+-  global_id glob = {.index = 0, .flags = GLOBAL_FLAG_NONE, .errors = GLOBAL_UNDEFINED};
+-  return glob;
++  global_id glob_id = {.index = 0, .flags = GLOBAL_FLAG_NONE, .errors = GLOBAL_UNDEFINED};
++  return glob_id;
+ }
+diff --git a/src/okglobals_store.h b/src/okglobals_store.h
+index 3062294..2b9935a 100644
+--- a/src/okglobals_store.h
++++ b/src/okglobals_store.h
+@@ -5,6 +5,7 @@
+ #include "okchunk.h"
+ #include "okfwd.h"
+ #include "okindex.h"
++#include "okmap.h"
+ #include "okstring.h"
+ #include "oktable.h"
+ #include "okvalue.h"
+@@ -31,7 +32,7 @@ typedef index_wrapper global_id;
+ 
+ ARRAY_DECLARE(global_values, value, uint16_t)
+ ARRAY_DECLARE(global_descriptors, global, uint16_t)
+-TABLE_DECLARE(globals_table, uint16_t, uint16_t, hashed_string, global_id, hash_t)
++MAP_DECLARE(globals_map, string, global_id, ok_string_view)
+ 
+ #if defined(OK_DEBUG) // TODO debug meta data to get a name from an index
+ TABLE_DECLARE(debug_table, uint32_t, uint32_t, uint32_t, hashed_string, hash_t)
+@@ -40,7 +41,7 @@ TABLE_DECLARE(debug_table, uint32_t, uint32_t, uint32_t, hashed_string, hash_t)
+ struct globals_store {
+   global_values global_values;
+   global_descriptors global_descriptors;
+-  globals_table table;
++  globals_map map;
+   allocators* alloc;
+ };
+ 
+diff --git a/src/okmap.h b/src/okmap.h
+new file mode 100644
+index 0000000..c63cef2
+--- /dev/null
++++ b/src/okmap.h
+@@ -0,0 +1,230 @@
++#ifndef OK_MAP_H
++#define OK_MAP_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++
++#include "okmm.h"
++#include "okstring.h"
++
++// open-addressed hash map: linear probing, parallel key/hash/value arrays,
++// backward-shift deletion (no tombstones). replaces oktable.h's separate
++// chaining (one heap allocation per occupied bucket, pointer-chasing probes)
++// for all users that migrate to it.
++//
++// MAP_DECLARE(name, key_type, value_type, probe_type)
++// MAP_DEFINE(name, key_type, value_type, probe_type,
++//            KEY_IS_EMPTY(k), KEY_SET_EMPTY(k),
++//            PROBE_HASH(p), PROBE_MATCHES(p, k),
++//            KEY_CLONE(p, a), KEY_DEINIT(k, a), VALUE_DEINIT(v, a))
++//
++// contract:
++//   - an EMPTY slot is one whose key satisfies KEY_IS_EMPTY. the empty
++//     sentinel must never be a storable key (the language's map object uses
++//     the strict-null value for this; this table uses chars == NULL).
++//   - PROBE_HASH is computed once per operation, on the PROBE. the hash of a
++//     stored entry is cached in the parallel hashes[] array at insert time
++//     and is NEVER recomputed: growing re-inserts from the cache. probe keys
++//     do not have to be stored keys (globals_store probes with a string view,
++//     zero allocations; interning will probe with raw char*).
++//   - PROBE_MATCHES(p, k) compares a probe against a stored key. it must
++//     agree with PROBE_HASH: equal probes imply equal hashes.
++//   - KEY_CLONE(p, a) builds an OWNED stored key from a probe. it may
++//     allocate; it is only called on the insert path, after the table has
++//     successfully made room, so a failed clone never leaves partial state.
++//   - KEY_DEINIT/VALUE_DEINIT release owned keys/values at remove/deinit
++//     time. both are no-ops for the current users.
++//   - capacity is 0 before the first insert, then a power of two >= 8. load
++//     factor is kept <= 0.7 ((count + 1) * 10 > capacity * 7 grows x2).
++//     because an empty slot always exists, probes terminate.
++//   - remove uses backward-shift deletion: the freed slot pulls backward any
++//     following entry in its cluster that is allowed to live there, so every
++//     entry stays reachable from its home slot. no tombstones, no rehash.
++
++#define MAP_DECLARE(name, key_type, value_type, probe_type)                                                              \
++  typedef struct name name;                                                                                              \
++  struct name {                                                                                                          \
++    allocators* alloc;                                                                                                   \
++    uint32_t count;    /* live entries */                                                                                \
++    uint32_t capacity; /* 0, or power of two >= 8 */                                                                     \
++    key_type* keys;    /* parallel arrays: probes touch hashes + keys only */                                            \
++    hash_t* hashes;    /* cached; garbage in empty slots, read after the key check */                                    \
++    value_type* values;                                                                                                  \
++  };                                                                                                                     \
++  void name##_init(name* p_map, allocators* p_alloc);                                                                    \
++  void name##_deinit(name* p_map);                                                                                       \
++  value_type* name##_get(const name* p_map, probe_type p_probe);                                                          \
++  bool name##_set(name* p_map, probe_type p_probe, value_type p_value); /* update-or-insert; false = OOM only */          \
++  bool name##_remove(name* p_map, probe_type p_probe); /* false = absent */
++
++#define MAP_DEFINE(name,                                                                                                 \
++                   key_type,                                                                                             \
++                   value_type,                                                                                           \
++                   probe_type,                                                                                           \
++                   KEY_IS_EMPTY,                                                                                         \
++                   KEY_SET_EMPTY,                                                                                        \
++                   PROBE_HASH,                                                                                           \
++                   PROBE_MATCHES,                                                                                        \
++                   KEY_CLONE,                                                                                            \
++                   KEY_DEINIT,                                                                                           \
++                   VALUE_DEINIT)                                                                                         \
++                                                                                                                         \
++  void name##_init(name* p_map, allocators* p_alloc) {                                                                   \
++    p_map->alloc = p_alloc;                                                                                              \
++    p_map->count = 0;                                                                                                    \
++    p_map->capacity = 0;                                                                                                 \
++    p_map->keys = NULL;                                                                                                  \
++    p_map->hashes = NULL;                                                                                                \
++    p_map->values = NULL;                                                                                                \
++  }                                                                                                                      \
++                                                                                                                         \
++  void name##_deinit(name* p_map) {                                                                                      \
++    if (p_map->keys != NULL) {                                                                                           \
++      for (uint32_t i = 0; i < p_map->capacity; ++i) {                                                                   \
++        if (!KEY_IS_EMPTY(p_map->keys[i])) {                                                                             \
++          KEY_DEINIT(&p_map->keys[i], p_map->alloc);                                                                     \
++          VALUE_DEINIT(&p_map->values[i], p_map->alloc);                                                                 \
++        }                                                                                                                \
++      }                                                                                                                  \
++      p_map->alloc->release(p_map->alloc, p_map->keys);                                                                  \
++      p_map->alloc->release(p_map->alloc, p_map->hashes);                                                                \
++      p_map->alloc->release(p_map->alloc, p_map->values);                                                                \
++    }                                                                                                                    \
++    p_map->keys = NULL;                                                                                                  \
++    p_map->hashes = NULL;                                                                                                \
++    p_map->values = NULL;                                                                                                \
++    p_map->capacity = 0;                                                                                                 \
++    p_map->count = 0;                                                                                                    \
++  }                                                                                                                      \
++                                                                                                                         \
++  static uint32_t name##_find_slot(const name* p_map, hash_t p_hash, probe_type p_probe) {                                \
++    if (p_map->capacity == 0) {                                                                                          \
++      return UINT32_MAX;                                                                                                 \
++    }                                                                                                                    \
++    const uint32_t mask = p_map->capacity - 1;                                                                           \
++    uint32_t i = (uint32_t)p_hash & mask;                                                                                \
++    while (!KEY_IS_EMPTY(p_map->keys[i])) {                                                                              \
++      if (p_map->hashes[i] == p_hash && PROBE_MATCHES(p_probe, p_map->keys[i])) {                                        \
++        return i;                                                                                                        \
++      }                                                                                                                  \
++      i = (i + 1) & mask;                                                                                               \
++    }                                                                                                                    \
++    return UINT32_MAX;                                                                                                   \
++  }                                                                                                                      \
++                                                                                                                         \
++  static bool name##_grow(name* p_map) {                                                                                 \
++    const uint32_t new_capacity = p_map->capacity == 0 ? 8 : p_map->capacity * 2;                                        \
++    key_type* new_keys = (key_type*)p_map->alloc->allocate(p_map->alloc, new_capacity * sizeof(key_type));               \
++    hash_t* new_hashes = (hash_t*)p_map->alloc->allocate(p_map->alloc, new_capacity * sizeof(hash_t));                   \
++    value_type* new_values = (value_type*)p_map->alloc->allocate(p_map->alloc, new_capacity * sizeof(value_type));       \
++    if (new_keys == NULL || new_hashes == NULL || new_values == NULL) {                                                  \
++      if (new_keys != NULL) {                                                                                            \
++        p_map->alloc->release(p_map->alloc, new_keys);                                                                   \
++      }                                                                                                                  \
++      if (new_hashes != NULL) {                                                                                          \
++        p_map->alloc->release(p_map->alloc, new_hashes);                                                                 \
++      }                                                                                                                  \
++      if (new_values != NULL) {                                                                                          \
++        p_map->alloc->release(p_map->alloc, new_values);                                                                 \
++      }                                                                                                                  \
++      return false;                                                                                                      \
++    }                                                                                                                    \
++    for (uint32_t i = 0; i < new_capacity; ++i) {                                                                        \
++      KEY_SET_EMPTY(&new_keys[i]);                                                                                       \
++    }                                                                                                                    \
++    /* re-insert from the cached hashes: stored keys are never re-hashed */                                              \
++    for (uint32_t i = 0; i < p_map->capacity; ++i) {                                                                     \
++      if (KEY_IS_EMPTY(p_map->keys[i])) {                                                                                \
++        continue;                                                                                                        \
++      }                                                                                                                  \
++      uint32_t j = (uint32_t)p_map->hashes[i] & (new_capacity - 1);                                                      \
++      while (!KEY_IS_EMPTY(new_keys[j])) {                                                                               \
++        j = (j + 1) & (new_capacity - 1);                                                                                \
++      }                                                                                                                  \
++      new_keys[j] = p_map->keys[i];                                                                                      \
++      new_hashes[j] = p_map->hashes[i];                                                                                  \
++      new_values[j] = p_map->values[i];                                                                                  \
++    }                                                                                                                    \
++    if (p_map->keys != NULL) {                                                                                           \
++      p_map->alloc->release(p_map->alloc, p_map->keys);                                                                  \
++      p_map->alloc->release(p_map->alloc, p_map->hashes);                                                                \
++      p_map->alloc->release(p_map->alloc, p_map->values);                                                                \
++    }                                                                                                                    \
++    p_map->keys = new_keys;                                                                                              \
++    p_map->hashes = new_hashes;                                                                                          \
++    p_map->values = new_values;                                                                                          \
++    p_map->capacity = new_capacity;                                                                                      \
++    return true;                                                                                                         \
++  }                                                                                                                      \
++                                                                                                                         \
++  value_type* name##_get(const name* p_map, probe_type p_probe) {                                                        \
++    const uint32_t slot = name##_find_slot(p_map, PROBE_HASH(p_probe), p_probe);                                         \
++    return slot == UINT32_MAX ? NULL : &p_map->values[slot];                                                             \
++  }                                                                                                                      \
++                                                                                                                         \
++  bool name##_set(name* p_map, probe_type p_probe, value_type p_value) {                                                 \
++    const hash_t hash = PROBE_HASH(p_probe);                                                                             \
++    uint32_t slot = name##_find_slot(p_map, hash, p_probe);                                                              \
++    if (slot != UINT32_MAX) {                                                                                            \
++      VALUE_DEINIT(&p_map->values[slot], p_map->alloc);                                                                  \
++      p_map->values[slot] = p_value;                                                                                     \
++      return true;                                                                                                       \
++    }                                                                                                                    \
++    if (p_map->capacity == 0 || (uint64_t)(p_map->count + 1) * 10 > (uint64_t)p_map->capacity * 7) {                     \
++      if (!name##_grow(p_map)) {                                                                                         \
++        return false;                                                                                                    \
++      }                                                                                                                  \
++      slot = name##_find_slot(p_map, hash, p_probe);                                                                     \
++      if (slot != UINT32_MAX) { /* grew into an existing key: update */                                                  \
++        VALUE_DEINIT(&p_map->values[slot], p_map->alloc);                                                                \
++        p_map->values[slot] = p_value;                                                                                   \
++        return true;                                                                                                     \
++      }                                                                                                                  \
++    }                                                                                                                    \
++    const uint32_t mask = p_map->capacity - 1;                                                                           \
++    uint32_t i = (uint32_t)hash & mask;                                                                                  \
++    while (!KEY_IS_EMPTY(p_map->keys[i])) { /* an empty slot exists: load <= 0.7 */                                      \
++      i = (i + 1) & mask;                                                                                                \
++    }                                                                                                                    \
++    p_map->keys[i] = KEY_CLONE(p_probe, p_map->alloc);                                                                   \
++    p_map->hashes[i] = hash;                                                                                             \
++    p_map->values[i] = p_value;                                                                                          \
++    p_map->count++;                                                                                                      \
++    return true;                                                                                                         \
++  }                                                                                                                      \
++                                                                                                                         \
++  bool name##_remove(name* p_map, probe_type p_probe) {                                                                  \
++    const hash_t hash = PROBE_HASH(p_probe);                                                                             \
++    const uint32_t slot = name##_find_slot(p_map, hash, p_probe);                                                        \
++    if (slot == UINT32_MAX) {                                                                                            \
++      return false;                                                                                                      \
++    }                                                                                                                    \
++    KEY_DEINIT(&p_map->keys[slot], p_map->alloc);                                                                        \
++    VALUE_DEINIT(&p_map->values[slot], p_map->alloc);                                                                    \
++    const uint32_t mask = p_map->capacity - 1;                                                                           \
++    uint32_t hole = slot;                                                                                                \
++    for (;;) {                                                                                                           \
++      KEY_SET_EMPTY(&p_map->keys[hole]);                                                                                 \
++      uint32_t k = hole;                                                                                                 \
++      for (;;) {                                                                                                         \
++        k = (k + 1) & mask;                                                                                              \
++        if (KEY_IS_EMPTY(p_map->keys[k])) { /* cluster ended: the hole is final */                                       \
++          p_map->count--;                                                                                                \
++          return true;                                                                                                   \
++        }                                                                                                                \
++        const uint32_t home = (uint32_t)p_map->hashes[k] & mask;                                                         \
++        /* the entry at k may fill the hole iff its home is at-or-before the hole: */                                    \
++        /* distance(home -> k) >= distance(hole -> k), cyclically. otherwise keep walking. */                            \
++        if (((k - home) & mask) >= ((k - hole) & mask)) {                                                                \
++          break;                                                                                                         \
++        }                                                                                                                \
++      }                                                                                                                  \
++      p_map->keys[hole] = p_map->keys[k];                                                                                \
++      p_map->hashes[hole] = p_map->hashes[k];                                                                            \
++      p_map->values[hole] = p_map->values[k];                                                                            \
++      hole = k;                                                                                                          \
++    }                                                                                                                    \
++  }
++
++#endif // OK_MAP_H
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index e960a9a..7a1f69f 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ set(tests 
+   test_array
++  test_map
+   test_table
+   test_nan
+ )
+diff --git a/tests/unit/src/oktest_map.c b/tests/unit/src/oktest_map.c
+new file mode 100644
+index 0000000..6748113
+--- /dev/null
++++ b/tests/unit/src/oktest_map.c
+@@ -0,0 +1,310 @@
++#include <unity.h>
++
++#include <stdio.h>
++#include <string.h>
++
++#include <ok/ok_specs.h>
++#include <okarray.h>
++#include <okmap.h>
++#include <okspecs.h>
++#include <okutils.h>
++
++// instantiation 1: the globals_store shape — raw string keys, uint32 values,
++// string-view probes (zero-allocation lookups).
++#define S_KEY_IS_EMPTY(k) ((k).chars == NULL)
++#define S_KEY_SET_EMPTY(k)                                                                                               \
++  do {                                                                                                                   \
++    (k)->chars = NULL;                                                                                                   \
++    (k)->info = 0;                                                                                                       \
++  } while (0)
++#define S_PROBE_HASH(p) (default_hash_str(p))
++#define S_PROBE_MATCHES(p, k)                                                                                            \
++  (ok_string_view_get_length(&(p)) == string_get_length(&(k)) &&                                                         \
++   memcmp((k).chars, (p).chars, ok_string_view_get_length(&(p))) == 0)
++#define S_KEY_CLONE(p, a) (create_string_from_string_view((p), (a)))
++#define S_KEY_DEINIT(k, a) (string_deinit((k), (a)))
++
++MAP_DECLARE(str_map, string, uint32_t, ok_string_view)
++MAP_DEFINE(str_map, string, uint32_t, ok_string_view, S_KEY_IS_EMPTY, S_KEY_SET_EMPTY, S_PROBE_HASH, S_PROBE_MATCHES, S_KEY_CLONE, S_KEY_DEINIT, ARRAY_DEFAULT_TYPE_DEINIT)
++
++// instantiation 2: adversarial hashing (two buckets regardless of capacity)
++// to stress probing and backward-shift deletion under maximal clustering.
++#define U_KEY_IS_EMPTY(k) ((k) == UINT32_MAX)
++#define U_KEY_SET_EMPTY(k) (*(k) = UINT32_MAX)
++#define U_PROBE_HASH(p) ((hash_t)((p) % 2))
++#define U_PROBE_MATCHES(p, k) ((p) == (k))
++#define U_KEY_CLONE(p, a) (p)
++#define U_KEY_DEINIT(k, a)
++
++MAP_DECLARE(bad_map, uint32_t, uint32_t, uint32_t)
++MAP_DEFINE(bad_map, uint32_t, uint32_t, uint32_t, U_KEY_IS_EMPTY, U_KEY_SET_EMPTY, U_PROBE_HASH, U_PROBE_MATCHES, U_KEY_CLONE, U_KEY_DEINIT, ARRAY_DEFAULT_TYPE_DEINIT)
++
++// instantiation 3: identity hashing — lets tests place entries at chosen
++// home slots (wraparound coverage).
++#define W_PROBE_HASH(p) ((hash_t)(p))
++
++MAP_DECLARE(wrap_map, uint32_t, uint32_t, uint32_t)
++MAP_DEFINE(wrap_map, uint32_t, uint32_t, uint32_t, U_KEY_IS_EMPTY, U_KEY_SET_EMPTY, W_PROBE_HASH, U_PROBE_MATCHES, U_KEY_CLONE, U_KEY_DEINIT, ARRAY_DEFAULT_TYPE_DEINIT)
++
++static str_map smap;
++static bad_map bmap;
++static wrap_map wmap;
++
++ok_specs specs = {0};
++allocators alloc = {0};
++
++// deterministic LCG so failures reproduce.
++static uint32_t rng_state = 0x12345678u;
++static uint32_t rng() {
++  rng_state = rng_state * 1664525u + 1013904223u;
++  return rng_state >> 8;
++}
++
++// tiny shadow model: the "reference python dict" from the spec, C-ified.
++#define SHADOW_KEYS 32
++typedef struct {
++  char key[8];
++  uint32_t val;
++  bool used;
++} shadow_slot;
++static shadow_slot shadow[SHADOW_KEYS];
++
++static int32_t shadow_find(const char* p_key) {
++  for (uint32_t i = 0; i < SHADOW_KEYS; ++i) {
++    if (shadow[i].used && strcmp(shadow[i].key, p_key) == 0) {
++      return (int32_t)i;
++    }
++  }
++  return -1;
++}
++
++static void shadow_set(const char* p_key, uint32_t p_val) {
++  int32_t i = shadow_find(p_key);
++  if (i < 0) {
++    for (uint32_t j = 0; j < SHADOW_KEYS; ++j) {
++      if (!shadow[j].used) {
++        i = (int32_t)j;
++        strcpy(shadow[i].key, p_key);
++        shadow[i].used = true;
++        break;
++      }
++    }
++  }
++  shadow[i].val = p_val;
++}
++
++static bool shadow_remove(const char* p_key) {
++  int32_t i = shadow_find(p_key);
++  if (i < 0) {
++    return false;
++  }
++  shadow[i].used = false;
++  return true;
++}
++
++static uint32_t shadow_count() {
++  uint32_t n = 0;
++  for (uint32_t i = 0; i < SHADOW_KEYS; ++i) {
++    if (shadow[i].used) {
++      n++;
++    }
++  }
++  return n;
++}
++
++// invariant: every occupied slot's entry is findable from its home slot.
++static void assert_str_map_invariants() {
++  TEST_ASSERT_TRUE(smap.capacity == 0 || (smap.capacity >= 8 && (smap.capacity & (smap.capacity - 1)) == 0));
++  uint32_t live = 0;
++  for (uint32_t i = 0; i < smap.capacity; ++i) {
++    if (S_KEY_IS_EMPTY(smap.keys[i])) {
++      continue;
++    }
++    live++;
++    const ok_string_view probe = ok_create_string_view_from_string(smap.keys[i]);
++    uint32_t* v = str_map_get(&smap, probe);
++    TEST_ASSERT_NOT_NULL(v);
++    TEST_ASSERT_EQUAL_UINT32(smap.values[i], *v);
++  }
++  TEST_ASSERT_EQUAL_UINT32(live, smap.count);
++}
++
++void setUp() {
++  patch_specs(&specs);
++  alloc = create_raw_allocators_wrapper(&specs.allocators);
++  str_map_init(&smap, &alloc);
++  bad_map_init(&bmap, &alloc);
++  wrap_map_init(&wmap, &alloc);
++  memset(shadow, 0, sizeof(shadow));
++}
++
++void tearDown() {
++  str_map_deinit(&smap);
++  bad_map_deinit(&bmap);
++  wrap_map_deinit(&wmap);
++}
++
++void test_init_state() {
++  TEST_ASSERT_EQUAL_UINT32(0, smap.count);
++  TEST_ASSERT_EQUAL_UINT32(0, smap.capacity);
++  TEST_ASSERT_NULL(smap.keys);
++  TEST_ASSERT_NULL(str_map_get(&smap, ok_create_string_view("absent", 6, true)));
++  TEST_ASSERT_FALSE(str_map_remove(&smap, ok_create_string_view("absent", 6, true)));
++}
++
++void test_set_get_roundtrip() {
++  TEST_ASSERT_TRUE(str_map_set(&smap, ok_create_string_view("alpha", 5, true), 1));
++  TEST_ASSERT_TRUE(str_map_set(&smap, ok_create_string_view("beta", 4, true), 2));
++  TEST_ASSERT_EQUAL_UINT32(2, smap.count);
++  TEST_ASSERT_EQUAL_UINT32(1, *str_map_get(&smap, ok_create_string_view("alpha", 5, true)));
++  TEST_ASSERT_EQUAL_UINT32(2, *str_map_get(&smap, ok_create_string_view("beta", 4, true)));
++  TEST_ASSERT_NULL(str_map_get(&smap, ok_create_string_view("gamma", 5, true)));
++}
++
++void test_set_updates_existing() {
++  TEST_ASSERT_TRUE(str_map_set(&smap, ok_create_string_view("k", 1, true), 10));
++  TEST_ASSERT_TRUE(str_map_set(&smap, ok_create_string_view("k", 1, true), 20));
++  TEST_ASSERT_EQUAL_UINT32(1, smap.count);
++  TEST_ASSERT_EQUAL_UINT32(20, *str_map_get(&smap, ok_create_string_view("k", 1, true)));
++}
++
++void test_remove_then_get() {
++  TEST_ASSERT_TRUE(str_map_set(&smap, ok_create_string_view("k", 1, true), 7));
++  TEST_ASSERT_TRUE(str_map_remove(&smap, ok_create_string_view("k", 1, true)));
++  TEST_ASSERT_EQUAL_UINT32(0, smap.count);
++  TEST_ASSERT_NULL(str_map_get(&smap, ok_create_string_view("k", 1, true)));
++  TEST_ASSERT_FALSE(str_map_remove(&smap, ok_create_string_view("k", 1, true)));
++}
++
++// the worked example from the design doc: three keys sharing one home slot,
++// deleting the middle one must slide the third back or lose it.
++void test_backward_shift_worked_example() {
++  TEST_ASSERT_TRUE(bad_map_set(&bmap, 2, 200));
++  TEST_ASSERT_TRUE(bad_map_set(&bmap, 4, 400));
++  TEST_ASSERT_TRUE(bad_map_set(&bmap, 6, 600));
++  // all three hash to bucket 0: they occupy slots 0, 1, 2.
++  TEST_ASSERT_EQUAL_UINT32(2, bmap.keys[0]);
++  TEST_ASSERT_EQUAL_UINT32(4, bmap.keys[1]);
++  TEST_ASSERT_EQUAL_UINT32(6, bmap.keys[2]);
++  TEST_ASSERT_TRUE(bad_map_remove(&bmap, 4));
++  TEST_ASSERT_EQUAL_UINT32(2, bmap.count);
++  // entry 6 slid back into slot 1; slot 2 is empty again.
++  TEST_ASSERT_EQUAL_UINT32(2, bmap.keys[0]);
++  TEST_ASSERT_EQUAL_UINT32(6, bmap.keys[1]);
++  TEST_ASSERT_TRUE(U_KEY_IS_EMPTY(bmap.keys[2]));
++  TEST_ASSERT_EQUAL_UINT32(200, *bad_map_get(&bmap, 2));
++  TEST_ASSERT_EQUAL_UINT32(600, *bad_map_get(&bmap, 6));
++  TEST_ASSERT_NULL(bad_map_get(&bmap, 4));
++}
++
++// cluster wrapping past the end of the array: homes at cap-1 and 0.
++void test_backward_shift_wraparound() {
++  TEST_ASSERT_TRUE(wrap_map_set(&wmap, 7, 70));
++  TEST_ASSERT_TRUE(wrap_map_set(&wmap, 15, 150)); // home 7 is taken, wraps to slot 0
++  TEST_ASSERT_TRUE(wrap_map_set(&wmap, 0, 0)); // home 0 is taken, lands at slot 1
++  TEST_ASSERT_EQUAL_UINT32(7, wmap.keys[7]);
++  TEST_ASSERT_EQUAL_UINT32(15, wmap.keys[0]);
++  TEST_ASSERT_EQUAL_UINT32(0, wmap.keys[1]);
++  TEST_ASSERT_TRUE(wrap_map_remove(&wmap, 7));
++  TEST_ASSERT_EQUAL_UINT32(150, *wrap_map_get(&wmap, 15));
++  TEST_ASSERT_EQUAL_UINT32(0, *wrap_map_get(&wmap, 0));
++  TEST_ASSERT_NULL(wrap_map_get(&wmap, 7));
++}
++
++void test_grow_path() {
++  char key[16];
++  for (uint32_t i = 0; i < 1000; ++i) {
++    snprintf(key, sizeof(key), "key_%u", i);
++    TEST_ASSERT_TRUE(str_map_set(&smap, ok_create_string_view(key, strlen(key), true), i));
++  }
++  TEST_ASSERT_EQUAL_UINT32(1000, smap.count);
++  TEST_ASSERT_TRUE(smap.capacity >= 16 && (smap.capacity & (smap.capacity - 1)) == 0);
++  for (uint32_t i = 0; i < 1000; i += 97) {
++    snprintf(key, sizeof(key), "key_%u", i);
++    TEST_ASSERT_EQUAL_UINT32(i, *str_map_get(&smap, ok_create_string_view(key, strlen(key), true)));
++  }
++}
++
++// random operations against the shadow model, with the invariant checker
++// run periodically. the backward-shift correctness property is exactly this:
++// after any sequence of sets/removes, every live key is still findable.
++void test_property_vs_shadow_model() {
++  char key[8];
++  for (uint32_t op = 0; op < 2000; ++op) {
++    const uint32_t k = rng() % SHADOW_KEYS;
++    const uint32_t action = rng() % 10;
++    snprintf(key, sizeof(key), "k%u", k);
++    const ok_string_view probe = ok_create_string_view(key, strlen(key), true);
++    if (action < 6) {
++      const uint32_t val = rng() % 1000000;
++      TEST_ASSERT_TRUE(str_map_set(&smap, probe, val));
++      shadow_set(key, val);
++    } else {
++      const bool map_removed = str_map_remove(&smap, probe);
++      const bool shadow_removed = shadow_remove(key);
++      TEST_ASSERT_EQUAL_INT(shadow_removed ? 1 : 0, map_removed ? 1 : 0);
++    }
++    uint32_t* got = str_map_get(&smap, probe);
++    const int32_t idx = shadow_find(key);
++    if (idx < 0) {
++      TEST_ASSERT_NULL(got);
++    } else {
++      TEST_ASSERT_NOT_NULL(got);
++      TEST_ASSERT_EQUAL_UINT32(shadow[idx].val, *got);
++    }
++    if (op % 100 == 99) {
++      TEST_ASSERT_EQUAL_UINT32(shadow_count(), smap.count);
++      assert_str_map_invariants();
++    }
++  }
++  TEST_ASSERT_EQUAL_UINT32(shadow_count(), smap.count);
++  assert_str_map_invariants();
++}
++
++// the adversarial instantiation under the same regime: everything collides.
++void test_property_adversarial_hash() {
++  for (uint32_t op = 0; op < 1000; ++op) {
++    const uint32_t k = rng() % 24;
++    const uint32_t action = rng() % 10;
++    if (action < 6) {
++      TEST_ASSERT_TRUE(bad_map_set(&bmap, k, k * 3));
++      uint32_t* got = bad_map_get(&bmap, k);
++      TEST_ASSERT_NOT_NULL(got);
++      TEST_ASSERT_EQUAL_UINT32(k * 3, *got);
++    } else {
++      (void)bad_map_remove(&bmap, k);
++      // presence now depends on history: if present, the value must hold.
++      uint32_t* got = bad_map_get(&bmap, k);
++      if (got != NULL) {
++        TEST_ASSERT_EQUAL_UINT32(k * 3, *got);
++      }
++    }
++  }
++  // final invariant: every occupied slot's entry is findable and correct.
++  uint32_t live = 0;
++  for (uint32_t i = 0; i < bmap.capacity; ++i) {
++    if (U_KEY_IS_EMPTY(bmap.keys[i])) {
++      continue;
++    }
++    live++;
++    uint32_t* got = bad_map_get(&bmap, bmap.keys[i]);
++    TEST_ASSERT_NOT_NULL(got);
++    TEST_ASSERT_EQUAL_UINT32(bmap.values[i], *got);
++  }
++  TEST_ASSERT_EQUAL_UINT32(live, bmap.count);
++  TEST_ASSERT_TRUE(bmap.capacity == 0 || (bmap.capacity & (bmap.capacity - 1)) == 0);
++}
++
++int main() {
++  UNITY_BEGIN();
++  RUN_TEST(test_init_state);
++  RUN_TEST(test_set_get_roundtrip);
++  RUN_TEST(test_set_updates_existing);
++  RUN_TEST(test_remove_then_get);
++  RUN_TEST(test_backward_shift_worked_example);
++  RUN_TEST(test_backward_shift_wraparound);
++  RUN_TEST(test_grow_path);
++  RUN_TEST(test_property_vs_shadow_model);
++  RUN_TEST(test_property_adversarial_hash);
++  return UNITY_END();
++}
