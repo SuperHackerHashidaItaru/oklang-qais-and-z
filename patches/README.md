@@ -53,3 +53,4 @@ ok_map_* API) + patch C (scope tables + oktable.h deletion).
   `9ad153c`, tagged **v0.1.0**.
 - 16-tree-sitter-oklang-no-question-update: APPLIED by Q to the
   tree-sitter-oklang repo (grammar + queries + corpus, 131/131).
+
