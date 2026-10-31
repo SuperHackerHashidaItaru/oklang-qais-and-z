@@ -1,0 +1,12 @@
+// iteration: 1M passes over a prebuilt 8-entry map (8M visited entries),
+// the map sibling of array_for_in_sum. lua uses pairs, python iterates keys.
+let m = {"k0": 1, "k1": 2, "k2": 3, "k3": 4, "k4": 5, "k5": 6, "k6": 7, "k7": 8};
+let mut pass = 0;
+let mut sum = 0;
+while pass < 1000000 {
+  for let k, v : m {
+    sum = sum + v;
+  }
+  pass = pass + 1;
+}
+print sum;

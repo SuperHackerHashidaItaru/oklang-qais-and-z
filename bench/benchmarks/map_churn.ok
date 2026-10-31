@@ -1,0 +1,12 @@
+// churn-heavy: interleaved insert/remove, exercising backward-shift deletion
+// and slot reuse. odd keys survive.
+let mut m = {:};
+let mut i = 0;
+while i < 200000 {
+  m["k" + i as str] = i;
+  if i % 2 == 0 {
+    remove(m, "k" + i as str);
+  }
+  i = i + 1;
+}
+print m["k199999"];

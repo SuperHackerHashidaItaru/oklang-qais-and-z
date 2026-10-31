@@ -1,0 +1,8 @@
+// insert-heavy: 200k string-key inserts, forcing repeated rehash growth.
+let mut m = {:};
+let mut i = 0;
+while i < 200000 {
+  m["k" + i as str] = i;
+  i = i + 1;
+}
+print m["k0"] + m["k199999"];

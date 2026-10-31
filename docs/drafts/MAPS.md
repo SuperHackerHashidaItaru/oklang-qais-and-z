@@ -247,18 +247,48 @@ constantly. startup-alloc survey stays with B as planned (the 13.2
 "cached global ids" follow-up targeted the pre-patch-A hashed_string
 lookups, which no longer exist).
 
-**patch B — the surface** (next): object_string gains a cached `hash` field
-(computed at creation — needed by value-keyed string lookups; this was
-formerly patch C's first half, moved here) + the map OBJECT (ok_value keys
-and values, strict-null key = empty slot) + literal `{k: v}` / empty `{:}` +
-index r/w ([] missing = error per R1; write = insert-or-overwrite) + `get()`
-builtin (the lax path) + len/remove + the for-in-map opcode pair + errors +
-tag + tracer (marks key AND value arrays) + native API ok_map_* mirroring
-patch 13 + e2e files (literals, missing-errors, get()-null,
-compound-on-missing, iteration, mutation, key-type errors, null-value
-storage, aliasing, literal-in-call, the {:} parser cases) + asan-aggr
-torture (rehash mid-fill under collection) + tree-sitter grammar delta
-(separate repo patch, same series).
+**patch B — DELIVERED (session 21): `patches/19-map-surface.patch`**
+vs maps-staging (`0987b4e`). object_string's cached hash (computed at
+creation — **standard FNV-1a, NOT okutils' fnv1a_hash_str**: that variant
+xors `byte * prime` and its low bits collapse for short ascii keys — a
+200k-string-key map clustered at average probe distance 377; standard FNV
+gives 0.31, flagged for globals_store/okutils separately) + the map OBJECT
+(value_map instantiation of okmap.h, strict-null key = empty slot, version
+bumped on size change only — overwrites stay legal mid-iteration) + literal
+`{k: v}` / `{:}` (a bare `{}` in expression position gets a dedicated error;
+statement `{` stays a block — position disambiguation, zero lookahead) +
+index r/w through **OP_INDEX_GET/SET (renamed from OP_ARRAY_*: they are
+polymorphic now — arrays unchanged, maps added; renaming was free
+pre-modules)** + `get()` builtin incl. the 3-arg default form + len/remove
+(`remove` dispatches 3-arg array range / 2-arg map key via a new
+OK_NATIVE_ARITY_ANY variadic sentinel; absent map key = legal no-op) + the
+**ITER trio (OP_ITER_PREP/GET/LOOP)** instead of a map-only pair: the
+one-binding form must run over arrays AND maps (python semantics: elements
+vs keys) and body duplication was unacceptable, so arrays migrated onto the
+polymorphic trio too — **the len() compile-time dependency of the ranged
+for is deleted**, array for-in benches improved 11-12%, numeric for keeps
+its FOR pair + two-binding over arrays is a runtime error. syntax call for
+Q: `for let k, v : m` (one `let`, comma list, per-binder `mut`) — the doc
+sketched `for k, v in m` but `in` is not a token and the family form is
+`for let v : arr`. mid-iteration insert/remove = hard error ("map changed
+size during iteration" — the version snapshot); overwrites legal. + tag
+(`m as map` = checked identity, TT_MAP) + tracer (occupied slots only —
+empty value slots hold stale garbage) + native API ok_map_new/get/set/remove/
+len/is_map (ok_map_get returns bool so stored nulls are distinguishable;
+constructor guard pattern across the whole fill) + 50 e2e files + embed map
+section (300-entry host-built map under asan-aggr, forced rehashes
+mid-construction) + tree-sitter grammar delta note (separate repo). gates:
+e2e 261/261 x4 (211 + 50), embed x3, unit x3, fresh-apply. drive-by fixes
+flagged in the patch: array_as_str separator placement ("[, 1, 23]" —
+v0.1.0 bug, no test converted a multi-element array), array_as_str chars
+leak, object_debug_print array/map tags (ok.h always documented "per-type
+tags"). bench trio + map_for_in_sum added to the suite; sandbox preview
+(-O2, median of 9, lua pending the CI runner): map_insert 128ms vs python
+84, map_lookup 203 vs 423 (2.1x faster), map_churn 178 vs 96,
+map_for_in_sum 161 vs 1000 (6.2x faster). NaN keys: hash/equals agree on
+bits (same-bits NaN = same key) — needs a ruling when floats get looked at.
+
+**0.2.0-maps is feature complete pending Q's review of patch 19.**
 
 **bench trio** (lands with B): insert-heavy, lookup-heavy, churn-heavy, vs
 lua tables and python dicts, on the real bench protocol (the micro-bench

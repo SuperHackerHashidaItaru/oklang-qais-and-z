@@ -86,3 +86,16 @@ ok_map_* API — unchanged by C landing first).
 - 16-tree-sitter-oklang-no-question-update: APPLIED by Q to the
   tree-sitter-oklang repo (grammar + queries + corpus, 131/131).
 
+
+## 19 — map-surface (MAPS.md patch B, the last maps patch)
+
+vs maps-staging `0987b4e`. the surface: literals `{k: v}` / `{:}`, polymorphic
+index r/w (OP_ARRAY_* renamed OP_INDEX_*), the ITER trio (for-in over arrays
+AND maps, one- or two-binding; mid-iteration size change = hard error),
+get/len/remove builtins (variadic-native sentinel), `as map` tag, tracer,
+native API ok_map_*, 50 e2e files, embed map section. includes the string
+-hash fix (standard FNV-1a — okutils' variant's low bits collapse on short
+ascii keys) and three flagged drive-by fixes (array_as_str separator +
+leak, debug-print tags). full what/why/blast-radius: 19-map-surface.md (also
+in download/). READ THE .md FIRST — it carries the one syntax call
+(`for let k, v : m`) and three honest notes needing Q's eye.

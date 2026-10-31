@@ -45,6 +45,10 @@ The old stack VM is deliberately skipped for these because it does not implement
 | `array_subscript_variable_add_compound` | Same variable-index case using `a[i] += 1`. | 2,000,000 | `2000000` |
 | `global_array_subscript_add_plain` | Array-element add through global container `g`, using literal index `0`. | 2,000,000 | `2000000` |
 | `global_array_subscript_add_compound` | Same global-container case using `g[0] += 1`. | 2,000,000 | `2000000` |
+| `map_insert` | Insert-heavy maps: 200k string-key inserts into an empty map, forcing repeated rehash growth. Lua uses table assignment, Python dict assignment. | 200,000 | `199999` |
+| `map_lookup` | Lookup-heavy maps: 8 million string-key reads over a prebuilt 8-entry map; the map sibling of `array_index_sum`. | 1,000,000 passes (8M reads) | `36000000` |
+| `map_churn` | Churn-heavy maps: interleaved insert/remove (odd keys survive), exercising backward-shift deletion and slot reuse. | 200,000 | `199999` |
+| `map_for_in_sum` | Map iteration: Oklang `for let k, v :`, Lua `pairs`, Python key iteration + value lookup; 8M visited entries. | 1,000,000 passes (8M visited) | `36000000` |
 
 ## Run it
 
@@ -90,6 +94,8 @@ The multiplication/division benchmarks use a factor of `1.0000001` over two mill
 - The while-loop baselines are retained so you can compare generic looping against numeric-for specialization.
 - `array_index_sum` uses explicit indexing. `array_for_in_sum` uses Oklang's `for-in`, Lua's `ipairs`, and Python's native list iteration; those are idiomatic counterparts, not identical implementation strategies.
 - Oklang uses `%g` formatting in the register VM while an older build may use `%f`. Output formatting can differ; validate numeric results, not exact text, and the single final print has negligible influence on these loop timings.
+- `map_for_in_sum` compares Oklang's two-binding form (k and v delivered by the loop op) against Lua's `pairs` (also k + v) and Python's `for key in m: m[key]` - the idiomatic way to get both key and value per trip in each language. Python's `.values()` would only be a fair comparison for a keys-discarding variant.
+- `array_for_in_sum` timings across Oklang versions: since the maps patch, the ranged for-in is lowered onto the ITER op trio (no more `len` call at loop entry). On the sandbox preview the array for-in benchmarks improved ~11-12% from this; the numbers below were taken with the new lowering.
 - The static indexed-global test measures Oklang's compile-time-resolved global slots, not dynamic name lookup. Do not interpret it as a generic comparison of global-name resolution.
 - Make sure every benchmark finishes successfully and produces the documented result before trusting timings. The runner checks command exit status through Hyperfine but does not automatically compare output values.
 

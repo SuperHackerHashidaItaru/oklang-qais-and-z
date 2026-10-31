@@ -1,0 +1,3024 @@
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index b10ed0d..fa78ceb 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -56,6 +56,12 @@ bool ok_global_get(ok* p_ok, ok_string_view p_name, ok_value* p_value);
+ 
+ /* native */
+ typedef ok_value (*ok_native_fn)(ok* p_ok, uint8_t p_argc, const ok_value* p_argv);
++
++// register with this arity to accept any argument count and validate inside
++// the callback (used by the polymorphic core builtins: 'remove' takes 3
++// arguments for arrays, 2 for maps; 'get' takes 2 or 3 for maps).
++#define OK_NATIVE_ARITY_ANY UINT8_MAX
++
+ bool ok_global_define_native_function(ok* p_ok, ok_string_view p_name, uint8_t p_arity, ok_native_fn p_cb);
+ 
+ bool ok_native_error(ok* p_ok, ok_string_view p_message);
+@@ -97,6 +103,33 @@ bool ok_array_set(ok_value p_value, uint32_t p_index, ok_value p_new_value);
+ // throught either (ok_root, a traced native value, registers, or a global).
+ bool ok_array_push(ok* p_ok, ok_value p_array, ok_value p_value);
+ 
++/* maps */
++
++// builds a new map from p_pair_count (key, value) pairs laid out flat:
++// {k0, v0, k1, v1, ...}. p_pairs may be NULL when p_pair_count is 0.
++// duplicate keys: the later pair wins, same as the literal. returns a null
++// value on allocation failure or an illegal key (null / unhashable - only
++// strings, numbers and booleans can be keys). the map stays rooted across the
++// whole fill loop: each set may rehash under the collector.
++ok_value ok_map_new(ok* p_ok, const ok_value* p_pairs, uint32_t p_pair_count);
++
++bool ok_value_is_map(ok_value p_value);
++
++// 0 for anything that is not a map.
++uint32_t ok_map_len(ok_value p_value);
++
++// read-only, allocation-free. false = not a map, illegal key, or absent; the
++// stored value (even a stored null) lands in *p_out only when true.
++bool ok_map_get(ok_value p_map, ok_value p_key, ok_value* p_out);
++
++// insert-or-overwrite. the map, key and value are guarded against the
++// collector for the duration of the call (the set may grow).
++bool ok_map_set(ok* p_ok, ok_value p_map, ok_value p_key, ok_value p_value);
++
++// removes the key. false = not a map, illegal key, or absent (no store
++// happens either way). never allocates.
++bool ok_map_remove(ok_value p_map, ok_value p_key);
++
+ /* output */
+ 
+ // print statements route through p_cb when set. the default (NULL) keeps the
+diff --git a/src/ok.c b/src/ok.c
+index 61cf394..a1ec661 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -33,14 +33,63 @@ struct ok {
+ 
+ static ok_value native_len(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
+   (void)p_argc;
+-  if (!IS_VALUE_ARRAY(p_argv[0])) {
++  if (IS_VALUE_ARRAY(p_argv[0])) {
++    // f64, never an int, numbers are the only public numeric type
++    return NUMBER_AS_VALUE((double)VALUE_AS_ARRAY(p_argv[0])->values.count);
++  }
++  if (IS_VALUE_MAP(p_argv[0])) {
++    return NUMBER_AS_VALUE((double)VALUE_AS_MAP(p_argv[0])->entries.count);
++  }
++  ok_native_error(
++      p_ok,
++      ok_create_string_view("invalid argument: 'len' expects an array or a map.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  return NULL_AS_VALUE();
++}
++
++// get(m, k) / get(m, k, default): the lax read - absent yields null (or the
++// given default), where [] hard-errors (R1). the key rules are the map's:
++// null and unhashable keys error, only absence is lax.
++static ok_value native_get(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  if (p_argc < 1) {
++    ok_native_error(p_ok,
++                    ok_create_string_view(
++                        "invalid call to 'get': expected 2 arguments (map, key) or 3 (map, key, default).",
++                        OK_STRING_VIEW_CALCULATE_LENGTH,
++                        true));
++    return NULL_AS_VALUE();
++  }
++  if (!IS_VALUE_MAP(p_argv[0])) {
+     ok_native_error(
+         p_ok,
+-        ok_create_string_view("invalid argument: 'len' expects an array.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        ok_create_string_view("invalid argument: 'get' expects a map.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  if (p_argc != 2 && p_argc != 3) {
++    ok_native_error(p_ok,
++                    ok_create_string_view(
++                        "invalid call to 'get': expected 2 arguments (map, key) or 3 (map, key, default).",
++                        OK_STRING_VIEW_CALCULATE_LENGTH,
++                        true));
+     return NULL_AS_VALUE();
+   }
+-  // f64, never an int, numbers are the only public numeric type
+-  return NUMBER_AS_VALUE((double)VALUE_AS_ARRAY(p_argv[0])->values.count);
++  if (IS_VALUE_STRICTLY_NULL(p_argv[1])) {
++    ok_native_error(
++        p_ok, ok_create_string_view("map key cannot be null.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  if (!map_key_is_legal(p_argv[1])) {
++    ok_native_error(p_ok,
++                    ok_create_string_view(
++                        "invalid map key: only strings, numbers and booleans can be keys.",
++                        OK_STRING_VIEW_CALCULATE_LENGTH,
++                        true));
++    return NULL_AS_VALUE();
++  }
++  value* slot = value_map_get(&VALUE_AS_MAP(p_argv[0])->entries, p_argv[1]);
++  if (slot != NULL) {
++    return *slot;
++  }
++  return p_argc == 3 ? p_argv[2] : NULL_AS_VALUE();
+ }
+ 
+ static ok_value native_push(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
+@@ -80,15 +129,54 @@ static ok_value native_pop(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
+   return popped;
+ }
+ 
+-// remove(a, [m, n)): in place removal of the half open range [m, n). the language
+-// surface is half open, the underlying OK_ARRAY remove is
+-// inclusive end, so translation happen here.
++// remove: arrays take the half open range remove(a, m, n); maps take the key
++// remove(m, k). the argc + type dispatch is explicit - one builtin name, two
++// shapes, both documented. removing an absent map key is a legal no-op (the
++// array form's empty range is legal for the same reason).
+ static ok_value native_remove(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
+-  (void)p_argc;
++  if (p_argc < 1) {
++    ok_native_error(p_ok,
++                    ok_create_string_view(
++                        "invalid argument: 'remove' expects an array or a map.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  if (IS_VALUE_MAP(p_argv[0])) {
++    if (p_argc != 2) {
++      ok_native_error(p_ok,
++                      ok_create_string_view(
++                          "invalid call to 'remove' on a map: expected 2 arguments (map, key).",
++                          OK_STRING_VIEW_CALCULATE_LENGTH,
++                          true));
++      return NULL_AS_VALUE();
++    }
++    if (IS_VALUE_STRICTLY_NULL(p_argv[1])) {
++      ok_native_error(
++          p_ok, ok_create_string_view("map key cannot be null.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      return NULL_AS_VALUE();
++    }
++    if (!map_key_is_legal(p_argv[1])) {
++      ok_native_error(p_ok,
++                      ok_create_string_view(
++                          "invalid map key: only strings, numbers and booleans can be keys.",
++                          OK_STRING_VIEW_CALCULATE_LENGTH,
++                          true));
++      return NULL_AS_VALUE();
++    }
++    object_map_remove(VALUE_AS_MAP(p_argv[0]), p_argv[1]); // absent = no-op
++    return NULL_AS_VALUE();
++  }
++  if (p_argc != 3) {
++    ok_native_error(p_ok,
++                    ok_create_string_view(
++                        "invalid call to 'remove' on an array: expected 3 arguments (array, start, end).",
++                        OK_STRING_VIEW_CALCULATE_LENGTH,
++                        true));
++    return NULL_AS_VALUE();
++  }
+   if (!IS_VALUE_ARRAY(p_argv[0])) {
+     ok_native_error(
+         p_ok,
+-        ok_create_string_view("invalid argument: 'remove' expects an array.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        ok_create_string_view("invalid argument: 'remove' expects an array or a map.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+     return NULL_AS_VALUE();
+   }
+   uint32_t range[2] = {0, 0};
+@@ -145,8 +233,12 @@ static bool ok_define_core_natives(ok* p_ok) {
+       p_ok, ok_create_string_view(" push", OK_STRING_VIEW_CALCULATE_LENGTH, true), 2, native_push);
+   status &= ok_global_define_native_function(
+       p_ok, ok_create_string_view(" pop", OK_STRING_VIEW_CALCULATE_LENGTH, true), 1, native_pop);
++  // ' remove' and ' get' validate argc themselves: remove is 3-for-arrays /
++  // 2-for-maps, get is 2 or 3 (the default-value form)
+   status &= ok_global_define_native_function(
+-      p_ok, ok_create_string_view(" remove", OK_STRING_VIEW_CALCULATE_LENGTH, true), 3, native_remove);
++      p_ok, ok_create_string_view(" remove", OK_STRING_VIEW_CALCULATE_LENGTH, true), OK_NATIVE_ARITY_ANY, native_remove);
++  status &= ok_global_define_native_function(
++      p_ok, ok_create_string_view(" get", OK_STRING_VIEW_CALCULATE_LENGTH, true), OK_NATIVE_ARITY_ANY, native_get);
+   return status;
+ }
+ 
+@@ -158,6 +250,8 @@ static bool ok_define_temporary_types(ok* p_ok) {
+       p_ok, ok_create_string_view(" num", OK_STRING_VIEW_CALCULATE_LENGTH, true), RESERVED_1_AS_VALUE(TT_NUM), false);
+   status &= ok_global_define(
+       p_ok, ok_create_string_view(" bool", OK_STRING_VIEW_CALCULATE_LENGTH, true), RESERVED_1_AS_VALUE(TT_BOOL), false);
++  status &= ok_global_define(
++      p_ok, ok_create_string_view(" map", OK_STRING_VIEW_CALCULATE_LENGTH, true), RESERVED_1_AS_VALUE(TT_MAP), false);
+   return status;
+ }
+ 
+@@ -168,9 +262,11 @@ static top_level_declarations ok_get_top_level_declarations(ok* p_ok, bool* p_er
+                                       {ok_create_string_view("push", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+                                       {ok_create_string_view("pop", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+                                       {ok_create_string_view("remove", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
++                                      {ok_create_string_view("get", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+                                       {ok_create_string_view("str", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+                                       {ok_create_string_view("num", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+-                                      {ok_create_string_view("bool", OK_STRING_VIEW_CALCULATE_LENGTH, true)}};
++                                      {ok_create_string_view("bool", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
++                                      {ok_create_string_view("map", OK_STRING_VIEW_CALCULATE_LENGTH, true)}};
+ 
+   *p_error = !top_level_declarations_append_n(&decls, raw_decls, sizeof(raw_decls) / sizeof(variable_declaration));
+   return decls;
+@@ -181,9 +277,11 @@ static value_array ok_get_top_level_values(ok* p_ok, bool* p_error) {
+                                  ok_create_string_view(" push", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+                                  ok_create_string_view(" pop", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+                                  ok_create_string_view(" remove", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                                 ok_create_string_view(" get", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+                                  ok_create_string_view(" str", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+                                  ok_create_string_view(" num", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                 ok_create_string_view(" bool", OK_STRING_VIEW_CALCULATE_LENGTH, true)};
++                                 ok_create_string_view(" bool", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                                 ok_create_string_view(" map", OK_STRING_VIEW_CALCULATE_LENGTH, true)};
+ 
+   value_array vals;
+   value_array_init(&vals, &p_ok->alloc);
+@@ -488,6 +586,7 @@ bool ok_unroot(ok* p_ok, uint32_t p_root) {
+   return gc_unroot(&p_ok->gc, p_root);
+ }
+ 
++
+ ok_value ok_array_new(ok* p_ok, const ok_value* p_items, uint32_t p_count) {
+   object_specs s = {.alloc = &p_ok->alloc, .store = &p_ok->objects_store};
+   object_array* arr = create_object_array(&s);
+@@ -553,3 +652,94 @@ bool ok_array_push(ok* p_ok, ok_value p_array, ok_value p_value) {
+   gc_guard_down(&p_ok->gc);
+   return appended;
+ }
++
++/* maps */
++
++// builds a new map from p_pair_count (key, value) pairs laid out flat:
++// {k0, v0, k1, v1, ...}. p_pairs may be NULL when p_pair_count is 0.
++// duplicate keys: the later pair wins, same as the literal. returns a null
++// value on allocation failure or an illegal key (null / unhashable).
++ok_value ok_map_new(ok* p_ok, const ok_value* p_pairs, uint32_t p_pair_count) {
++  object_specs s = {.alloc = &p_ok->alloc, .store = &p_ok->objects_store};
++  object_map* map = create_object_map(&s);
++  if (map == NULL) {
++    return NULL_AS_VALUE();
++  }
++  // the constructor guard pattern, mirroring ok_array_new: the map is linked
++  // in the store yet unreachable, and every set may rehash (grow) under the
++  // collector - so it stays rooted across the whole fill and each pair across
++  // its own set. guard depth peaks at 3 (capacity 16).
++  gc_guard_up(&p_ok->gc, OBJECT_AS_VALUE(map));
++  for (uint32_t i = 0; i < p_pair_count; ++i) {
++    const ok_value key = p_pairs[2 * i];
++    const ok_value val = p_pairs[2 * i + 1];
++    if (IS_VALUE_STRICTLY_NULL(key) || !map_key_is_legal(key)) {
++      gc_guard_down(&p_ok->gc);
++      return NULL_AS_VALUE(); // null return: only strings, numbers, bools key
++    }
++    gc_guard_up(&p_ok->gc, key);
++    gc_guard_up(&p_ok->gc, val);
++    const bool set = object_map_set(map, key, val);
++    gc_guard_down(&p_ok->gc);
++    gc_guard_down(&p_ok->gc);
++    if (!set) {
++      gc_guard_down(&p_ok->gc);
++      return NULL_AS_VALUE();
++    }
++  }
++  gc_guard_down(&p_ok->gc);
++  return OBJECT_AS_VALUE(map);
++}
++
++bool ok_value_is_map(ok_value p_value) {
++  return IS_VALUE_MAP(p_value);
++}
++
++uint32_t ok_map_len(ok_value p_value) {
++  if (!IS_VALUE_MAP(p_value)) {
++    return 0;
++  }
++  return VALUE_AS_MAP(p_value)->entries.count;
++}
++
++// read-only and allocation-free (probes never allocate). false = not a map,
++// illegal key, or absent; the stored value (even a stored null) lands in
++// *p_out only when true.
++bool ok_map_get(ok_value p_map, ok_value p_key, ok_value* p_out) {
++  if (!IS_VALUE_MAP(p_map) || IS_VALUE_STRICTLY_NULL(p_key) || !map_key_is_legal(p_key)) {
++    return false;
++  }
++  value* slot = value_map_get(&VALUE_AS_MAP(p_map)->entries, p_key);
++  if (slot == NULL) {
++    return false;
++  }
++  *p_out = *slot;
++  return true;
++}
++
++// insert-or-overwrite. unlike the ' get'/' remove' core natives (whose
++// arguments are rooted through the caller's register window), a host-held map,
++// key and value are invisible to the collector: all three need the guard while
++// the set may grow (collect).
++bool ok_map_set(ok* p_ok, ok_value p_map, ok_value p_key, ok_value p_value) {
++  if (!IS_VALUE_MAP(p_map) || IS_VALUE_STRICTLY_NULL(p_key) || !map_key_is_legal(p_key)) {
++    return false;
++  }
++  gc_guard_up(&p_ok->gc, p_map);
++  gc_guard_up(&p_ok->gc, p_key);
++  gc_guard_up(&p_ok->gc, p_value);
++  const bool set = object_map_set(VALUE_AS_MAP(p_map), p_key, p_value);
++  gc_guard_down(&p_ok->gc);
++  gc_guard_down(&p_ok->gc);
++  gc_guard_down(&p_ok->gc);
++  return set;
++}
++
++// backward-shift removal, no allocation. false = not a map, illegal key, or
++// absent (in which case nothing changed).
++bool ok_map_remove(ok_value p_map, ok_value p_key) {
++  if (!IS_VALUE_MAP(p_map) || IS_VALUE_STRICTLY_NULL(p_key) || !map_key_is_legal(p_key)) {
++    return false;
++  }
++  return object_map_remove(VALUE_AS_MAP(p_map), p_key);
++}
+diff --git a/src/okast.c b/src/okast.c
+index b6bfc8b..424f68c 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -31,7 +31,7 @@
+   /*X(AST_THIS_EXPRESSION, ast_this_expression)*/                                                                      \
+   /*X(AST_SUPER_EXPRESSION, ast_super_expression)*/                                                                    \
+   X(AST_ARRAY_EXPRESSION, ast_array_expression)                                                                        \
+-  /*X(AST_MAP_EXPRESSION, ast_map_expression)*/                                                                        \
++  X(AST_MAP_EXPRESSION, ast_map_expression)                                                                        \
+   X(AST_SUBSCRIPT_EXPRESSION, ast_subscript_expression)                                                                \
+   X(AST_FUNCTION_EXPRESSION, ast_function_expression)                                                                  \
+   X(AST_EMPTY_STATEMENT, ast_empty_statement)                                                                          \
+@@ -807,6 +807,64 @@ string ast_array_expression_asprint(const ast_array_expression* p_array) {
+   return ret;
+ }
+ 
++void ast_map_expression_init(ast_map_expression* p_map,
++                             token p_token,
++                             ast_expressions_list p_keys,
++                             ast_expressions_list p_values,
++                             ast_specs* p_specs) {
++  ast_expression_init(&p_map->expression, AST_MAP_EXPRESSION, p_token, p_specs);
++  p_map->keys = p_keys;
++  p_map->values = p_values;
++}
++
++void ast_map_expression_deinit(ast_map_expression* p_map) {
++  ast_expressions_list_deinit(&p_map->keys, p_map->expression.node.alloc);
++  ast_expressions_list_deinit(&p_map->values, p_map->expression.node.alloc);
++  ast_expression_deinit(&p_map->expression);
++}
++
++bool ast_map_expression_print(const ast_map_expression* p_map) {
++  bool status = printf("{") > 0;
++  for (uint32_t i = 0; i < p_map->keys.count; ++i) {
++    status &= ast_dispatch_print((ast_node*)p_map->keys.data[i]);
++    status &= printf(": ") > 0;
++    status &= ast_dispatch_print((ast_node*)p_map->values.data[i]);
++    if (i + 1 < p_map->keys.count) {
++      status &= printf(", ") > 0;
++    }
++  }
++  status &= printf("}") > 0;
++  return status;
++}
++
++string ast_map_expression_asprint(const ast_map_expression* p_map) {
++  allocators* alloc = p_map->expression.node.alloc;
++  string ret = create_static_string("{:}", 3); // empty until entries are folded in
++  if (p_map->keys.count == 0) {
++    return ret;
++  }
++  string_deinit(&ret, alloc);
++  ret = create_static_string("{", 1);
++  for (uint32_t i = 0; i < p_map->keys.count; ++i) {
++    string k = ast_dispatch_asprint((ast_node*)p_map->keys.data[i]);
++    string v = ast_dispatch_asprint((ast_node*)p_map->values.data[i]);
++    string joined = asprint(alloc,
++                            "%s%s%s: %s%s",
++                            ret.chars,
++                            i == 0 ? "" : ", ",
++                            k.chars,
++                            v.chars,
++                            "");
++    string_deinit(&k, alloc);
++    string_deinit(&v, alloc);
++    string_deinit(&ret, alloc);
++    ret = joined;
++  }
++  string closed = asprint(alloc, "%s}", ret.chars);
++  string_deinit(&ret, alloc);
++  return closed;
++}
++
+ void ast_subscript_expression_init(ast_subscript_expression* p_subscript,
+                                    token p_token,
+                                    ast_expression* p_left,
+@@ -1105,6 +1163,7 @@ void ast_for_statement_init(ast_for_statement* p_for, token p_token, ast_specs*
+ void ast_for_in_statement_init(ast_for_in_statement* p_for_in, token p_token, ast_specs* p_specs) {
+   ast_statement_init(&p_for_in->statement, AST_FOR_IN_STATEMENT, p_token, p_specs);
+   p_for_in->binding = NULL;
++  p_for_in->value_binding = NULL;
+   p_for_in->iterable = NULL;
+   p_for_in->body = NULL;
+ }
+@@ -1116,6 +1175,11 @@ void ast_for_in_statement_deinit(ast_for_in_statement* p_for_in) {
+     alloc->release(alloc, p_for_in->binding);
+     p_for_in->binding = NULL;
+   }
++  if (p_for_in->value_binding != NULL) {
++    ast_binding_deinit(p_for_in->value_binding);
++    alloc->release(alloc, p_for_in->value_binding);
++    p_for_in->value_binding = NULL;
++  }
+   if (p_for_in->iterable != NULL) {
+     ast_dispatch_deinit((ast_node*)p_for_in->iterable);
+     alloc->release(alloc, p_for_in->iterable);
+diff --git a/src/okast.h b/src/okast.h
+index 455a1f1..afb9155 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -332,6 +332,22 @@ string ast_function_expression_asprint(const ast_function_expression* p_function
+ 
+ ARRAY_DECLARE_DEFAULT(ast_expressions_list, ast_expression*)
+ 
++typedef struct {
++  ast_expression expression;
++  ast_expressions_list keys;   // keys[i] pairs with values[i]. storage is
++  ast_expressions_list values; // parallel, evaluation is left to right per entry
++                              // (key, value, key, value) - codegen walks entries
++} ast_map_expression;
++
++void ast_map_expression_init(ast_map_expression* p_map,
++                             token p_token,
++                             ast_expressions_list p_keys,
++                             ast_expressions_list p_values,
++                             ast_specs* p_specs);
++void ast_map_expression_deinit(ast_map_expression* p_map);
++bool ast_map_expression_print(const ast_map_expression* p_map);
++string ast_map_expression_asprint(const ast_map_expression* p_map);
++
+ typedef struct {
+   ast_expression expression;
+   ast_expressions_list elements;
+@@ -484,8 +500,10 @@ string ast_for_statement_asprint(const ast_for_statement* p_for);
+ 
+ typedef struct {
+   ast_statement statement;
+-  ast_binding* binding;     // the loop variable (name + mutability)
+-  ast_expression* iterable; // evaluated once at loop entry
++  ast_binding* binding;      // the loop variable (name + mutability)
++  ast_binding* value_binding; // nullable: the map two-binding form (`for let k, v : m`).
++                              // when set, binding binds keys and this binds values.
++  ast_expression* iterable;  // evaluated once at loop entry
+   ast_statement* body;
+ } ast_for_in_statement;
+ 
+diff --git a/src/okchunk.h b/src/okchunk.h
+index aba91b1..eeef9a0 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -195,10 +195,16 @@ typedef enum {
+   OP_PRINT,              // w:    (p, A)          -> print r[A]
+   OP_ARRAY_NEW,          // w:    (a, b, c)       -> r[a] = c != 0 then Array(r[b]..r[b + c - 1]) otherwise Array()
+   OP_ARRAY_NEW_LONG,     // 2w:   (A, B, C)       -> same; ip += w
+-  OP_ARRAY_GET,          // w:    (p, a, b, c)    -> r[a] = r[b][p then k[c] otherwise r[c]]
+-  OP_ARRAY_GET_LONG,     // 2w:   (p, A, B, C)    -> r[A] = r[B][p then k[C] otherwise r[C]]; ip += w
+-  OP_ARRAY_SET,          // w:    (p, a, b, c)    -> r[a][p then k[b] otherwise r[b]] = r[c] (value is a register in narrow)
+-  OP_ARRAY_SET_LONG,     // 2w:   (p, q, A, B, C) -> r[A][p then k[B] : r[B]] = (q otherwise k[C] : r[C]); ip += w
++  OP_MAP_NEW,            // w:    (a, b, c)       -> r[a] = c != 0 then Map(r[b], r[b + 1], .. r[b + 2c - 1]) otherwise Map()
++                         //                          c is the PAIR count: [b, b + 2c) is k0, v0, k1, v1, ...
++  OP_MAP_NEW_LONG,       // 2w:   (A, B, C)       -> same; ip += w
++  OP_INDEX_GET,          // w:    (p, a, b, c)    -> r[a] = r[b][p then k[c] otherwise r[c]]
++  OP_INDEX_GET_LONG,     // 2w:   (p, A, B, C)    -> r[A] = r[B][p then k[C] otherwise r[C]]; ip += w
++                         //                          r[B] array: whole-number index, out of bounds errors.
++                         //                          r[B] map: key lookup, missing key errors (R1 - get() is the lax path)
++  OP_INDEX_SET,          // w:    (p, a, b, c)    -> r[a][p then k[b] otherwise r[b]] = r[c] (value is a register in narrow)
++  OP_INDEX_SET_LONG,     // 2w:   (p, q, A, B, C) -> r[A][p then k[B] : r[B]] = (q otherwise k[C] : r[C]); ip += w
++                         //                          r[A] array: bounds checked store. r[A] map: insert-or-overwrite
+   OP_JUMP_IF_ARGC,       // 2w:   (p, A, B)       -> ip += A when (p == 1) == (frame->argc > B); B is the 0-based parameter position
+   OP_FOR_PREP,           // 2w:   (A, B)          -> numeric for entry: r[B] is the counter, r[B + 1] the limit, r[B + 2] the step
+                          //                          (compiler allocates the three adjacently and asserts it). validates all
+@@ -215,6 +221,22 @@ typedef enum {
+                          //                          checks (FOR_PREP's normalization holds: the limit/step are nameless, the
+                          //                          counter is statically unwritable). p == 0: `let mut` - the counter is gated
+                          //                          each trip, the body may reseat it to any value.
++  OP_ITER_PREP,          // 2w:   (p, A, B)       -> for-in entry (arrays and maps, runtime dispatched). r[B] is the
++                         //                          iterable, r[B + 1] the cursor, r[B + 2] the end (arrays: element
++                         //                          count; maps: the version snapshot). arrays: cursor = 0, first bounds
++                         //                          test, empty skips the loop (ip += A like OP_JUMP_IF's forward offset).
++                         //                          maps: snapshot the version, advance the cursor to the first occupied
++                         //                          slot, empty skips. p == 1: the two-binding form (k, v) - arrays error
++                         //                          ("arrays bind one loop variable"), maps write both loop registers.
++                         //                          anything else: "can only iterate over arrays and maps".
++  OP_ITER_GET,           // 2w:   (p, A, B, C)    -> for-in body top: r[C] = current element. arrays: r[C] =
++                         //                          r[B] values[cursor]. maps: r[C] = keys[cursor], and when p == 1 also
++                         //                          r[C + 1] = values[cursor] (the compiler declares k, v adjacent).
++                         //                          (A unused, always 0)
++  OP_ITER_LOOP,          // 2w:   (p, A, B)       -> for-in back edge. arrays: cursor + 1, still < end -> ip -= A.
++                         //                          maps: the version snapshot must match (a size change during iteration
++                         //                          is a hard error, overwrites are fine), advance the cursor to the next
++                         //                          occupied slot, found -> ip -= A. (p unused, always false)
+ } opcode;
+ 
+ // clang-format on
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 6926568..7bf3e50 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -442,6 +442,11 @@ static bool compile_array_expression(compiler* p_compiler,
+                                      _register p_dest,
+                                      uint32_t p_requested_count,
+                                      expression_result* p_out);
++static bool compile_map_expression(compiler* p_compiler,
++                                   ast_map_expression* p_map,
++                                   _register p_dest,
++                                   uint32_t p_requested_count,
++                                   expression_result* p_out);
+ static bool compile_subscript_expression(compiler* p_compiler,
+                                          ast_subscript_expression* p_subscript,
+                                          _register p_dest,
+@@ -692,6 +697,9 @@ static bool compile_expression(compiler* p_compiler,
+     result =
+         compile_array_expression(p_compiler, (ast_array_expression*)p_expression, p_dest, p_requested_count, p_out);
+     break;
++  case AST_MAP_EXPRESSION:
++    result = compile_map_expression(p_compiler, (ast_map_expression*)p_expression, p_dest, p_requested_count, p_out);
++    break;
+   case AST_SUBSCRIPT_EXPRESSION:
+     result = compile_subscript_expression(
+         p_compiler, (ast_subscript_expression*)p_expression, p_dest, p_requested_count, p_out);
+@@ -1246,6 +1254,17 @@ static bool expression_is_inert(const ast_expression* p_expression) {
+     }
+     return true;
+   }
++  case AST_MAP_EXPRESSION: {
++    // a literal allocates but never reseats a local (the gc is non-moving);
++    // only its entries' expressions can write
++    const ast_map_expression* map = (const ast_map_expression*)p_expression;
++    for (uint32_t i = 0; i < map->keys.count; ++i) {
++      if (!expression_is_inert(map->keys.data[i]) || !expression_is_inert(map->values.data[i])) {
++        return false;
++      }
++    }
++    return true;
++  }
+   case AST_CONDITIONAL_EXPRESSION: {
+     const ast_conditional_expression* conditional = (const ast_conditional_expression*)p_expression;
+     return expression_is_inert(conditional->condition) && expression_is_inert(conditional->then_arm) &&
+@@ -1373,7 +1392,7 @@ static bool store_lvalue(compiler* p_compiler, lvalue p_lvalue, expression_resul
+     const uint16_t index_operand = p_lvalue.subscript.index.index;
+     if (!is_value_constant && base_index <= a_MAX && index_operand <= b_MAX && value.index <= c_MAX) {
+       if (!emit_word(p_compiler,
+-                     encode_oppabc(OP_ARRAY_SET, is_index_constant, base_index, index_operand, value.index),
++                     encode_oppabc(OP_INDEX_SET, is_index_constant, base_index, index_operand, value.index),
+                      p_author)) {
+         report_oom(p_compiler, p_author);
+         return false;
+@@ -1383,7 +1402,7 @@ static bool store_lvalue(compiler* p_compiler, lvalue p_lvalue, expression_resul
+     if (!emit_word2(
+             p_compiler,
+             encode_OPPABCQ(
+-                OP_ARRAY_SET_LONG, is_index_constant, base_index, index_operand, value.index, is_value_constant),
++                OP_INDEX_SET_LONG, is_index_constant, base_index, index_operand, value.index, is_value_constant),
+             p_author)) {
+       report_oom(p_compiler, p_author);
+       return false;
+@@ -2496,15 +2515,16 @@ bool compile_call_expression(compiler* p_compiler,
+   return true;
+ }
+ 
+-// r[p_dest] = r[p_base][p_index]. base is always a register (resolve_lvalue
++// r[p_dest] = r[p_base][p_index]. the INDEX ops dispatch array/map at
++// runtime; base is always a register (resolve_lvalue
+ // materializes it), index may be a constant (GET carries a const-index flag).
+ static bool
+-emit_array_get(compiler* p_compiler, _register p_dest, location p_base, location p_index, ast_node* p_author) {
++emit_index_get(compiler* p_compiler, _register p_dest, location p_base, location p_index, ast_node* p_author) {
+   const bool is_index_constant = p_index.kind == LOCATION_KIND_CONSTANT;
+   if (p_dest.index > a_MAX || p_base.index > b_MAX || p_index.index > c_MAX) {
+     if (!emit_word2(
+             p_compiler,
+-            encode_OPPABCQ(OP_ARRAY_GET_LONG, is_index_constant, p_dest.index, p_base.index, p_index.index, false),
++            encode_OPPABCQ(OP_INDEX_GET_LONG, is_index_constant, p_dest.index, p_base.index, p_index.index, false),
+             p_author)) {
+       report_oom(p_compiler, p_author);
+       return false;
+@@ -2512,7 +2532,7 @@ emit_array_get(compiler* p_compiler, _register p_dest, location p_base, location
+     return true;
+   }
+   if (!emit_word(p_compiler,
+-                 encode_oppabc(OP_ARRAY_GET, is_index_constant, p_dest.index, p_base.index, p_index.index),
++                 encode_oppabc(OP_INDEX_GET, is_index_constant, p_dest.index, p_base.index, p_index.index),
+                  p_author)) {
+     report_oom(p_compiler, p_author);
+     return false;
+@@ -2553,6 +2573,75 @@ static bool compile_array_expression(compiler* p_compiler,
+   return true;
+ }
+ 
++// `{k0: v0, k1: v1}` - entries compile into consecutive temps in evaluation
++// order (k0, v0, k1, v1: left to right per entry, like every other list), so
++// they end up exactly at [start .. start + 2 * count). MAP_NEW's (dest, src,
++// pair count) operands are independent, mirroring ARRAY_NEW.
++static bool compile_map_expression(compiler* p_compiler,
++                                   ast_map_expression* p_map,
++                                   _register p_dest,
++                                   uint32_t p_requested_count,
++                                   expression_result* p_out) {
++  (void)p_requested_count;
++  ast_node* author = (ast_node*)p_map;
++  register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
++  const uint32_t count = p_map->keys.count;
++  if (count > C_MAX) {
++    string note = asprint(p_compiler->alloc, "limit is: %d pairs.", C_MAX);
++    error_at_noted(p_compiler,
++                   author,
++                   ok_create_string_view("too many map entries.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                   ok_create_string_view_from_string(note));
++    string_deinit(&note, p_compiler->alloc);
++    return false;
++  }
++  _register start = {0, REGISTER_FLAG_NONE, REGISTER_OK};
++  for (uint32_t i = 0; i < count; ++i) {
++    _register key_reg;
++    if (!register_allocator_allocate_temp(regalloc, &key_reg)) {
++      report_oom(p_compiler, author);
++      return false;
++    }
++    if (i == 0) {
++      start = key_reg;
++    }
++    expression_result key_result;
++    if (!compile_expression(p_compiler, p_map->keys.data[i], key_reg, 1, &key_result)) {
++      return false;
++    }
++    if (!materialize_into(p_compiler, &key_result.value, key_reg, author)) {
++      return false;
++    }
++    _register value_reg;
++    if (!register_allocator_allocate_temp(regalloc, &value_reg)) {
++      report_oom(p_compiler, author);
++      return false;
++    }
++    expression_result value_result;
++    if (!compile_expression(p_compiler, p_map->values.data[i], value_reg, 1, &value_result)) {
++      return false;
++    }
++    if (!materialize_into(p_compiler, &value_result.value, value_reg, author)) {
++      return false;
++    }
++  }
++  const uint16_t src = count > 0 ? (uint16_t)start.index : (uint16_t)p_dest.index; // unused when count == 0
++  if (p_dest.index > a_MAX || src > b_MAX || count > c_MAX) {
++    if (!emit_word2(p_compiler, encode_OPPABCQ(OP_MAP_NEW_LONG, false, p_dest.index, src, count, false), author)) {
++      report_oom(p_compiler, author);
++      return false;
++    }
++  } else if (!emit_word(p_compiler, encode_oppabc(OP_MAP_NEW, false, p_dest.index, src, (uint8_t)count), author)) {
++    report_oom(p_compiler, author);
++    return false;
++  }
++  p_out->type = EXPRESSION_VALUE;
++  p_out->value = (location){p_dest.index, LOCATION_KIND_REGISTER, LOCATION_OK};
++  p_out->lvalue = (lvalue){LVALUE_INVALID};
++  p_out->count = 1;
++  return true;
++}
++
+ static bool compile_subscript_expression(compiler* p_compiler,
+                                          ast_subscript_expression* p_subscript,
+                                          _register p_dest,
+@@ -2567,7 +2656,7 @@ static bool compile_subscript_expression(compiler* p_compiler,
+   if (lv.kind == LVALUE_INVALID) {
+     return false;
+   }
+-  if (!emit_array_get(p_compiler, p_dest, lv.subscript.base, lv.subscript.index, (ast_node*)p_subscript)) {
++  if (!emit_index_get(p_compiler, p_dest, lv.subscript.base, lv.subscript.index, (ast_node*)p_subscript)) {
+     return false;
+   }
+   p_out->type = EXPRESSION_VALUE | EXPRESSION_SUBSCRIPT;
+@@ -2650,7 +2739,7 @@ static bool compile_compound_assign_expression(compiler* p_compiler,
+       if (!materialize_value(p_compiler, cur, lv.variable, author)) {
+         return false;
+       }
+-    } else if (!emit_array_get(p_compiler, cur, lv.subscript.base, lv.subscript.index, author)) {
++    } else if (!emit_index_get(p_compiler, cur, lv.subscript.base, lv.subscript.index, author)) {
+       return false;
+     }
+     cur_loc = (location){cur.index, LOCATION_KIND_REGISTER, LOCATION_OK};
+@@ -2699,6 +2788,14 @@ static bool compile_compound_assign_expression(compiler* p_compiler,
+   return true;
+ }
+ 
++// `for let k (, v)? : <iterable> <statement>` - the ranged loop, runtime
++// polymorphic over arrays (elements / one binding) and maps (keys, or keys and
++// values with the two-binding form). the ITER op trio carries the whole loop:
++// PREP validates the iterable and parks the cursor, GET writes the binding(s)
++// at the body top, LOOP advances at the bottom - one fused dispatch per trip,
++// the same shape the numeric for's FOR pair has. hidden state is [iter, cur,
++// end]: locals, not temps (every body statement resets temps to local_top and
++// would clobber them), nameless by the leading space, adjacency asserted.
+ static bool compile_for_in_statement(compiler* p_compiler, ast_for_in_statement* p_for_in) {
+   allocators* alloc = p_compiler->alloc;
+   compile_context* ctx = current_context(p_compiler);
+@@ -2721,179 +2818,96 @@ static bool compile_for_in_statement(compiler* p_compiler, ast_for_in_statement*
+ #define CTX ctx->loop_stack.data[ctx->loop_stack.count - 1]
+   CTX.scope_depth = ctx->scopes.count - 1;
+ 
+-  // hidden state must be locals, not temps: every body statement resets temps to
+-  // local_top, which sits below any temp allocated here. the registers would be
+-  // handed out to the body's own expressions and clobbered. the leading space makes
+-  // the names untypeable, and this loop's dedicated scope makes nesting safe.
+-  // the counter, limit and step are declared adjacently because the FOR ops read
+-  // the limit at counter + 1 and the step at counter + 2 (the same fused back edge
+-  // the numeric for uses - one increment/test dispatch per iteration).
+-  variable_declaration counter_decl = {.identifier = ok_create_string_view(" i", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                       .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
+-  _register counter = add_local(p_compiler, counter_decl, false, author);
+-  if (!IS_REGISTER_VALID(counter)) {
+-    goto fail;
+-  }
+-  variable_declaration limit_decl = {.identifier =
+-                                         ok_create_string_view(" limit", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                     .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
+-  _register limit = add_local(p_compiler, limit_decl, false, author);
+-  if (!IS_REGISTER_VALID(limit)) {
++  // the ITER ops read the cursor at B + 1 and the end at B + 2: the three
++  // hidden declarations must stay adjacent (asserted below).
++  variable_declaration iter_decl = {.identifier = ok_create_string_view(" iter", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                                    .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
++  _register iter = add_local(p_compiler, iter_decl, false, author);
++  if (!IS_REGISTER_VALID(iter)) {
+     goto fail;
+   }
+-  variable_declaration step_decl = {.identifier = ok_create_string_view(" step", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                    .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
+-  _register step = add_local(p_compiler, step_decl, false, author);
+-  if (!IS_REGISTER_VALID(step)) {
++  variable_declaration cur_decl = {.identifier = ok_create_string_view(" cur", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                                   .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
++  _register cur = add_local(p_compiler, cur_decl, false, author);
++  if (!IS_REGISTER_VALID(cur)) {
+     goto fail;
+   }
+-  ASSERT(limit.index == counter.index + 1 && step.index == counter.index + 2);
+-  variable_declaration arr_decl = {.identifier = ok_create_string_view(" arr", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++  variable_declaration end_decl = {.identifier = ok_create_string_view(" end", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+                                    .flags = VARIABLE_DECLARATION_FLAGS_MUTABLE};
+-  _register arr = add_local(p_compiler, arr_decl, false, author);
+-  if (!IS_REGISTER_VALID(arr)) {
++  _register end = add_local(p_compiler, end_decl, false, author);
++  if (!IS_REGISTER_VALID(end)) {
+     goto fail;
+   }
+-  variable_declaration var_decl = {
++  ASSERT(cur.index == iter.index + 1 && end.index == iter.index + 2);
++
++  // the two-binding map form: `for let k, v : m`. k and v must stay adjacent
++  // too - ITER_GET writes the value register at C + 1. arrays reject the form
++  // at runtime (PREP), the compiler cannot know the iterable's type.
++  const bool binds_value = p_for_in->value_binding != NULL;
++  variable_declaration key_decl = {
+       .identifier = ast_identifier_expression_get_value((ast_identifier_expression*)p_for_in->binding->lvalue),
+       .flags = variable_declaration_flags_from_modifiers(DECLARATION_NONE, p_for_in->binding->modifiers)};
+-  _register var = add_local(p_compiler, var_decl, false, (ast_node*)p_for_in->binding);
+-  if (!IS_REGISTER_VALID(var)) {
++  _register key = add_local(p_compiler, key_decl, false, (ast_node*)p_for_in->binding);
++  if (!IS_REGISTER_VALID(key)) {
+     goto fail;
+   }
+-  // the loop variable is defined by the first GET: clear the uninit flag so body
+-  // resolution finds it (resolve_local skips uninitialized locals for shadowing).
+-  regalloc->registers.data[var.index].flags &= ~REGISTER_FLAG_UNINITIALIZED;
+-
+-  // arr = <iterable> (evaluated exactly once, at loop entry)
+-  {
+-    expression_result iterable;
+-    if (!compile_expression(p_compiler, p_for_in->iterable, arr, 1, &iterable)) {
+-      goto fail;
+-    }
+-    if (!materialize_into(p_compiler, &iterable.value, arr, author)) {
++  _register value = {0, REGISTER_FLAG_NONE, REGISTER_OK};
++  if (binds_value) {
++    variable_declaration value_decl = {
++        .identifier = ast_identifier_expression_get_value((ast_identifier_expression*)p_for_in->value_binding->lvalue),
++        .flags = variable_declaration_flags_from_modifiers(DECLARATION_NONE, p_for_in->value_binding->modifiers)};
++    value = add_local(p_compiler, value_decl, false, (ast_node*)p_for_in->value_binding);
++    if (!IS_REGISTER_VALID(value)) {
+       goto fail;
+     }
++    ASSERT(value.index == key.index + 1);
+   }
+-
+-  {
+-    const global len_global = globals_store_get(p_compiler->globals_store,
+-                                                ok_create_string_view(" len", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+-    if (!IS_GLOBAL_VALID(len_global)) {
+-      error_at_noted(p_compiler,
+-                     author,
+-                     ok_create_string_view("undefined variable: len.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                     ok_create_string_view("ranged for needs the 'len' builtin. ok_create registers it.",
+-                                           OK_STRING_VIEW_CALCULATE_LENGTH,
+-                                           true));
+-      goto fail;
+-    }
+-    _register t_len;
+-    if (!register_allocator_allocate_temp(regalloc, &t_len)) {
+-      report_oom(p_compiler, author);
+-      goto fail;
+-    }
+-    if (t_len.index > aprime_MAX || len_global.index > bprime_MAX) {
+-      if (!emit_word2(
+-              p_compiler, encode_OPPABCQ(OP_LOAD_GLOBAL_LONG, false, t_len.index, len_global.index, 0, 0), author)) {
+-        report_oom(p_compiler, author);
+-        goto fail;
+-      }
+-    } else if (!emit_word(
+-                   p_compiler, encode_oppabprime(OP_LOAD_GLOBAL, false, t_len.index, len_global.index), author)) {
+-      report_oom(p_compiler, author);
+-      goto fail;
+-    }
+-    // stage the call window: callable at t_len, argument at t_len + 1
+-    _register t_arg;
+-    if (!register_allocator_allocate_temp(regalloc, &t_arg)) {
+-      report_oom(p_compiler, author);
+-      goto fail;
+-    }
+-    if (!materialize_value(p_compiler, t_arg, (location){arr.index, LOCATION_KIND_REGISTER, LOCATION_OK}, author)) {
+-      goto fail;
+-    }
+-    if (t_len.index > a_MAX || t_arg.index > a_MAX) {
+-      if (!emit_word2(p_compiler, encode_OPPABCQ(OP_CALL_LONG, false, t_len.index, 1, 2, 0), author)) {
+-        report_oom(p_compiler, author);
+-        goto fail;
+-      }
+-    } else if (!emit_word(p_compiler, encode_oppabc(OP_CALL, false, t_len.index, 1, 2), author)) {
+-      report_oom(p_compiler, author);
+-      goto fail;
+-    }
+-    // t_len now holds the count: move it into the hidden limit local
+-    if (!materialize_value(p_compiler, limit, (location){t_len.index, LOCATION_KIND_REGISTER, LOCATION_OK}, author)) {
+-      goto fail;
+-    }
++  // the loop variables are defined by the first ITER_GET: clear the uninit
++  // flags so body resolution finds them (resolve_local skips uninitialized
++  // locals for shadowing).
++  regalloc->registers.data[key.index].flags &= ~REGISTER_FLAG_UNINITIALIZED;
++  if (binds_value) {
++    regalloc->registers.data[value.index].flags &= ~REGISTER_FLAG_UNINITIALIZED;
+   }
+ 
+-  // counter = 0, step = 1: constants feeding the fused FOR pair
+-  {
+-    constant zero = add_constant(p_compiler, NUMBER_AS_VALUE(0), author);
+-    if (!IS_CONSTANT_VALID(zero)) {
+-      goto fail;
+-    }
+-    if (counter.index > aprime_MAX || zero.index > bprime_MAX) {
+-      if (!emit_word2(
+-              p_compiler, encode_OPPABCQ(OP_LOAD_CONSTANT_LONG, false, counter.index, zero.index, 0, 0), author)) {
+-        report_oom(p_compiler, author);
+-        goto fail;
+-      }
+-    } else if (!emit_word(p_compiler, encode_oppabprime(OP_LOAD_CONSTANT, false, counter.index, zero.index), author)) {
+-      report_oom(p_compiler, author);
+-      goto fail;
+-    }
+-  }
++  // iter = <iterable> (evaluated exactly once, at loop entry)
+   {
+-    constant one = add_constant(p_compiler, NUMBER_AS_VALUE(1), author);
+-    if (!IS_CONSTANT_VALID(one)) {
++    expression_result iterable;
++    if (!compile_expression(p_compiler, p_for_in->iterable, iter, 1, &iterable)) {
+       goto fail;
+     }
+-    if (step.index > aprime_MAX || one.index > bprime_MAX) {
+-      if (!emit_word2(p_compiler, encode_OPPABCQ(OP_LOAD_CONSTANT_LONG, false, step.index, one.index, 0, 0), author)) {
+-        report_oom(p_compiler, author);
+-        goto fail;
+-      }
+-    } else if (!emit_word(p_compiler, encode_oppabprime(OP_LOAD_CONSTANT, false, step.index, one.index), author)) {
+-      report_oom(p_compiler, author);
++    if (!materialize_into(p_compiler, &iterable.value, iter, author)) {
+       goto fail;
+     }
+   }
+ 
+-  // entry: FOR_PREP runs the first bounds test (0 < len) and skips the whole
+-  // loop for empty iterables. per iteration from here on: one ARRAY_GET at the
+-  // body top, one FOR_LOOP at the bottom - the counter machinery is the same
+-  // fused back edge as the numeric for.
++  // entry: PREP validates the iterable (array or map), inits cursor/end and
++  // runs the first emptiness test (skips the whole loop for empty iterables).
++  // per iteration from here on: one ITER_GET at the body top, one ITER_LOOP at
++  // the bottom. the len builtin is no longer a compile-time dependency of the
++  // loop: PREP reads the element count (or maps the slot walk) itself.
+   uint32_t prep;
+-  if (!emit_incomplete_for_jump(p_compiler, OP_FOR_PREP, false, counter, &prep, author)) {
++  if (!emit_incomplete_for_jump(p_compiler, OP_ITER_PREP, binds_value, iter, &prep, author)) {
+     goto fail;
+   }
+ 
+   const uint32_t body_start = chunk->code.count;
+ 
+-  // var = arr[i] (fresh each iteration through the same slot; the body may
+-  // capture it. same shared-slot semantics as the C style for today)
+-  if (!emit_array_get(p_compiler,
+-                      var,
+-                      (location){arr.index, LOCATION_KIND_REGISTER, LOCATION_OK},
+-                      (location){counter.index, LOCATION_KIND_REGISTER, LOCATION_OK},
+-                      author)) {
++  // k (and v) = the current entry (fresh each iteration through the same
++  // slots; the body may capture them. same shared-slot semantics as arrays).
++  if (!emit_word2(p_compiler, encode_OPPABCQ(OP_ITER_GET, binds_value, 0, iter.index, key.index, 0), author)) {
++    report_oom(p_compiler, author);
+     goto fail;
+   }
+ 
+-  CTX.continue_forward = true; // continue jumps to the increment, like C for update
++  CTX.continue_forward = true; // continue jumps to the advance, like C for update
+   if (!compile_statement(p_compiler, p_for_in->body)) {
+     goto fail;
+   }
+ 
+-  // the back edge's p flag: the for-in counter is a nameless hidden local,
+-  // unwritable by construction - the raw-read fast path always applies.
+-  const bool counter_immutable = true;
+-
+   CTX.continue_target = chunk->code.count;
+   uint32_t back_edge;
+-  if (!emit_incomplete_for_jump(p_compiler, OP_FOR_LOOP, counter_immutable, counter, &back_edge, author)) {
++  if (!emit_incomplete_for_jump(p_compiler, OP_ITER_LOOP, false, iter, &back_edge, author)) {
+     goto fail;
+   }
+   if (!patch_jump_if(p_compiler, true, back_edge, body_start, author)) {
+diff --git a/src/okdebug.c b/src/okdebug.c
+index c544cfd..7982cbd 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -69,15 +69,20 @@ static const char* const OPCODE_NAMES[] = {
+     "PRINT",
+     "ARRAY_NEW",
+     "ARRAY_NEW_LONG",
+-    "ARRAY_GET",
+-    "ARRAY_GET_LONG",
+-    "ARRAY_SET",
+-    "ARRAY_SET_LONG",
++    "MAP_NEW",
++    "MAP_NEW_LONG",
++    "INDEX_GET",
++    "INDEX_GET_LONG",
++    "INDEX_SET",
++    "INDEX_SET_LONG",
+     "JUMP_IF_ARGC",
+     "FOR_PREP",
+     "FOR_LOOP",
++    "ITER_PREP",
++    "ITER_GET",
++    "ITER_LOOP",
+ };
+-typedef char opcode_names_in_sync[(sizeof(OPCODE_NAMES) / sizeof(OPCODE_NAMES[0]) == (size_t)OP_FOR_LOOP + 1) ? 1 : -1];
++typedef char opcode_names_in_sync[(sizeof(OPCODE_NAMES) / sizeof(OPCODE_NAMES[0]) == (size_t)OP_ITER_LOOP + 1) ? 1 : -1];
+ 
+ static const char* binop_symbol(const opcode p_op) {
+   switch (p_op) {
+@@ -171,11 +176,15 @@ static bool op_is_two_words(opcode p_op) {
+   case OP_LESS_EQUAL_LONG:
+   case OP_AS_LONG:
+   case OP_ARRAY_NEW_LONG:
+-  case OP_ARRAY_GET_LONG:
+-  case OP_ARRAY_SET_LONG:
++  case OP_MAP_NEW_LONG:
++  case OP_INDEX_GET_LONG:
++  case OP_INDEX_SET_LONG:
+   case OP_JUMP_IF_ARGC:
+   case OP_FOR_PREP:
+   case OP_FOR_LOOP:
++  case OP_ITER_PREP:
++  case OP_ITER_GET:
++  case OP_ITER_LOOP:
+     return true;
+   default:
+     return false;
+@@ -442,7 +451,21 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+       printf("r%u = [r%u..r%u]", A, B, B + C - 1);
+     }
+     break;
+-  case OP_ARRAY_GET:
++  case OP_MAP_NEW:
++    if (c == 0) {
++      printf("r%u = {:}", a);
++    } else {
++      printf("r%u = {r%u..r%u} (x%u pairs)", a, b, b + 2 * c - 1, c);
++    }
++    break;
++  case OP_MAP_NEW_LONG:
++    if (C == 0) {
++      printf("r%u = {:}", A);
++    } else {
++      printf("r%u = {r%u..r%u} (x%u pairs)", A, B, B + 2 * C - 1, C);
++    }
++    break;
++  case OP_INDEX_GET:
+     printf("r%u = r%u[", a, b);
+     if (p) {
+       print_constant_inline(chunk, c);
+@@ -451,7 +474,7 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+     }
+     printf("]");
+     break;
+-  case OP_ARRAY_GET_LONG:
++  case OP_INDEX_GET_LONG:
+     printf("r%u = r%u[", A, B);
+     if (p) {
+       print_constant_inline(chunk, C);
+@@ -460,7 +483,7 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+     }
+     printf("]");
+     break;
+-  case OP_ARRAY_SET:
++  case OP_INDEX_SET:
+     printf("r%u[", a);
+     if (p) {
+       print_constant_inline(chunk, b);
+@@ -469,7 +492,7 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+     }
+     printf("] = r%u", c);
+     break;
+-  case OP_ARRAY_SET_LONG:
++  case OP_INDEX_SET_LONG:
+     printf("r%u[", A);
+     if (p) {
+       print_constant_inline(chunk, B);
+@@ -492,6 +515,18 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+   case OP_FOR_LOOP:
+     printf("i=r%u += r%u, -> %04u (back)%s", B, B + 2, p_offset + 2 - A, p ? " imm" : "");
+     break;
++  case OP_ITER_PREP:
++    printf("it=r%u cur=r%u end=r%u, empty -> %04u%s", B, B + 1, B + 2, p_offset + 2 + A, p ? " (k, v)" : "");
++    break;
++  case OP_ITER_GET:
++    printf("r%u = cur it", C);
++    if (p) {
++      printf(", r%u = cur val", C + 1);
++    }
++    break;
++  case OP_ITER_LOOP:
++    printf("cur advance, -> %04u (back)", p_offset + 2 - A);
++    break;
+   case OP_PRINT:
+     printf("print r%u", Al);
+     break;
+diff --git a/src/okgc.c b/src/okgc.c
+index 2644a66..531f824 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -364,6 +364,22 @@ static bool trace_object(gc* p_gc, object* p_object) {
+     }
+     break;
+   }
++  case OBJ_MAP: {
++    // walk OCCUPIED slots only, marking key AND value (both are gc refs -
++    // strings are heap objects). empty slots hold the strict-null key
++    // sentinel, and their value slots are stale garbage from backward-shift
++    // moves and overwrites: marking those could resurrect a swept object's
++    // dangling pointer. the keys array is the occupancy authority.
++    object_map* map = (object_map*)p_object;
++    for (uint32_t i = 0; i < map->entries.capacity; ++i) {
++      if (!IS_VALUE_STRICTLY_NULL(map->entries.keys[i])) {
++        if (!mark_value(p_gc, map->entries.keys[i]) || !mark_value(p_gc, map->entries.values[i])) {
++          return false;
++        }
++      }
++    }
++    break;
++  }
+   }
+   return true;
+ }
+diff --git a/src/okobject.c b/src/okobject.c
+index 2516946..bbb818d 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -3,6 +3,117 @@
+ 
+ #include "okobject.h"
+ #include "okobject_store.h"
++#include "okutils.h"
++
++// ===================== surface map (value keys and values) =====================
++//
++// the okmap.h core instantiated at ok_value keys/values. hashing rules (docs/drafts/MAPS.md §5):
++//   - numbers (and int-tagged operands, widened to their double form like
++//     perform_equal's int/number comparison): splitmix64 over the normalized
++//     bits. -0.0 folds to +0.0 first (R2) so 0.0 and -0.0 are one key. NaN keys
++//     keep their bits: same-bits NaNs are one key, different NaNs are different
++//     keys - hashing and equality stay in agreement, which is the only hard rule.
++//   - strings: the cached FNV-1a from the string header, so probing never walks
++//     the bytes twice.
++//   - bools: the tag bits themselves.
++//   - the tag is mixed into the final hash so `1`, `true` and `"1"` can never
++//     share a probe path (quality: PROBE_MATCHES is the real authority).
++
++static hash_t splitmix64(hash_t p_x) {
++  p_x += UINT64_C(0x9e3779b97f4a7c15);
++  p_x = (p_x ^ (p_x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
++  p_x = (p_x ^ (p_x >> 27)) * UINT64_C(0x94d049bb133111eb);
++  return p_x ^ (p_x >> 31);
++}
++
++// the normalized double bits two keys must share to compare equal
++static uint64_t map_key_number_bits(value p_key) {
++  double d;
++  if (IS_VALUE_NUMBER(p_key)) {
++    d = VALUE_AS_NUMBER(p_key);
++  } else {
++    d = (double)VALUE_AS_INT(p_key);
++  }
++  if (d == 0.0) {
++    d = 0.0; // -0.0 -> +0.0 (R2): one key, not two
++  }
++  union pun {
++    uint64_t bits;
++    double d;
++  };
++  union pun val = {.d = d};
++  return val.bits;
++}
++
++hash_t map_value_hash(value p_key) {
++  uint64_t raw;
++  uint64_t tag_mix;
++  if (IS_VALUE_NUMBER(p_key) || IS_VALUE_INT(p_key)) {
++    raw = map_key_number_bits(p_key);
++    tag_mix = 0; // numbers ARE their tag space; mixing 0 keeps splitmix64(bits)
++  } else if (IS_VALUE_STRING(p_key)) {
++    raw = VALUE_AS_STRING(p_key)->hash;
++    tag_mix = TAG_OBJECT_MASK;
++  } else {
++    raw = 0; // bools: the tag bits are the whole identity
++    tag_mix = VALUE_TAG(p_key);
++  }
++  return splitmix64(raw ^ tag_mix);
++}
++
++bool map_value_key_equals(value p_probe, value p_key) {
++  if (IS_VALUE_NUMBER(p_probe) || IS_VALUE_INT(p_probe)) {
++    return (IS_VALUE_NUMBER(p_key) || IS_VALUE_INT(p_key)) &&
++           map_key_number_bits(p_probe) == map_key_number_bits(p_key);
++  }
++  if (IS_VALUE_STRING(p_probe)) {
++    if (!IS_VALUE_STRING(p_key)) {
++      return false;
++    }
++    // the cached-hash fast reject already ran in find_slot (hashes[i] == hash)
++    const object_string* left = VALUE_AS_STRING(p_probe);
++    const object_string* right = VALUE_AS_STRING(p_key);
++    const uint64_t left_length = string_get_length(&left->string);
++    return left_length == string_get_length(&right->string) &&
++           memcmp(left->string.chars, right->string.chars, left_length) == 0;
++  }
++  return p_probe == p_key; // bools (and any future same-tag scalars): raw identity
++}
++
++// number first: a negative subnormal double can alias TAG_INT_MASK, but
++// IS_VALUE_NUMBER already claimed every raw double before this check runs.
++bool map_key_is_legal(value p_key) {
++  return IS_VALUE_NUMBER(p_key) || IS_VALUE_INT(p_key) || IS_VALUE_STRICTLY_BOOL(p_key) ||
++         IS_VALUE_STRING(p_key);
++}
++
++#define VM_KEY_IS_EMPTY(k) IS_VALUE_STRICTLY_NULL(k)
++#define VM_KEY_SET_EMPTY(k) (*(k) = NULL_AS_VALUE())
++#define VM_PROBE_HASH(p) (map_value_hash(p))
++#define VM_PROBE_MATCHES(p, k) (map_value_key_equals((p), (k)))
++#define VM_KEY_CLONE(p, a) (p)                    /* values are copied bit for bit; the gc owns the memory */
++#define VM_NO_DEINIT(k, a) ((void)0)              /* ditto: nothing to release per entry */
++
++MAP_DEFINE(value_map, value, value, value, VM_KEY_IS_EMPTY, VM_KEY_SET_EMPTY, VM_PROBE_HASH, VM_PROBE_MATCHES, VM_KEY_CLONE, VM_NO_DEINIT, VM_NO_DEINIT)
++
++bool object_map_set(object_map* p_map, value p_key, value p_value) {
++  const uint32_t before = p_map->entries.count;
++  if (!value_map_set(&p_map->entries, p_key, p_value)) {
++    return false;
++  }
++  if (p_map->entries.count != before) {
++    p_map->version++; // a size change: active for-ins must fail, not mis-walk
++  }
++  return true;
++}
++
++bool object_map_remove(object_map* p_map, value p_key) {
++  if (!value_map_remove(&p_map->entries, p_key)) {
++    return false;
++  }
++  p_map->version++;
++  return true;
++}
+ 
+ static void object_init(object* p_object, uint32_t p_type) {
+   p_object->info = p_type & 0x00ffffff;
+@@ -29,9 +140,25 @@ void object_set_marked(object* p_object, bool p_marked) {
+   p_object->info = p_marked ? p_object->info | mask : p_object->info & ~mask;
+ }
+ 
++// standard FNV-1a (xor the byte, THEN multiply): the multiply spreads every
++// byte into the full 64 bits. (okutils' fnv1a_hash_str xors byte*prime
++// instead, whose low bits stay confined to a narrow band for short ASCII
++// keys - fine for the dozens of identifiers globals_store hashes, but a
++// 200k-string-key map collapsed to an average probe distance of 377 with it.
++// found via the map_insert bench; globals_store keeps its own hash.)
++static hash_t string_hash_fnv1a(const ok_string_view p_string) {
++  hash_t hash = 14695981039346656037ULL;
++  for (uint64_t i = 0; i < ok_string_view_get_length(&p_string); ++i) {
++    hash ^= (uint8_t)p_string.chars[i];
++    hash *= 1099511628211ULL;
++  }
++  return hash;
++}
++
+ static void object_string_init(object_string* p_object_string, const ok_string_view p_string, object_specs* p_specs) {
+   object_init(&p_object_string->object, OBJ_STRING);
+   p_object_string->string = create_string_from_string_view(p_string, p_specs->alloc);
++  p_object_string->hash = string_hash_fnv1a(p_string);
+ }
+ 
+ static void object_string_deinit(object_string* p_object_string, object_specs* p_specs) {
+@@ -238,6 +365,29 @@ object_array* create_object_array(object_specs* p_specs) {
+   return object_arr;
+ }
+ 
++static void object_map_init(object_map* p_object_map, object_specs* p_specs) {
++  object_init(&p_object_map->object, OBJ_MAP);
++  value_map_init(&p_object_map->entries, p_specs->alloc);
++  p_object_map->version = 0;
++}
++
++static void object_map_deinit(object_map* p_object_map, object_specs* p_specs) {
++  // entry keys and values are gc owned (the instantiation's deinits are no-ops),
++  // this only releases the parallel backing buffers.
++  value_map_deinit(&p_object_map->entries);
++  object_deinit(&p_object_map->object);
++}
++
++object_map* create_object_map(object_specs* p_specs) {
++  object_map* object_m = (object_map*)p_specs->alloc->allocate(p_specs->alloc, sizeof(object_map));
++  if (object_m == NULL) {
++    return NULL;
++  }
++  object_map_init(object_m, p_specs);
++  object_store_append(p_specs->store, (object*)object_m);
++  return object_m;
++}
++
+ void object_dispatch_deinit(object* p_object, object_specs* p_specs) {
+   switch (object_get_type(p_object)) {
+   case OBJ_STRING:
+@@ -261,6 +411,9 @@ void object_dispatch_deinit(object* p_object, object_specs* p_specs) {
+   case OBJ_ARRAY:
+     object_array_deinit((object_array*)p_object, p_specs);
+     break;
++  case OBJ_MAP:
++    object_map_deinit((object_map*)p_object, p_specs);
++    break;
+   }
+ }
+ 
+@@ -305,5 +458,13 @@ void object_debug_print(object* p_object) {
+     printf("<native function %s a: %d %p>", fu->name.chars, fu->arity, fu->function);
+     break;
+   }
++  case OBJ_ARRAY: {
++    printf("<array %u>", ((object_array*)p_object)->values.count);
++    break;
++  }
++  case OBJ_MAP: {
++    printf("<map %u>", ((object_map*)p_object)->entries.count);
++    break;
++  }
+   }
+ }
+diff --git a/src/okobject.h b/src/okobject.h
+index 9c2397d..e94b9c0 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -8,6 +8,7 @@
+ #include "okchunk.h"
+ #include "okfwd.h"
+ #include "okindex.h"
++#include "okmap.h"
+ #include "okobject_store.h"
+ #include "okstring.h"
+ #include "okvalue.h"
+@@ -21,6 +22,7 @@
+ #define IS_VALUE_NATIVE_VALUE(value) value_is_object_type(value, OBJ_NATIVE_VALUE)
+ #define IS_VALUE_NATIVE_FUNCTION(value) value_is_object_type(value, OBJ_NATIVE_FUNCTION)
+ #define IS_VALUE_ARRAY(value) value_is_object_type(value, OBJ_ARRAY)
++#define IS_VALUE_MAP(value) value_is_object_type(value, OBJ_MAP)
+ 
+ #define VALUE_AS_STRING(value) ((object_string*)VALUE_AS_OBJECT(value))
+ #define VALUE_AS_FUNCTION(value) ((object_function*)VALUE_AS_OBJECT(value))
+@@ -29,6 +31,7 @@
+ #define VALUE_AS_NATIVE_VALUE(value) ((object_native_type*)VALUE_AS_OBJECT(value))
+ #define VALUE_AS_NATIVE_FUNCTION(value) ((object_native_function*)VALUE_AS_OBJECT(value))
+ #define VALUE_AS_ARRAY(value) ((object_array*)VALUE_AS_OBJECT(value))
++#define VALUE_AS_MAP(value) ((object_map*)VALUE_AS_OBJECT(value))
+ 
+ typedef struct {
+   allocators* alloc;
+@@ -43,6 +46,7 @@ typedef enum {
+   OBJ_NATIVE_VALUE,
+   OBJ_NATIVE_FUNCTION,
+   OBJ_ARRAY,
++  OBJ_MAP,
+ } object_type;
+ 
+ struct object {
+@@ -62,6 +66,8 @@ static inline bool value_is_object_type(value p_value, object_type p_type) {
+ typedef struct {
+   object object;
+   string string;
++  hash_t hash; // FNV-1a over the bytes, cached at creation. strings are immutable,
++               // so map keys (and any future hashed user) never re-walk the bytes.
+ } object_string;
+ 
+ object_string* create_object_string(const ok_string_view p_string, object_specs* p_specs);
+@@ -101,6 +107,11 @@ value* object_upvalue_get_value(object_upvalue* p_upvalue, value* p_frame_window
+ object_upvalue* create_object_upvalue(uint32_t p_location, object_specs* p_specs);
+ 
+ ARRAY_DECLARE_DEFAULT(upvalue_array, object_upvalue*)
++
++// the ok_value-keyed instantiation of the okmap core (defined in okobject.c):
++// strict-null key = empty slot, cached hashes, backward-shift deletion.
++MAP_DECLARE(value_map, value, value, value)
++
+ typedef struct {
+   object object;
+   object_function* function;
+@@ -138,6 +149,42 @@ typedef struct {
+ 
+ object_array* create_object_array(object_specs* p_specs);
+ 
++// the surface map: the same linear-probing core the compiler's tables use
++// (okmap.h), instantiated at ok_value keys AND values. the strict-null key is
++// the empty-slot sentinel, which is exactly why null KEYS are illegal on the
++// surface (the encoding spends them on "empty"). keys are stored as the values
++// they arrived as; probes hash through map_value_hash and compare through
++// map_value_key_equals, both of which must stay in agreement with perform_equal
++// for the types that are legal keys (strings, numbers, bools).
++//
++// version: bumped by every size-changing operation (insert-new, remove;
++// overwrites do NOT bump). the for-in ops snapshot it at loop entry and hard
++// error on a mid-iteration size change - overwriting values while iterating is
++// fine, inserting/removing is not.
++typedef struct {
++  object object;
++  value_map entries;
++  uint32_t version;
++} object_map;
++
++object_map* create_object_map(object_specs* p_specs);
++
++hash_t map_value_hash(value p_key);
++bool map_value_key_equals(value p_probe, value p_key);
++
++// the v1 key whitelist: strings, numbers (int-tagged included) and booleans.
++// null is the empty-slot encoding (never a legal key), arrays/maps/functions
++// are identity-shaped and wait for classes (docs/drafts/MAPS.md §1).
++bool map_key_is_legal(value p_key);
++
++// insert-or-overwrite + version bookkeeping. returns false only on OOM (the
++// okmap core's contract); a size change bumps p_map->version so active
++// iterations can detect it.
++bool object_map_set(object_map* p_map, value p_key, value p_value);
++
++// false = absent (no version change).
++bool object_map_remove(object_map* p_map, value p_key);
++
+ void object_dispatch_deinit(object* p_object, object_specs* p_specs);
+ void objects_list_deinit(object* p_head, object_specs* p_specs);
+ 
+diff --git a/src/okparser.c b/src/okparser.c
+index 1453af7..dfb13bc 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -42,6 +42,7 @@ static void sync_state(parser* p_parser);
+ static ast_expression* parse_unary_prefix(parser* p_parser, token p_trigger);
+ static ast_expression* parse_grouping(parser* p_parser, token p_trigger);
+ // static ast_expression* parse_map(parser* p_parser, token p_trigger);
++static ast_expression* parse_map_literal(parser* p_parser, token p_trigger);
+ // static ast_expression* parse_array(parser* p_parser, token p_trigger);
+ static ast_expression* parse_array_literal(parser* p_parser, token p_trigger);
+ static ast_expression* parse_subscript(
+@@ -115,7 +116,7 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_GREATER] = {NULL, parse_binary_infix, PREC_COMPARISION},
+     [TOKEN_LEFT_PAREN] = {parse_grouping, parse_call, PREC_CALL},
+     [TOKEN_RIGHT_PAREN] = {NULL, NULL, PREC_NONE},
+-    [TOKEN_LEFT_BRACE] = {NULL, NULL, PREC_NONE},
++    [TOKEN_LEFT_BRACE] = {parse_map_literal, NULL, PREC_NONE},
+     [TOKEN_RIGHT_BRACE] = {NULL, NULL, PREC_NONE},
+     [TOKEN_LEFT_BRACKET] = {parse_array_literal, parse_subscript, PREC_SUBSCRIPT},
+     [TOKEN_RIGHT_BRACKET] = {NULL, NULL, PREC_NONE},
+@@ -667,6 +668,114 @@ ast_expression* parse_array_literal(parser* p_parser, token p_trigger) {
+   return (ast_expression*)array;
+ }
+ 
++// `{k: v, ...}` in expression position. statement-position `{` is a block
++// (parse_statement never consults the expression rules for its first token),
++// so the disambiguation is positional and needs no lookahead. `{:}` is the
++// empty map: a leading ':' is unambiguous because no expression starts with
++// one. a trailing comma is allowed, mirroring arrays.
++ast_expression* parse_map_literal(parser* p_parser, token p_trigger) {
++  allocators* alloc = p_parser->alloc;
++  token trigger = p_parser->previous; // '{'
++  ast_expressions_list keys;
++  ast_expressions_list values;
++  ast_expressions_list_init(&keys, alloc);
++  ast_expressions_list_init(&values, alloc);
++
++  if (p_parser->current.type == TOKEN_RIGHT_BRACE) {
++    // `{}` in expression position: the ruled surface has exactly one empty
++    // map literal, `{:}` - a bare `{}` stays the block statement's shape and
++    // is rejected here rather than guessed at.
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view(
++                 "empty '{}' is not an expression - the empty map literal is '{:}'.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto fail_lists;
++  }
++
++  if (p_parser->current.type == TOKEN_COLON) {
++    // `{:}` - the load-bearing empty literal (bindings are immutable, so
++    // `let m = null` needs mut for later assignment; `{:}` doesn't).
++    advance(p_parser); // ':' consumed, current = '}' (or an error to report)
++    if (!expect(p_parser, TOKEN_RIGHT_BRACE, ok_create_string_view("expected '}' to complete the empty map.", OK_STRING_VIEW_CALCULATE_LENGTH, true))) {
++      goto fail_lists;
++    }
++  } else {
++    for (;;) {
++      advance(p_parser); // first key token into previous
++      ast_expression* key = parse_expression(p_parser, PREC_NONE);
++      if (key == NULL) {
++        error_at(p_parser,
++                 p_parser->previous,
++                 ok_create_string_view("failed to parse map key.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        goto fail_lists;
++      }
++      if (!expect(p_parser, TOKEN_COLON, ok_create_string_view("expected ':' after map key.", OK_STRING_VIEW_CALCULATE_LENGTH, true))) {
++        ast_dispatch_deinit((ast_node*)key);
++        alloc->release(alloc, key);
++        goto fail_lists;
++      }
++      advance(p_parser); // first value token into previous
++      ast_expression* value = parse_expression(p_parser, PREC_NONE);
++      if (value == NULL) {
++        error_at(p_parser,
++                 p_parser->previous,
++                 ok_create_string_view("failed to parse map value.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        ast_dispatch_deinit((ast_node*)key);
++        alloc->release(alloc, key);
++        goto fail_lists;
++      }
++      if (!ast_expressions_list_append(&keys, key)) {
++        // the list did not take ownership
++        ast_dispatch_deinit((ast_node*)key);
++        alloc->release(alloc, key);
++        ast_dispatch_deinit((ast_node*)value);
++        alloc->release(alloc, value);
++        goto fail_lists;
++      }
++      if (!ast_expressions_list_append(&values, value)) {
++        // keys owns its entry, values does not
++        ast_dispatch_deinit((ast_node*)value);
++        alloc->release(alloc, value);
++        goto fail_lists;
++      }
++      if (p_parser->current.type == TOKEN_COMMA) {
++        advance(p_parser); // ',' consumed
++        if (p_parser->current.type == TOKEN_RIGHT_BRACE) {
++          break; // trailing comma
++        }
++        continue;
++      }
++      break;
++    }
++    if (!expect(p_parser, TOKEN_RIGHT_BRACE, ok_create_string_view("expected '}' after map literal.", OK_STRING_VIEW_CALCULATE_LENGTH, true))) {
++      goto fail_lists;
++    }
++  }
++
++  ast_map_expression* map = (ast_map_expression*)alloc->allocate(alloc, sizeof(ast_map_expression));
++  if (map == NULL) {
++    error_at(p_parser,
++             trigger,
++             ok_create_string_view("failed to allocate memory for map node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto fail_lists;
++  }
++  ast_specs s = {alloc};
++  ast_map_expression_init(map, trigger, keys, values, &s);
++  return (ast_expression*)map;
++fail_lists:
++  for (uint32_t i = 0; i < keys.count; ++i) {
++    ast_dispatch_deinit((ast_node*)keys.data[i]);
++    alloc->release(alloc, keys.data[i]);
++  }
++  for (uint32_t i = 0; i < values.count; ++i) {
++    ast_dispatch_deinit((ast_node*)values.data[i]);
++    alloc->release(alloc, values.data[i]);
++  }
++  ast_expressions_list_deinit(&keys, alloc);
++  ast_expressions_list_deinit(&values, alloc);
++  return NULL;
++}
++
+ ast_expression* parse_subscript(
+     parser* p_parser, ast_expression* p_left, precedence p_precedence, bool is_right_associative, token p_trigger) {
+   (void)p_precedence;
+@@ -1341,8 +1450,15 @@ ast_while_statement* parse_while_statement(parser* p_parser) {
+ 
+ // called with current == TOKEN_COLON and the loop-variable head already consumed:
+ // `for (let (mut)?) IDENT :` the rest is `<iterable> <compound_statement>`.
+-static ast_for_in_statement*
+-parse_for_in_rest(parser* p_parser, token p_for_tok, token p_name_tok, ast_binding_modifiers_t p_binds) {
++// p_has_value: the two-binding map form `for let k, (mut)? v :` - binding binds
++// keys, value_binding binds values (arrays reject it at runtime).
++static ast_for_in_statement* parse_for_in_rest(parser* p_parser,
++                                                token p_for_tok,
++                                                token p_name_tok,
++                                                ast_binding_modifiers_t p_binds,
++                                                token p_value_name_tok,
++                                                ast_binding_modifiers_t p_value_binds,
++                                                bool p_has_value) {
+   allocators* alloc = p_parser->alloc;
+   advance(p_parser); // ':' consumed, current = first iterable token
+   advance(p_parser); // iterable's first token into previous
+@@ -1390,24 +1506,54 @@ parse_for_in_rest(parser* p_parser, token p_for_tok, token p_name_tok, ast_bindi
+     alloc->release(alloc, ident);
+     goto fail_body;
+   }
++  ast_identifier_expression* value_ident = NULL;
++  ast_binding* value_binding = NULL;
++  if (p_has_value) {
++    value_ident = (ast_identifier_expression*)alloc->allocate(alloc, sizeof(ast_identifier_expression));
++    value_binding = (ast_binding*)alloc->allocate(alloc, sizeof(ast_binding));
++    if (value_ident == NULL || value_binding == NULL) {
++      error_at(p_parser,
++               p_for_tok,
++               ok_create_string_view(
++                   "failed to allocate memory for ranged-for binding.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      if (value_ident != NULL) {
++        alloc->release(alloc, value_ident);
++      }
++      if (value_binding != NULL) {
++        alloc->release(alloc, value_binding);
++      }
++      goto fail_binding;
++    }
++  }
+   ast_for_in_statement* fin = (ast_for_in_statement*)alloc->allocate(alloc, sizeof(ast_for_in_statement));
+   if (fin == NULL) {
+     error_at(
+         p_parser,
+         p_for_tok,
+         ok_create_string_view("failed to allocate memory for ranged-for node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+-    ast_binding_deinit(binding); // frees ident
+-    alloc->release(alloc, binding);
+-    goto fail_body;
++    if (value_ident != NULL) {
++      ast_identifier_expression_deinit(value_ident);
++      alloc->release(alloc, value_ident);
++    }
++    alloc->release(alloc, value_binding);
++    goto fail_binding;
+   }
+   ast_specs s = {alloc};
+   ast_identifier_expression_init(ident, p_name_tok, &s);
+   ast_binding_init(binding, (ast_expression*)ident, p_binds, p_name_tok, &s);
++  if (p_has_value) {
++    ast_identifier_expression_init(value_ident, p_value_name_tok, &s);
++    ast_binding_init(value_binding, (ast_expression*)value_ident, p_value_binds, p_value_name_tok, &s);
++  }
+   ast_for_in_statement_init(fin, p_for_tok, &s);
+   fin->binding = binding;
++  fin->value_binding = p_has_value ? value_binding : NULL;
+   fin->iterable = iterable;
+   fin->body = body;
+   return fin;
++fail_binding:
++  ast_binding_deinit(binding); // frees ident
++  alloc->release(alloc, binding);
+ fail_body:
+   ast_dispatch_deinit((ast_node*)body);
+   alloc->release(alloc, body);
+@@ -1624,11 +1770,38 @@ ast_for_statement* parse_for_statement(parser* p_parser) {
+       return NULL;
+     }
+     const token name_tok = p_parser->current;
+-    advance(p_parser); // previous = name, current = ':' | '=' | ';' | ...
++    advance(p_parser); // previous = name, current = ':' | ',' | '=' | ';' | ...
+     if (p_parser->current.type == TOKEN_COLON) {
+       // the cast is safe: both statements share the ast_statement prefix.
+       // the caller dispatches on node_type.
+-      return (ast_for_statement*)parse_for_in_rest(p_parser, for_tok, name_tok, binds);
++      return (ast_for_statement*)parse_for_in_rest(p_parser, for_tok, name_tok, binds, name_tok, BINDING_NONE, false);
++    }
++    if (p_parser->current.type == TOKEN_COMMA) {
++      // `for let k, (mut)? v : <iterable>` - the two-binding map form: keys and
++      // values. one `let` governs the pair, each binder takes its own `mut`.
++      advance(p_parser); // ',' consumed, current = 'mut' | identifier
++      const ast_binding_modifiers_t value_binds = parse_binding_modifiers(p_parser, BINDING_MUT);
++      if (value_binds == BINDING_ERROR) {
++        return NULL;
++      }
++      if (p_parser->current.type != TOKEN_IDENTIFIER) {
++        error_at(p_parser,
++                 p_parser->current,
++                 ok_create_string_view(
++                     "expected an identifier for the map for value binding.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        return NULL;
++      }
++      const token value_tok = p_parser->current;
++      advance(p_parser); // previous = value name, current = ':'
++      if (p_parser->current.type != TOKEN_COLON) {
++        error_at(p_parser,
++                 p_parser->current,
++                 ok_create_string_view(
++                     "expected ':' after the map for bindings.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        return NULL;
++      }
++      return (ast_for_statement*)parse_for_in_rest(
++          p_parser, for_tok, name_tok, binds, value_tok, value_binds, true);
+     }
+     // `for let (mut)? IDENT = <expr> ...` or the bare `for let x; ...` C init:
+     // parse the head expression once (previous = name, so `x = 0` parses as an
+diff --git a/src/okvm.c b/src/okvm.c
+index d10be39..8bc0485 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -948,12 +948,87 @@ static inline bool int_as_str(vm* p_vm, int64_t p_value, value* p_result) {
+ 
+ static inline bool as_str(vm* p_vm, value p_value, value* p_result);
+ 
++// `{k: v, ...}` in slot order (iteration order is unspecified v1 - printing
++// follows it). string keys print unquoted, same display form array elements
++// use; the empty map prints `{:}`, its literal. the key's bytes are copied
++// into the scratch buffer BEFORE the value converts: each as_str allocates
++// (collects), and an unrooted intermediate would be swept otherwise.
++static inline bool map_as_str(vm* p_vm, object* p_obj, value* p_result) {
++  object_map* map = (object_map*)p_obj;
++  char* chars = NULL;
++  size_t len = 0;
++  for (uint32_t i = 0; i < map->entries.capacity; ++i) {
++    if (IS_VALUE_STRICTLY_NULL(map->entries.keys[i])) {
++      continue;
++    }
++    const uint8_t dellen = len == 0 ? 0 : 2;
++    value kres;
++    if (!as_str(p_vm, map->entries.keys[i], &kres)) {
++      return false;
++    }
++    string* kstr = &VALUE_AS_STRING(kres)->string;
++    const uint32_t klen = (uint32_t)string_get_length(kstr);
++    if (kstr->chars != NULL) {
++      gc_guard_up(p_vm->alloc->gc, kres);
++      chars = p_vm->alloc->reallocate(p_vm->alloc, chars, len, len + dellen + klen + 2);
++      gc_guard_down(p_vm->alloc->gc);
++      if (chars == NULL) {
++        runtime_error(p_vm, "out of memory: failed to convert map to string.");
++        return false;
++      }
++      if (dellen != 0) {
++        memcpy(chars + len, ", ", dellen);
++      }
++      memcpy(chars + len + dellen, kstr->chars, klen);
++      memcpy(chars + len + dellen + klen, ": ", 2);
++      len += dellen + klen + 2;
++    }
++    value vres;
++    if (!as_str(p_vm, map->entries.values[i], &vres)) {
++      return false;
++    }
++    string* vstr = &VALUE_AS_STRING(vres)->string;
++    const uint32_t vlen = (uint32_t)string_get_length(vstr);
++    if (vstr->chars != NULL) {
++      gc_guard_up(p_vm->alloc->gc, vres);
++      chars = p_vm->alloc->reallocate(p_vm->alloc, chars, len, len + vlen);
++      gc_guard_down(p_vm->alloc->gc);
++      if (chars == NULL) {
++        runtime_error(p_vm, "out of memory: failed to convert map to string.");
++        return false;
++      }
++      memcpy(chars + len, vstr->chars, vlen);
++      len += vlen;
++    }
++  }
++  string fstr = len == 0 ? asprint(p_vm->alloc, "{:}") : asprint(p_vm->alloc, "{%.*s}", len, chars);
++  if (chars != NULL) {
++    p_vm->alloc->release(p_vm->alloc, chars);
++  }
++  if (fstr.chars == NULL) {
++    runtime_error(p_vm, "out of memory: failed to convert map to string.");
++    return false;
++  }
++  object_specs specs = {p_vm->alloc, p_vm->objects_store};
++  object_string* str = create_object_string(ok_create_string_view_from_string(fstr), &specs);
++  if (str == NULL) {
++    runtime_error(p_vm, "out of memory: failed to convert map to string.");
++    return false;
++  }
++  *p_result = OBJECT_AS_VALUE(str);
++  string_deinit(&fstr, p_vm->alloc); // here so obj str is rooted
++  return true;
++}
++
+ static inline bool array_as_str(vm* p_vm, object* p_arr, value* p_result) {
+   object_array* arr = (object_array*)p_arr;
+   char* chars = NULL;
+   size_t len = 0;
+   for (uint32_t i = 0; i < arr->values.count; ++i) {
+-    const uint8_t delemlen = i < arr->values.count - 1 ? 2 : 0;
++    // ", " AFTER each element except the last. (the original placed it before
++    // each element except the last, printing "[, 1, 23]" for [1, 2, 3] - no
++    // e2e test ever converted a multi-element array, so it survived v0.1.0.)
++    const uint8_t delemlen = i + 1 < arr->values.count ? 2 : 0;
+     value res;
+     if (!as_str(p_vm, arr->values.data[i], &res)) {
+       return false;
+@@ -968,14 +1043,17 @@ static inline bool array_as_str(vm* p_vm, object* p_arr, value* p_result) {
+         runtime_error(p_vm, "out of memory: failed to convert array to string.");
+         return false;
+       }
++      memcpy(chars + len, str->chars, reslen);
+       if (delemlen != 0) {
+-        memcpy(chars + len, ", ", delemlen);
++        memcpy(chars + len + reslen, ", ", delemlen);
+       }
+-      memcpy(chars + len + delemlen, str->chars, reslen);
+       len += reslen + delemlen;
+     }
+   }
+   string fstr = asprint(p_vm->alloc, "[%.*s]", len, chars);
++  if (chars != NULL) {
++    p_vm->alloc->release(p_vm->alloc, chars); // release only after asprint copied: it could be NULL for an all-empty array
++  }
+   if (fstr.chars == NULL) {
+     runtime_error(p_vm, "failed to convert array to string.");
+     return false;
+@@ -1003,7 +1081,13 @@ static inline bool closure_as_str(vm* p_vm, object* p_closure, value* p_result)
+ 
+ static inline bool native_function_as_str(vm* p_vm, object* p_native_function, value* p_result) {
+   object_native_function* nativefu = (object_native_function*)p_native_function;
+-  string str = asprint(p_vm->alloc, "native fu %s |%i| (@%p)", nativefu->name, nativefu->arity, nativefu->function);
++  char arity[16];
++  if (nativefu->arity == OK_NATIVE_ARITY_ANY) {
++    snprintf(arity, sizeof(arity), "any");
++  } else {
++    snprintf(arity, sizeof(arity), "%u", nativefu->arity);
++  }
++  string str = asprint(p_vm->alloc, "native fu %s |%s| (@%p)", nativefu->name, arity, nativefu->function);
+   if (str.chars == NULL) {
+     runtime_error(p_vm, "failed to convert native function to string.");
+     return false;
+@@ -1030,6 +1114,9 @@ static inline bool object_as_str(vm* p_vm, object* p_obj, value* p_result) {
+   case OBJ_ARRAY: {
+     return array_as_str(p_vm, p_obj, p_result);
+   }
++  case OBJ_MAP: {
++    return map_as_str(p_vm, p_obj, p_result);
++  }
+   case OBJ_CLOSURE: {
+     return closure_as_str(p_vm, p_obj, p_result);
+   }
+@@ -1107,6 +1194,10 @@ static inline bool object_as_num(vm* p_vm, object* p_obj, value* p_result) {
+     runtime_error(p_vm, "array is not convertable to number.");
+     return false;
+   }
++  case OBJ_MAP: {
++    runtime_error(p_vm, "map is not convertable to number.");
++    return false;
++  }
+   case OBJ_CLOSURE: {
+     runtime_error(p_vm, "function is not convertable to number.");
+     return false;
+@@ -1196,6 +1287,17 @@ perform_as(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest,
+     }
+     break;
+   }
++  case TT_MAP: {
++    // a checked identity, not a conversion: nothing sensibly converts to a map.
++    // this is the doc's type check (`m as map`), the bridge to 0.5.0's real types.
++    if (IS_VALUE_MAP(p_lhs)) {
++      *dest = p_lhs;
++      res.status = RUNTIME_OK;
++    } else {
++      runtime_error(p_vm, "value is not a map.");
++    }
++    break;
++  }
+   }
+   return res;
+ }
+@@ -1298,7 +1400,7 @@ static inline interpret_result top_level_return(register_file* p_registers, call
+   return result;
+ }
+ 
+-// array index resolution shared by OP_ARRAY_GET / OP_ARRAY_SET
++// array index resolution shared by OP_INDEX_GET / OP_INDEX_SET
+ static bool resolve_array_index(vm* p_vm, value p_index, uint32_t p_count, uint32_t* p_out) {
+   if (IS_VALUE_NUMBER(p_index)) {
+     const double d = VALUE_AS_NUMBER(p_index);
+@@ -1341,12 +1443,66 @@ static bool for_operand_as_number(vm* p_vm, value p_value, const char* p_which,
+ 
+ static object_array* resolve_array_base(vm* p_vm, value p_base) {
+   if (!value_is_object_type(p_base, OBJ_ARRAY)) {
+-    runtime_error(p_vm, "invalid operand for '[]': expected an array.");
++    runtime_error(p_vm, "invalid operand for '[]': expected an array or a map.");
+     return NULL;
+   }
+   return VALUE_AS_ARRAY(p_base);
+ }
+ 
++// ---- map index paths (shared by OP_INDEX_GET / OP_INDEX_SET) ----
++
++// the key gate every map write/read runs: null is the empty-slot encoding, and
++// only strings, numbers (int-tagged included) and booleans hash (docs/drafts/MAPS.md §1).
++static bool map_key_check(vm* p_vm, value p_key) {
++  if (IS_VALUE_STRICTLY_NULL(p_key)) {
++    runtime_error(p_vm, "map key cannot be null.");
++    return false;
++  }
++  if (!map_key_is_legal(p_key)) {
++    runtime_error(p_vm, "invalid map key: only strings, numbers and booleans can be keys.");
++    return false;
++  }
++  return true;
++}
++
++// R1: the strict read - a missing key is a hard error, get() is the lax path.
++// read-only and allocation-free (probes never allocate).
++static bool map_read(vm* p_vm, value p_map_value, value p_key, value* p_out) {
++  if (!map_key_check(p_vm, p_key)) {
++    return false;
++  }
++  value* slot = value_map_get(&VALUE_AS_MAP(p_map_value)->entries, p_key);
++  if (slot == NULL) {
++    runtime_error(p_vm, "map key not found.");
++    return false;
++  }
++  *p_out = *slot;
++  return true;
++}
++
++// insert-or-overwrite. the map lives in a register (rooted); key/value operands
++// are registers or constants (rooted via the frame / the function's constant
++// array), so a grow-triggered collection mid-set is safe: the tracer walks the
++// still-attached old arrays, and the new arrays are plain invisible memory.
++static bool map_write(vm* p_vm, value p_map_value, value p_key, value p_value) {
++  if (!map_key_check(p_vm, p_key)) {
++    return false;
++  }
++  if (!object_map_set(VALUE_AS_MAP(p_map_value), p_key, p_value)) {
++    runtime_error(p_vm, "out of memory: failed to grow map.");
++    return false;
++  }
++  return true;
++}
++
++// the error return every opcode handler uses after runtime_error reported
++static interpret_result interpret_result_error(void) {
++  interpret_result result;
++  result.status = RUNTIME_ERROR;
++  result.top_level_return = NULL_AS_VALUE();
++  return result;
++}
++
+ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+   execution_state* exe = p_vm->current_execution_state;
+   call_frame* frame = &exe->call_stack.data[exe->call_stack.count - 1];
+@@ -2048,71 +2204,149 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       result.top_level_return = NULL_AS_VALUE();
+       return result;
+     }
+-    case OP_ARRAY_GET: {
++    case OP_MAP_NEW: {
++      const uint8_t a = a_of(instruction);
++      const uint8_t b = b_of(instruction);
++      const uint8_t c = c_of(instruction);
++      // pairs are live frame registers ([0, top) rooted). like ARRAY_NEW, the
++      // map is linked in the store yet unreachable until it lands in r[a], and
++      // every insert may grow through the gc-aware allocator (collects): guard
++      // the whole fill. duplicate keys in a literal: the later insert
++      // overwrites, len counts the unique keys.
++      object_specs s = {p_vm->alloc, p_vm->objects_store};
++      object_map* map = create_object_map(&s);
++      if (map == NULL) {
++        goto oom_map_new;
++      }
++      gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(map));
++      bool filled = true;
++      for (uint32_t i = 0; i < c && filled; ++i) {
++        filled = map_write(p_vm, OBJECT_AS_VALUE(map), REG_AT(b + 2 * i), REG_AT(b + 2 * i + 1));
++      }
++      gc_guard_down(p_vm->alloc->gc);
++      if (!filled) {
++        return interpret_result_error(); // map_write already reported
++      }
++      REG_AT(a) = OBJECT_AS_VALUE(map);
++      break;
++    oom_map_new:
++      runtime_error(p_vm, "out of memory: failed to allocate map.");
++      return interpret_result_error();
++    }
++    case OP_MAP_NEW_LONG: {
++      const word2 words = JOIN_WORD(instruction);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      const uint16_t C = C_of(words);
++      object_specs s = {p_vm->alloc, p_vm->objects_store};
++      object_map* map = create_object_map(&s);
++      if (map == NULL) {
++        goto oom_map_new_long;
++      }
++      gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(map));
++      bool filled = true;
++      for (uint32_t i = 0; i < C && filled; ++i) {
++        filled = map_write(p_vm, OBJECT_AS_VALUE(map), REG_AT(B + 2 * i), REG_AT(B + 2 * i + 1));
++      }
++      gc_guard_down(p_vm->alloc->gc);
++      if (!filled) {
++        return interpret_result_error(); // map_write already reported
++      }
++      REG_AT(A) = OBJECT_AS_VALUE(map);
++      break;
++    oom_map_new_long:
++      runtime_error(p_vm, "out of memory: failed to allocate map.");
++      return interpret_result_error();
++    }
++    case OP_INDEX_GET: {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      const object_array* arr = resolve_array_base(p_vm, REG_AT(b));
++      const value base = REG_AT(b);
++      const value key = resolve_operand(frame, reg, c, p);
++      if (value_is_object_type(base, OBJ_MAP)) {
++        value read;
++        if (!map_read(p_vm, base, key, &read)) {
++          return interpret_result_error();
++        }
++        REG_AT(a) = read;
++        break;
++      }
++      const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+-      if (arr == NULL || !resolve_array_index(p_vm, resolve_operand(frame, reg, c, p), arr->values.count, &index)) {
+-        interpret_result result;
+-        result.status = RUNTIME_ERROR;
+-        result.top_level_return = NULL_AS_VALUE();
+-        return result;
++      if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
++        return interpret_result_error();
+       }
+       REG_AT(a) = arr->values.data[index];
+       break;
+     }
+-    case OP_ARRAY_GET_LONG: {
++    case OP_INDEX_GET_LONG: {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      const object_array* arr = resolve_array_base(p_vm, REG_AT(B));
++      const value base = REG_AT(B);
++      const value key = resolve_operand(frame, reg, C, p);
++      if (value_is_object_type(base, OBJ_MAP)) {
++        value read;
++        if (!map_read(p_vm, base, key, &read)) {
++          return interpret_result_error();
++        }
++        REG_AT(A) = read;
++        break;
++      }
++      const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+-      if (arr == NULL || !resolve_array_index(p_vm, resolve_operand(frame, reg, C, p), arr->values.count, &index)) {
+-        interpret_result result;
+-        result.status = RUNTIME_ERROR;
+-        result.top_level_return = NULL_AS_VALUE();
+-        return result;
++      if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
++        return interpret_result_error();
+       }
+       REG_AT(A) = arr->values.data[index];
+       break;
+     }
+-    case OP_ARRAY_SET: {
++    case OP_INDEX_SET: {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+-      const object_array* arr = resolve_array_base(p_vm, REG_AT(a));
++      const value base = REG_AT(a);
++      const value key = resolve_operand(frame, reg, b, p);
++      if (value_is_object_type(base, OBJ_MAP)) {
++        // narrow SET has no room for a value-const flag (p is spent on the key):
++        // the compiler materializes constant values, c is always a register here.
++        if (!map_write(p_vm, base, key, REG_AT(c))) {
++          return interpret_result_error();
++        }
++        break;
++      }
++      const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+-      if (arr == NULL || !resolve_array_index(p_vm, resolve_operand(frame, reg, b, p), arr->values.count, &index)) {
+-        interpret_result result;
+-        result.status = RUNTIME_ERROR;
+-        result.top_level_return = NULL_AS_VALUE();
+-        return result;
++      if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
++        return interpret_result_error();
+       }
+-      // narrow SET has no room for a value-const flag (p is spent on the index):
+-      // the compiler materializes constant values, c is always a register here.
+       ((object_array*)arr)->values.data[index] = REG_AT(c);
+       break;
+     }
+-    case OP_ARRAY_SET_LONG: {
++    case OP_INDEX_SET_LONG: {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(words);
+       const bool q = Q_of(words);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+-      const object_array* arr = resolve_array_base(p_vm, REG_AT(A));
++      const value base = REG_AT(A);
++      const value key = resolve_operand(frame, reg, B, p);
++      if (value_is_object_type(base, OBJ_MAP)) {
++        if (!map_write(p_vm, base, key, resolve_operand(frame, reg, C, q))) {
++          return interpret_result_error();
++        }
++        break;
++      }
++      const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+-      if (arr == NULL || !resolve_array_index(p_vm, resolve_operand(frame, reg, B, p), arr->values.count, &index)) {
+-        interpret_result result;
+-        result.status = RUNTIME_ERROR;
+-        result.top_level_return = NULL_AS_VALUE();
+-        return result;
++      if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
++        return interpret_result_error();
+       }
+       ((object_array*)arr)->values.data[index] = resolve_operand(frame, reg, C, q);
+       break;
+@@ -2165,10 +2399,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         counter = VALUE_AS_NUMBER(REG_AT(B));
+       } else if (!for_operand_as_number(p_vm, REG_AT(B), "numeric for counter", &counter)) {
+         // mut counter: the body may reseat it to any value, keep the gate.
+-        interpret_result result;
+-        result.status = RUNTIME_ERROR;
+-        result.top_level_return = NULL_AS_VALUE();
+-        return result;
++        return interpret_result_error();
+       }
+       // only the counter is reachable by name
+       const double limit = VALUE_AS_NUMBER(REG_AT(B + 1));
+@@ -2181,6 +2412,98 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       }
+       break;
+     }
++    case OP_ITER_PREP: {
++      const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(words);    // p == 1: the (k, v) two-binding form
++      const uint16_t A = A_of(words); // forward offset to the loop exit
++      const uint16_t B = B_of(words); // state: iterable, cursor at B + 1, end at B + 2
++      const value iterable = REG_AT(B);
++      if (value_is_object_type(iterable, OBJ_ARRAY)) {
++        if (p) {
++          runtime_error(p_vm, "array iteration binds one loop variable.");
++          return interpret_result_error();
++        }
++        // cursor/end are written here and by ITER_LOOP only, always as plain
++        // numbers: the back edge reads them raw with no tag gate.
++        const uint32_t count = VALUE_AS_ARRAY(iterable)->values.count;
++        REG_AT(B + 1) = NUMBER_AS_VALUE(0);
++        REG_AT(B + 2) = NUMBER_AS_VALUE((double)count);
++        if (count == 0) {
++          ip += A;
++        }
++        break;
++      }
++      if (value_is_object_type(iterable, OBJ_MAP)) {
++        // snapshot the version for the back edge's size-change check, then
++        // park the cursor on the first occupied slot.
++        object_map* map = VALUE_AS_MAP(iterable);
++        REG_AT(B + 2) = NUMBER_AS_VALUE((double)map->version);
++        uint32_t slot = 0;
++        while (slot < map->entries.capacity && IS_VALUE_STRICTLY_NULL(map->entries.keys[slot])) {
++          slot++;
++        }
++        REG_AT(B + 1) = NUMBER_AS_VALUE((double)slot);
++        if (slot >= map->entries.capacity) {
++          ip += A;
++        }
++        break;
++      }
++      runtime_error(p_vm, "can only iterate over arrays and maps.");
++      return interpret_result_error();
++    }
++    case OP_ITER_GET: {
++      const bool p = p_of(instruction); // p == 1: also write the value register
++      const word2 words = JOIN_WORD(instruction);
++      const uint16_t B = B_of(words); // state base
++      const uint16_t C = C_of(words); // the binding: k, and v at C + 1 when p
++      const value iterable = REG_AT(B);
++      // cursor: written only by PREP/LOOP as a plain number, read raw
++      const uint32_t cursor = (uint32_t)VALUE_AS_NUMBER(REG_AT(B + 1));
++      if (value_is_object_type(iterable, OBJ_ARRAY)) {
++        REG_AT(C) = VALUE_AS_ARRAY(iterable)->values.data[cursor];
++      } else {
++        // a map: PREP validated the type, cursor is parked on an occupied slot
++        object_map* map = VALUE_AS_MAP(iterable);
++        REG_AT(C) = map->entries.keys[cursor];
++        if (p) {
++          REG_AT(C + 1) = map->entries.values[cursor];
++        }
++      }
++      break;
++    }
++    case OP_ITER_LOOP: {
++      const word2 words = JOIN_WORD(instruction);
++      const uint16_t A = A_of(words); // backward offset to the body top
++      const uint16_t B = B_of(words); // state base
++      const value iterable = REG_AT(B);
++      if (value_is_object_type(iterable, OBJ_ARRAY)) {
++        // the frozen end makes pushes during the body invisible to this trip
++        // (lua-style): the loop runs to the entry-time element count.
++        const double cursor = VALUE_AS_NUMBER(REG_AT(B + 1)) + 1.0;
++        REG_AT(B + 1) = NUMBER_AS_VALUE(cursor);
++        if (cursor < VALUE_AS_NUMBER(REG_AT(B + 2))) {
++          ip -= A;
++        }
++        break;
++      }
++      // a map: PREP validated the type. a size change since the snapshot is a
++      // hard error (the slot walk would mis-walk: backward shifts move entries
++      // under the cursor, grows swap the arrays entirely). value overwrites do
++      // not bump the version and stay legal mid-iteration.
++      object_map* map = VALUE_AS_MAP(iterable);
++      if ((double)map->version != VALUE_AS_NUMBER(REG_AT(B + 2))) {
++        runtime_error(p_vm, "map changed size during iteration.");
++        return interpret_result_error();
++      }
++      uint32_t slot = (uint32_t)VALUE_AS_NUMBER(REG_AT(B + 1));
++      for (++slot; slot < map->entries.capacity && IS_VALUE_STRICTLY_NULL(map->entries.keys[slot]); ++slot) {
++      }
++      REG_AT(B + 1) = NUMBER_AS_VALUE((double)slot);
++      if (slot < map->entries.capacity) {
++        ip -= A;
++      }
++      break;
++    }
+     case OP_PRINT: {
+       const bool p = p_of(instruction);
+       const value printed = resolve_operand(frame, reg, Alarge_of(instruction), p);
+@@ -2338,7 +2661,7 @@ static inline bool call_native(vm* p_vm,
+                                uint32_t p_callee,
+                                uint16_t p_argc,
+                                uint32_t p_retc) {
+-  if (p_argc != p_native->arity) {
++  if (p_native->arity != OK_NATIVE_ARITY_ANY && p_argc != p_native->arity) {
+     runtime_error(p_vm,
+                   "invalid call to native '%s': expected %d arguments, got: %d.",
+                   p_native->name.chars,
+diff --git a/src/okvm.h b/src/okvm.h
+index 58b8160..f39d175 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -86,6 +86,6 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs);
+ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc);
+ bool vm_native_error(vm* p_vm, ok_string_view p_message);
+ 
+-typedef enum { TT_STR, TT_NUM, TT_BOOL } temporary_type_tags;
++typedef enum { TT_STR, TT_NUM, TT_BOOL, TT_MAP } temporary_type_tags;
+ 
+ #endif // OK_VM_H
+diff --git a/tests/e2e/tests/maps/aliasing.ok b/tests/e2e/tests/maps/aliasing.ok
+new file mode 100644
+index 0000000..0d217f7
+--- /dev/null
++++ b/tests/e2e/tests/maps/aliasing.ok
+@@ -0,0 +1,13 @@
++// the binding is immutable, the container mutates: two names, one map
++let mut a = {:};
++let b = a;
++a["k"] = 1;
++print b["k"]; // expect: 1
++b["j"] = 2;
++print len(a); // expect: 2
++// identity: same map
++print a == b; // expect: true
++
++let other = {:};
++// different maps
++print a == other; // expect: false
+diff --git a/tests/e2e/tests/maps/as_map.ok b/tests/e2e/tests/maps/as_map.ok
+new file mode 100644
+index 0000000..d084d2f
+--- /dev/null
++++ b/tests/e2e/tests/maps/as_map.ok
+@@ -0,0 +1,6 @@
++let m = {"a": 1};
++let checked = m as map;
++print checked["a"]; // expect: 1
++// objects are truthy, like arrays
++print m as bool; // expect: true
++print {:} as bool; // expect: true
+diff --git a/tests/e2e/tests/maps/as_str.ok b/tests/e2e/tests/maps/as_str.ok
+new file mode 100644
+index 0000000..914887f
+--- /dev/null
++++ b/tests/e2e/tests/maps/as_str.ok
+@@ -0,0 +1,3 @@
++print {"only": 1} as str; // expect: {only: 1}
++print {:} as str; // expect: {:}
++print {"k": [1, 2]} as str; // expect: {k: [1, 2]}
+diff --git a/tests/e2e/tests/maps/compound_assign.ok b/tests/e2e/tests/maps/compound_assign.ok
+new file mode 100644
+index 0000000..f83f4fd
+--- /dev/null
++++ b/tests/e2e/tests/maps/compound_assign.ok
+@@ -0,0 +1,9 @@
++let mut m = {"a": 1};
++m["a"] += 10;
++print m["a"]; // expect: 11
++m["a"] *= 2;
++print m["a"]; // expect: 22
++m["a"] -= 2;
++print m["a"]; // expect: 20
++m["a"] /= 4;
++print m["a"]; // expect: 5
+diff --git a/tests/e2e/tests/maps/empty_literal.ok b/tests/e2e/tests/maps/empty_literal.ok
+new file mode 100644
+index 0000000..bd2cb0f
+--- /dev/null
++++ b/tests/e2e/tests/maps/empty_literal.ok
+@@ -0,0 +1,10 @@
++let m = {:};
++print len(m); // expect: 0
++m["k"] = true;
++print len(m); // expect: 1
++print m["k"]; // expect: true
++
++// a bare {} in expression position is rejected - the empty map is {:}
++let x = {}; // expect error: empty '{}' is not an expression - the empty map literal is '{:}'.
++// a bare {} STATEMENT stays an empty block
++{ print "block"; } // expect: block
+diff --git a/tests/e2e/tests/maps/equality_identity.ok b/tests/e2e/tests/maps/equality_identity.ok
+new file mode 100644
+index 0000000..f6a01e5
+--- /dev/null
++++ b/tests/e2e/tests/maps/equality_identity.ok
+@@ -0,0 +1,5 @@
++let m = {"a": 1};
++print m == m; // expect: true
++let n = {"a": 1};
++// identity, not content
++print m == n; // expect: false
+diff --git a/tests/e2e/tests/maps/errors/array_key.ok b/tests/e2e/tests/maps/errors/array_key.ok
+new file mode 100644
+index 0000000..54d37c1
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/array_key.ok
+@@ -0,0 +1,2 @@
++let m = {:};
++m[[1, 2]] = 1; // expect error
+diff --git a/tests/e2e/tests/maps/errors/as_map_not_map.ok b/tests/e2e/tests/maps/errors/as_map_not_map.ok
+new file mode 100644
+index 0000000..2f7ad68
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/as_map_not_map.ok
+@@ -0,0 +1 @@
++print [1, 2] as map; // expect error
+diff --git a/tests/e2e/tests/maps/errors/as_num_map.ok b/tests/e2e/tests/maps/errors/as_num_map.ok
+new file mode 100644
+index 0000000..35a906f
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/as_num_map.ok
+@@ -0,0 +1 @@
++print {"a": 1} as num; // expect error
+diff --git a/tests/e2e/tests/maps/errors/compound_on_missing.ok b/tests/e2e/tests/maps/errors/compound_on_missing.ok
+new file mode 100644
+index 0000000..1f7e10e
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/compound_on_missing.ok
+@@ -0,0 +1,3 @@
++// R1: the read errors first - compound assign on a missing key never inserts
++let mut m = {"a": 1};
++m["zz"] += 1; // expect error
+diff --git a/tests/e2e/tests/maps/errors/function_key.ok b/tests/e2e/tests/maps/errors/function_key.ok
+new file mode 100644
+index 0000000..06330b9
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/function_key.ok
+@@ -0,0 +1,2 @@
++let m = {:};
++m[fu() { return 1; }] = 1; // expect error
+diff --git a/tests/e2e/tests/maps/errors/get_bad_arity.ok b/tests/e2e/tests/maps/errors/get_bad_arity.ok
+new file mode 100644
+index 0000000..eb071bc
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/get_bad_arity.ok
+@@ -0,0 +1,2 @@
++let m = {:};
++print get(m); // expect error
+diff --git a/tests/e2e/tests/maps/errors/get_not_map.ok b/tests/e2e/tests/maps/errors/get_not_map.ok
+new file mode 100644
+index 0000000..1387112
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/get_not_map.ok
+@@ -0,0 +1 @@
++print get([1, 2], 0); // expect error
+diff --git a/tests/e2e/tests/maps/errors/insert_during_iteration.ok b/tests/e2e/tests/maps/errors/insert_during_iteration.ok
+new file mode 100644
+index 0000000..7368780
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/insert_during_iteration.ok
+@@ -0,0 +1,4 @@
++let m = {"a": 1, "b": 2};
++for let k, v : m {
++  m["c"] = 3; // expect error: map changed size during iteration.
++}
+diff --git a/tests/e2e/tests/maps/errors/iterate_number.ok b/tests/e2e/tests/maps/errors/iterate_number.ok
+new file mode 100644
+index 0000000..23df154
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/iterate_number.ok
+@@ -0,0 +1,3 @@
++for let k : 5 {
++  print k;
++} // expect error
+diff --git a/tests/e2e/tests/maps/errors/iterate_string.ok b/tests/e2e/tests/maps/errors/iterate_string.ok
+new file mode 100644
+index 0000000..88ddcea
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/iterate_string.ok
+@@ -0,0 +1,3 @@
++for let k : "abc" {
++  print k;
++} // expect error
+diff --git a/tests/e2e/tests/maps/errors/map_key.ok b/tests/e2e/tests/maps/errors/map_key.ok
+new file mode 100644
+index 0000000..787311f
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/map_key.ok
+@@ -0,0 +1,2 @@
++let m = {:};
++m[{:}] = 1; // expect error
+diff --git a/tests/e2e/tests/maps/errors/missing_key.ok b/tests/e2e/tests/maps/errors/missing_key.ok
+new file mode 100644
+index 0000000..1f7a09d
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/missing_key.ok
+@@ -0,0 +1,2 @@
++let m = {"a": 1};
++print m["zz"]; // expect error
+diff --git a/tests/e2e/tests/maps/errors/null_key_literal.ok b/tests/e2e/tests/maps/errors/null_key_literal.ok
+new file mode 100644
+index 0000000..a261f20
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/null_key_literal.ok
+@@ -0,0 +1 @@
++let m = {null: 1}; // expect error
+diff --git a/tests/e2e/tests/maps/errors/null_key_read.ok b/tests/e2e/tests/maps/errors/null_key_read.ok
+new file mode 100644
+index 0000000..87d054e
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/null_key_read.ok
+@@ -0,0 +1,2 @@
++let m = {"a": 1};
++print m[null]; // expect error
+diff --git a/tests/e2e/tests/maps/errors/null_key_write.ok b/tests/e2e/tests/maps/errors/null_key_write.ok
+new file mode 100644
+index 0000000..2cc298e
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/null_key_write.ok
+@@ -0,0 +1,2 @@
++let mut m = {:};
++m[null] = 1; // expect error
+diff --git a/tests/e2e/tests/maps/errors/remove_bad_arity.ok b/tests/e2e/tests/maps/errors/remove_bad_arity.ok
+new file mode 100644
+index 0000000..017936a
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/remove_bad_arity.ok
+@@ -0,0 +1,2 @@
++let m = {:};
++remove(m); // expect error
+diff --git a/tests/e2e/tests/maps/errors/remove_during_iteration.ok b/tests/e2e/tests/maps/errors/remove_during_iteration.ok
+new file mode 100644
+index 0000000..50c6aaa
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/remove_during_iteration.ok
+@@ -0,0 +1,4 @@
++let m = {"a": 1, "b": 2};
++for let k, v : m {
++  remove(m, k); // expect error: map changed size during iteration.
++}
+diff --git a/tests/e2e/tests/maps/errors/subscript_map_number_index.ok b/tests/e2e/tests/maps/errors/subscript_map_number_index.ok
+new file mode 100644
+index 0000000..f8d47dc
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/subscript_map_number_index.ok
+@@ -0,0 +1,2 @@
++let m = {"a": 1};
++print m[0]; // expect error (0 is not a key here)
+diff --git a/tests/e2e/tests/maps/errors/two_binding_array.ok b/tests/e2e/tests/maps/errors/two_binding_array.ok
+new file mode 100644
+index 0000000..1873e12
+--- /dev/null
++++ b/tests/e2e/tests/maps/errors/two_binding_array.ok
+@@ -0,0 +1,3 @@
++for let k, v : [1, 2, 3] {
++  print k;
++} // expect error
+diff --git a/tests/e2e/tests/maps/get_lax.ok b/tests/e2e/tests/maps/get_lax.ok
+new file mode 100644
+index 0000000..f395fd3
+--- /dev/null
++++ b/tests/e2e/tests/maps/get_lax.ok
+@@ -0,0 +1,13 @@
++let m = {"a": 1};
++print get(m, "a"); // expect: 1
++print get(m, "zz"); // expect: null
++print get(m, "zz", 99); // expect: 99
++// default only on absence
++print get(m, "a", 99); // expect: 1
++
++// the config-shaped "absent = use default" case, served explicitly (R1)
++let config = {:};
++print get(config, "port", 8080); // expect: 8080
++config["port"] = 9090;
++config["port"] = 9090;
++print get(config, "port", 8080); // expect: 9090
+diff --git a/tests/e2e/tests/maps/get_set_roundtrip.ok b/tests/e2e/tests/maps/get_set_roundtrip.ok
+new file mode 100644
+index 0000000..7ba8499
+--- /dev/null
++++ b/tests/e2e/tests/maps/get_set_roundtrip.ok
+@@ -0,0 +1,9 @@
++let mut m = {:};
++m["a"] = 1;
++print m["a"]; // expect: 1
++m["a"] = 2; // overwrite
++print m["a"]; // expect: 2
++print len(m); // expect: 1
++m["b"] = 3; // insert
++print len(m); // expect: 2
++print m["b"]; // expect: 3
+diff --git a/tests/e2e/tests/maps/iteration/basic.ok b/tests/e2e/tests/maps/iteration/basic.ok
+new file mode 100644
+index 0000000..823ad0f
+--- /dev/null
++++ b/tests/e2e/tests/maps/iteration/basic.ok
+@@ -0,0 +1,17 @@
++// iteration order is unspecified (slot order): tests count and sum, never order
++let m = {"a": 1, "b": 2, "c": 3};
++let mut total = 0;
++let mut count = 0;
++for let k, v : m {
++  total = total + v;
++  count = count + 1;
++}
++print total; // expect: 6
++print count; // expect: 3
++
++// keys-only form
++let mut sum_keys = 0;
++for let k : m {
++  sum_keys = sum_keys + m[k];
++}
++print sum_keys; // expect: 6
+diff --git a/tests/e2e/tests/maps/iteration/break_continue.ok b/tests/e2e/tests/maps/iteration/break_continue.ok
+new file mode 100644
+index 0000000..180530f
+--- /dev/null
++++ b/tests/e2e/tests/maps/iteration/break_continue.ok
+@@ -0,0 +1,17 @@
++// order-independent: trip counting, not value tracking (iteration order is
++// unspecified - slot order)
++let m = {"a": 1, "b": 2};
++let mut count = 0;
++for let k, v : m {
++  count = count + 1;
++  if count == 1 { continue; } // skip the rest of the first body only
++  count = count + 10;
++}
++print count; // expect: 12
++
++let mut trips = 0;
++for let k : m {
++  trips = trips + 1;
++  if trips == 1 { break; }
++}
++print trips; // expect: 1
+diff --git a/tests/e2e/tests/maps/iteration/capture.ok b/tests/e2e/tests/maps/iteration/capture.ok
+new file mode 100644
+index 0000000..e1f25d0
+--- /dev/null
++++ b/tests/e2e/tests/maps/iteration/capture.ok
+@@ -0,0 +1,16 @@
++// the loop bindings are real locals with shared-slot semantics: a closure
++// captures the slot, every iteration reseats it
++// single entry: the slot's final value is deterministic regardless of order
++let m = {"only": 42};
++let mut fns = [];
++for let k, v : m {
++  push(fns, fu() {
++    return v;
++  });
++  push(fns, fu() {
++    return k;
++  });
++}
++// shared-slot semantics: every closure sees the value its slot last held
++print fns[0](); // expect: 42
++print fns[1](); // expect: only
+diff --git a/tests/e2e/tests/maps/iteration/empty.ok b/tests/e2e/tests/maps/iteration/empty.ok
+new file mode 100644
+index 0000000..d380337
+--- /dev/null
++++ b/tests/e2e/tests/maps/iteration/empty.ok
+@@ -0,0 +1,7 @@
++for let k, v : {:} {
++  print "never";
++}
++for let k : {:} {
++  print "never";
++}
++print "done"; // expect: done
+diff --git a/tests/e2e/tests/maps/iteration/mixed_array_map.ok b/tests/e2e/tests/maps/iteration/mixed_array_map.ok
+new file mode 100644
+index 0000000..9f0e3d0
+--- /dev/null
++++ b/tests/e2e/tests/maps/iteration/mixed_array_map.ok
+@@ -0,0 +1,11 @@
++// one compiled shape, runtime dispatch: arrays bind elements, maps bind keys
++let values = [10, 20, 30];
++let keys = {"x": 1, "y": 2};
++let mut total = 0;
++for let v : values {
++  total = total + v;
++}
++for let k : keys {
++  total = total + 1;
++}
++print total; // expect: 62
+diff --git a/tests/e2e/tests/maps/iteration/mut_bindings.ok b/tests/e2e/tests/maps/iteration/mut_bindings.ok
+new file mode 100644
+index 0000000..81e71b6
+--- /dev/null
++++ b/tests/e2e/tests/maps/iteration/mut_bindings.ok
+@@ -0,0 +1,11 @@
++// iteration order is unspecified: assert through sums, not print order
++let m = {"a": 1, "b": 2};
++let mut sum = 0;
++for let mut k, mut v : m {
++  k = k + "!";
++  v = v * 100;
++  sum = sum + v;
++}
++print sum; // expect: 300
++// the binding is a copy: the map is untouched
++print m["a"] + m["b"]; // expect: 3
+diff --git a/tests/e2e/tests/maps/iteration/nested.ok b/tests/e2e/tests/maps/iteration/nested.ok
+new file mode 100644
+index 0000000..c0c528d
+--- /dev/null
++++ b/tests/e2e/tests/maps/iteration/nested.ok
+@@ -0,0 +1,18 @@
++let outer = {"a": 1, "b": 2};
++let mut pairs = 0;
++for let k1, v1 : outer {
++  for let k2, v2 : outer {
++    pairs = pairs + 1;
++  }
++}
++print pairs; // expect: 4
++
++// nested iteration over the same map is legal: two cursors, no mutation
++let mut total = 0;
++for let k, v : outer {
++  for let k2, v2 : outer {
++    total = total + v2;
++  }
++}
++// each inner sweep sums 1 + 2 = 3, two outer trips
++print total; // expect: 6
+diff --git a/tests/e2e/tests/maps/iteration/numeric_unchanged.ok b/tests/e2e/tests/maps/iteration/numeric_unchanged.ok
+new file mode 100644
+index 0000000..7a371dd
+--- /dev/null
++++ b/tests/e2e/tests/maps/iteration/numeric_unchanged.ok
+@@ -0,0 +1,9 @@
++// the numeric for keeps its own fused pair; both loop kinds interoperate
++let m = {"a": 1};
++let mut total = 0;
++for let i = 0 : 3 {
++  for let k, v : m {
++    total = total + v;
++  }
++}
++print total; // expect: 3
+diff --git a/tests/e2e/tests/maps/literal.ok b/tests/e2e/tests/maps/literal.ok
+new file mode 100644
+index 0000000..166dcea
+--- /dev/null
++++ b/tests/e2e/tests/maps/literal.ok
+@@ -0,0 +1,14 @@
++let m = {"a": 1, "b": 2};
++print m["a"]; // expect: 1
++print m["b"]; // expect: 2
++print len(m); // expect: 2
++
++let nums = {1: "one", 2: "two"};
++print nums[1]; // expect: one
++print nums[2]; // expect: two
++
++let mixed = {"s": 1, 2.5: true, false: "no"};
++print mixed["s"]; // expect: 1
++print mixed[2.5]; // expect: true
++print mixed[false]; // expect: no
++print len(mixed); // expect: 3
+diff --git a/tests/e2e/tests/maps/literal_computed_keys.ok b/tests/e2e/tests/maps/literal_computed_keys.ok
+new file mode 100644
+index 0000000..f33d006
+--- /dev/null
++++ b/tests/e2e/tests/maps/literal_computed_keys.ok
+@@ -0,0 +1,12 @@
++// keys are expressions, evaluated left to right with their values
++let k = "dyn";
++let m = {k: 1, k + "2": 2};
++print m["dyn"]; // expect: 1
++print m["dyn2"]; // expect: 2
++
++fu key(i) {
++  return "k" + i as str;
++}
++let m2 = {key(1): 10, key(2): 20};
++print m2["k1"]; // expect: 10
++print m2["k2"]; // expect: 20
+diff --git a/tests/e2e/tests/maps/literal_duplicates.ok b/tests/e2e/tests/maps/literal_duplicates.ok
+new file mode 100644
+index 0000000..e357ae2
+--- /dev/null
++++ b/tests/e2e/tests/maps/literal_duplicates.ok
+@@ -0,0 +1,4 @@
++// duplicate keys in a literal: the later insert overwrites, len counts unique
++let m = {"a": 1, "b": 2, "a": 3};
++print len(m); // expect: 2
++print m["a"]; // expect: 3
+diff --git a/tests/e2e/tests/maps/literal_in_call.ok b/tests/e2e/tests/maps/literal_in_call.ok
+new file mode 100644
+index 0000000..3d1d710
+--- /dev/null
++++ b/tests/e2e/tests/maps/literal_in_call.ok
+@@ -0,0 +1,9 @@
++fu first_value(m) {
++  return m["only"];
++}
++print first_value({"only": 42}); // expect: 42
++
++fu make() {
++  return {"built": "inside"};
++}
++print make()["built"]; // expect: inside
+diff --git a/tests/e2e/tests/maps/literal_nested.ok b/tests/e2e/tests/maps/literal_nested.ok
+new file mode 100644
+index 0000000..067d436
+--- /dev/null
++++ b/tests/e2e/tests/maps/literal_nested.ok
+@@ -0,0 +1,4 @@
++let m = {"inner": {"x": [1, 2, 3]}, "n": 5};
++print m["inner"]["x"][1]; // expect: 2
++print m["n"]; // expect: 5
++print len(m["inner"]["x"]); // expect: 3
+diff --git a/tests/e2e/tests/maps/literal_trailing_comma.ok b/tests/e2e/tests/maps/literal_trailing_comma.ok
+new file mode 100644
+index 0000000..0fa5bc2
+--- /dev/null
++++ b/tests/e2e/tests/maps/literal_trailing_comma.ok
+@@ -0,0 +1,3 @@
++let m = {"a": 1, "b": 2,};
++print len(m); // expect: 2
++print m["b"]; // expect: 2
+diff --git a/tests/e2e/tests/maps/mutation_during_iteration_overwrite.ok b/tests/e2e/tests/maps/mutation_during_iteration_overwrite.ok
+new file mode 100644
+index 0000000..b065bbf
+--- /dev/null
++++ b/tests/e2e/tests/maps/mutation_during_iteration_overwrite.ok
+@@ -0,0 +1,9 @@
++// overwriting values mid-iteration is legal: no size change, no version bump
++let m = {"a": 1, "b": 2, "c": 3};
++for let k, v : m {
++  m[k] = v * 10;
++}
++print m["a"]; // expect: 10
++print m["b"]; // expect: 20
++print m["c"]; // expect: 30
++print len(m); // expect: 3
+diff --git a/tests/e2e/tests/maps/null_values.ok b/tests/e2e/tests/maps/null_values.ok
+new file mode 100644
+index 0000000..a2c287a
+--- /dev/null
++++ b/tests/e2e/tests/maps/null_values.ok
+@@ -0,0 +1,7 @@
++// null VALUES are fine; only keys can't be null
++let m = {"a": null};
++print m["a"]; // expect: null
++print len(m); // expect: 1
++print get(m, "a"); // expect: null
++m["b"] = null;
++print len(m); // expect: 2
+diff --git a/tests/e2e/tests/maps/print_tag.ok b/tests/e2e/tests/maps/print_tag.ok
+new file mode 100644
+index 0000000..c5ce0dd
+--- /dev/null
++++ b/tests/e2e/tests/maps/print_tag.ok
+@@ -0,0 +1,3 @@
++// print routes through the CLI's per-type tags (ok.h contract): counts, not contents
++print {:}; // expect: <map 0>
++print {"a": 1}; // expect: <map 1>
+diff --git a/tests/e2e/tests/maps/regressions/array_as_str_separator.ok b/tests/e2e/tests/maps/regressions/array_as_str_separator.ok
+new file mode 100644
+index 0000000..d91cb5e
+--- /dev/null
++++ b/tests/e2e/tests/maps/regressions/array_as_str_separator.ok
+@@ -0,0 +1,6 @@
++// found while building maps: array_as_str placed ", " before each element
++// except the last, printing "[, 1, 23]" for [1, 2, 3] (v0.1.0, untested then)
++print [1, 2, 3] as str; // expect: [1, 2, 3]
++print [] as str; // expect: []
++print [1] as str; // expect: [1]
++print ["a", "b"] as str; // expect: [a, b]
+diff --git a/tests/e2e/tests/maps/regressions/gc_churn.ok b/tests/e2e/tests/maps/regressions/gc_churn.ok
+new file mode 100644
+index 0000000..b04acfe
+--- /dev/null
++++ b/tests/e2e/tests/maps/regressions/gc_churn.ok
+@@ -0,0 +1,26 @@
++// rehash mid-fill under collection: 300 inserts force grows; aggressive gc
++// (the CI gate variant) collects on every allocation
++let mut m = {:};
++for let i = 0 : 300 {
++  m["key" + i as str] = i * 2;
++}
++print len(m); // expect: 300
++print m["key0"]; // expect: 0
++print m["key299"]; // expect: 598
++
++for let i = 0 : 150 {
++  remove(m, "key" + i as str);
++}
++print len(m); // expect: 150
++print get(m, "key0"); // expect: null
++print m["key150"]; // expect: 300
++
++let mut nest = {:};
++for let i = 0 : 50 {
++  nest["arr" + i as str] = [i, i + 1, i + 2];
++}
++let mut total = 0;
++for let k, v : nest {
++  total = total + v[0] + v[1] + v[2];
++}
++print total; // expect: 3825
+diff --git a/tests/e2e/tests/maps/regressions/int_and_double_key.ok b/tests/e2e/tests/maps/regressions/int_and_double_key.ok
+new file mode 100644
+index 0000000..752788b
+--- /dev/null
++++ b/tests/e2e/tests/maps/regressions/int_and_double_key.ok
+@@ -0,0 +1,6 @@
++// 1 and 1.0 are one key (hash and equality agree, mirroring 1 == 1.0)
++let m = {1: "int"};
++print m[1.0]; // expect: int
++m[1.0] = "double";
++print len(m); // expect: 1
++print m[1]; // expect: double
+diff --git a/tests/e2e/tests/maps/regressions/minus_zero_key.ok b/tests/e2e/tests/maps/regressions/minus_zero_key.ok
+new file mode 100644
+index 0000000..f28a698
+--- /dev/null
++++ b/tests/e2e/tests/maps/regressions/minus_zero_key.ok
+@@ -0,0 +1,6 @@
++// R2: -0.0 normalizes to +0.0 - one key, not two
++let m = {0.0: "zero"};
++m[-0.0] = "minus";
++print len(m); // expect: 1
++print m[0.0]; // expect: minus
++print m[-0.0]; // expect: minus
+diff --git a/tests/e2e/tests/maps/remove.ok b/tests/e2e/tests/maps/remove.ok
+new file mode 100644
+index 0000000..a781eda
+--- /dev/null
++++ b/tests/e2e/tests/maps/remove.ok
+@@ -0,0 +1,15 @@
++let mut m = {"a": 1, "b": 2, "c": 3};
++remove(m, "b");
++print len(m); // expect: 2
++print get(m, "b"); // expect: null
++print m["a"]; // expect: 1
++print m["c"]; // expect: 3
++
++// absent key: legal no-op (the array form's empty range is legal the same way)
++remove(m, "zz");
++print len(m); // expect: 2
++
++// remove then re-insert: the slot is reusable
++m["b"] = 20;
++print m["b"]; // expect: 20
++print len(m); // expect: 3
+diff --git a/tests/e2e/tests/maps/shadowing.ok b/tests/e2e/tests/maps/shadowing.ok
+new file mode 100644
+index 0000000..a1a3c55
+--- /dev/null
++++ b/tests/e2e/tests/maps/shadowing.ok
+@@ -0,0 +1,21 @@
++// the surface builtins are ordinary (shadowable) names; the hidden
++// intrinsics the compiled paths read (" len", " get", ...) are unreachable
++fu shadowed() {
++  let len = 1;
++  let get = 2;
++  let remove = 3;
++  print len; // expect: 1
++  print get; // expect: 2
++  print remove; // expect: 3
++}
++shadowed();
++
++let m = {"a": 1, "b": 2};
++let mut total = 0;
++for let k : m {
++  total = total + 1;
++}
++print total; // expect: 2
++print get(m, "a"); // expect: 1
++remove(m, "a");
++print len(m); // expect: 1
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index bc3db8f..5fa79c8 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -522,6 +522,150 @@ int main() {
+   assert(ok_array_len(squares) == 18);                           // script push -> host len
+   assert(ok_value_as_number(ok_array_get(squares, 17)) == 7);
+ 
++  // ---- maps: the string_bag shape, table edition ----
++  // host values are invisible to the collector until they land somewhere
++  // traced (the contract: ok_root / a traced native / registers / a global).
++  // so: build the map empty + rooted, then fill it one set at a time - each
++  // key string is created immediately before its own guarded set, and every
++  // stored key stays reachable through the rooted map's tracer afterwards.
++  ok_value host_map = ok_map_new(vm, nullptr, 0);
++  assert(ok_value_is_map(host_map));
++  assert(ok_map_len(host_map) == 0);
++  const uint32_t host_map_root = ok_root(vm, host_map);
++  assert(host_map_root != OK_ROOT_INVALID);
++
++  // 300 entries on purpose: the parallel arrays must grow repeatedly mid-fill,
++  // which collects under the aggressive build on every single set.
++  for (uint32_t i = 0; i < 300; ++i) {
++    char buffer[32];
++    std::snprintf(buffer, sizeof(buffer), "key %u", i);
++    const ok_value key = ok_value_string(vm, ok_create_string_view(buffer, OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    assert(ok_map_set(vm, host_map, key, ok_value_number((double)(i * 3))));
++  }
++  assert(ok_map_len(host_map) == 300);
++  assert(ok_map_len(ok_value_number(42)) == 0);
++  assert(!ok_value_is_map(ok_value_number(42)));
++
++  // probe keys are held across further allocations (each ok_value_string
++  // collects): an unrooted host value would dangle, and a root taken AFTER
++  // later allocations would root a swept pointer - so each key is rooted the
++  // moment it exists. (found the hard way: a swept "key 0" probed through
++  // recycled memory and matched "key 8" - 24.0 instead of 0.)
++  uint32_t key_roots[4];
++  const ok_value key0 = ok_value_string(vm, ok_create_string_view("key 0", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  key_roots[0] = ok_root(vm, key0);
++  const ok_value key299 = ok_value_string(vm, ok_create_string_view("key 299", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  key_roots[1] = ok_root(vm, key299);
++  const ok_value key7 = ok_value_string(vm, ok_create_string_view("key 7", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  key_roots[2] = ok_root(vm, key7);
++  const ok_value key8 = ok_value_string(vm, ok_create_string_view("key 8", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  key_roots[3] = ok_root(vm, key8);
++  for (uint32_t i = 0; i < 4; ++i) {
++    assert(key_roots[i] != OK_ROOT_INVALID);
++  }
++
++  ok_value fetched = ok_value_null();
++  assert(ok_map_get(host_map, key0, &fetched));
++  assert(ok_value_as_number(fetched) == 0);
++  assert(ok_map_get(host_map, key299, &fetched));
++  assert(ok_value_as_number(fetched) == 897);
++  assert(!ok_map_get(host_map,
++                     ok_value_string(vm, ok_create_string_view("absent", OK_STRING_VIEW_CALCULATE_LENGTH, true)),
++                     &fetched));
++  assert(!ok_map_get(host_map, ok_value_null(), &fetched)); // null key rejected
++  assert(!ok_map_get(ok_value_number(42), key0, &fetched));
++
++  // stored nulls are values, not absence: get reports found
++  const ok_value null_key = ok_value_string(vm, ok_create_string_view("null slot", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  assert(ok_map_set(vm, host_map, null_key, ok_value_null()));
++  assert(ok_map_get(host_map, null_key, &fetched));
++  assert(ok_value_is_null(fetched));
++  assert(ok_map_len(host_map) == 301);
++  assert(ok_map_remove(host_map, null_key));
++  assert(!ok_map_remove(host_map, null_key)); // absent remove: no-op, reported
++  assert(ok_map_len(host_map) == 300);
++
++  // illegal keys are rejected without storing
++  assert(!ok_map_set(vm, host_map, ok_value_null(), ok_value_number(1)));
++  ok_value bad_key_items[] = {ok_value_number(1)};
++  const ok_value bad_key = ok_array_new(vm, bad_key_items, 1);
++  assert(!ok_map_set(vm, host_map, bad_key, ok_value_number(1)));
++  assert(ok_map_len(host_map) == 300);
++
++  // ok_map_new's flat pair list with number keys (no rooting needed for
++  // numbers): duplicate keys, the later pair wins, like the literal
++  ok_value dupe_pairs[] = {
++      ok_value_number(1),
++      ok_value_number(10),
++      ok_value_number(2),
++      ok_value_number(20),
++      ok_value_number(1),
++      ok_value_number(30),
++  };
++  ok_value dupes = ok_map_new(vm, dupe_pairs, 3);
++  assert(ok_value_is_map(dupes));
++  assert(ok_map_len(dupes) == 2);
++  assert(ok_map_get(dupes, ok_value_number(1), &fetched));
++  assert(ok_value_as_number(fetched) == 30);
++  assert(ok_map_get(dupes, ok_value_number(2), &fetched));
++  assert(ok_value_as_number(fetched) == 20);
++  // and the constructor rejects an illegal flat list outright
++  ok_value illegal_pairs[] = {
++      ok_value_number(1),
++      ok_value_number(1),
++      ok_value_null(),
++      ok_value_number(2),
++  };
++  assert(ok_value_is_null(ok_map_new(vm, illegal_pairs, 2)));
++
++  // host -> script: the script reads the host-built map and builds one for us
++  assert(
++      ok_global_define(vm, ok_create_string_view("host_map", OK_STRING_VIEW_CALCULATE_LENGTH, true), host_map, false));
++
++  const char* map_code = R"(
++    if host_map["key 7"] != 21 {
++      print "bad: host->script map read";
++    }
++    if len(host_map) != 300 {
++      print "bad: script sees host map len";
++    }
++    host_map["key 7"] = 7000;
++    remove(host_map, "key 8");
++
++    glob let script_map = {"a": 1, "b": 2};
++  )";
++
++  ok_source map_source = {
++      .from = OK_FROM_FILE,
++      .code = map_code,
++      .path = "map",
++  };
++
++  result = ok_run(vm, map_source);
++  assert(result == OK);
++
++  // script -> host: read the script's writes back out
++  assert(ok_map_get(host_map, key7, &fetched));
++  assert(ok_value_as_number(fetched) == 7000); // script write
++  assert(ok_map_len(host_map) == 299);         // script remove
++  assert(!ok_map_get(host_map, key8, &fetched));
++
++  ok_value script_map = ok_value_null();
++  assert(ok_global_get(vm, ok_create_string_view("script_map", OK_STRING_VIEW_CALCULATE_LENGTH, true), &script_map));
++  assert(ok_value_is_map(script_map));
++  assert(ok_map_len(script_map) == 2);
++  assert(ok_map_set(vm, script_map, ok_value_string(vm, ok_create_string_view("c", OK_STRING_VIEW_CALCULATE_LENGTH, true)),
++                    ok_value_number(3)));
++  assert(ok_map_len(script_map) == 3); // host write -> script's map
++  assert(ok_map_remove(script_map,
++                       ok_value_string(vm, ok_create_string_view("a", OK_STRING_VIEW_CALCULATE_LENGTH, true))));
++  assert(ok_map_len(script_map) == 2);
++
++  for (uint32_t i = 0; i < 4; ++i) {
++    assert(ok_unroot(vm, key_roots[i]));
++  }
++  assert(ok_unroot(vm, host_map_root));
++
+   std::vector<std::string> printed_lines;
+   ok_set_print(
+       vm,
