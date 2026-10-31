@@ -223,7 +223,31 @@ alloc kill is real but sub-noise at this scale; its value is structural
 class shrinks). the GC is untouched by design: mark_globals_store walks the
 values array only, never the table internals (verified before writing).
 
-**patch B — the surface**: object_string gains a cached `hash` field
+**patch C — DELIVERED (session 20): `patches/18-compiler-scope-tables-to-okmap.patch`**
+vs maps-staging (`2239723` — Q's applied patch A; C landed before B on Q's
+call, "finish the internals first"). compiler scope tables migrate to
+okmap.h: scope_registers is the second instantiation of the same string-map
+shape as globals_store (owned string keys, uint16 register-index values,
+string-view probes — a lookup allocates nothing, the probe is the AST-owned
+identifier view). the hashed_string wrapper died with its last user, exactly
+as §3 ruled: add_local no longer builds an allocated key copy per
+declaration, resolve_local/resolve_upvalue take views directly,
+resolve_variable's per-lookup create/deinit pair is gone, and
+`hashed_string` is deleted from okstring.h/.c. the old impl is fully dead:
+oktable.h deleted, oktest_table.c deleted (subsumed by oktest_map.c's
+property tests), the never-defined OK_DEBUG debug_table decl removed.
+compile-time only, ~51 ins / ~558 del. gates: e2e 211/211 x
+plain/asan/asan-aggr, embed x3, unit x3, fresh-apply rebuild. honest A/B on
+a purpose-built scope stress (300 functions x 3 nested blocks x 30 locals +
+shadowing + closures + the local->upvalue->global miss chain): outputs
+byte-identical, **median 46ms -> 42ms** (20 interleaved -O2 runs,
+reproduced) — the first measurable win of the series; patch A's
+parity-on-globals was sub-noise because globals resolve once, scopes resolve
+constantly. startup-alloc survey stays with B as planned (the 13.2
+"cached global ids" follow-up targeted the pre-patch-A hashed_string
+lookups, which no longer exist).
+
+**patch B — the surface** (next): object_string gains a cached `hash` field
 (computed at creation — needed by value-keyed string lookups; this was
 formerly patch C's first half, moved here) + the map OBJECT (ok_value keys
 and values, strict-null key = empty slot) + literal `{k: v}` / empty `{:}` +
@@ -235,11 +259,6 @@ compound-on-missing, iteration, mutation, key-type errors, null-value
 storage, aliasing, literal-in-call, the {:} parser cases) + asan-aggr
 torture (rehash mid-fill under collection) + tree-sitter grammar delta
 (separate repo patch, same series).
-
-**patch C — the cleanup**: compiler scope tables migrate to okmap.h +
-oktable.h deleted + the dead OK_DEBUG debug_table declaration removed +
-(here or in B) any startup-alloc leftovers. compile-time-only, zero runtime
-risk, pure churn — kept separate so patch A stays reviewable.
 
 **bench trio** (lands with B): insert-heavy, lookup-heavy, churn-heavy, vs
 lua tables and python dicts, on the real bench protocol (the micro-bench

@@ -1,0 +1,822 @@
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 2b6668d..b4fa32c 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -10,21 +10,40 @@
+ #include "okutils.h"
+ #include "okvalue.h"
+ 
+-#define ARE_KEYS_EQUAL(lhs, rhs)                                                                                       \
+-  (string_get_length(&lhs.string) == string_get_length(&rhs.string) &&                                                 \
+-   strncmp(lhs.string.chars, rhs.string.chars, string_get_length(&lhs.string)) == 0)
+-#define GET_HASH(key) (key.hash)
+-
+ ARRAY_DEFINE_DEFAULT(top_level_declarations, variable_declaration, ARRAY_DEFAULT_TYPE_DEINIT);
+ 
+-TABLE_DEFINE_DEFAULT(scope_registers,
+-                     hashed_string,
+-                     uint16_t,
+-                     hash_t,
+-                     ARE_KEYS_EQUAL,
+-                     hashed_string_deinit,
+-                     ARRAY_DEFAULT_TYPE_DEINIT,
+-                     GET_HASH)
++// scope_registers is the second okmap.h user, same shape as globals_store's
++// globals_map: owned string keys (identifier copies made by the map on the
++// insert path only), uint16 register-index values, and plain string-view
++// probes — the caller passes the identifier view the AST already owns, and a
++// lookup allocates nothing. the old oktable version took a hashed_string by
++// value per call: the caller built an allocated copy WITH its hash to probe
++// with, and then handed over ownership on insert or freed it on every miss.
++
++#define SR_KEY_IS_EMPTY(k) ((k).chars == NULL)
++#define SR_KEY_SET_EMPTY(k)                                                                                            \
++  do {                                                                                                                 \
++    (k)->chars = NULL;                                                                                                \
++    (k)->info = 0;                                                                                                    \
++  } while (0)
++#define SR_PROBE_HASH(p) (default_hash_str(p))
++#define SR_PROBE_MATCHES(p, k)                                                                                         \
++  (ok_string_view_get_length(&(p)) == string_get_length(&(k)) &&                                                       \
++   memcmp((k).chars, (p).chars, ok_string_view_get_length(&(p))) == 0)
++#define SR_KEY_CLONE(p, a) (create_string_from_string_view((p), (a)))
++#define SR_KEY_DEINIT(k, a) (string_deinit((k), (a)))
++
++MAP_DEFINE(scope_registers,
++           string,
++           uint16_t,
++           ok_string_view,
++           SR_KEY_IS_EMPTY,
++           SR_KEY_SET_EMPTY,
++           SR_PROBE_HASH,
++           SR_PROBE_MATCHES,
++           SR_KEY_CLONE,
++           SR_KEY_DEINIT,
++           ARRAY_DEFAULT_TYPE_DEINIT)
+ 
+ static void register_allocator_init(register_allocator* p_regalloc, allocators* p_alloc) {
+   p_regalloc->registers_count = 0;
+@@ -98,14 +117,14 @@ static void register_allocator_reset_locals(register_allocator* p_regalloc, uint
+ }
+ 
+ static void scope_init(scope* p_scope, uint32_t p_checkpoint, allocators* p_alloc) {
+-  scope_registers_init(&p_scope->registers_table, p_alloc);
++  scope_registers_init(&p_scope->registers_map, p_alloc);
+   uint16_array_init(&p_scope->registers, p_alloc);
+   p_scope->registers_checkpoint = p_checkpoint;
+   p_scope->captures_any = false;
+ }
+ 
+ static void scope_deinit(scope* p_scope, allocators* p_alloc) {
+-  scope_registers_deinit(&p_scope->registers_table);
++  scope_registers_deinit(&p_scope->registers_map);
+   uint16_array_deinit(&p_scope->registers, p_alloc);
+   p_scope->registers_checkpoint = 0;
+ }
+@@ -243,8 +262,8 @@ static bool end_scope(compiler* p_compiler, ast_node* p_author) {
+     status = false;
+   }
+   register_allocator_reset_locals(&ctx->register_allocator, scp->registers_checkpoint);
+-  // scopes_pop only decrements count. the popped scope owns its registers_table
+-  // (with hashed_string keys) and registers array and must deinit it or they leak.
++  // scopes_pop only decrements count. the popped scope owns its registers_map
++  // (with owned string keys) and registers array and must deinit it or they leak.
+   scope_deinit(scp, p_compiler->alloc);
+   ASSERT(scopes_pop(&ctx->scopes));
+   return status;
+@@ -295,15 +314,11 @@ add_local(compiler* p_compiler, const variable_declaration p_declration, bool p_
+       ((p_declration.flags & VARIABLE_DECLARATION_FLAGS_MUTABLE) != 0 ? REGISTER_FLAG_MUTABLE : REGISTER_FLAG_NONE);
+   _register reg = {0, flags, REGISTER_OK};
+   allocators* alloc = p_compiler->alloc;
+-  hashed_string hs = create_hashed_string_hash(p_declration.identifier, alloc);
+-  if (hs.string.chars == NULL) {
+-    report_oom(p_compiler, p_author);
+-    reg.errors = REGISTER_ALLOCATION_FAILED;
+-    return reg;
+-  }
+   compile_context* ctx = current_context(p_compiler);
+   scope* scp = current_scope(p_compiler);
+-  uint16_t* resolved = scope_registers_get(&scp->registers_table, hs);
++  // the probe is the identifier view the AST owns: the lookup itself allocates
++  // nothing, the map copies the key only when the insert path runs.
++  uint16_t* resolved = scope_registers_get(&scp->registers_map, p_declration.identifier);
+   if (resolved == NULL) {
+     register_allocator_allocate_local(&ctx->register_allocator, &reg);
+     if (reg.errors != REGISTER_OK) {
+@@ -315,12 +330,10 @@ add_local(compiler* p_compiler, const variable_declaration p_declration, bool p_
+             ok_create_string_view("too many local variables in function.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+             ok_create_string_view_from_string(note));
+         string_deinit(&note, alloc);
+-        hashed_string_deinit(&hs, alloc);
+         reg.errors = REGISTER_OVERFLOW;
+         return reg;
+       } else if (reg.errors == REGISTER_ALLOCATION_FAILED) {
+         report_oom(p_compiler, p_author);
+-        hashed_string_deinit(&hs, alloc);
+         return reg;
+       }
+     }
+@@ -330,13 +343,11 @@ add_local(compiler* p_compiler, const variable_declaration p_declration, bool p_
+ 
+     if (!uint16_array_append(&scp->registers, reg.index)) {
+       report_oom(p_compiler, p_author);
+-      hashed_string_deinit(&hs, alloc);
+       register_allocator_rollback_local(&ctx->register_allocator);
+       return reg;
+     }
+-    if (!scope_registers_set(&scp->registers_table, hs, reg.index)) {
++    if (!scope_registers_set(&scp->registers_map, p_declration.identifier, reg.index)) {
+       report_oom(p_compiler, p_author);
+-      hashed_string_deinit(&hs, alloc);
+       uint16_array_remove(&scp->registers, scp->registers.count - 1, scp->registers.count - 1);
+       register_allocator_rollback_local(&ctx->register_allocator);
+       return reg;
+@@ -348,7 +359,6 @@ add_local(compiler* p_compiler, const variable_declaration p_declration, bool p_
+   error_at(p_compiler, p_author, ok_create_string_view_from_string(message));
+   string_deinit(&message, alloc);
+   string_deinit(&name, alloc);
+-  hashed_string_deinit(&hs, alloc);
+   reg.errors = REGISTER_REDEFINED_LOCAL;
+   return reg;
+ }
+@@ -954,14 +964,14 @@ static bool define_global(compiler* p_compiler, location p_global, expression_re
+   return write_global(p_compiler, (global){p_global.index, GLOBAL_FLAG_NONE, GLOBAL_OK}, p_value, p_author);
+ }
+ 
+-static _register* resolve_local(compile_context* p_context, hashed_string* p_identifier, scope** p_owning) {
++static _register* resolve_local(compile_context* p_context, ok_string_view p_identifier, scope** p_owning) {
+   uint16_t* sindex = NULL;
+   uint32_t depth = p_context->scopes.count;
+   while (sindex == NULL && depth != 0) {
+     scope* scp = &p_context->scopes.data[--depth];
+ 
+-    // the table value IS the register slot (scope_registers_set stores reg.index directly),
+-    sindex = scope_registers_get(&scp->registers_table, *p_identifier);
++    // the map value IS the register slot (scope_registers_set stores reg.index directly),
++    sindex = scope_registers_get(&scp->registers_map, p_identifier);
+     // TODO: report that we skipped if we couldn't resolve other local with same name.
+     if (sindex != NULL &&
+         (p_context->register_allocator.registers.data[*sindex].flags & REGISTER_FLAG_UNINITIALIZED) != 0) {
+@@ -1123,7 +1133,7 @@ static upvalue add_upvalue(compiler* p_compiler, compile_context* p_ctx, upvalue
+ }
+ 
+ static upvalue
+-resolve_upvalue(compiler* p_compiler, uint32_t p_context_index, hashed_string p_identifier, ast_node* p_author) {
++resolve_upvalue(compiler* p_compiler, uint32_t p_context_index, ok_string_view p_identifier, ast_node* p_author) {
+   const uint32_t contexts = p_compiler->contexts.count;
+   upvalue u = {0, UPVALUE_FLAG_LOCAL, UPVALUE_OK};
+   if (contexts < p_context_index + 2) {
+@@ -1134,7 +1144,7 @@ resolve_upvalue(compiler* p_compiler, uint32_t p_context_index, hashed_string p_
+   compile_context* current = &p_compiler->contexts.data[contexts - p_context_index - 1];
+   compile_context* up = &p_compiler->contexts.data[contexts - p_context_index - 2];
+   scope* scp;
+-  _register* local_reg = resolve_local(up, &p_identifier, &scp);
++  _register* local_reg = resolve_local(up, p_identifier, &scp);
+   if (local_reg != NULL) {
+     local_reg->flags |= REGISTER_FLAG_CAPTURED;
+     u.index = local_reg->index;
+@@ -1172,50 +1182,38 @@ static bool store_upvalue(compiler* p_compiler, location p_upvalue, expression_r
+ }
+ 
+ static location resolve_variable(compiler* p_compiler, const ok_string_view p_identifier, ast_node* p_author) {
+-  allocators* alloc = p_compiler->alloc;
+   location invalid = {0, LOCATION_KIND_INVALID, LOCATION_INVALID};
+-  hashed_string hs = create_hashed_string_hash(p_identifier, alloc);
+-
+-  if (hs.string.chars == NULL) {
+-    report_oom(p_compiler, p_author);
+-    return invalid;
+-  }
+ 
+   {
+     scope* scp;
+-    _register* local = resolve_local(current_context(p_compiler), &hs, &scp);
++    _register* local = resolve_local(current_context(p_compiler), p_identifier, &scp);
+ 
+     if (local != NULL) {
+-      hashed_string_deinit(&hs, alloc);
+       return (location){local->index, LOCATION_KIND_REGISTER, LOCATION_OK};
+     }
+   }
+ 
+   {
+-    upvalue up = resolve_upvalue(p_compiler, 0, hs, p_author);
++    upvalue up = resolve_upvalue(p_compiler, 0, p_identifier, p_author);
+     if (up.error == UPVALUE_OK) {
+-      hashed_string_deinit(&hs, alloc);
+       return (location){up.index, LOCATION_KIND_UPVALUE, LOCATION_OK};
+     }
+     if (up.error != UPVALUE_UNDEFINED) {
+-      hashed_string_deinit(&hs, alloc);
+       return invalid;
+     }
+   }
+ 
+   {
+-    // TODO make globals store accept direct hs
+     const global glob = globals_store_get(p_compiler->globals_store, p_identifier);
+     if (IS_GLOBAL_VALID(glob)) {
+-      hashed_string_deinit(&hs, alloc);
+       return (location){glob.index, LOCATION_KIND_GLOBAL, LOCATION_OK};
+     }
+   }
++  allocators* alloc = p_compiler->alloc;
+   string message =
+       asprint(alloc, "undefined variable: %.*s", ok_string_view_get_length(&p_identifier), p_identifier.chars);
+   error_at(p_compiler, p_author, ok_create_string_view_from_string(message));
+   string_deinit(&message, alloc);
+-  hashed_string_deinit(&hs, alloc);
+   return invalid;
+ }
+ 
+diff --git a/src/okcompiler.h b/src/okcompiler.h
+index b198934..d0d0d81 100644
+--- a/src/okcompiler.h
++++ b/src/okcompiler.h
+@@ -7,6 +7,7 @@
+ #include "okfwd.h"
+ #include "okglobals_store.h"
+ #include "okindex.h"
++#include "okmap.h"
+ #include "okobject.h"
+ #include "okobject_store.h"
+ 
+@@ -114,12 +115,12 @@ typedef struct {
+ } variable_declaration;
+ 
+ ARRAY_DECLARE_DEFAULT(uint16_array, uint16_t)
+-TABLE_DECLARE_DEFAULT(scope_registers, hashed_string, uint16_t /* index to the scope's registers array */, hash_t)
++MAP_DECLARE(scope_registers, string, uint16_t /* index to the scope's registers array */, ok_string_view)
+ ARRAY_DECLARE_DEFAULT(registers, _register)
+ ARRAY_DECLARE_DEFAULT(upvalues, upvalue)
+ 
+ typedef struct {
+-  scope_registers registers_table; // indices into the scope's registers
++  scope_registers registers_map;   // indices into the scope's registers
+   uint16_array registers;          // indices into the function's registers
+   uint32_t registers_checkpoint;
+   bool captures_any;
+diff --git a/src/okglobals_store.h b/src/okglobals_store.h
+index 2b9935a..dc11376 100644
+--- a/src/okglobals_store.h
++++ b/src/okglobals_store.h
+@@ -7,7 +7,6 @@
+ #include "okindex.h"
+ #include "okmap.h"
+ #include "okstring.h"
+-#include "oktable.h"
+ #include "okvalue.h"
+ 
+ typedef index_wrapper global;
+@@ -34,10 +33,6 @@ ARRAY_DECLARE(global_values, value, uint16_t)
+ ARRAY_DECLARE(global_descriptors, global, uint16_t)
+ MAP_DECLARE(globals_map, string, global_id, ok_string_view)
+ 
+-#if defined(OK_DEBUG) // TODO debug meta data to get a name from an index
+-TABLE_DECLARE(debug_table, uint32_t, uint32_t, uint32_t, hashed_string, hash_t)
+-#endif
+-
+ struct globals_store {
+   global_values global_values;
+   global_descriptors global_descriptors;
+diff --git a/src/okstring.c b/src/okstring.c
+index b3c4356..47e0a30 100644
+--- a/src/okstring.c
++++ b/src/okstring.c
+@@ -196,29 +196,3 @@ ok_cstring_view ok_ok_create_cstring_view_from_string_view(const ok_string_view
+   }
+   return ok_create_cstring_view(NULL, 0);
+ }
+-
+-void hashed_string_init(hashed_string* p_hashed_string,
+-                        const ok_string_view p_view,
+-                        const hash_t p_hash,
+-                        allocators* p_alloc) {
+-  p_hashed_string->string = create_string_from_string_view(p_view, p_alloc);
+-  p_hashed_string->hash = p_hash;
+-}
+-
+-void hashed_string_deinit(hashed_string* p_hashed_string, allocators* p_alloc) {
+-  string_deinit(&p_hashed_string->string, p_alloc);
+-  p_hashed_string->hash = 0;
+-}
+-
+-hashed_string create_hashed_string(const ok_string_view p_view, hash_t p_hash, allocators* p_alloc) {
+-  hashed_string hs;
+-  hashed_string_init(&hs, p_view, p_hash, p_alloc);
+-  return hs;
+-}
+-
+-hashed_string create_hashed_string_hash(const ok_string_view p_view, allocators* p_alloc) {
+-  hashed_string hs;
+-  hash_t hash = default_hash_str(p_view);
+-  hashed_string_init(&hs, p_view, hash, p_alloc);
+-  return hs;
+-}
+diff --git a/src/okstring.h b/src/okstring.h
+index 62c8dbb..67572e4 100644
+--- a/src/okstring.h
++++ b/src/okstring.h
+@@ -31,17 +31,5 @@ string create_string_from_string_view(const ok_string_view p_string_view, alloca
+ string create_string_from_cstring_view(ok_cstring_view p_cstring_view, allocators* p_alloc);
+ 
+ typedef uint64_t hash_t;
+-typedef struct {
+-  string string;
+-  hash_t hash;
+-} hashed_string;
+-
+-void hashed_string_init(hashed_string* p_hashed_string,
+-                        const ok_string_view p_view,
+-                        const hash_t p_hash,
+-                        allocators* p_alloc);
+-void hashed_string_deinit(hashed_string* p_hashed_string, allocators* p_alloc);
+-hashed_string create_hashed_string(const ok_string_view p_string, const hash_t p_hash, allocators* p_alloc);
+-hashed_string create_hashed_string_hash(const ok_string_view p_view, allocators* p_alloc);
+ 
+ #endif // OK_SRC_STRING_H
+diff --git a/src/oktable.h b/src/oktable.h
+deleted file mode 100644
+index d41b94d..0000000
+--- a/src/oktable.h
++++ /dev/null
+@@ -1,232 +0,0 @@
+-#ifndef OK_TABLE_H
+-#define OK_TABLE_H
+-
+-#include "okarray.h"
+-
+-#define TABLE_DEFAULT_LOAD_NUM 3
+-#define TABLE_DEFAULT_LOAD_DEN 4
+-
+-#define TABLE_DECLARE_DEFAULT(name, key_type, value_type, hash_type)                                                   \
+-  TABLE_DECLARE(name, uint32_t, uint32_t, key_type, value_type, hash_type)
+-#define TABLE_DEFINE_DEFAULT(                                                                                          \
+-    name, key_type, value_type, hash_type, are_keys_equal, key_deinit, value_deinit, get_hash)                         \
+-  TABLE_DEFINE(name,                                                                                                   \
+-               uint32_t,                                                                                               \
+-               uint32_t,                                                                                               \
+-               UINT32_MAX,                                                                                             \
+-               UINT32_MAX,                                                                                             \
+-               key_type,                                                                                               \
+-               value_type,                                                                                             \
+-               hash_type,                                                                                              \
+-               TABLE_DEFAULT_LOAD_NUM,                                                                                 \
+-               TABLE_DEFAULT_LOAD_DEN,                                                                                 \
+-               are_keys_equal,                                                                                         \
+-               key_deinit,                                                                                             \
+-               value_deinit,                                                                                           \
+-               get_hash)
+-
+-#define TABLE_DECLARE(name, table_size_type, bucket_size_type, key_type, value_type, hash_type)                        \
+-  typedef struct name name;                                                                                            \
+-  typedef struct name##_entry name##_entry;                                                                            \
+-                                                                                                                       \
+-  struct name##_entry {                                                                                                \
+-    key_type key;                                                                                                      \
+-    value_type value;                                                                                                  \
+-  };                                                                                                                   \
+-                                                                                                                       \
+-  void name##_entry_init(name##_entry* p_entry, key_type p_key, value_type p_value);                                   \
+-  void name##_entry_deinit(name##_entry* p_entry, allocators* p_alloc);                                                \
+-                                                                                                                       \
+-  ARRAY_DECLARE(name##_bucket, name##_entry, bucket_size_type)                                                         \
+-  ARRAY_DECLARE(name##_buckets, name##_bucket, table_size_type)                                                        \
+-  struct name {                                                                                                        \
+-    name##_buckets buckets;                                                                                            \
+-    table_size_type count;                                                                                             \
+-    allocators* alloc;                                                                                                 \
+-  };                                                                                                                   \
+-                                                                                                                       \
+-  void name##_init(name* p_table, allocators* p_alloc);                                                                \
+-  void name##_deinit(name* p_table);                                                                                   \
+-  bool name##_set(name* p_table, key_type p_key, value_type p_value);                                                  \
+-  value_type* name##_get(name* p_table, key_type p_key);                                                               \
+-  bool name##_remove(name* p_table, key_type p_key);
+-
+-#define TABLE_DEFINE(name,                                                                                             \
+-                     table_size_type,                                                                                  \
+-                     bucket_size_type,                                                                                 \
+-                     table_size_type_max,                                                                              \
+-                     bucket_size_type_max,                                                                             \
+-                     key_type,                                                                                         \
+-                     value_type,                                                                                       \
+-                     hash_type,                                                                                        \
+-                     load_num,                                                                                         \
+-                     load_den,                                                                                         \
+-                     are_keys_equal,                                                                                   \
+-                     key_deinit,                                                                                       \
+-                     value_deinit,                                                                                     \
+-                     get_hash /* called in hot paths, preferably the actuall hash is stroed in the key_type,*/         \
+-                     /* and this *call* only returns cached value. */)                                                 \
+-                                                                                                                       \
+-  ARRAY_DEFINE(name##_bucket, name##_entry, bucket_size_type, bucket_size_type_max, name##_entry_deinit)               \
+-  ARRAY_DEFINE(name##_buckets, name##_bucket, table_size_type, table_size_type_max, name##_bucket_deinit)              \
+-                                                                                                                       \
+-  void name##_entry_init(name##_entry* p_entry, key_type p_key, value_type p_value) {                                  \
+-    p_entry->key = p_key;                                                                                              \
+-    p_entry->value = p_value;                                                                                          \
+-  }                                                                                                                    \
+-                                                                                                                       \
+-  void name##_entry_deinit(name##_entry* p_entry, allocators* p_alloc) {                                               \
+-    value_deinit(&p_entry->value, p_alloc);                                                                            \
+-    key_deinit(&p_entry->key, p_alloc);                                                                                \
+-  }                                                                                                                    \
+-  static name##_entry* name##_bucket_get(name##_bucket* p_bucket, const key_type p_key, bucket_size_type* p_index) {   \
+-    if (p_bucket->count == 1) {                                                                                        \
+-      if (get_hash(p_bucket->data[0].key) == get_hash(p_key) && are_keys_equal(p_bucket->data[0].key, p_key)) {        \
+-        *p_index = 0;                                                                                                  \
+-        return &p_bucket->data[0];                                                                                     \
+-      }                                                                                                                \
+-    }                                                                                                                  \
+-    if (p_bucket->count == 0) {                                                                                        \
+-      return NULL;                                                                                                     \
+-    }                                                                                                                  \
+-    for (bucket_size_type i = 0; i < p_bucket->count; ++i) {                                                           \
+-      if (get_hash(p_bucket->data[i].key) == get_hash(p_key) && are_keys_equal(p_bucket->data[i].key, p_key)) {        \
+-        *p_index = i;                                                                                                  \
+-        return &p_bucket->data[i];                                                                                     \
+-      }                                                                                                                \
+-    }                                                                                                                  \
+-    return NULL;                                                                                                       \
+-  }                                                                                                                    \
+-                                                                                                                       \
+-  static void name##_free_buckets_storage(name##_buckets* p_buckets) {                                                 \
+-    for (uint32_t i = 0; i < p_buckets->capacity; ++i) {                                                               \
+-      name##_bucket_free_storage(&p_buckets->data[i]);                                                                 \
+-    }                                                                                                                  \
+-    name##_buckets_free_storage(p_buckets);                                                                            \
+-  }                                                                                                                    \
+-                                                                                                                       \
+-  void name##_init(name* p_table, allocators* p_alloc) {                                                               \
+-    p_table->alloc = p_alloc;                                                                                          \
+-    p_table->count = 0;                                                                                                \
+-    name##_buckets_init(&p_table->buckets, p_table->alloc);                                                            \
+-  }                                                                                                                    \
+-                                                                                                                       \
+-  void name##_deinit(name* p_table) {                                                                                  \
+-    for (table_size_type i = 0; i < p_table->buckets.capacity; ++i) {                                                  \
+-      name##_bucket_deinit(&p_table->buckets.data[i], p_table->alloc);                                                 \
+-    }                                                                                                                  \
+-    name##_buckets_deinit(&p_table->buckets, p_table->alloc);                                                          \
+-  }                                                                                                                    \
+-                                                                                                                       \
+-  static table_size_type name##_find_entry(name##_buckets* p_buckets,                                                  \
+-                                           const table_size_type p_capacity,                                           \
+-                                           key_type p_key,                                                             \
+-                                           name##_entry** p_out,                                                       \
+-                                           bucket_size_type* p_index_in_bucket) {                                      \
+-    table_size_type bucket_index = get_hash(p_key) & (p_capacity - 1);                                                 \
+-    name##_entry* ptr = name##_bucket_get(&p_buckets->data[bucket_index], p_key, p_index_in_bucket);                   \
+-    *p_out = ptr;                                                                                                      \
+-    return bucket_index;                                                                                               \
+-  }                                                                                                                    \
+-                                                                                                                       \
+-  static bool name##_adjust_to_capacity(name* p_table, table_size_type p_capacity) {                                   \
+-    name##_buckets buckets;                                                                                            \
+-    name##_buckets_init(&buckets, p_table->alloc);                                                                     \
+-    if (!name##_buckets_grow(&buckets, p_capacity)) {                                                                  \
+-      name##_buckets_free_storage(&buckets);                                                                           \
+-      return false;                                                                                                    \
+-    }                                                                                                                  \
+-    for (table_size_type i = 0; i < p_capacity; ++i) {                                                                 \
+-      name##_bucket_init(&buckets.data[i], p_table->alloc);                                                            \
+-    }                                                                                                                  \
+-    for (table_size_type i = 0; i < p_table->buckets.capacity; ++i) {                                                  \
+-      name##_bucket* bucket = &p_table->buckets.data[i];                                                               \
+-      for (bucket_size_type i = 0; i < bucket->count; ++i) {                                                           \
+-        const name##_entry* entry = &bucket->data[i];                                                                  \
+-        name##_entry* dest = NULL;                                                                                     \
+-        bucket_size_type _index = 0;                                                                                   \
+-        const table_size_type bucket_index = name##_find_entry(&buckets, p_capacity, entry->key, &dest, &_index);      \
+-        name##_bucket* bucket = &buckets.data[bucket_index];                                                           \
+-        if (bucket->count == 0) {                                                                                      \
+-          buckets.count++;                                                                                             \
+-        }                                                                                                              \
+-        if (!name##_bucket_append(bucket, *entry)) {                                                                   \
+-        fail_add:                                                                                                      \
+-          name##_free_buckets_storage(&buckets);                                                                       \
+-          return false;                                                                                                \
+-        }                                                                                                              \
+-      }                                                                                                                \
+-    }                                                                                                                  \
+-    name##_free_buckets_storage(&p_table->buckets);                                                                    \
+-    p_table->buckets = buckets;                                                                                        \
+-    return true;                                                                                                       \
+-  }                                                                                                                    \
+-                                                                                                                       \
+-  bool name##_set(name* p_table, key_type p_key, value_type p_value) {                                                 \
+-    if ((p_table->buckets.count + 1) * (load_den) > (p_table->buckets.capacity * (load_num))) {                        \
+-      table_size_type capacity = array_grow_capacity(                                                                  \
+-          p_table->buckets.capacity,                                                                                   \
+-          0,                                                                                                           \
+-          table_size_type_max); /* it's mandatory to not use the min parameter of the array_grow_capacity function */  \
+-                                /* so we can safely replace the % operator with fast bitwise opperation. */            \
+-      if (!name##_adjust_to_capacity(p_table, capacity)) {                                                             \
+-        return false;                                                                                                  \
+-      }                                                                                                                \
+-    }                                                                                                                  \
+-    name##_entry* entry = NULL;                                                                                        \
+-    bucket_size_type _index = 0;                                                                                       \
+-    const table_size_type index =                                                                                      \
+-        name##_find_entry(&p_table->buckets, p_table->buckets.capacity, p_key, &entry, &_index);                       \
+-    if (entry != NULL) {                                                                                               \
+-      value_deinit(&entry->value, p_table->alloc);                                                                     \
+-      key_deinit(&p_key, p_table->alloc);                                                                              \
+-      entry->value = p_value;                                                                                          \
+-      return true;                                                                                                     \
+-    }                                                                                                                  \
+-    name##_bucket* bucket = &p_table->buckets.data[index];                                                             \
+-    if (bucket->count == 0) {                                                                                          \
+-      name##_bucket_init(bucket, p_table->alloc);                                                                      \
+-      p_table->buckets.count++;                                                                                        \
+-    }                                                                                                                  \
+-    name##_entry new_entry = {.key = p_key, .value = p_value};                                                         \
+-    if (!name##_bucket_append(bucket, new_entry)) {                                                                    \
+-      return false;                                                                                                    \
+-    }                                                                                                                  \
+-    p_table->count++;                                                                                                  \
+-    return true;                                                                                                       \
+-  }                                                                                                                    \
+-                                                                                                                       \
+-  value_type* name##_get(name* p_table, key_type p_key) {                                                              \
+-    if (p_table->count == 0) {                                                                                         \
+-      return NULL;                                                                                                     \
+-    }                                                                                                                  \
+-    name##_entry* entry = NULL;                                                                                        \
+-    bucket_size_type _index = 0;                                                                                       \
+-    name##_find_entry(&p_table->buckets, p_table->buckets.capacity, p_key, &entry, &_index);                           \
+-    if (entry != NULL) {                                                                                               \
+-      return &entry->value;                                                                                            \
+-    }                                                                                                                  \
+-    return NULL;                                                                                                       \
+-  }                                                                                                                    \
+-                                                                                                                       \
+-  bool name##_remove(name* p_table, key_type p_key) {                                                                  \
+-    name##_entry* entry = NULL;                                                                                        \
+-    bucket_size_type index_in_bucket = 0;                                                                              \
+-    const table_size_type bucket_index =                                                                               \
+-        name##_find_entry(&p_table->buckets, p_table->buckets.capacity, p_key, &entry, &index_in_bucket);              \
+-    if (entry == NULL) {                                                                                               \
+-      return false;                                                                                                    \
+-    }                                                                                                                  \
+-    name##_bucket* bucket = &p_table->buckets.data[bucket_index];                                                      \
+-    if (name##_bucket_remove(bucket, index_in_bucket, index_in_bucket)) {                                              \
+-      p_table->count--;                                                                                                \
+-      if (bucket->count == 0) {                                                                                        \
+-        name##_bucket_deinit(bucket, p_table->alloc);                                                                  \
+-        p_table->buckets.count--;                                                                                      \
+-      }                                                                                                                \
+-      return true;                                                                                                     \
+-    }                                                                                                                  \
+-    return false;                                                                                                      \
+-  }
+-
+-#endif // OK_TABLE_H
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 7a1f69f..25c4080 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -1,7 +1,6 @@
+ set(tests 
+   test_array
+   test_map
+-  test_table
+   test_nan
+ )
+ 
+diff --git a/tests/unit/src/oktest_table.c b/tests/unit/src/oktest_table.c
+deleted file mode 100644
+index b67cd44..0000000
+--- a/tests/unit/src/oktest_table.c
++++ /dev/null
+@@ -1,229 +0,0 @@
+-#include <unity.h>
+-
+-#include <ok/ok_specs.h>
+-#include <okspecs.h>
+-#include <oktable.h>
+-
+-#define ARE_U_KEY_EQUAL(lhs, rhs) (lhs == rhs)
+-#define GET_U_HASH(key) (key)
+-
+-TABLE_DECLARE_DEFAULT(test_table, uint32_t, uint32_t, uint32_t)
+-TABLE_DEFINE_DEFAULT(test_table,
+-                     uint32_t,
+-                     uint32_t,
+-                     uint32_t,
+-                     ARE_U_KEY_EQUAL,
+-                     ARRAY_DEFAULT_TYPE_DEINIT,
+-                     ARRAY_DEFAULT_TYPE_DEINIT,
+-                     GET_U_HASH)
+-
+-test_table table;
+-
+-ok_specs specs = {0};
+-allocators alloc = {0};
+-
+-void setUp() {
+-  patch_specs(&specs);
+-  alloc = create_raw_allocators_wrapper(&specs.allocators);
+-  test_table_init(&table, &alloc);
+-}
+-
+-void tearDown() {
+-  test_table_deinit(&table);
+-}
+-
+-void test_init_state() {
+-  TEST_ASSERT_EQUAL_UINT32(0, table.count);
+-  TEST_ASSERT_EQUAL_UINT32(0, table.buckets.count);
+-  TEST_ASSERT_EQUAL_UINT32(0, table.buckets.capacity);
+-  TEST_ASSERT_NULL(table.buckets.data);
+-}
+-
+-void test_set_1_remove_1() {
+-  const uint32_t old_count = table.count;
+-  const uint32_t expected_count_after_add = old_count + 1;
+-  const uint32_t expected_count_after_remove = old_count;
+-  const uint32_t key = 67;
+-  const uint32_t value = 69;
+-  TEST_ASSERT_TRUE(test_table_set(&table, key, value));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_add, table.count);
+-  TEST_ASSERT_GREATER_OR_EQUAL_UINT32(table.buckets.count, table.buckets.capacity);
+-  TEST_ASSERT_GREATER_OR_EQUAL_UINT32(table.count, table.buckets.count);
+-
+-  const uint32_t* retrived = test_table_get(&table, key);
+-  TEST_ASSERT_NOT_NULL(retrived);
+-  TEST_ASSERT_EQUAL_UINT32(value, *retrived);
+-
+-  TEST_ASSERT_TRUE(test_table_remove(&table, key));
+-  TEST_ASSERT_NULL(test_table_get(&table, key));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_remove, table.count);
+-}
+-
+-void test_set_set_retrive_remove() {
+-  const uint32_t old_count = table.count;
+-  const uint32_t expected_count_after_add = old_count + 1;
+-  const uint32_t expected_count_after_remove = old_count;
+-
+-  TEST_ASSERT_TRUE(test_table_set(&table, 67, 69));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_add, table.count);
+-  {
+-    const uint32_t* retrived = test_table_get(&table, 67);
+-    TEST_ASSERT_NOT_NULL(retrived);
+-    TEST_ASSERT_EQUAL_UINT32(69, *retrived);
+-  }
+-  TEST_ASSERT_TRUE(test_table_set(&table, 67, 101));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_add, table.count);
+-  const uint32_t* retrived = test_table_get(&table, 67);
+-  TEST_ASSERT_NOT_NULL(retrived);
+-  TEST_ASSERT_EQUAL_UINT32(101, *retrived);
+-
+-  TEST_ASSERT_TRUE(test_table_remove(&table, 67));
+-  TEST_ASSERT_NULL(test_table_get(&table, 67));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_remove, table.count);
+-}
+-
+-void test_set_a_set_b_remove_a_retrive_b_clear() {
+-  const uint32_t old_count = table.count;
+-  const uint32_t expected_count_after_a_add = old_count + 1;
+-  const uint32_t expected_count_after_b_add = expected_count_after_a_add + 1;
+-  const uint32_t expected_count_after_a_remove = expected_count_after_a_add;
+-  const uint32_t expected_count_after_all_remove = old_count;
+-
+-  TEST_ASSERT_TRUE(test_table_set(&table, 'a', 'a'));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_a_add, table.count);
+-  TEST_ASSERT_TRUE(test_table_set(&table, 'b', 'b'));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_b_add, table.count);
+-  {
+-    const uint32_t* a = test_table_get(&table, 'a');
+-    const uint32_t* b = test_table_get(&table, 'b');
+-    TEST_ASSERT_NOT_NULL(a);
+-    TEST_ASSERT_NOT_NULL(b);
+-    TEST_ASSERT_EQUAL_UINT32('a', *a);
+-    TEST_ASSERT_EQUAL_UINT32('b', *b);
+-  }
+-  TEST_ASSERT_TRUE(test_table_remove(&table, 'a'));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_a_remove, table.count);
+-  const uint32_t* b = test_table_get(&table, 'b');
+-  TEST_ASSERT_NOT_NULL(b);
+-  TEST_ASSERT_EQUAL_UINT32('b', *b);
+-  TEST_ASSERT_NULL(test_table_get(&table, 'a'));
+-  TEST_ASSERT_TRUE(test_table_remove(&table, 'b'));
+-  TEST_ASSERT_NULL(test_table_get(&table, 'b'));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_all_remove, table.count);
+-}
+-
+-void test_set_1000_remove_1000() {
+-  const uint32_t old_count = table.count;
+-  const uint32_t expected_count_after_add = old_count + 1000;
+-  const uint32_t expected_count_after_remove = old_count;
+-  for (uint32_t i = 0; i < 1000; ++i) {
+-    const uint32_t c = i + 1;
+-    TEST_ASSERT_TRUE(test_table_set(&table, i, c));
+-    TEST_ASSERT_EQUAL_UINT32(old_count + c, table.count);
+-    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(table.buckets.count, table.buckets.capacity);
+-    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(table.count, table.buckets.count);
+-  }
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_add, table.count);
+-
+-  for (uint32_t i = 0; i < 1000; ++i) {
+-    const uint32_t c = i + 1;
+-    const uint32_t* retrived = test_table_get(&table, i);
+-    TEST_ASSERT_NOT_NULL(retrived);
+-    TEST_ASSERT_EQUAL_UINT32(c, *retrived);
+-  }
+-
+-  for (uint32_t i = 0; i < 1000; ++i) {
+-    const uint32_t c = i + 1;
+-    TEST_ASSERT_TRUE(test_table_remove(&table, i));
+-    TEST_ASSERT_NULL(test_table_get(&table, i));
+-  }
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_remove, table.count);
+-}
+-
+-void test_set_1_invalid_get_clear() {
+-  test_table_deinit(&table);
+-  test_table_init(&table, &alloc);
+-  test_init_state();
+-
+-  TEST_ASSERT_TRUE(test_table_set(&table, 67, 69));
+-  TEST_ASSERT_NOT_NULL(test_table_get(&table, 67));
+-  TEST_ASSERT_NULL(test_table_get(&table, 69));
+-}
+-
+-#define GET_COLLISION_HASH(key) (67)
+-
+-TABLE_DECLARE_DEFAULT(test_table_collision, uint32_t, uint32_t, uint32_t)
+-TABLE_DEFINE_DEFAULT(test_table_collision,
+-                     uint32_t,
+-                     uint32_t,
+-                     uint32_t,
+-                     ARE_U_KEY_EQUAL,
+-                     ARRAY_DEFAULT_TYPE_DEINIT,
+-                     ARRAY_DEFAULT_TYPE_DEINIT,
+-                     GET_COLLISION_HASH)
+-
+-void test_set_a_set_b_retrive_a_retrive_b_clear_collision() {
+-  test_table_collision table;
+-  test_table_collision_init(&table, &alloc);
+-  const uint32_t old_count = table.count;
+-  const uint32_t expected_count_after_a_add = old_count + 1;
+-  const uint32_t expected_count_after_b_add = expected_count_after_a_add + 1;
+-  const uint32_t expected_count_after_a_remove = expected_count_after_a_add;
+-  const uint32_t expected_count_after_all_remove = old_count;
+-  const uint32_t expected_bucket_count = 1;
+-
+-  TEST_ASSERT_TRUE(test_table_collision_set(&table, 'a', 'a'));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_a_add, table.count);
+-  TEST_ASSERT_TRUE(test_table_collision_set(&table, 'b', 'b'));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_b_add, table.count);
+-  TEST_ASSERT_EQUAL_UINT32(expected_bucket_count, table.buckets.count);
+-  {
+-    const uint32_t* a = test_table_collision_get(&table, 'a');
+-    const uint32_t* b = test_table_collision_get(&table, 'b');
+-    TEST_ASSERT_NOT_NULL(a);
+-    TEST_ASSERT_NOT_NULL(b);
+-    TEST_ASSERT_EQUAL_UINT32('a', *a);
+-    TEST_ASSERT_EQUAL_UINT32('b', *b);
+-  }
+-  TEST_ASSERT_TRUE(test_table_collision_remove(&table, 'a'));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_a_remove, table.count);
+-  TEST_ASSERT_TRUE(test_table_collision_remove(&table, 'b'));
+-  TEST_ASSERT_EQUAL_UINT32(expected_count_after_all_remove, table.count);
+-  test_table_collision_deinit(&table);
+-}
+-
+-#define ARE_PTR_KEYS_EQUAL(lhs, rhs) ((lhs) == (rhs))
+-#define GET_PTR_HASH(ptr) ((uint64_t)(ptr))
+-
+-#include <stdlib.h>
+-
+-void freekv(uint32_t** p_kv, allocators* p_alloc) {
+-  p_alloc->release(p_alloc, *p_kv);
+-  *p_kv = NULL;
+-}
+-
+-TABLE_DECLARE_DEFAULT(needsfree, uint32_t*, uint32_t*, uint32_t)
+-TABLE_DEFINE_DEFAULT(needsfree, uint32_t*, uint32_t*, uint32_t, ARE_PTR_KEYS_EQUAL, freekv, freekv, GET_PTR_HASH)
+-
+-void test_deinit() {
+-  needsfree table;
+-  needsfree_init(&table, &alloc);
+-
+-  for (uint32_t i = 0; i < 1000; ++i) {
+-    TEST_ASSERT_TRUE(needsfree_set(&table, malloc(sizeof(uint32_t)), malloc(sizeof(uint32_t))));
+-  }
+-  needsfree_deinit(&table);
+-}
+-
+-int main() {
+-  UNITY_BEGIN();
+-  RUN_TEST(test_init_state);
+-  RUN_TEST(test_set_1_remove_1);
+-  RUN_TEST(test_set_set_retrive_remove);
+-  RUN_TEST(test_set_a_set_b_remove_a_retrive_b_clear);
+-  RUN_TEST(test_set_1000_remove_1000);
+-  RUN_TEST(test_set_1_invalid_get_clear);
+-  RUN_TEST(test_set_a_set_b_retrive_a_retrive_b_clear_collision);
+-  RUN_TEST(test_deinit);
+-  return UNITY_END();
+-}

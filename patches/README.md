@@ -31,9 +31,41 @@ stacked in apply order. **when Q applies + pushes, they move to
    with it); pre-existing okutils.h hash_combine -Wparentheses warning
    noticed, not touched.
 
+2. `18-compiler-scope-tables-to-okmap.patch` — vs maps-staging (`2239723`,
+   Q's applied patch A). the 0.2.0 maps series, **patch C delivered before
+   B** (Q's call: finish the internals first). compile-time only, zero
+   runtime surface change: `scope_registers` migrates from oktable.h's
+   separate chaining to okmap.h — same instantiation shape as
+   globals_store's globals_map (owned `string` keys, uint16 register-index
+   values, `ok_string_view` probes), `scope.registers_table` renamed
+   `registers_map`. the whole `hashed_string` dance dies in the compiler:
+   add_local no longer builds an allocated key copy per declaration (the
+   probe is the AST-owned identifier view; the map clones the key on the
+   insert path only), resolve_local/resolve_upvalue take the view directly,
+   and resolve_variable's create/deinit-per-lookup wrapper is gone — along
+   with its TODO ("make globals store accept direct hs", now moot). the old
+   impl is dead: `oktable.h` deleted, `oktest_table.c` deleted (its
+   scenarios are subsumed by oktest_map.c's stronger property tests), the
+   never-defined OK_DEBUG `debug_table` decl removed, and `hashed_string`
+   itself deleted from okstring.h/.c (the wrapper, exactly as §3 ruled —
+   "the thing that dies is the WRAPPER, not the generality"). ~51 ins /
+   ~558 del. verification: build x3 + paranoid clean, e2e 211/211 x
+   plain/asan/asan-aggr, embed x3, unit x3 (array/map/nan) on the sandbox
+   tree AND on a fresh 2239723 + patch-18 apply + rebuild. honest A/B vs
+   maps-staging on a purpose-built scope stress (300 functions x 3 nested
+   blocks x 30 locals + shadowing + closures + the local->upvalue->global
+   miss chain, 62k lines, python-mirrored expected output): outputs
+   byte-identical, and unlike patch A's parity-on-globals this workload
+   shows a real win — **median 46ms -> 42ms, min 45ms -> 40ms** (20
+   interleaved runs, -O2, reproduced twice): the per-probe
+   alloc+free-per-miss is gone from the hottest compiler path. notes: the
+   13.2 follow-up "cached global ids" targeted the pre-patch-A hashed_string
+   lookups which no longer exist; a full startup-alloc survey stays with
+   patch B as planned.
+
 next expected: patch B (surface maps: object_string hash field, map object,
 literals `{k: v}` / `{:}`, [] strict + `get()` lax, for-in-map opcodes,
-ok_map_* API) + patch C (scope tables + oktable.h deletion).
+ok_map_* API — unchanged by C landing first).
 
 ## history
 
