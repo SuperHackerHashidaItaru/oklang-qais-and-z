@@ -41,7 +41,7 @@ jobs:
           hyperfine --version
 
       - name: clone oklang
-        run: git clone --depth 1 --branch "${OKLANG_REF}" https://codeberg.org /tmp/oklang
+        run: git clone --depth 1 --branch "${OKLANG_REF}" https://codeberg.org/qais/oklang.git /tmp/oklang
         env:
           OKLANG_REF: ${{ inputs.oklang_ref || 'master' }}
 
