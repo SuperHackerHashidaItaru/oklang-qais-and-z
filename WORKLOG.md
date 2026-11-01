@@ -611,3 +611,104 @@ Stage Summary:
 - patch 19 (the surface) is IN patches/ + download/, gated: e2e 261/261 x4 (211+50), embed x3, unit x3, fresh-apply clean. 0.2.0-maps is FEATURE COMPLETE pending Q's review — one syntax call (the for-head comma shape) + three honest notes (NaN keys, stale error positions, globals_store hash) await his eye.
 - SPANS.md drafted per his ask — D6 turned out to be ~70% pre-implemented by the port; the draft's real work is surface syntax + static arity + the varargs token.
 - his side: review/apply 19, merge maps-staging when confident, then spans rulings (R1-R7). standing chores unchanged (Credence release object, tree-sitter tag, CI account).
+
+## session 22 — spans: both patches delivered; the v0.2.0 as-map hole found
+
+Task: Q merged the maps series to master (three "version v0.2.0 (Etymos)"
+commits), released v0.2.0, and ruled R1-R7 on SPANS.md — parens+per-binder
+mut (R1), inference with '->' reserved (R2), '...' (R3), print stays
+one-arg (R4), spread SHIPS (R5), no adjust-to-receiver (R6), spans stays
+internal (R7). "you may continue as planned! then we can draft the next
+feature (i forgot what was it!)" — that's errors (0.4.0) per ROADMAP-v1.
+
+Work Log:
+- THE FIND: master/v0.2.0 is missing the whole `as map` surface — no TT_MAP
+  case in perform_as, no " map" hidden intrinsic, no as_map.ok. root cause:
+  Q's hand-apply of patch 19 onto maps-staging missed the TT_MAP enum line
+  in okvm.h (staging didn't compile!), and the release commits on master
+  dropped the as-map pieces entirely. delivered **patch 20 (as-map-repair)**
+  vs master: the enum line + ok.c intrinsics + okvm TT_MAP case + the test.
+  staging needs only the enum line; my spans patches are based on
+  c75c583 + that line, so 20→21→22 apply cleanly in sequence.
+- sandbox housekeeping: unity shim extended (TEST_ASSERT_EQUAL_PTR, UINT8,
+  INT64, EQUAL, GREATER_OR_EQUAL_UINT32, EQUAL_DOUBLE with unity's
+  NaN==NaN semantics) — Q's v0.2.0 unit tests use them; pure sandbox
+  artifact, not in any patch. baseline gates BEFORE work: e2e 261x4,
+  unit x3, embed x3 on c75c583+enum.
+- recon: the whole spans surface was confirmed against the code —
+  compile_expression's temp checkpoint/reset (the window discipline: dest is
+  always the allocation top, args land adjacent), return_n_from_frame's
+  self-copy shape, OP_CALL's c-operand retc encoding, the for-in hidden
+  locals as the window-at-binding precedent, the 12/16-bit operand widths.
+- PATCH 21 (multi-return + destructuring): ast_return_statement became an
+  expressions_list (0=bare, 1=classic RETURN_1 path byte-identical, n=span
+  OP_RETURN base/count); ast_let_declaration gained span_bindings; the
+  compiler threads return_span per context with the both-lines mismatch
+  error (R2), the destructuring let declares binding[0] FIRST so the call
+  window anchors at its register then names 1..n-1 at the registers the
+  results occupy (ZERO MOVEs — the for-in trick user-visible, adjacency
+  ASSERTed); compile_call_expression's requested_count IS the retc operand
+  (0=discard lane c=1, 1=classic c=2, n=span) — the CRASH_MSGs die; proto
+  gains uint16_t results (default 1); call() enforces R6 at runtime
+  ("it returns 2 values, 1 were requested here") — retc==0 stays the
+  discard lane (statement calls, top-level), DYNAMIC stays take-all;
+  vm_call/ok_call switched to DYNAMIC = first-of-span (§6), ok.h documents
+  it. 26 e2e + embed minmax section.
+- bugs i wrote and killed during A, honestly: the return-list parse broke
+  the advance convention (parse_expression anchors at previous — each
+  post-comma element costs TWO advances); ast_let_declaration_deinit
+  dereferenced the NULL binding of the span form (asan caught it); four of
+  my own test files had wrong expectations (float-division assumptions,
+  non-mut binding, an invented slice syntax, a wrong error shape) — the
+  CORE was right every time, the tests were wrong. lesson re-confirmed:
+  write the expectation AFTER reasoning about the actual semantics.
+- PATCH 22 (varargs + spread): TOKEN_ELLIPSIS (the token enum is
+  hand-written, NOT generated from TOKEN_LIST_X — the X list only feeds
+  token_type_to_string; missing the enum entry was my 20-minute bug);
+  ast_binding.is_varargs + ast_spread_expression (wraps the inner expr,
+  parser-accepted anywhere, compile-rejected outside a call's last arg with
+  a precise error); parse_bindings_list gated by allow_varargs (fu params
+  true, let-span false) with must-be-last/no-default/one-only checks, the
+  ellipsis parsed AFTER the identifier (the anchor lesson, applied);
+  OP_VA_PACK (a',b') packs [bp, argc] with the ARRAY_NEW guard pattern;
+  OP_CALL_SPREAD(+_LONG) stages the array's elements over its own slot
+  under a gc guard with top raised BEFORE the copy (the rooting window —
+  elements above the caller's top are only reachable through the guard
+  until call() raises top); call() varargs floor = arity-ndefaults-1, no
+  ceiling, frame_top widened past `registers` to cover staged args with a
+  16-bit register-file guard ("too many arguments", hard error not clamp);
+  the defaults ladder range excludes the varargs param (defaults_end =
+  count-1) — the naive ndefaults counted c... as defaulted and crashed
+  compile_expression(NULL). 19 e2e incl. a gc-churn torture (maps+arrays as
+  varargs under asan-aggr) + embed sum_all section.
+- verification: e2e **306/306 x4** (261 + 26 spans + 19 varargs), unit x3,
+  embed x3, fresh-apply of 20?no—21+22 on a clean c75c583+enum worktree
+  (287 then 306), bytecode-identity for single-result callers verified by
+  full paranoid trace diff (203 lines, addresses normalized — only ASLR
+  pointers differed). bench trio written + cross-verified vs python:
+  sandbox preview mr_call 82ms vs 345ms (4.2x), varargs_pack 47ms vs 94ms
+  (2x); lua awaits Q's runner.
+- honest notes for Q, all in SPANS.md §7 + patch README: (1) falling off
+  the end of a span function null-pads to the agreed width — consistent
+  with single-result fall-off, flagged for his eye; (2) `return f();` is
+  NOT span forwarding v1 — the return list counts ONE expression, so the
+  inner call errors at runtime; destructure first (compile-time rejection
+  needs the known-globals table, interning era); (3) the R6 arity check is
+  runtime for the same proto-visibility reason; (4) statement-position
+  span calls now emit the true discard lane (c=1) instead of
+  write-to-devnull — the takes-1 path is byte-identical, the takes-0 path
+  changed on purpose (better GC honesty); (5) tree-sitter delta spec'd in
+  the doc (ELLIPSIS token + four rule changes, corpus ready).
+- docs: SPANS.md rulings folded (all seven CLOSED, R5 flipped to SHIPS),
+  §7 marked DELIVERED per patch, bench + tree-sitter sections; bench README
+  rows + fair-reading notes; patches/README staging entries 20/21/22.
+
+Stage Summary:
+- patches 20 (master repair), 21 (spans A), 22 (spans B) are IN patches/ +
+  download/, gated and fresh-apply-verified. 0.3.0-spans is FEATURE
+  COMPLETE pending Q's review. his side: apply 20 to master (or merge
+  staging + the enum line), then 21 + 22 to staging; the five honest notes
+  above want his eye; the lua halves of the two new benches want his CI.
+- next: the errors (0.4.0) conversation — he forgot it was next; ROADMAP-v1
+  has the shape (try/catch-vs-pcall still open until the coro session,
+  no-longjmp ruled). i can draft ERRORS.md whenever he says go.

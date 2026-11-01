@@ -1,0 +1,15 @@
+// varargs packing + iteration (SPANS bench)
+fu sum_all(nums...) {
+  let mut total = 0;
+  for let n : nums {
+    total = total + n;
+  }
+  return total;
+}
+let mut acc = 0;
+let mut i = 0;
+while i < 200000 {
+  acc = acc + sum_all(i, i + 1, i + 2);
+  i = i + 1;
+}
+print acc;

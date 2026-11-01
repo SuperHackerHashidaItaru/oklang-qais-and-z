@@ -1,0 +1,1339 @@
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index d1bb89c..da2f7fb 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -48,6 +48,11 @@ double ok_value_as_number(ok_value p_value);
+ ok_cstring_view ok_value_as_string(ok_value p_value);
+ 
+ /* calls */
++// calls a script closure or native and yields ONE result. multi-result
++// (span) script functions are legal callees: ok_call exposes the FIRST result
++// ("first of span") — the script side destructures with `let (a, b) = f();`,
++// the host side takes the head. hosts wanting every result stage their own
++// calls in script code. natives are single-result by construction.
+ bool ok_call(ok* p_ok, ok_value p_callee, uint8_t p_argc, const ok_value* p_argv, ok_value* p_result);
+ 
+ /* globals */
+diff --git a/src/okast.c b/src/okast.c
+index 424f68c..addb39c 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -1347,7 +1347,7 @@ string ast_control_flow_statement_asprint(const ast_control_flow_statement* p_co
+ }
+ 
+ void ast_return_statement_init(ast_return_statement* p_return,
+-                               ast_expression* p_returned,
++                               ast_expressions_list p_returned,
+                                token p_token,
+                                ast_specs* p_specs) {
+   ast_statement_init(&p_return->statement, AST_RETURN_STATEMENT, p_token, p_specs);
+@@ -1355,32 +1355,37 @@ void ast_return_statement_init(ast_return_statement* p_return,
+ }
+ 
+ void ast_return_statement_deinit(ast_return_statement* p_return) {
+-  if (p_return->returned != NULL) {
+-    allocators* alloc = p_return->statement.node.alloc;
+-    ast_dispatch_deinit((ast_node*)p_return->returned);
+-    alloc->release(alloc, p_return->returned);
+-    p_return->returned = NULL;
+-  }
++  allocators* alloc = p_return->statement.node.alloc;
++  ast_expressions_list_deinit(&p_return->returned, alloc);
+   ast_statement_deinit(&p_return->statement);
+ }
+ 
+ bool ast_return_statement_print(const ast_return_statement* p_return) {
+   bool res = printf("return ") > 0;
+-  if (p_return->returned != NULL) {
+-    res &= ast_dispatch_print((ast_node*)p_return->returned);
++  for (uint32_t i = 0; i < p_return->returned.count; ++i) {
++    res &= ast_dispatch_print((ast_node*)p_return->returned.data[i]);
++    if (i + 1 < p_return->returned.count) {
++      res &= printf(", ") > 0;
++    }
+   }
+   return res;
+ }
+ 
+ string ast_return_statement_asprint(const ast_return_statement* p_return) {
+-  if (p_return->returned != NULL) {
+-    allocators* alloc = p_return->statement.node.alloc;
+-    string returned_str = ast_dispatch_asprint((ast_node*)p_return->returned);
+-    string res = asprint(alloc, "return %s", returned_str.chars);
+-    string_deinit(&returned_str, alloc);
+-    return res;
++  allocators* alloc = p_return->statement.node.alloc;
++  if (p_return->returned.count == 0) {
++    return create_static_string("return", STRING_CALCULATE_LENGTH);
++  }
++  string res = create_static_string("return ", STRING_CALCULATE_LENGTH);
++  for (uint32_t i = 0; i < p_return->returned.count; ++i) {
++    string part = ast_dispatch_asprint((ast_node*)p_return->returned.data[i]);
++    string joined =
++        asprint(alloc, "%s%s%s", res.chars, part.chars, i + 1 < p_return->returned.count ? ", " : "");
++    string_deinit(&part, alloc);
++    string_deinit(&res, alloc); // no-op for the leading static string
++    res = joined;
+   }
+-  return create_static_string("return", STRING_CALCULATE_LENGTH);
++  return res;
+ }
+ 
+ void ast_let_declaration_init(ast_let_declaration* p_let,
+@@ -1392,14 +1397,37 @@ void ast_let_declaration_init(ast_let_declaration* p_let,
+   ast_declaration_init(&p_let->declaration, AST_LET_DECLARATION, p_token, p_modifiers, p_specs);
+   p_let->binding = p_binding;
+   p_let->value = p_value;
++  ast_bindings_list_init(&p_let->span_bindings, p_specs->p_alloc);
++}
++
++// the destructuring form: bindings come pre-parsed (paren list), the value
++// must be a call expression (the compiler checks that, not the parser).
++void ast_let_declaration_init_span(ast_let_declaration* p_let,
++                                   ast_bindings_list p_bindings,
++                                   ast_expression* p_value,
++                                   ast_declaration_modifiers_t p_modifiers,
++                                   const token p_token,
++                                   ast_specs* p_specs) {
++  ast_declaration_init(&p_let->declaration, AST_LET_DECLARATION, p_token, p_modifiers, p_specs);
++  p_let->binding = NULL;
++  p_let->value = p_value;
++  p_let->span_bindings = p_bindings;
+ }
+ 
+ void ast_let_declaration_deinit(ast_let_declaration* p_let) {
+   allocators* alloc = p_let->declaration.statement.node.alloc;
+-  ast_dispatch_deinit((ast_node*)p_let->binding);
+-  ast_dispatch_deinit((ast_node*)p_let->value);
+-  alloc->release(alloc, p_let->binding);
+-  alloc->release(alloc, p_let->value);
++  // binding is NULL in the span form (the span_bindings own the binders)
++  if (p_let->binding != NULL) {
++    ast_dispatch_deinit((ast_node*)p_let->binding);
++    alloc->release(alloc, p_let->binding);
++    p_let->binding = NULL;
++  }
++  if (p_let->value != NULL) {
++    ast_dispatch_deinit((ast_node*)p_let->value);
++    alloc->release(alloc, p_let->value);
++    p_let->value = NULL;
++  }
++  ast_bindings_list_deinit(&p_let->span_bindings, alloc);
+   ast_declaration_deinit(&p_let->declaration);
+ }
+ 
+@@ -1407,7 +1435,18 @@ bool ast_let_declaration_print(const ast_let_declaration* p_let) {
+   bool fail = ast_declaration_print(&p_let->declaration);
+   fail &= printf("let ");
+   fail &= printf(" ");
+-  fail &= ast_binding_print(p_let->binding);
++  if (p_let->span_bindings.count > 0) {
++    fail &= printf("(") > 0;
++    for (uint32_t i = 0; i < p_let->span_bindings.count; ++i) {
++      fail &= ast_binding_print(p_let->span_bindings.data[i]);
++      if (i + 1 < p_let->span_bindings.count) {
++        fail &= printf(", ") > 0;
++      }
++    }
++    fail &= printf(")") > 0;
++  } else {
++    fail &= ast_binding_print(p_let->binding);
++  }
+   fail &= printf(" ");
+   return fail & ast_dispatch_print((ast_node*)p_let->value);
+ }
+@@ -1415,15 +1454,32 @@ bool ast_let_declaration_print(const ast_let_declaration* p_let) {
+ string ast_let_declaration_asprint(const ast_let_declaration* p_let) {
+   allocators* alloc = p_let->declaration.statement.node.alloc;
+   string decl_str = ast_declaration_asprint(&p_let->declaration);
+-  string binding_str = ast_binding_asprint(p_let->binding);
++  // the span form renders its binding list parenthesized: `let (x, y) = f()`
++  string bindings_str = create_static_string("(", 1);
++  if (p_let->span_bindings.count > 0) {
++    for (uint32_t i = 0; i < p_let->span_bindings.count; ++i) {
++      string part = ast_binding_asprint(p_let->span_bindings.data[i]);
++      string joined = asprint(alloc,
++                              "%s%s%s",
++                              bindings_str.chars,
++                              part.chars,
++                              i + 1 < p_let->span_bindings.count ? ", " : ")");
++      string_deinit(&part, alloc);
++      string_deinit(&bindings_str, alloc); // no-op for the leading static string
++      bindings_str = joined;
++    }
++  } else {
++    string_deinit(&bindings_str, alloc);
++    bindings_str = ast_binding_asprint(p_let->binding);
++  }
+   string value_str = ast_dispatch_asprint((ast_node*)p_let->value);
+-  const bool fail = decl_str.chars == NULL || binding_str.chars == NULL || value_str.chars == NULL;
++  const bool fail = decl_str.chars == NULL || bindings_str.chars == NULL || value_str.chars == NULL;
+   string ret = create_static_string("", 0);
+   if (!fail) {
+-    ret = asprint(alloc, "%s %s %s", decl_str.chars, binding_str.chars, value_str.chars);
++    ret = asprint(alloc, "%s %s %s", decl_str.chars, bindings_str.chars, value_str.chars);
+   }
+   string_deinit(&decl_str, alloc);
+-  string_deinit(&binding_str, alloc);
++  string_deinit(&bindings_str, alloc);
+   string_deinit(&value_str, alloc);
+   return ret;
+ }
+diff --git a/src/okast.h b/src/okast.h
+index 8153cd1..49e9194 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -548,11 +548,14 @@ string ast_control_flow_statement_asprint(const ast_control_flow_statement* p_co
+ 
+ typedef struct {
+   ast_statement statement;
+-  ast_expression* returned;
++  // a return yields a span of expressions: 0 = bare `return;` (one null at
++  // runtime), 1 = the classic single form (bytecode-identical path), n >= 2 =
++  // the multi-result form (SPANS R2: arity by inference, every path must agree).
++  ast_expressions_list returned;
+ } ast_return_statement;
+ 
+ void ast_return_statement_init(ast_return_statement* p_return,
+-                               ast_expression* p_returned,
++                               ast_expressions_list p_returned,
+                                token p_token,
+                                ast_specs* p_specs);
+ void ast_return_statement_deinit(ast_return_statement* p_return);
+@@ -561,8 +564,11 @@ string ast_return_statement_asprint(const ast_return_statement* p_return);
+ 
+ typedef struct {
+   ast_declaration declaration;
+-  ast_binding* binding;
++  ast_binding* binding; // the single-binder form (`let x = v;`), NULL in the span form
+   ast_expression* value;
++  // the destructuring form `let (x, y) = f();` (SPANS R1). empty list = the
++  // single form above; the bindings take the call's result window slot by slot.
++  ast_bindings_list span_bindings;
+ } ast_let_declaration;
+ 
+ void ast_let_declaration_init(ast_let_declaration* p_let,
+@@ -571,6 +577,13 @@ void ast_let_declaration_init(ast_let_declaration* p_let,
+                               ast_declaration_modifiers_t p_modifiers,
+                               const token p_token,
+                               ast_specs* p_specs);
++// the destructuring form: `let (x, y) = f();` (SPANS R1)
++void ast_let_declaration_init_span(ast_let_declaration* p_let,
++                                   ast_bindings_list p_bindings,
++                                   ast_expression* p_value,
++                                   ast_declaration_modifiers_t p_modifiers,
++                                   const token p_token,
++                                   ast_specs* p_specs);
+ void ast_let_declaration_deinit(ast_let_declaration* p_let);
+ bool ast_let_declaration_print(const ast_let_declaration* p_let);
+ string ast_let_declaration_asprint(const ast_let_declaration* p_let);
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 707d859..d9db6d1 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -152,6 +152,8 @@ static void compile_context_init(compile_context* p_context,
+   loop_stack_init(&p_context->loop_stack, p_alloc);
+   p_context->function.function = p_obj_function;
+   p_context->function.type = p_type;
++  p_context->return_span = 0;
++  p_context->first_return_author = NULL;
+ }
+ 
+ static void compile_context_deinit(compile_context* p_context, allocators* p_alloc) {
+@@ -225,6 +227,26 @@ static bool emit_default_return(compiler* p_compiler, ast_node* p_author) {
+   return emit_word(p_compiler, encode_oppAe(OP_RETURN_1, true, 0, RETURNED_NULL), p_author);
+ }
+ 
++// the fall-off-the-end return of a span function: null-fill the whole result
++// window, then hand it back with one OP_RETURN — the span-width generalization
++// of emit_default_return's single null. consistent with the single-result
++// doctrine (falling off the end yields null, never an error); flagged in the
++// patch notes for Q's eye.
++static bool emit_default_span_return(compiler* p_compiler, uint32_t p_count, ast_node* p_author) {
++  if (!emit_word2(p_compiler, encode_OPPABCQ(OP_LOAD_NULL, false, 0, p_count, 0, 0), p_author)) {
++    report_oom(p_compiler, p_author);
++    return false;
++  }
++  if (p_count > bprime_MAX) {
++    if (!emit_word2(p_compiler, encode_OPPABCQ(OP_RETURN_LONG, false, 0, p_count, 0, 0), p_author)) {
++      report_oom(p_compiler, p_author);
++      return false;
++    }
++    return true;
++  }
++  return emit_word(p_compiler, encode_oppabprime(OP_RETURN, false, 0, p_count), p_author);
++}
++
+ static bool begin_scope(compiler* p_compiler, ast_node* p_author) {
+   scope scp;
+   scope_init(&scp, current_context(p_compiler)->register_allocator.local_top, p_compiler->alloc);
+@@ -363,6 +385,7 @@ static bool compile_expression(compiler* p_compiler,
+                                expression_result* p_out);
+ 
+ static bool compile_let_declration(compiler* p_compiler, ast_let_declaration* p_let);
++static bool compile_let_declaration_span(compiler* p_compiler, ast_let_declaration* p_let);
+ static bool compile_function_declaration(compiler* p_compiler, ast_function_declaration* p_fu);
+ 
+ static bool compile_expression_statement(compiler* p_compiler, ast_expression_statement* p_expression_statement);
+@@ -1017,6 +1040,9 @@ static variable_declaration_flags_t variable_declaration_flags_from_modifiers(as
+ }
+ 
+ static bool compile_let_declration(compiler* p_compiler, ast_let_declaration* p_let) {
++  if (p_let->span_bindings.count > 0) {
++    return compile_let_declaration_span(p_compiler, p_let);
++  }
+   ok_string_view name = ast_identifier_expression_get_value((ast_identifier_expression*)p_let->binding->lvalue);
+   variable_declaration vardecl = {
+       .identifier = name,
+@@ -1037,6 +1063,56 @@ static bool compile_let_declration(compiler* p_compiler, ast_let_declaration* p_
+   return define_variable(p_compiler, variable, value, (ast_node*)p_let);
+ }
+ 
++// `let (x, y) = f();` — the window-at-register binding (SPANS R1). binding[0]
++// is declared FIRST so the call window starts at its register (the invariant
++// every call already rides: dest is the allocation top, args land right above
++// it); the call requests exactly n results; then bindings 1..n-1 are declared
++// at the registers those results already occupy — add_local's truncate-and-
++// append grows over the dead arg temps. zero MOVEs: the window IS the bindings,
++// the same trick the for-in hidden state plays, user-visible.
++static bool compile_let_declaration_span(compiler* p_compiler, ast_let_declaration* p_let) {
++  const uint32_t n = p_let->span_bindings.count;
++  if (p_let->value == NULL || p_let->value->node.node_type != AST_CALL_EXPRESSION) {
++    error_at_noted(p_compiler,
++                   (ast_node*)p_let,
++                   ok_create_string_view("a destructuring let needs a call on the right side.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                   ok_create_string_view("a span is a calling-convention fact, not a value: there are no tuple literals (that is an object-system thing).",
++                                         OK_STRING_VIEW_CALCULATE_LENGTH,
++                                         true));
++    return false;
++  }
++  // binding[0]: its register anchors the call window.
++  variable_declaration decl0 = {
++      .identifier =
++          ast_identifier_expression_get_value((ast_identifier_expression*)p_let->span_bindings.data[0]->lvalue),
++      .flags = variable_declaration_flags_from_modifiers(DECLARATION_NONE, p_let->span_bindings.data[0]->modifiers)};
++  _register window = add_local(p_compiler, decl0, true, (ast_node*)p_let->span_bindings.data[0]);
++  if (!IS_REGISTER_VALID(window)) {
++    return false;
++  }
++  // the call, requesting exactly n results (call() compares against the
++  // callee's inferred span — the R6 strictness check lives there).
++  expression_result value;
++  if (!compile_call_expression(p_compiler, (ast_call_expression*)p_let->value, window, n, &value)) {
++    return false;
++  }
++  // bindings 1..n-1 name the result registers the call just wrote. the
++  // adjacency is structural (locals grow up, the window grows down from the
++  // same top) — asserted, not hoped for.
++  for (uint32_t i = 1; i < n; ++i) {
++    variable_declaration decl = {
++        .identifier =
++            ast_identifier_expression_get_value((ast_identifier_expression*)p_let->span_bindings.data[i]->lvalue),
++        .flags = variable_declaration_flags_from_modifiers(DECLARATION_NONE, p_let->span_bindings.data[i]->modifiers)};
++    _register slot = add_local(p_compiler, decl, true, (ast_node*)p_let->span_bindings.data[i]);
++    if (!IS_REGISTER_VALID(slot)) {
++      return false;
++    }
++    ASSERT_MSG(slot.index == window.index + i, "span binding left the result window.");
++  }
++  return true;
++}
++
+ static bool compile_function_declaration(compiler* p_compiler, ast_function_declaration* p_fu) {
+   ok_string_view name = ast_identifier_expression_get_value((ast_identifier_expression*)p_fu->binding->lvalue);
+   variable_declaration vardecl = {
+@@ -1879,43 +1955,122 @@ bool compile_control_flow_statement(compiler* p_compiler, ast_control_flow_state
+   return true;
+ }
+ 
+-static bool compile_return_statement(compiler* p_compiler, ast_return_statement* p_return) {
+-  // TODO: multiple returns when required by langauge.
+-  if (p_return->returned == NULL) {
+-    return emit_default_return(p_compiler, (ast_node*)p_return);
++// record this return path's span width against the function's agreed width
++// (SPANS R2: inference — every path must agree, checked at compile). a bare
++// `return;` counts as one null, matching the runtime's RETURNED_NULL.
++static bool record_return_span(compiler* p_compiler, ast_return_statement* p_return, uint32_t p_count) {
++  compile_context* ctx = current_context(p_compiler);
++  if (p_count > UINT16_MAX) {
++    error_at_noted(p_compiler,
++                   (ast_node*)p_return,
++                   ok_create_string_view("too many return values.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                   ok_create_string_view("limit is: 65535.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return false;
+   }
+-  expression_result returned;
+-  _register dest; // TODO: cant we do this in place or this a tailcall thingy?
+-  if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &dest)) {
++  if (ctx->return_span == 0) {
++    ctx->return_span = (uint16_t)p_count;
++    ctx->first_return_author = (ast_node*)p_return;
++    return true;
++  }
++  if (ctx->return_span != p_count) {
++    allocators* alloc = p_compiler->alloc;
++    string message = asprint(alloc,
++                             "return span mismatch: this path returns %u values, the return at line %u returns %u.",
++                             p_count,
++                             ctx->first_return_author != NULL ? ctx->first_return_author->token.line_info.line : 0,
++                             ctx->return_span);
++    error_at_noted(p_compiler,
++                   (ast_node*)p_return,
++                   ok_create_string_view_from_string(message),
++                   ok_create_string_view("every return path of a function must agree on how many values it returns (R2: inference).",
++                                         OK_STRING_VIEW_CALCULATE_LENGTH,
++                                         true));
++    string_deinit(&message, alloc);
+     return false;
+   }
+-  if (!compile_expression(p_compiler, p_return->returned, dest, 1, &returned)) {
++  return true;
++}
++
++static bool compile_return_statement(compiler* p_compiler, ast_return_statement* p_return) {
++  const uint32_t count = p_return->returned.count;
++  if (!record_return_span(p_compiler, p_return, count == 0 ? 1 : count)) {
+     return false;
+   }
+-  uint8_t e = RETURNED_NULL;
+-  chunk* chunk = current_chunk(p_compiler);
+-  switch (returned.value.kind) {
+-  case LOCATION_KIND_CONSTANT: {
+-    value con = chunk->constants.data[returned.value.index];
+-    if (IS_VALUE_STRICTLY_BOOL(con)) {
+-      e = VALUE_AS_BOOL(con) ? RETURNED_KTRUE : RETURNED_KFALSE;
++  if (count == 0) {
++    return emit_default_return(p_compiler, (ast_node*)p_return);
++  }
++  if (count == 1) {
++    // the classic single-result fast path: RETURN_1 with its constant/global/
++    // upvalue/register operand encodings. bytecode-identical to pre-spans.
++    expression_result returned;
++    _register dest;
++    if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &dest)) {
++      return false;
++    }
++    if (!compile_expression(p_compiler, p_return->returned.data[0], dest, 1, &returned)) {
++      return false;
++    }
++    uint8_t e = RETURNED_NULL;
++    chunk* chunk = current_chunk(p_compiler);
++    switch (returned.value.kind) {
++    case LOCATION_KIND_CONSTANT: {
++      value con = chunk->constants.data[returned.value.index];
++      if (IS_VALUE_STRICTLY_BOOL(con)) {
++        e = VALUE_AS_BOOL(con) ? RETURNED_KTRUE : RETURNED_KFALSE;
++        break;
++      }
++      e = RETURNED_CONSTANT;
+       break;
+     }
+-    e = RETURNED_CONSTANT;
+-    break;
++    case LOCATION_KIND_GLOBAL:
++      e = RETURNED_GLOBAL;
++      break;
++    case LOCATION_KIND_UPVALUE:
++      e = RETURNED_UPVALUE;
++      break;
++    case LOCATION_KIND_REGISTER:
++      e = RETURNED_REGISTER;
++      break;
++    }
++
++    return emit_word(p_compiler, encode_oppAe(OP_RETURN_1, false, returned.value.index, e), (ast_node*)p_return);
+   }
+-  case LOCATION_KIND_GLOBAL:
+-    e = RETURNED_GLOBAL;
+-    break;
+-  case LOCATION_KIND_UPVALUE:
+-    e = RETURNED_UPVALUE;
+-    break;
+-  case LOCATION_KIND_REGISTER:
+-    e = RETURNED_REGISTER;
+-    break;
++  // the span path (n >= 2): each expression lands in its own consecutive temp
++  // (the args discipline — allocate, compile, the wrapper's checkpoint keeps it),
++  // then one OP_RETURN (base, n) hands the whole window back. the results sit
++  // at the callee's own registers, so return_n_from_frame's copy is a
++  // self-copy when they start at 0 — zero moves for the common shape.
++  register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
++  _register first = {0, REGISTER_FLAG_NONE, REGISTER_OK};
++  for (uint32_t i = 0; i < count; ++i) {
++    _register slot;
++    if (!register_allocator_allocate_temp(regalloc, &slot)) {
++      report_oom(p_compiler, (ast_node*)p_return);
++      return false;
++    }
++    if (i == 0) {
++      first = slot;
++    }
++    expression_result result;
++    if (!compile_expression(p_compiler, p_return->returned.data[i], slot, 1, &result)) {
++      return false;
++    }
++    if (!materialize_into(p_compiler, &result.value, slot, (ast_node*)p_return)) {
++      return false;
++    }
+   }
+-
+-  return emit_word(p_compiler, encode_oppAe(OP_RETURN_1, false, returned.value.index, e), (ast_node*)p_return);
++  if (first.index > aprime_MAX || count > bprime_MAX) {
++    if (!emit_word2(p_compiler, encode_OPPABCQ(OP_RETURN_LONG, false, first.index, count, 0, 0), (ast_node*)p_return)) {
++      report_oom(p_compiler, (ast_node*)p_return);
++      return false;
++    }
++    return true;
++  }
++  if (!emit_word(p_compiler, encode_oppabprime(OP_RETURN, false, first.index, count), (ast_node*)p_return)) {
++    report_oom(p_compiler, (ast_node*)p_return);
++    return false;
++  }
++  return true;
+ }
+ 
+ static bool compile_number_expression(compiler* p_compiler,
+@@ -2475,8 +2630,13 @@ bool compile_call_expression(compiler* p_compiler,
+                              _register p_dest,
+                              uint32_t p_requested_count,
+                              expression_result* p_out) {
+-  CRASH_MSG(p_requested_count <= 1, "unimplemented multi-result.");
+-
++  // p_requested_count is the result-span request (the SPANS hook):
++  //   0 = statement position — discard (c = 1: the VM's retc-0 lane, no arity
++  //       check; the old code wrote the one result into the devnull instead).
++  //   1 = expression position — the classic strict single (c = 2, bytecode-
++  //       identical to pre-spans). call() checks it against the proto's results.
++  //   n >= 2 = destructuring position — the binding count (the destructuring
++  //       let is the only caller that passes n; call() checks it, R6 strictness).
+   allocators* alloc = p_compiler->alloc;
+   register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
+   expression_result callable;
+@@ -2496,21 +2656,31 @@ bool compile_call_expression(compiler* p_compiler,
+     return false;
+   }
+   const uint32_t argc = p_call->arguments.count;
++  if (p_requested_count + 1 > c_MAX) {
++    string note = asprint(alloc, "limit is: %d.", c_MAX - 1);
++    error_at_noted(p_compiler,
++                   (ast_node*)p_call,
++                   ok_create_string_view("too many values requested from one call.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                   ok_create_string_view_from_string(note));
++    string_deinit(&note, alloc);
++    return false;
++  }
++  const uint32_t retc = p_requested_count + 1; // c == 0 stays the VM's dynamic sentinel
+   bool is_long = p_dest.index > a_MAX || (argc > 0 && args.index > a_MAX) || argc > b_MAX;
+   if (is_long) {
+-    if (!emit_word2(p_compiler, encode_OPPABCQ(OP_CALL_LONG, false, p_dest.index, argc, 2, 0), (ast_node*)p_call)) {
++    if (!emit_word2(p_compiler, encode_OPPABCQ(OP_CALL_LONG, false, p_dest.index, argc, retc, 0), (ast_node*)p_call)) {
+       report_oom(p_compiler, (ast_node*)p_call);
+       return false;
+     }
+   } else {
+-    if (!emit_word(p_compiler, encode_oppabc(OP_CALL, false, p_dest.index, argc, 2), (ast_node*)p_call)) {
++    if (!emit_word(p_compiler, encode_oppabc(OP_CALL, false, p_dest.index, argc, retc), (ast_node*)p_call)) {
+       report_oom(p_compiler, (ast_node*)p_call);
+       return false;
+     }
+   }
+   p_out->value = (location){p_dest.index, LOCATION_KIND_REGISTER, LOCATION_OK};
+   p_out->lvalue = (lvalue){LVALUE_INVALID};
+-  p_out->count = 1;
++  p_out->count = p_requested_count;
+   p_out->type = EXPRESSION_VALUE;
+   return true;
+ }
+@@ -3265,10 +3435,17 @@ static bool compile_function_impl(compiler* p_compiler,
+     return false;
+   }
+ 
+-  if (!emit_default_return(p_compiler, (ast_node*)p_body)) {
+-    end_scope(p_compiler, p_author);
+-    end_context(p_compiler);
+-    return false;
++  // the fall-off-the-end safety net. the single-result net keeps its exact
++  // pre-spans position (before the scope close, bytecode-identical for every
++  // existing function). the span net emits AFTER end_scope's CLOSE_UPVALUES:
++  // its null-fill covers [0, n) and a captured local living there must close
++  // over its real value first, not the padding.
++  if (current_context(p_compiler)->return_span < 2) {
++    if (!emit_default_return(p_compiler, (ast_node*)p_body)) {
++      end_scope(p_compiler, p_author);
++      end_context(p_compiler);
++      return false;
++    }
+   }
+ 
+   if (!end_scope(p_compiler, p_author)) {
+@@ -3276,9 +3453,20 @@ static bool compile_function_impl(compiler* p_compiler,
+     return false;
+   }
+ 
++  if (current_context(p_compiler)->return_span >= 2) {
++    if (!emit_default_span_return(p_compiler, current_context(p_compiler)->return_span, (ast_node*)p_body)) {
++      end_context(p_compiler);
++      return false;
++    }
++  }
++
+   compile_context* function_ctx = current_context(p_compiler);
+   object_function* proto = function_ctx->function.function;
+   proto->registers = function_ctx->register_allocator.registers_count; // frame size for the vm
++  // SPANS R2: the inferred result width. 0 explicit returns (or only single
++  // ones) means the fall-off null path decides: 1. a span function that falls
++  // off the end null-pads to its agreed width (emit at the close, below).
++  proto->results = function_ctx->return_span > 0 ? function_ctx->return_span : 1;
+   gc_guard_up(alloc->gc, OBJECT_AS_VALUE(proto));
+ 
+   if (function_ctx->upvalues.count > 0 &&
+diff --git a/src/okcompiler.h b/src/okcompiler.h
+index d0d0d81..287c609 100644
+--- a/src/okcompiler.h
++++ b/src/okcompiler.h
+@@ -164,6 +164,12 @@ typedef struct {
+   loop_stack loop_stack;
+   compile_function function;
+   register_allocator register_allocator;
++  // SPANS R2 (inference): the agreed result width of the function being
++  // compiled. 0 = no explicit return seen yet; 1 = single (the classic path);
++  // n >= 2 = every return path agreed on n. first_return_author points at the
++  // first return's AST node for the mismatch error's "at line N" half.
++  uint16_t return_span;
++  ast_node* first_return_author;
+ } compile_context;
+ 
+ ARRAY_DECLARE_DEFAULT(compile_contexts, compile_context)
+diff --git a/src/okobject.c b/src/okobject.c
+index bbb818d..9f1bc55 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -185,6 +185,7 @@ static void object_function_init(object_function* p_object_function,
+   p_object_function->arity = p_arity;
+   p_object_function->ndefaults = 0; // compiler sets this when the function is complete
+   p_object_function->registers = 0; // compiler sets this when the function is complete
++  p_object_function->results = 1;   // compiler raises this when every return path agrees on n
+   upvalue_descriptor_array_init(&p_object_function->upvalues, p_specs->alloc);
+   chunk_init(&p_object_function->chunk, p_specs->alloc);
+ }
+diff --git a/src/okobject.h b/src/okobject.h
+index e94b9c0..dffa881 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -86,6 +86,10 @@ typedef struct {
+   uint16_t arity;
+   uint16_t ndefaults; // trailing defaulted params: floor = arity - ndefaults
+   uint16_t registers;
++  uint16_t results; // the function's result span width (SPANS R2, inferred by the compiler).
++                     // 1 for every single-result function (the default); n >= 2 when every
++                     // return path agrees on n. call() compares the caller's requested retc
++                     // against this — the strictness doctrine (R6) lives there.
+   upvalue_descriptor_array upvalues;
+ } object_function;
+ 
+diff --git a/src/okparser.c b/src/okparser.c
+index dfb13bc..d0a720c 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -13,6 +13,9 @@ static ast_expression* parse_expression(parser* p_parser, precedence p_precedenc
+ static ast_statement* parse_statement(parser* p_parser);
+ static ast_statement* try_parse_declaration(parser* p_parser);
+ static ast_let_declaration* parse_let_declaration(parser* p_parser, ast_declaration_modifiers_t p_modifiers);
++static ast_let_declaration* parse_let_declaration_span(parser* p_parser,
++                                                       ast_declaration_modifiers_t p_modifiers,
++                                                       ast_binding_modifiers_t p_binding_mods);
+ static ast_function_declaration* parse_function_declaration(parser* p_parser, ast_declaration_modifiers_t p_modifiers);
+ static ast_empty_statement* parse_empty_statement(parser* p_parser);
+ static ast_expression_statement* parse_expression_statement(parser* p_parser);
+@@ -1038,6 +1041,13 @@ ast_let_declaration* parse_let_declaration(parser* p_parser, ast_declaration_mod
+   if (binding_mods == BINDING_ERROR) {
+     return NULL;
+   }
++  // the destructuring form: `let (x, y) = f();` (SPANS R1). the paren after
++  // the binding modifiers is unambiguous — `let` is a statement keyword, no
++  // expression form starts here. the binding list takes the same per-binder
++  // modifiers as any binding (`let (mut x, y) = f();`).
++  if (p_parser->current.type == TOKEN_LEFT_PAREN) {
++    return parse_let_declaration_span(p_parser, p_declaration_modifiers, binding_mods);
++  }
+   ast_binding* binding = (ast_binding*)alloc->allocate(alloc, sizeof(ast_binding));
+   if (binding == NULL) {
+     error_at(
+@@ -1119,6 +1129,93 @@ free:
+   return NULL;
+ }
+ 
++// `let (x, y) = f();` — the destructuring let (SPANS R1). the '(' is already
++// current on entry. per-binder modifiers ride the shared binding-list parser;
++// defaults are rejected (a let binding never has one), and the value must be
++// a call (the compiler enforces that with a precise error, not the parser).
++ast_let_declaration* parse_let_declaration_span(parser* p_parser,
++                                                 ast_declaration_modifiers_t p_declaration_modifiers,
++                                                 ast_binding_modifiers_t p_binding_mods) {
++  allocators* alloc = p_parser->alloc;
++  const token let_tok = p_parser->previous;
++  if (p_declaration_modifiers != DECLARATION_NONE) {
++    string mods_str = ast_declaration_modifiers_asprint(p_declaration_modifiers, alloc);
++    string message = asprint(alloc, "illegal declaration modifier(s): [%s] on a destructuring let.", mods_str.chars);
++    error_at_noted(p_parser,
++                   let_tok,
++                   ok_create_string_view_from_string(message),
++                   ok_create_string_view("the span bindings are locals; glob spans would need per-global stores, deferred.",
++                                         OK_STRING_VIEW_CALCULATE_LENGTH,
++                                         true));
++    string_deinit(&message, alloc);
++    string_deinit(&mods_str, alloc);
++    return NULL;
++  }
++  (void)p_binding_mods; // per-binder modifiers are parsed inside the list itself
++  advance(p_parser); // consume '('
++  ast_bindings_list bindings = parse_bindings_list(p_parser, BINDING_MUT, TOKEN_COMMA, TOKEN_RIGHT_PAREN);
++  if (bindings.capacity == 1 && bindings.count == 0) {
++    error_at(p_parser,
++             p_parser->previous,
++             ok_create_string_view("failed to parse the destructuring binding list.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL;
++  }
++  if (bindings.count == 0) {
++    error_at(p_parser,
++             p_parser->previous,
++             ok_create_string_view("a destructuring let needs at least one binding.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto free_bindings;
++  }
++  for (uint32_t i = 0; i < bindings.count; ++i) {
++    if (bindings.data[i]->default_value != NULL) {
++      error_at(p_parser,
++               p_parser->previous,
++               ok_create_string_view("a destructuring let binding cannot have a default.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      goto free_bindings;
++    }
++  }
++  advance(p_parser); // consume ')'
++  if (p_parser->current.type != TOKEN_ASSIGN) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("expected '=' after the destructuring binding list.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto free_bindings;
++  }
++  advance(p_parser); // consume '='
++  advance(p_parser); // first value token into previous (parse_expression starts there)
++  ast_expression* value = parse_expression(p_parser, PREC_NONE);
++  if (value == NULL) {
++    error_at(p_parser,
++             p_parser->previous,
++             ok_create_string_view("failed to parse the span call.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto free_bindings;
++  }
++  if (p_parser->current.type != TOKEN_SEMICOLON) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("expected ';' after let declaration.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ast_dispatch_deinit((ast_node*)value);
++    alloc->release(alloc, value);
++    goto free_bindings;
++  }
++  advance(p_parser); // consume ';'
++  ast_let_declaration* let = (ast_let_declaration*)alloc->allocate(alloc, sizeof(ast_let_declaration));
++  if (let == NULL) {
++    error_at(p_parser,
++             let_tok,
++             ok_create_string_view("failed to allocate memory for let node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ast_dispatch_deinit((ast_node*)value);
++    alloc->release(alloc, value);
++    goto free_bindings;
++  }
++  ast_specs s = {alloc};
++  ast_let_declaration_init_span(let, bindings, value, p_declaration_modifiers, let_tok, &s);
++  return let;
++free_bindings:
++  ast_bindings_list_deinit(&bindings, alloc);
++  return NULL;
++}
++
+ ast_function_declaration* parse_function_declaration(parser* p_parser,
+                                                      ast_declaration_modifiers_t p_declaration_modifiers) {
+   allocators* alloc = p_parser->alloc;
+@@ -1932,12 +2029,31 @@ static ast_return_statement* parse_return_statement(parser* p_parser) {
+   allocators* alloc = p_parser->alloc;
+ 
+   token return_tok = p_parser->previous;
+-  ast_expression* returned = NULL;
++  ast_expressions_list returned;
++  ast_expressions_list_init(&returned, alloc);
+   if (p_parser->current.type != TOKEN_SEMICOLON) {
+-    advance(p_parser);
+-    returned = parse_expression(p_parser, PREC_NONE);
+-    if (returned == NULL) {
+-      return NULL;
++    // the span form: `return a, b, c;` — a comma list of expressions under one
++    // return (SPANS R2: the count is the path's result arity, inferred).
++    // convention: parse_expression starts at previous, so each element costs
++    // one advance into its first token; after a comma that is two (comma, then
++    // the token) — the same shape parse_expressions_list rides.
++    advance(p_parser); // first element's first token into previous
++    while (true) {
++      ast_expression* expr = parse_expression(p_parser, PREC_NONE);
++      if (expr == NULL) {
++        goto free;
++      }
++      if (!ast_expressions_list_append(&returned, expr)) {
++        ast_dispatch_deinit((ast_node*)expr);
++        alloc->release(alloc, expr);
++        goto free;
++      }
++      if (p_parser->current.type == TOKEN_COMMA) {
++        advance(p_parser); // consume ','
++        advance(p_parser); // next element's first token into previous
++        continue;
++      }
++      break;
+     }
+   }
+   if (p_parser->current.type != TOKEN_SEMICOLON) {
+@@ -1956,10 +2072,7 @@ static ast_return_statement* parse_return_statement(parser* p_parser) {
+   ast_return_statement_init(ret, returned, return_tok, &s);
+   return ret;
+ free:
+-  if (returned != NULL) {
+-    ast_dispatch_deinit((ast_node*)returned);
+-    alloc->release(alloc, returned);
+-  }
++  ast_expressions_list_deinit(&returned, alloc);
+   return NULL;
+ }
+ 
+diff --git a/src/okvm.c b/src/okvm.c
+index 85ac089..f526ee1 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -158,7 +158,11 @@ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc) {
+   // data[base + base], which is a garbage register, instead of the closure staged at
+   // data[base]. every tested ok_call until now ran from C on an empty call stack
+   // (base == 0), where 0 + 0 was accidentally correct. a regression test was written for this very case.
+-  if (!call_value(p_vm, exe, reg, base, 0, p_argc, 1)) {
++  //
++  // SPANS §6: ok_call requests the DYNAMIC lane — take everything, expose the
++  // first ("first of span") instead of tripping the R6 arity check. single-result
++  // callees are byte-for-byte the old behavior.
++  if (!call_value(p_vm, exe, reg, base, 0, p_argc, RETURN_COUNT_DYNAMIC)) {
+     return vm_error(exe);
+   }
+   if (exe->call_stack.count == call_depth) {
+@@ -2608,6 +2612,20 @@ static inline bool call(vm* p_vm,
+     }
+     return false;
+   }
++  // SPANS R6 (no adjust-to-receiver): a caller that requested a specific
++  // count must get exactly the function's inferred result span. destructuring
++  // 2 results into 1 binding, or reading a 2-result call in single-expression
++  // position, errors here — no lua-style silent take-first or padding. the
++  // retc == 0 lane is the discard (statement calls, the top-level entry):
++  // no check, the results are dropped. the dynamic lane (ok_call) takes all.
++  if (p_retc != RETURN_COUNT_DYNAMIC && p_retc >= 1 && p_retc != (uint32_t)fu->results) {
++    runtime_error(p_vm,
++                  "invalid call to '%s': it returns %u values, %u were requested here.",
++                  fu->name->string.chars,
++                  fu->results,
++                  p_retc);
++    return false;
++  }
+   const uint32_t frame_top = p_callee + p_closure->function->registers;
+   if (frame_top > p_reg->array.capacity) {
+     // grow with headroom so we do not realloc on every nested call
+diff --git a/tests/e2e/tests/spans/chained.ok b/tests/e2e/tests/spans/chained.ok
+new file mode 100644
+index 0000000..33c984f
+--- /dev/null
++++ b/tests/e2e/tests/spans/chained.ok
+@@ -0,0 +1,18 @@
++// destructured results feeding the next call's arguments
++fu pair(a, b) {
++  return a, b;
++}
++
++fu add(a, b) {
++  return a + b;
++}
++
++let (x, y) = pair(3, 4);
++print add(x, y); // expect: 7
++
++// a span call nested in another call's arguments is still expression position
++// for the inner one (it returns 1)
++fu wrap(n) {
++  return n * 2;
++}
++print wrap(add(x, y)); // expect: 14
+diff --git a/tests/e2e/tests/spans/closures.ok b/tests/e2e/tests/spans/closures.ok
+new file mode 100644
+index 0000000..f92ceca
+--- /dev/null
++++ b/tests/e2e/tests/spans/closures.ok
+@@ -0,0 +1,16 @@
++// span-bound locals are ordinary locals: capturable, shared-slot semantics
++fu pair(a, b) {
++  return a, b;
++}
++
++fu make() {
++  let (mut x, y) = pair(10, 20);
++  let get_x = fu() { return x; };
++  let get_y = fu() { return y; };
++  x = x + 1;
++  print get_y(); // expect: 20
++  return get_x;
++}
++
++let getter = make();
++print getter(); // expect: 11
+diff --git a/tests/e2e/tests/spans/errors/arithmetic_position_error.ok b/tests/e2e/tests/spans/errors/arithmetic_position_error.ok
+new file mode 100644
+index 0000000..88037d1
+--- /dev/null
++++ b/tests/e2e/tests/spans/errors/arithmetic_position_error.ok
+@@ -0,0 +1,6 @@
++// a span call cannot feed an operator: expression position wants one value
++fu pair(a, b) {
++  return a, b;
++}
++
++print pair(1, 2) + 1; // expect error: it returns 2 values, 1 were requested
+diff --git a/tests/e2e/tests/spans/errors/arity_too_few.ok b/tests/e2e/tests/spans/errors/arity_too_few.ok
+new file mode 100644
+index 0000000..1831549
+--- /dev/null
++++ b/tests/e2e/tests/spans/errors/arity_too_few.ok
+@@ -0,0 +1,7 @@
++// R6: no adjust-to-receiver — 2 results into 1 binding is an error
++fu pair(a, b) {
++  return a, b;
++}
++
++let (only) = pair(1, 2);
++print only; // expect error: it returns 2 values, 1 were requested
+diff --git a/tests/e2e/tests/spans/errors/arity_too_many.ok b/tests/e2e/tests/spans/errors/arity_too_many.ok
+new file mode 100644
+index 0000000..6981674
+--- /dev/null
++++ b/tests/e2e/tests/spans/errors/arity_too_many.ok
+@@ -0,0 +1,7 @@
++// R6, the other direction: 1 result destructured into 2 bindings
++fu one() {
++  return 1;
++}
++
++let (a, b) = one();
++print a; // expect error: it returns 1 values, 2 were requested
+diff --git a/tests/e2e/tests/spans/errors/bare_return_mismatch.ok b/tests/e2e/tests/spans/errors/bare_return_mismatch.ok
+new file mode 100644
+index 0000000..f6ec965
+--- /dev/null
++++ b/tests/e2e/tests/spans/errors/bare_return_mismatch.ok
+@@ -0,0 +1,6 @@
++// a bare `return;` yields one null: it cannot serve a 2-wide function
++fu bad(a) {
++  if a { return 1, 2; }
++  return;
++}
++print bad(true); // expect error: return span mismatch
+diff --git a/tests/e2e/tests/spans/errors/default_rejected.ok b/tests/e2e/tests/spans/errors/default_rejected.ok
+new file mode 100644
+index 0000000..05c071b
+--- /dev/null
++++ b/tests/e2e/tests/spans/errors/default_rejected.ok
+@@ -0,0 +1,6 @@
++// a destructuring binding cannot carry a default
++fu pair(a, b) {
++  return a, b;
++}
++
++let (a = 1) = pair(1, 2); // expect error: cannot have a default
+diff --git a/tests/e2e/tests/spans/errors/empty_bindings.ok b/tests/e2e/tests/spans/errors/empty_bindings.ok
+new file mode 100644
+index 0000000..67e0d8f
+--- /dev/null
++++ b/tests/e2e/tests/spans/errors/empty_bindings.ok
+@@ -0,0 +1,6 @@
++// the span form needs at least one binding
++fu f() {
++  return 1;
++}
++
++let () = f(); // expect error: at least one binding
+diff --git a/tests/e2e/tests/spans/errors/expr_position_error.ok b/tests/e2e/tests/spans/errors/expr_position_error.ok
+new file mode 100644
+index 0000000..43e34a6
+--- /dev/null
++++ b/tests/e2e/tests/spans/errors/expr_position_error.ok
+@@ -0,0 +1,7 @@
++// a multi-result call in single-expression position errors (R4/R6):
++// print takes exactly one value, always
++fu pair(a, b) {
++  return a, b;
++}
++
++print pair(1, 2); // expect error: it returns 2 values, 1 were requested
+diff --git a/tests/e2e/tests/spans/errors/glob_rejected.ok b/tests/e2e/tests/spans/errors/glob_rejected.ok
+new file mode 100644
+index 0000000..231e192
+--- /dev/null
++++ b/tests/e2e/tests/spans/errors/glob_rejected.ok
+@@ -0,0 +1,6 @@
++// glob spans need per-global stores from the window: deferred
++fu pair(a, b) {
++  return a, b;
++}
++
++glob let (a, b) = pair(1, 2); // expect error: illegal declaration modifier
+diff --git a/tests/e2e/tests/spans/errors/noncall_error.ok b/tests/e2e/tests/spans/errors/noncall_error.ok
+new file mode 100644
+index 0000000..0d3c471
+--- /dev/null
++++ b/tests/e2e/tests/spans/errors/noncall_error.ok
+@@ -0,0 +1,2 @@
++// the span expression must be a call: no tuple literals
++let (a, b) = 1; // expect error: a destructuring let needs a call
+diff --git a/tests/e2e/tests/spans/errors/span_forward_error.ok b/tests/e2e/tests/spans/errors/span_forward_error.ok
+new file mode 100644
+index 0000000..37af812
+--- /dev/null
++++ b/tests/e2e/tests/spans/errors/span_forward_error.ok
+@@ -0,0 +1,14 @@
++// v1: `return pair(1, 2);` counts as a ONE-wide return path (the list has one
++// expression), so outer's inferred span is 1 — and the destructuring caller
++// is told exactly that. the fix inside outer is `let (a, b) = pair(1, 2);
++// return a, b;`. compile-time rejection of the forwarding shape needs the
++// known-globals table; flagged in the patch notes.
++fu pair(a, b) {
++  return a, b;
++}
++
++fu outer() {
++  return pair(1, 2);
++}
++
++let (a, b) = outer(); // expect error: it returns 1 values, 2 were requested
+diff --git a/tests/e2e/tests/spans/errors/span_mismatch.ok b/tests/e2e/tests/spans/errors/span_mismatch.ok
+new file mode 100644
+index 0000000..7b6fd4f
+--- /dev/null
++++ b/tests/e2e/tests/spans/errors/span_mismatch.ok
+@@ -0,0 +1,6 @@
++// R2: every return path must agree on the width
++fu bad(a) {
++  if a { return 1, 2; }
++  return 1;
++}
++print bad(true); // expect error: return span mismatch
+diff --git a/tests/e2e/tests/spans/falloff_padding.ok b/tests/e2e/tests/spans/falloff_padding.ok
+new file mode 100644
+index 0000000..b58bf79
+--- /dev/null
++++ b/tests/e2e/tests/spans/falloff_padding.ok
+@@ -0,0 +1,13 @@
++// falling off the end of a span function null-pads to the agreed width,
++// the span-wide shape of the single-result fall-off doctrine
++fu maybe_pair(flag) {
++  if flag { return 1, 2; }
++}
++
++let (a, b) = maybe_pair(true);
++print a; // expect: 1
++print b; // expect: 2
++
++let (c, d) = maybe_pair(false);
++print c; // expect: null
++print d; // expect: null
+diff --git a/tests/e2e/tests/spans/many_results.ok b/tests/e2e/tests/spans/many_results.ok
+new file mode 100644
+index 0000000..fff75ba
+--- /dev/null
++++ b/tests/e2e/tests/spans/many_results.ok
+@@ -0,0 +1,8 @@
++// eight results through one window
++fu eight() {
++  return 1, 2, 3, 4, 5, 6, 7, 8;
++}
++
++let (a, b, c, d, e, f, g, h) = eight();
++print a + h; // expect: 9
++print b + c + d + e + f + g; // expect: 27
+diff --git a/tests/e2e/tests/spans/mut_and_mixed.ok b/tests/e2e/tests/spans/mut_and_mixed.ok
+new file mode 100644
+index 0000000..70f592b
+--- /dev/null
++++ b/tests/e2e/tests/spans/mut_and_mixed.ok
+@@ -0,0 +1,16 @@
++// per-binder modifiers: mut rides the binding list like anywhere else
++fu pair(a, b) {
++  return a, b;
++}
++
++let (mut a, b) = pair(1, 2);
++a = a + b;
++print a; // expect: 3
++print b; // expect: 2
++
++// the immutable one refuses assignment
++fu pair2(a, b) {
++  return a, b;
++}
++let (p, q) = pair2(3, 4);
++print p + q; // expect: 7
+diff --git a/tests/e2e/tests/spans/nested_functions.ok b/tests/e2e/tests/spans/nested_functions.ok
+new file mode 100644
+index 0000000..cbac414
+--- /dev/null
++++ b/tests/e2e/tests/spans/nested_functions.ok
+@@ -0,0 +1,18 @@
++// a span function whose results feed a closure that itself returns a span:
++// the inner call is destructured first, then returned explicitly
++fu pair(a, b) {
++  return a, b;
++}
++
++fu outer(a, b) {
++  let (x, y) = pair(a, b);
++  let inner = fu() {
++    return y, x;
++  };
++  let (p, q) = inner();
++  return p, q;
++}
++
++let (p, q) = outer(1, 2);
++print p; // expect: 2
++print q; // expect: 1
+diff --git a/tests/e2e/tests/spans/null_results.ok b/tests/e2e/tests/spans/null_results.ok
+new file mode 100644
+index 0000000..0946f36
+--- /dev/null
++++ b/tests/e2e/tests/spans/null_results.ok
+@@ -0,0 +1,15 @@
++// null is a legal result value, not a missing one
++fu find(arr, want) {
++  for let v : arr {
++    if v == want { return v, true; }
++  }
++  return null, false;
++}
++
++let (found, ok) = find([1, 2, 3], 2);
++print found; // expect: 2
++print ok; // expect: true
++
++let (missing, no) = find([1, 2, 3], 9);
++print missing; // expect: null
++print no; // expect: false
+diff --git a/tests/e2e/tests/spans/results_in_loops.ok b/tests/e2e/tests/spans/results_in_loops.ok
+new file mode 100644
+index 0000000..9a501f4
+--- /dev/null
++++ b/tests/e2e/tests/spans/results_in_loops.ok
+@@ -0,0 +1,29 @@
++// span calls inside loop bodies, fresh bindings each trip. split(n)'s two
++// halves always sum back to n, so the trip prints n itself.
++fu split(n) {
++  let half = n / 2;
++  return half, n - half;
++}
++
++let mut n = 10;
++while n > 0 {
++  let (a, b) = split(n);
++  print a + b; // expect: 10
++                // expect: 9
++                // expect: 8
++                // expect: 7
++                // expect: 6
++                // expect: 5
++                // expect: 4
++                // expect: 3
++                // expect: 2
++                // expect: 1
++  n = n - 1;
++}
++
++for let i : [1, 2, 3] {
++  let (lo, hi) = split(i * 10);
++  print lo; // expect: 5
++            // expect: 10
++            // expect: 15
++}
+diff --git a/tests/e2e/tests/spans/sequential.ok b/tests/e2e/tests/spans/sequential.ok
+new file mode 100644
+index 0000000..6dc97d0
+--- /dev/null
++++ b/tests/e2e/tests/spans/sequential.ok
+@@ -0,0 +1,15 @@
++// two span lets in one scope: the second window starts right after the
++// first bindings, adjacency re-derived per let
++fu pair(a, b) {
++  return a, b;
++}
++
++let (a, b) = pair(1, 2);
++let plain = a + b;
++let (c, d) = pair(10, 20);
++print a; // expect: 1
++print b; // expect: 2
++print plain; // expect: 3
++print c; // expect: 10
++print d; // expect: 20
++print c + d; // expect: 30
+diff --git a/tests/e2e/tests/spans/shadowing.ok b/tests/e2e/tests/spans/shadowing.ok
+new file mode 100644
+index 0000000..95143f3
+--- /dev/null
++++ b/tests/e2e/tests/spans/shadowing.ok
+@@ -0,0 +1,12 @@
++// span bindings shadow outer locals like any let
++fu pair(a, b) {
++  return a, b;
++}
++
++let x = 100;
++let y = 200;
++{
++  let (x, y) = pair(1, 2);
++  print x + y; // expect: 3
++}
++print x + y; // expect: 300
+diff --git a/tests/e2e/tests/spans/single_binding_span.ok b/tests/e2e/tests/spans/single_binding_span.ok
+new file mode 100644
+index 0000000..84050e3
+--- /dev/null
++++ b/tests/e2e/tests/spans/single_binding_span.ok
+@@ -0,0 +1,7 @@
++// one binding under parens: a 1-span destructure, no special case
++fu one() {
++  return 42;
++}
++
++let (x) = one();
++print x; // expect: 42
+diff --git a/tests/e2e/tests/spans/statement_discard.ok b/tests/e2e/tests/spans/statement_discard.ok
+new file mode 100644
+index 0000000..8466041
+--- /dev/null
++++ b/tests/e2e/tests/spans/statement_discard.ok
+@@ -0,0 +1,14 @@
++// a span call in statement position discards: legal, no arity complaint
++fu pair(a, b) {
++  return a, b;
++}
++
++pair(1, 2);
++print "after"; // expect: after
++
++fu noisy(a, b) {
++  print a + b;
++  return a, b;
++}
++noisy(3, 4); // expect: 7
++print "done"; // expect: done
+diff --git a/tests/e2e/tests/spans/three_results.ok b/tests/e2e/tests/spans/three_results.ok
+new file mode 100644
+index 0000000..543d520
+--- /dev/null
++++ b/tests/e2e/tests/spans/three_results.ok
+@@ -0,0 +1,17 @@
++// three results round-tripping through one window, both paths agreeing on 3
++fu rotate3(a, b, c) {
++  if a > b { return a, b, c; }
++  return c, a, b;
++}
++
++let (x, y, z) = rotate3(1, 2, 3);
++print x + y + z; // expect: 6
++print x; // expect: 3
++print y; // expect: 1
++print z; // expect: 2
++
++// a > b takes the first path: identity order
++let (p, q, r) = rotate3(5, 1, 9);
++print p; // expect: 5
++print q; // expect: 1
++print r; // expect: 9
+diff --git a/tests/e2e/tests/spans/two_results.ok b/tests/e2e/tests/spans/two_results.ok
+new file mode 100644
+index 0000000..259208c
+--- /dev/null
++++ b/tests/e2e/tests/spans/two_results.ok
+@@ -0,0 +1,13 @@
++// the canonical shape: two results, destructured in one let
++fu minmax(a, b) {
++  if a < b { return a, b; }
++  return b, a;
++}
++
++let (lo, hi) = minmax(3, 9);
++print lo; // expect: 3
++print hi; // expect: 9
++
++let (lo2, hi2) = minmax(9, 3);
++print lo2; // expect: 3
++print hi2; // expect: 9
+diff --git a/tests/e2e/tests/spans/window_pressure.ok b/tests/e2e/tests/spans/window_pressure.ok
+new file mode 100644
+index 0000000..1e780e1
+--- /dev/null
++++ b/tests/e2e/tests/spans/window_pressure.ok
+@@ -0,0 +1,11 @@
++// a span call with many args: the arg window and the 3-wide result window
++// overlap in time (results overwrite dead args) — this is the register
++// discipline the whole design rides on
++fu three(a, b, c, d, e) {
++  return a + b, c + d, e;
++}
++
++let (x, y, z) = three(1, 2, 3, 4, 5);
++print x; // expect: 3
++print y; // expect: 7
++print z; // expect: 5
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index 5fa79c8..c801fb3 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -247,6 +247,16 @@ int main() {
+ 
+     let applied = host_apply(double_it, 21);
+     if applied != 42 { print "bad: apply"; }
++
++    // SPANS: a two-result script function, destructured on the script side
++    glob fu minmax(a, b) {
++      if a < b { return a, b; }
++      return b, a;
++    }
++
++    let (lo, hi) = minmax(3, 9);
++    if lo != 3 { print "bad: lo"; }
++    if hi != 9 { print "bad: hi"; }
+   )";
+ 
+   ok_source source = {
+@@ -277,6 +287,24 @@ int main() {
+   assert(ok_value_is_number(multiply_result));
+   assert(ok_value_as_number(multiply_result) == 42);
+ 
++  // SPANS §6: ok_call on a multi-result script function takes the FIRST result
++  // (the dynamic lane) — no arity error, single-result callees unchanged.
++  ok_value minmax = ok_value_null();
++
++  assert(ok_global_get(vm, ok_create_string_view("minmax", OK_STRING_VIEW_CALCULATE_LENGTH, true), &minmax));
++
++  ok_value minmax_args[] = {
++      ok_value_number(3),
++      ok_value_number(9),
++  };
++
++  ok_value minmax_result = ok_value_null();
++
++  assert(ok_call(vm, minmax, 2, minmax_args, &minmax_result));
++
++  assert(ok_value_is_number(minmax_result));
++  assert(ok_value_as_number(minmax_result) == 3); // the first of (3, 9)
++
+   ok_value host_add = ok_value_null();
+ 
+   assert(ok_global_get(vm, ok_create_string_view("host_add", OK_STRING_VIEW_CALCULATE_LENGTH, true), &host_add));

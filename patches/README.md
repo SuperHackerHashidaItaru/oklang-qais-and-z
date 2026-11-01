@@ -99,3 +99,42 @@ ascii keys) and three flagged drive-by fixes (array_as_str separator +
 leak, debug-print tags). full what/why/blast-radius: 19-map-surface.md (also
 in download/). READ THE .md FIRST — it carries the one syntax call
 (`for let k, v : m`) and three honest notes needing Q's eye.
+
+
+## 20 — as-map repair (the v0.2.0 hole)
+
+vs master `127ff0b` (v0.2.0). the release is missing the `as map` surface Q's
+maps-staging has: the TT_MAP case in perform_as, the `" map"` hidden type
+intrinsic in ok.c (three spots), and as_map.ok — the enum line
+(`temporary_type_tags` + TT_MAP) is what the hand-apply missed, which is
+why staging didn't compile and why the as-map hunks presumably got dropped
+from the release assembly. this patch is exactly those four pieces; applying
+it to master completes Etymos. (staging already carries the content — it only
+needs the one-line enum fix, which this patch also brings.)
+
+## 21 — spans patch A: multi-return + destructuring (SPANS.md)
+
+vs staging `c75c583` + the TT_MAP enum line (i.e. master + patch 20). the
+surface: `return a, b;` (every path agrees, compile error with both lines on
+mismatch — R2 inference), `let (x, y) = f();` (per-binder mut, R1 parens),
+proto `results` field, call() strictness (R6: "it returns 2 values, 1 were
+requested here" — runtime, see notes), ok_call first-of-span (§6). 26 e2e +
+embed spans section. bytecode-identical for every single-result caller that
+takes 1 (verified by full paranoid trace diff). HONEST NOTES in the worklog
+and SPANS.md §7: fall-off-the-end of a span function null-pads (null, null);
+`return f();` is not span forwarding (destructure first); the arity check is
+runtime because callee protos aren't statically reachable through globals
+yet — the interning-era known-globals table would make it compile-time.
+
+## 22 — spans patch B: varargs + spread (SPANS.md)
+
+on top of 21. the surface: `fu f(a, rest...)` (R3 token), VA_PACK prologue op
+(one array allocation per call, always-pack v1), call() floor drops the
+varargs param / no ceiling / frame widens past `registers` to cover the
+staged trailing args, `g(args...)` spread via CALL_SPREAD (+_LONG) that
+stages the elements into the window at runtime (R5: SHIPS). defaults +
+varargs compose (`fu f(a, b = 2, c...)`, the ladder range excludes the
+varargs param). 19 e2e (sum_all shapes, empty, defaults, capture, spread of
+empty/computed/mixed, gc-churn torture, arity/type/position errors) + embed
+varargs section + bench trio (mr_call, varargs_pack). spread in array/map
+literals and non-last call positions: precise compile errors.

@@ -1,10 +1,14 @@
-# SPANS — 0.3.0 candidate, first feature draft
+# SPANS — 0.3.0 candidate, feature draft, rulings LOCKED
 
-status: DRAFT for Q's review. carries D6 (DECISIONS.md, the "is the compiler
-arch good for it" answer) forward against the code as it stands after maps
-(0987b4e + patch 19), and adds what D6 didn't have to decide: the surface
-syntax, the static-arity mechanism, the natives/embed story, and the patch
-plan. read with ROADMAP-v1.md §0.3.0.
+status: all seven rulings RULED by Q (nov 1, post-v0.2.0-Etymos merge).
+R1 parens + per-binder modifier, R2 inference ('->' stays reserved for far
+future type annotations), R3 '...', R4 print stays one-arg, R5 spread SHIPS
+with patch B, R6 no adjust-to-receiver, R7 "spans" stays roadmap-internal.
+carries D6 (DECISIONS.md, the "is the compiler arch good for it" answer)
+forward against the code as it stands after maps (0987b4e + patch 19), and
+adds what D6 didn't have to decide: the surface syntax, the static-arity
+mechanism, the natives/embed story, and the patch plan. read with
+ROADMAP-v1.md §0.3.0.
 
 the name: a **span** is a base register + a length. parameter windows, result
 windows and varargs windows are all spans — the milestone is really "make the
@@ -147,10 +151,8 @@ evaluation/compilation:
   only lexer change in the milestone.
 - spread `g(args...)`: CALL_SPREAD stages the array's elements into the arg
   window (a copy — args are a window by definition) then CALLs with
-  argc = fixed + len. **R5: shippable but deferrable** — it's the only
-  piece that's pure sugar (`g(args[0], args[1])` exists today, and `push`
-  + a loop covers construction). recommend: land it in the same series
-  only if the lexer token is already in; else it waits for the std seed.
+  argc = fixed + len. **R5: RULED SHIP with patch B** — the token work is
+  tiny and the sugar pays for itself immediately.
 - varargs + defaults together: `fu f(a, b = 2, c...)` — the defaults
   ladder reads argc, varargs takes the remainder floor-1. allowed v1
   (the ladder already walks positions); one e2e proves the interaction.
@@ -177,30 +179,37 @@ evaluation/compilation:
 
 ## 7. implementation plan (patches, the usual rhythm)
 
-**patch A — multi-return + destructuring (the milestone's core)**:
-`object_function` gains `uint16_t results` (0 = infer-completed single, set
-by the compiler when the function closes); the compiler: every `return a, b`
+**patch A — multi-return + destructuring (the milestone's core)** — DELIVERED
+(patch 21, gated 287x4 + fresh-apply):
+`object_function` gains `uint16_t results` (1 = single, the default; set to
+the inferred span when the function closes); the compiler: every `return a, b`
 path checks span-width agreement across the function (compile error "return
 span mismatch: 2 here, 1 at line N" — static arity, no annotation);
 `compile_let_declaration` learns the paren binding list (window-at-register
 binding, the for-in hidden-local trick); `compile_call_expression` requests
-retc from the proto (kills the "unimplemented multi-result" CRASH_MSG);
-expression-position calls to multi-result functions error. e2e: two-result
-swap/minmax, three-result, null results, single-result fast path unchanged
-(bytecode-diff test: same opcodes as today), destructuring with mut,
-shadowing, closures capturing span-bound locals, error cases (arity
-mismatch, non-call span, expression-position truncation), RETURN range
+retc from the binding count (kills the "unimplemented multi-result" CRASH_MSG).
+HONEST LIMITATION (v1): expression-position calls to multi-result functions
+and destructuring-arity mismatches error at RUNTIME (call() compares the
+retc operand against the proto's `results`) — the callee's proto is not
+statically reachable through globals/locals yet, so a compile-time check
+needs the interning-era known-globals table. deferred, flagged. bare returns
+and falling off the end of a span function yield null-padding (null, null) —
+consistent with single-result fall-off semantics; flagged for Q's eye.
+e2e: two-result swap/minmax, three-result, null results, single-result fast
+path unchanged (bytecode-identical when the caller takes 1), destructuring
+with mut, shadowing, closures capturing span-bound locals, error cases
+(arity mismatch, non-call span, expression-position truncation), RETURN range
 already covered by existing retc tests. gates: the full battery.
 embed: ok_call-first-of-span contract test.
 
-**patch B — varargs (+ spread if R5 says ship)**: lexer `...` token;
+**patch B — varargs + spread (R5: SHIPS)** — DELIVERED (patch 22, gated 306x4 +
+fresh-apply on top of 21): lexer `...` token;
 `fu f(a, b...)` parse (binding modifier-style marker on the last param);
 proto flag; `call()` ceiling check; VA_PACK prologue op (array local);
-spread CALL_SPREAD if in-scope. e2e: sum_all shapes, empty varargs,
-varargs + defaults, spread of empty/spread counts, key-type errors N/A,
-varargs capture (the packed array is a normal local). bench: varargs call
-overhead vs lua's `...` (lua packs a table too — honest comparison) and vs
-python *args.
+spread CALL_SPREAD. e2e: sum_all shapes, empty varargs, varargs + defaults,
+spread of empty/spread counts, key-type errors N/A, varargs capture (the
+packed array is a normal local). bench: varargs call overhead vs lua's `...`
+(lua packs a table too — honest comparison) and vs python *args.
 
 **bench additions** (the suite): `mr_call` (two-result call + destructure in
 a loop, vs lua multi-return and python tuple-return), `varargs_pack`
@@ -208,30 +217,39 @@ a loop, vs lua multi-return and python tuple-return), `varargs_pack`
 interesting one: lua returns stack slots, we return register slots — both
 zero-copy in spirit; python pays a tuple allocation. we should WIN that
 bench; if we don't, the window-at-register binding didn't land and the
-patch isn't done.
+patch isn't done. [DELIVERED: sandbox preview -O2 mr_call ~82ms vs python
+~345ms (4.2x), varargs_pack ~47ms vs ~94ms (2x); lua side awaits Q's CI
+runner.]
 
-## 8. rulings — OPEN (none of these block drafting patch A except R1/R2)
+**tree-sitter delta (for Q's ts repo, mirrors patch 19's note-only precedent)**:
+new token `ELLIPSIS: "..."` (before DOT's rule, maximal munch — the
+lexer-level disambiguation from `..` pairs is a scanner question: the ts
+scanner needs the same peek-two-dots rule); parameter_list gains the trailing
+`'...'` after a binding identifier (varargs_param); call arguments gain
+`spread_expression: $._expression '...'` as a legal LAST element; return
+statement gains a comma-separated expression list; let gains the
+destructuring form `let (binding (',' binding)* ')' '=' call`. no keyword
+tokens. corpus: the spans/ e2e files are ready-made fixtures.
 
-- R1 destructuring shape: `let (x, y) = f();` with per-binder mut —
-  Z's recommendation, parens because the comma-list-under-let is spent
-  (for heads) and because the span is a thing, not a list of bindings.
-- R2 result arity mechanism: INFERENCE (every return path agrees, checked
-  at compile) vs ANNOTATION (`fu f() -> 2`). Z leans inference: parameter
-  arity is already structural, no second syntax to maintain, and the
-  mismatch error points at both sites. the annotation's one virtue —
-  interface documentation — is what 0.5.0's type syntax is for.
-- R3 varargs token: `...` (new lexeme) vs `*b` (existing token, C-deref
-  reading). Z leans `...`.
-- R4 `print` of a span call: error (expression position wants 1) — or
-  should print get a special multi-arg form? Z says error v1; print takes
-  one value, always has.
-- R5 spread: ship with B or defer to the std seed. Z leans defer unless
-  the token work is already in.
-- R6 no adjust-to-receiver: a 2-result call destructured into 1 binding is
-  a compile error, not lua's silent take-first. strictness doctrine; the
-  lax path, if ever wanted, is a future `first_of(f())` builtin.
-- R7 (naming): the milestone is "spans" in the roadmap; the SURFACE never
-  says the word. confirm the name stays roadmap-internal (Z assumes yes).
+## 8. rulings — CLOSED (Q ruled, nov 1)
+
+- R1 destructuring shape: **`let (x, y) = f();` with per-binder mut** — RULED
+  YES. Q adds: tuples were never planned for the language surface (object
+  system only, c++-ish style), so the paren form never collides with anything,
+  "it reads clean and it signals, this is no normal return."
+- R2 result arity mechanism: **INFERENCE** — RULED. no usercode touching this;
+  every return path agrees, checked at compile. the `->` token stays RESERVED
+  for far-future type annotations (do not spend it on arity).
+- R3 varargs token: **`...`** — RULED. ("i don't know who came up with * lol,
+  dudes at py be cooking straight poison lol")
+- R4 `print` of a span call: **ERROR, and print keeps taking exactly one
+  value, always** — RULED. no special cases.
+- R5 spread: **SHIPS with patch B** — RULED ("the token work is tiny").
+- R6 no adjust-to-receiver: **RULED** — a 2-result call destructured into 1
+  binding is an error, not lua's silent take-first. "i don't want to inherit
+  lua's bad things."
+- R7 naming: **non-issue** — "spans" is the roadmap-internal name, the
+  surface never says the word. RULED.
 
 ## 9. what maps already bought us (reuse inventory)
 

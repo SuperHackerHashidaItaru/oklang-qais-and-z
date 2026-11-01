@@ -1,0 +1,1179 @@
+diff --git a/src/okast.c b/src/okast.c
+index addb39c..d68e055 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -34,6 +34,7 @@
+   X(AST_MAP_EXPRESSION, ast_map_expression)                                                                        \
+   X(AST_SUBSCRIPT_EXPRESSION, ast_subscript_expression)                                                                \
+   X(AST_FUNCTION_EXPRESSION, ast_function_expression)                                                                  \
++  X(AST_SPREAD_EXPRESSION, ast_spread_expression)                                                                      \
+   X(AST_EMPTY_STATEMENT, ast_empty_statement)                                                                          \
+   X(AST_EXPRESSION_STATEMENT, ast_expression_statement)                                                                \
+   X(AST_PRINT_STATEMENT, ast_print_statement)                                                                          \
+@@ -130,6 +131,7 @@ void ast_binding_init(ast_binding* p_binding,
+   p_binding->lvalue = p_lvalue;
+   p_binding->default_value = NULL; // set by the parser when a parameter has "= <expr>"
+   p_binding->modifiers = p_modifiers;
++  p_binding->is_varargs = false; // set by the parser on `rest...` parameters
+ }
+ 
+ void ast_binding_deinit(ast_binding* p_binding) {
+@@ -745,6 +747,38 @@ void ast_call_expression_init(ast_call_expression* p_call,
+   p_call->arguments = p_args;
+ }
+ 
++void ast_spread_expression_init(ast_spread_expression* p_spread,
++                                const token p_token,
++                                ast_expression* p_inner,
++                                ast_specs* p_specs) {
++  ast_expression_init(&p_spread->expression, AST_SPREAD_EXPRESSION, p_token, p_specs);
++  p_spread->inner = p_inner;
++}
++
++void ast_spread_expression_deinit(ast_spread_expression* p_spread) {
++  allocators* alloc = p_spread->expression.node.alloc;
++  if (p_spread->inner != NULL) {
++    ast_dispatch_deinit((ast_node*)p_spread->inner);
++    alloc->release(alloc, p_spread->inner);
++    p_spread->inner = NULL;
++  }
++  ast_expression_deinit(&p_spread->expression);
++}
++
++bool ast_spread_expression_print(const ast_spread_expression* p_spread) {
++  bool res = ast_dispatch_print((ast_node*)p_spread->inner);
++  res &= printf("...") > 0;
++  return res;
++}
++
++string ast_spread_expression_asprint(const ast_spread_expression* p_spread) {
++  allocators* alloc = p_spread->expression.node.alloc;
++  string inner = ast_dispatch_asprint((ast_node*)p_spread->inner);
++  string res = asprint(alloc, "%s...", inner.chars);
++  string_deinit(&inner, alloc);
++  return res;
++}
++
+ void ast_call_expression_deinit(ast_call_expression* p_call) {
+   ast_expressions_list_deinit(&p_call->arguments, p_call->expression.node.alloc);
+   ast_dispatch_deinit((ast_node*)p_call->callable);
+diff --git a/src/okast.h b/src/okast.h
+index 49e9194..e6b21aa 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -48,7 +48,8 @@ typedef enum {
+   AST_MAP_EXPRESSION,
+   AST_SUBSCRIPT_EXPRESSION,
+   AST_FUNCTION_EXPRESSION,
+-  AST_RANGE_EXPRESSION_END = AST_FUNCTION_EXPRESSION,
++  AST_SPREAD_EXPRESSION,
++  AST_RANGE_EXPRESSION_END = AST_SPREAD_EXPRESSION,
+ 
+   AST_RANGE_STATEMENT_BEGIN,
+   AST_RANGE_PURE_STATEMENT_BEGIN,
+@@ -133,6 +134,8 @@ typedef struct {
+   ast_expression* lvalue;
+   ast_expression* default_value; // parameter default (NULL = required) (functions only)
+   ast_binding_modifiers modifiers;
++  bool is_varargs; // `fu f(a, rest...)`: the LAST parameter, packs the trailing
++                   // arguments into a fresh array (SPANS R3). set by the parser.
+ } ast_binding;
+ 
+ void ast_binding_init(ast_binding* p_binding,
+@@ -410,6 +413,23 @@ void ast_call_expression_deinit(ast_call_expression* p_call);
+ bool ast_call_expression_print(const ast_call_expression* p_call);
+ string ast_call_expression_asprint(const ast_call_expression* p_call);
+ 
++typedef struct {
++  ast_expression expression;
++  // `args...` in a call's argument list (SPANS R5): the inner expression must
++  // evaluate to an array; CALL_SPREAD stages its elements into the argument
++  // window at runtime. legal only as the LAST argument of a call — the other
++  // positions reject it at compile with a precise error.
++  ast_expression* inner;
++} ast_spread_expression;
++
++void ast_spread_expression_init(ast_spread_expression* p_spread,
++                                const token p_token,
++                                ast_expression* p_inner,
++                                ast_specs* p_specs);
++void ast_spread_expression_deinit(ast_spread_expression* p_spread);
++bool ast_spread_expression_print(const ast_spread_expression* p_spread);
++string ast_spread_expression_asprint(const ast_spread_expression* p_spread);
++
+ typedef struct {
+   ast_statement statement;
+ } ast_empty_statement;
+diff --git a/src/okchunk.h b/src/okchunk.h
+index 6a2dacf..88cc333 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -237,6 +237,17 @@ typedef enum {
+                          //                          maps: the version snapshot must match (a size change during iteration
+                          //                          is a hard error, overwrites are fine), advance the cursor to the next
+                          //                          occupied slot, found -> ip -= A. (p unused, always false)
++  OP_VA_PACK,            // w:    (a', b')        -> r[a'] = Array(r[b'] ... r[frame->argc]); the varargs prologue
++                         //                          (SPANS R3). b' is the varargs parameter's register (the first
++                         //                          trailing argument); the count is argc - b' + 1 when argc >= b',
++                         //                          else 0 (the fixed/defaulted params swallowed everything).
++                         //                          reads before writing: a' == b' is the normal self-packing shape.
++  OP_CALL_SPREAD,        // w:    (a, b, c)       -> r[a] stays the callable, r[a + 1] ... r[a + b] the fixed args;
++                         //                          r[a + b + 1] must be an array: its elements stage at
++                         //                          [a + b + 1, a + b + len] (overwriting the array slot as they go,
++                         //                          the object stays alive through the C-side reference), then CALL
++                         //                          with argc = b + len and retc = c - 1 (c == 0 => dynamic), like OP_CALL.
++  OP_CALL_SPREAD_LONG,   // 2w:   (A, B, C)       -> same; ip += w
+ } opcode;
+ 
+ // clang-format on
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index d9db6d1..a66dcbd 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -716,6 +716,19 @@ static bool compile_expression(compiler* p_compiler,
+     result = compile_function_expression(
+         p_compiler, (ast_function_expression*)p_expression, p_dest, p_requested_count, p_out);
+     break;
++  case AST_SPREAD_EXPRESSION:
++    // a spread reached expression compilation through a generic list (array
++    // literal, map pairs, a non-last call position): the only legal home is a
++    // call's LAST argument, which compile_call_expression peels off before this.
++    error_at_noted(p_compiler,
++                   (ast_node*)p_expression,
++                   ok_create_string_view("spread ('...') is only allowed as the last argument of a call.",
++                                         OK_STRING_VIEW_CALCULATE_LENGTH,
++                                         true),
++                   ok_create_string_view("array and map literals have no spread form (yet); build them with push or a loop.",
++                                         OK_STRING_VIEW_CALCULATE_LENGTH,
++                                         true));
++    return false;
+   case AST_ARRAY_EXPRESSION:
+     result =
+         compile_array_expression(p_compiler, (ast_array_expression*)p_expression, p_dest, p_requested_count, p_out);
+@@ -2652,8 +2665,52 @@ bool compile_call_expression(compiler* p_compiler,
+   args.index = 0;
+   args.flags = REGISTER_FLAG_NONE;
+   args.errors = REGISTER_OK;
+-  if (!compile_expressions_list(p_compiler, &p_call->arguments, A_MAX, &args, (ast_node*)p_call)) {
+-    return false;
++  // SPANS R5: a trailing `args...` switches the emission to CALL_SPREAD — the
++  // fixed arguments stage as today, the spread expression stages its array one
++  // slot past them, and the op expands the elements at runtime. a spread in any
++  // non-last position reaches compile_expression's spread case and errors
++  // precisely; only the last element takes this lane.
++  const bool has_spread = p_call->arguments.count > 0 &&
++                          p_call->arguments.data[p_call->arguments.count - 1]->node.node_type == AST_SPREAD_EXPRESSION;
++  const uint32_t fixed_count = has_spread ? p_call->arguments.count - 1 : p_call->arguments.count;
++  if (!has_spread) {
++    if (!compile_expressions_list(p_compiler, &p_call->arguments, A_MAX, &args, (ast_node*)p_call)) {
++      return false;
++    }
++  } else {
++    register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
++    for (uint32_t i = 0; i < fixed_count; ++i) {
++      _register argreg;
++      if (!register_allocator_allocate_temp(regalloc, &argreg)) {
++        report_oom(p_compiler, (ast_node*)p_call);
++        return false;
++      }
++      expression_result result;
++      if (!compile_expression(p_compiler, p_call->arguments.data[i], argreg, 1, &result)) {
++        return false;
++      }
++      if (!materialize_into(p_compiler, &result.value, argreg, (ast_node*)p_call)) {
++        return false;
++      }
++      if (i == 0) {
++        args = argreg;
++      }
++    }
++    // the spread's array lands one slot past the fixed args: exactly where
++    // CALL_SPREAD's (a + b + 1) reads it.
++    _register spread_reg;
++    if (!register_allocator_allocate_temp(regalloc, &spread_reg)) {
++      report_oom(p_compiler, (ast_node*)p_call);
++      return false;
++    }
++    ast_expression* inner = ((ast_spread_expression*)p_call->arguments.data[p_call->arguments.count - 1])->inner;
++    expression_result spread_result;
++    if (!compile_expression(p_compiler, inner, spread_reg, 1, &spread_result)) {
++      return false;
++    }
++    if (!materialize_into(p_compiler, &spread_result.value, spread_reg, (ast_node*)p_call)) {
++      return false;
++    }
+   }
+   const uint32_t argc = p_call->arguments.count;
+   if (p_requested_count + 1 > c_MAX) {
+@@ -2666,16 +2723,37 @@ bool compile_call_expression(compiler* p_compiler,
+     return false;
+   }
+   const uint32_t retc = p_requested_count + 1; // c == 0 stays the VM's dynamic sentinel
+-  bool is_long = p_dest.index > a_MAX || (argc > 0 && args.index > a_MAX) || argc > b_MAX;
+-  if (is_long) {
+-    if (!emit_word2(p_compiler, encode_OPPABCQ(OP_CALL_LONG, false, p_dest.index, argc, retc, 0), (ast_node*)p_call)) {
+-      report_oom(p_compiler, (ast_node*)p_call);
+-      return false;
++  if (has_spread) {
++    // CALL_SPREAD (a, b, c): a = the callable, b = the fixed count, c = retc + 1.
++    bool spread_is_long = p_dest.index > a_MAX || (fixed_count > 0 && args.index > a_MAX) || fixed_count > b_MAX ||
++                          retc > c_MAX;
++    if (spread_is_long) {
++      if (!emit_word2(p_compiler,
++                      encode_OPPABCQ(OP_CALL_SPREAD_LONG, false, p_dest.index, fixed_count, retc, 0),
++                      (ast_node*)p_call)) {
++        report_oom(p_compiler, (ast_node*)p_call);
++        return false;
++      }
++    } else {
++      if (!emit_word(p_compiler,
++                     encode_oppabc(OP_CALL_SPREAD, false, p_dest.index, fixed_count, retc),
++                     (ast_node*)p_call)) {
++        report_oom(p_compiler, (ast_node*)p_call);
++        return false;
++      }
+     }
+   } else {
+-    if (!emit_word(p_compiler, encode_oppabc(OP_CALL, false, p_dest.index, argc, retc), (ast_node*)p_call)) {
+-      report_oom(p_compiler, (ast_node*)p_call);
+-      return false;
++    bool is_long = p_dest.index > a_MAX || (argc > 0 && args.index > a_MAX) || argc > b_MAX;
++    if (is_long) {
++      if (!emit_word2(p_compiler, encode_OPPABCQ(OP_CALL_LONG, false, p_dest.index, argc, retc, 0), (ast_node*)p_call)) {
++        report_oom(p_compiler, (ast_node*)p_call);
++        return false;
++      }
++    } else {
++      if (!emit_word(p_compiler, encode_oppabc(OP_CALL, false, p_dest.index, argc, retc), (ast_node*)p_call)) {
++        report_oom(p_compiler, (ast_node*)p_call);
++        return false;
++      }
+     }
+   }
+   p_out->value = (location){p_dest.index, LOCATION_KIND_REGISTER, LOCATION_OK};
+@@ -3394,15 +3472,23 @@ static bool compile_function_impl(compiler* p_compiler,
+   // evaluation, c++ style. fresh mutable defaults per call, earlier params in
+   // scope. functions without defaults emit nothing at all.
+   {
+-    uint16_t ndefaults = 0;
+-    for (uint32_t i = 0; i < p_params.count; ++i) {
++    // the defaulted range: [first defaulted param, count), minus the varargs
++    // parameter when one trails the defaults (`fu f(a, b = 2, c...)` — the
++    // defaults are "trailing" among the REAL params, the varargs owns the
++    // remainder after them, needs no guard, and call()'s floor drops it
++    // separately through arity/ndefaults/has_varargs).
++    const bool last_is_varargs = p_params.count > 0 && p_params.data[p_params.count - 1]->is_varargs;
++    const uint32_t defaults_end = p_params.count - (last_is_varargs ? 1u : 0u);
++    uint32_t defaults_begin = defaults_end;
++    for (uint32_t i = 0; i < defaults_end; ++i) {
+       if (p_params.data[i]->default_value != NULL) {
+-        ndefaults = (uint16_t)(p_params.count - i); // defaults are trailing, parser enforced
++        defaults_begin = i; // defaults are trailing among the real params, parser enforced
+         break;
+       }
+     }
++    const uint16_t ndefaults = (uint16_t)(defaults_end - defaults_begin);
+     current_context(p_compiler)->function.function->ndefaults = ndefaults;
+-    for (uint32_t i = p_params.count - ndefaults; i < p_params.count; ++i) {
++    for (uint32_t i = defaults_begin; i < defaults_end; ++i) {
+       ast_binding* binding = p_params.data[i];
+       uint32_t guard;
+       if (!emit_incomplete_jump_if_argc(p_compiler, true, (uint16_t)i, &guard, (ast_node*)binding)) {
+@@ -3429,6 +3515,27 @@ static bool compile_function_impl(compiler* p_compiler,
+       }
+     }
+   }
++  // the varargs prologue (SPANS R3): the last parameter is `rest...` — one
++  // OP_VA_PACK materializes the trailing arguments into a fresh array at the
++  // parameter's own register, before any body code (so the incoming window is
++  // consumed before locals can clobber it). emitted after the defaults ladder:
++  // the ladder fills defaulted fixed params below the window, order-free.
++  if (p_params.count > 0 && p_params.data[p_params.count - 1]->is_varargs) {
++    current_context(p_compiler)->function.function->has_varargs = true;
++    const uint16_t va_reg = param_locations[p_params.count - 1].index;
++    if (va_reg > aprime_MAX) {
++      // the wide form: VA_PACK's operands are 12-bit (like MOVE); param counts
++      // are capped at 255 so this never fires today, but the check is cheap.
++      end_scope(p_compiler, p_author);
++      end_context(p_compiler);
++      return false;
++    }
++    if (!emit_word(p_compiler, encode_oppabprime(OP_VA_PACK, false, va_reg, va_reg), p_author)) {
++      end_scope(p_compiler, p_author);
++      end_context(p_compiler);
++      return false;
++    }
++  }
+   if (!compile_statement(p_compiler, p_body)) {
+     end_scope(p_compiler, p_author);
+     end_context(p_compiler);
+diff --git a/src/okdebug.c b/src/okdebug.c
+index 7982cbd..64ef0a4 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -81,8 +81,11 @@ static const char* const OPCODE_NAMES[] = {
+     "ITER_PREP",
+     "ITER_GET",
+     "ITER_LOOP",
++    "VA_PACK",
++    "CALL_SPREAD",
++    "CALL_SPREAD_LONG",
+ };
+-typedef char opcode_names_in_sync[(sizeof(OPCODE_NAMES) / sizeof(OPCODE_NAMES[0]) == (size_t)OP_ITER_LOOP + 1) ? 1 : -1];
++typedef char opcode_names_in_sync[(sizeof(OPCODE_NAMES) / sizeof(OPCODE_NAMES[0]) == (size_t)OP_CALL_SPREAD_LONG + 1) ? 1 : -1];
+ 
+ static const char* binop_symbol(const opcode p_op) {
+   switch (p_op) {
+@@ -180,6 +183,7 @@ static bool op_is_two_words(opcode p_op) {
+   case OP_INDEX_GET_LONG:
+   case OP_INDEX_SET_LONG:
+   case OP_JUMP_IF_ARGC:
++  case OP_CALL_SPREAD_LONG:
+   case OP_FOR_PREP:
+   case OP_FOR_LOOP:
+   case OP_ITER_PREP:
+@@ -356,6 +360,25 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+       printf("%u", C - 1);
+     }
+     break;
++  case OP_VA_PACK:
++    printf("r%u = pack r%u ... r[argc]", ap, bp);
++    break;
++  case OP_CALL_SPREAD:
++    printf("r%u = call r%u, fixed %u + spread r%u..., ret ", a, a, b, a + b + 1);
++    if (c == 0) {
++      printf("all");
++    } else {
++      printf("%u", c - 1);
++    }
++    break;
++  case OP_CALL_SPREAD_LONG:
++    printf("r%u = call r%u, fixed %u + spread r%u..., ret ", A, A, B, A + B + 1);
++    if (C == 0) {
++      printf("all");
++    } else {
++      printf("%u", C - 1);
++    }
++    break;
+   case OP_RETURN:
+     if (bp == 0) {
+       printf("return r%u..top (passthrough)", ap);
+diff --git a/src/oklexer.c b/src/oklexer.c
+index e074820..40b7777 100644
+--- a/src/oklexer.c
++++ b/src/oklexer.c
+@@ -327,6 +327,14 @@ start:
+   case ',':
+     return create_token(p_lexer, TOKEN_COMMA);
+   case '.':
++    // '...' is one lexeme (SPANS R3): peek-based so a lone '..' stays two DOTs
++    // and '1..2' lexes as NUMBER DOT NUMBER as before. numbers consume their
++    // own fractional dot before this case is ever reached (see number()).
++    if (peek(p_lexer) == '.' && peek1(p_lexer) == '.') {
++      advance(p_lexer);
++      advance(p_lexer);
++      return create_token(p_lexer, TOKEN_ELLIPSIS);
++    }
+     return create_token(p_lexer, TOKEN_DOT);
+   case '?':
+     return create_token(p_lexer, TOKEN_QUESTION);
+diff --git a/src/okobject.c b/src/okobject.c
+index 9f1bc55..2ffa682 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -186,6 +186,7 @@ static void object_function_init(object_function* p_object_function,
+   p_object_function->ndefaults = 0; // compiler sets this when the function is complete
+   p_object_function->registers = 0; // compiler sets this when the function is complete
+   p_object_function->results = 1;   // compiler raises this when every return path agrees on n
++  p_object_function->has_varargs = false; // compiler sets this when the last parameter is `rest...`
+   upvalue_descriptor_array_init(&p_object_function->upvalues, p_specs->alloc);
+   chunk_init(&p_object_function->chunk, p_specs->alloc);
+ }
+diff --git a/src/okobject.h b/src/okobject.h
+index dffa881..4e42df6 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -90,6 +90,9 @@ typedef struct {
+                      // 1 for every single-result function (the default); n >= 2 when every
+                      // return path agrees on n. call() compares the caller's requested retc
+                      // against this — the strictness doctrine (R6) lives there.
++  bool has_varargs;  // the last parameter is `rest...` (SPANS R3): argc has no ceiling, the
++                     // floor drops it, and the runtime frame widens past `registers` to cover
++                     // the staged arguments. set by the compiler at the prologue.
+   upvalue_descriptor_array upvalues;
+ } object_function;
+ 
+diff --git a/src/okparser.c b/src/okparser.c
+index d0a720c..a92b43a 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -29,7 +29,11 @@ static ast_control_flow_statement* parse_control_flow_statement(parser* p_parser
+ static ast_return_statement* parse_return_statement(parser* p_parser);
+ 
+ static ast_bindings_list
+-parse_bindings_list(parser* p_parser, ast_binding_modifiers_t p_allowed_binds, token_type p_delim, token_type p_end);
++parse_bindings_list(parser* p_parser,
++                    ast_binding_modifiers_t p_allowed_binds,
++                    token_type p_delim,
++                    token_type p_end,
++                    bool p_allow_varargs);
+ static ast_expressions_list parse_expressions_list(parser* p_parser, token_type p_delim, token_type p_end);
+ 
+ static void error_at(parser* p_parser, token p_token, const ok_string_view p_message);
+@@ -464,7 +468,8 @@ static ast_expression* parse_function(parser* p_parser, token p_trigger) {
+     return NULL;
+   }
+   advance(p_parser);
+-  ast_bindings_list params = parse_bindings_list(p_parser, BINDING_MUT, TOKEN_COMMA, TOKEN_RIGHT_PAREN);
++  ast_bindings_list params =
++      parse_bindings_list(p_parser, BINDING_MUT, TOKEN_COMMA, TOKEN_RIGHT_PAREN, true);
+   if (params.capacity == 1 && params.count == 0) {
+     error_at(p_parser,
+              p_parser->previous,
+@@ -1153,7 +1158,8 @@ ast_let_declaration* parse_let_declaration_span(parser* p_parser,
+   }
+   (void)p_binding_mods; // per-binder modifiers are parsed inside the list itself
+   advance(p_parser); // consume '('
+-  ast_bindings_list bindings = parse_bindings_list(p_parser, BINDING_MUT, TOKEN_COMMA, TOKEN_RIGHT_PAREN);
++  ast_bindings_list bindings =
++      parse_bindings_list(p_parser, BINDING_MUT, TOKEN_COMMA, TOKEN_RIGHT_PAREN, false);
+   if (bindings.capacity == 1 && bindings.count == 0) {
+     error_at(p_parser,
+              p_parser->previous,
+@@ -1275,13 +1281,15 @@ ast_function_declaration* parse_function_declaration(parser* p_parser,
+     goto free_bind;
+   }
+   advance(p_parser);
+-  ast_bindings_list params = parse_bindings_list(p_parser, BINDING_MUT, TOKEN_COMMA, TOKEN_RIGHT_PAREN);
++  ast_bindings_list params =
++      parse_bindings_list(p_parser, BINDING_MUT, TOKEN_COMMA, TOKEN_RIGHT_PAREN, true);
+   if (params.capacity == 1 && params.count == 0) {
+     error_at(p_parser,
+              p_parser->previous,
+              ok_create_string_view("failed to parse function parameters.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+     goto free_bind;
+   }
++
+   advance(p_parser);
+   advance(p_parser);
+   ast_statement* body = parse_statement(p_parser);
+@@ -2076,12 +2084,16 @@ free:
+   return NULL;
+ }
+ 
+-ast_bindings_list
+-parse_bindings_list(parser* p_parser, ast_binding_modifiers_t p_allowed_binds, token_type p_delim, token_type p_end) {
++ast_bindings_list parse_bindings_list(parser* p_parser,
++                                    ast_binding_modifiers_t p_allowed_binds,
++                                    token_type p_delim,
++                                    token_type p_end,
++                                    bool p_allow_varargs) {
+   allocators* alloc = p_parser->alloc;
+   ast_bindings_list list;
+   ast_bindings_list_init(&list, alloc);
+   bool seen_default = false; // defaults must be trailing: there are no keyword arguments
++  bool seen_varargs = false; // at most one, and it must be the last (SPANS R3)
+   while (p_parser->current.type != p_end && p_parser->current.type != TOKEN_EOF) {
+     ast_binding_modifiers_t binds = parse_binding_modifiers(p_parser, p_allowed_binds);
+     token tok = p_parser->previous;
+@@ -2119,6 +2131,27 @@ parse_bindings_list(parser* p_parser, ast_binding_modifiers_t p_allowed_binds, t
+       alloc->release(alloc, ident);
+       goto free_bind_list;
+     }
++    // `rest...`: the varargs marker (SPANS R3), parsed after the name so the
++    // identifier's parse anchor is untouched. only function parameters allow
++    // it (p_allow_varargs); anywhere else it is a syntax error.
++    bool is_varargs = false;
++    if (p_parser->current.type == TOKEN_ELLIPSIS) {
++      if (!p_allow_varargs) {
++        error_at(p_parser,
++                 p_parser->current,
++                 ok_create_string_view("'...' is not allowed in this binding list.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        goto free_bind_list;
++      }
++      advance(p_parser); // consume '...'
++      is_varargs = true;
++      if (seen_varargs) {
++        error_at(p_parser,
++                 p_parser->previous,
++                 ok_create_string_view("only one varargs parameter is allowed.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        goto free_bind_list;
++      }
++      seen_varargs = true;
++    }
+     ast_expression* default_value = NULL;
+     if (p_parser->current.type == TOKEN_ASSIGN) {
+       advance(p_parser); // consume '='
+@@ -2133,7 +2166,10 @@ parse_bindings_list(parser* p_parser, ast_binding_modifiers_t p_allowed_binds, t
+         goto free_bind_list;
+       }
+     }
+-    if (default_value == NULL && seen_default) {
++    // the defaults-trailing rule has one exempt: the varargs parameter. it is
++    // last by construction and never requires an argument, so it may follow
++    // defaulted params (`fu f(a, b = 2, c...)`).
++    if (default_value == NULL && seen_default && !is_varargs) {
+       error_at_noted(
+           p_parser,
+           p_parser->previous,
+@@ -2147,6 +2183,27 @@ parse_bindings_list(parser* p_parser, ast_binding_modifiers_t p_allowed_binds, t
+     if (default_value != NULL) {
+       seen_default = true;
+     }
++    if (is_varargs && default_value != NULL) {
++      error_at_noted(
++          p_parser,
++          p_parser->previous,
++          ok_create_string_view("a varargs parameter cannot have a default.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++          ok_create_string_view(
++              "it always defaults to an empty array; every argument past the fixed ones is its.",
++              OK_STRING_VIEW_CALCULATE_LENGTH,
++              true));
++      ast_dispatch_deinit((ast_node*)ident);
++      alloc->release(alloc, ident);
++      goto free_bind_list;
++    }
++    if (is_varargs && p_parser->current.type != p_end) {
++      error_at(p_parser,
++               p_parser->current,
++               ok_create_string_view("a varargs parameter must be the last one.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      ast_dispatch_deinit((ast_node*)ident);
++      alloc->release(alloc, ident);
++      goto free_bind_list;
++    }
+     ast_binding* binding = (ast_binding*)alloc->allocate(alloc, sizeof(ast_binding));
+     if (binding == NULL) {
+       error_at(p_parser,
+@@ -2158,6 +2215,7 @@ parse_bindings_list(parser* p_parser, ast_binding_modifiers_t p_allowed_binds, t
+     ast_specs s = {alloc};
+     ast_binding_init(binding, ident, binds, tok, &s);
+     binding->default_value = default_value;
++    binding->is_varargs = is_varargs;
+     if (!ast_bindings_list_append(&list, binding)) {
+       goto free_bind_list;
+     }
+@@ -2206,6 +2264,25 @@ ast_expressions_list parse_expressions_list(parser* p_parser, token_type p_delim
+                    "failed to parse expression in expressions list.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+       goto free_expr_list;
+     }
++    // `args...`: the spread marker (SPANS R5) wraps the element. parsed in any
++    // expressions list, rejected at compile anywhere but a call's LAST
++    // argument — the parser stays permissive, the errors stay precise.
++    if (p_parser->current.type == TOKEN_ELLIPSIS) {
++      advance(p_parser); // consume '...'
++      ast_spread_expression* spread = (ast_spread_expression*)alloc->allocate(alloc, sizeof(ast_spread_expression));
++      if (spread == NULL) {
++        ast_dispatch_deinit((ast_node*)expr);
++        alloc->release(alloc, expr);
++        error_at(p_parser,
++                 p_parser->previous,
++                 ok_create_string_view(
++                     "failed to allocate memory for spread node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        goto free_expr_list;
++      }
++      ast_specs s = {alloc};
++      ast_spread_expression_init(spread, p_parser->previous, expr, &s);
++      expr = (ast_expression*)spread;
++    }
+     if (!ast_expressions_list_append(&list, expr)) {
+       goto free_expr_list;
+     }
+diff --git a/src/oktoken.h b/src/oktoken.h
+index 94acd50..2fff777 100644
+--- a/src/oktoken.h
++++ b/src/oktoken.h
+@@ -35,7 +35,8 @@
+   X(TOKEN_COMMA, ",")                                                                                                  \
+   X(TOKEN_COLON, ":")                                                                                                  \
+   X(TOKEN_SEMICOLON, ";")                                                                                              \
+-  X(TOKEN_DOT, ".")                                                                                                    \
++  X(TOKEN_DOT, ".")                                                                                                     \
++  X(TOKEN_ELLIPSIS, "...")                                                                                                    \
+   X(TOKEN_QUESTION, "?")                                                                                               \
+   X(TOKEN_BANG, "!")                                                                                                   \
+   X(TOKEN_BANG_EQUAL, "!=")                                                                                            \
+@@ -116,6 +117,7 @@ typedef enum {
+   TOKEN_COLON,
+   TOKEN_SEMICOLON,
+   TOKEN_DOT,
++  TOKEN_ELLIPSIS,
+   TOKEN_QUESTION,
+   TOKEN_BANG,
+   TOKEN_BANG_EQUAL,
+diff --git a/src/okvm.c b/src/okvm.c
+index f526ee1..4bef4fc 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -22,6 +22,13 @@
+ #define STACK_SIZE 256
+ 
+ static void runtime_error(vm* p_vm, const char* p_fmt, ...);
++static bool call_spread(vm* p_vm,
++                        execution_state* p_exe,
++                        register_file* p_reg,
++                        uint32_t p_base,
++                        uint16_t p_callee,
++                        uint16_t p_fixed,
++                        uint32_t p_retc);
+ static bool call_value(vm* p_vm,
+                        execution_state* p_exe,
+                        register_file* p_reg,
+@@ -2509,6 +2516,73 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       }
+       break;
+     }
++    case OP_VA_PACK: {
++      const uint16_t ap = aprime_of(instruction);
++      const uint16_t bp = bprime_of(instruction);
++      // the trailing-argument window: [bp, argc] (bp is the varargs parameter's
++      // own register, i.e. the first trailing argument). fewer arguments than
++      // that means the fixed/defaulted params swallowed everything: an empty
++      // pack. the source slots are live frame registers ([0, top) rooted); the
++      // array being built is store-linked yet unreachable until it lands in
++      // r[ap] — guard through the append, exactly like OP_ARRAY_NEW.
++      const uint32_t count = (uint32_t)frame->argc >= bp ? (uint32_t)frame->argc - bp + 1u : 0u;
++      object_specs s = {p_vm->alloc, p_vm->objects_store};
++      object_array* arr = create_object_array(&s);
++      if (arr == NULL) {
++        runtime_error(p_vm, "out of memory: failed to allocate the varargs array.");
++        return interpret_result_error();
++      }
++      gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(arr));
++      const bool appended = count == 0 || value_array_append_n(&arr->values, &REG_AT(bp), count);
++      gc_guard_down(p_vm->alloc->gc);
++      if (!appended) {
++        runtime_error(p_vm, "out of memory: failed to allocate the varargs array.");
++        return interpret_result_error();
++      }
++      REG_AT(ap) = OBJECT_AS_VALUE(arr);
++      break;
++    }
++    case OP_CALL_SPREAD: {
++      const uint8_t a = a_of(instruction);
++      const uint8_t b = b_of(instruction);
++      const uint8_t c = c_of(instruction);
++      frame->ip = ip;
++      if (!call_spread(p_vm,
++                       exe,
++                       reg,
++                       frame->registers_base,
++                       a,
++                       b,
++                       c == 0 ? RETURN_COUNT_DYNAMIC : (uint32_t)c - 1u)) {
++        return interpret_result_error();
++      }
++      exe = p_vm->current_execution_state;
++      reg = &exe->registers;
++      frame = &exe->call_stack.data[exe->call_stack.count - 1];
++      ip = frame->ip;
++      break;
++    }
++    case OP_CALL_SPREAD_LONG: {
++      const word2 words = JOIN_WORD(instruction);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      const uint16_t C = C_of(words);
++      frame->ip = ip;
++      if (!call_spread(p_vm,
++                       exe,
++                       reg,
++                       frame->registers_base,
++                       A,
++                       B,
++                       C == 0 ? RETURN_COUNT_DYNAMIC : (uint32_t)C - 1u)) {
++        return interpret_result_error();
++      }
++      exe = p_vm->current_execution_state;
++      reg = &exe->registers;
++      frame = &exe->call_stack.data[exe->call_stack.count - 1];
++      ip = frame->ip;
++      break;
++    }
+     case OP_PRINT: {
+       const bool p = p_of(instruction);
+       const value printed = resolve_operand(frame, reg, Alarge_of(instruction), p);
+@@ -2593,7 +2667,22 @@ static inline bool call(vm* p_vm,
+                         uint16_t p_argc,
+                         uint32_t p_retc) {
+   const object_function* fu = p_closure->function;
+-  if (p_argc < (uint32_t)(fu->arity - fu->ndefaults) || p_argc > fu->arity) {
++  // SPANS R3 (varargs): `fu f(a, rest...)` — the varargs parameter never
++  // requires an argument (it defaults to an empty array), so the floor drops
++  // it; and there is no ceiling: the trailing arguments are the rest's, as
++  // many as the caller staged. non-varargs functions keep the exact old
++  // two-sided check.
++  if (fu->has_varargs) {
++    const uint32_t floor = (uint32_t)(fu->arity - fu->ndefaults) - 1u;
++    if (p_argc < floor) {
++      runtime_error(p_vm,
++                    "invalid call to '%s': expected at least %u arguments, got: %d.",
++                    fu->name->string.chars,
++                    floor,
++                    p_argc);
++      return false;
++    }
++  } else if (p_argc < (uint32_t)(fu->arity - fu->ndefaults) || p_argc > fu->arity) {
+     if (fu->ndefaults == 0) {
+       runtime_error(
+           p_vm, "invalid call to '%s': expected %d arguments, got: %d.", fu->name->string.chars, fu->arity, p_argc);
+@@ -2626,7 +2715,22 @@ static inline bool call(vm* p_vm,
+                   p_retc);
+     return false;
+   }
+-  const uint32_t frame_top = p_callee + p_closure->function->registers;
++  // SPANS R3: a varargs frame is as tall as its arguments — the trailing
++  // arguments live at [callee + arity, callee + argc], past the compile-time
++  // register count. the body's locals overlap them by design: VA_PACK reads
++  // the window before any local is written (locals are defined before use,
++  // the uninit discipline), and mark_vm roots [0, top) either way.
++  uint32_t frame_top = p_callee + p_closure->function->registers;
++  if (p_closure->function->has_varargs && (uint32_t)p_argc + 1u > frame_top) {
++    frame_top = p_callee + p_argc + 1u;
++  }
++  if (frame_top > UINT16_MAX + 1u) {
++    // the register file is 16-bit-addressable: a varargs call can stage more
++    // arguments than the file has slots. hard error, not a clamp — a clamp
++    // would silently truncate the window VA_PACK reads.
++    runtime_error(p_vm, "invalid call to '%s': too many arguments.", fu->name->string.chars);
++    return false;
++  }
+   if (frame_top > p_reg->array.capacity) {
+     // grow with headroom so we do not realloc on every nested call
+     const uint32_t target = frame_top + (frame_top >> 1u);
+@@ -2741,6 +2845,63 @@ static inline bool call_native(vm* p_vm,
+   return true;
+ }
+ 
++// stage the spread array's elements into the argument window, then make the
++// call (SPANS R5). r[base + callee] is the callable, [base + callee + 1,
++// base + callee + fixed] the pre-staged fixed arguments, r[base + callee +
++// fixed + 1] the array to spread. the elements land at [array_at, array_at +
++// len) — overwriting the array's own slot as they go; the object stays alive
++// through the C-side pointer under a gc guard while the copy runs.
++static bool call_spread(vm* p_vm,
++                        execution_state* p_exe,
++                        register_file* p_reg,
++                        uint32_t p_base,
++                        uint16_t p_callee,
++                        uint16_t p_fixed,
++                        uint32_t p_retc) {
++  const uint32_t array_at = p_base + p_callee + p_fixed + 1u;
++  const value spread = p_reg->array.data[array_at];
++  if (!IS_VALUE_ARRAY(spread)) {
++    runtime_error(p_vm, "can only spread an array.");
++    return false;
++  }
++  object_array* arr = VALUE_AS_ARRAY(spread);
++  const uint32_t len = arr->values.count;
++  const uint32_t need = array_at + len;
++  if (need > UINT16_MAX + 1u || (uint32_t)p_fixed + len > UINT16_MAX) {
++    // the register file is 16-bit-addressable and argc is 16-bit: this is the
++    // boundary, before any slot is written.
++    runtime_error(p_vm, "too many arguments to spread.");
++    return false;
++  }
++  if (need > p_reg->array.capacity) {
++    // same contract as call()'s growth: fresh slots must read as null.
++    const uint32_t target = need + (need >> 1u);
++    const uint32_t new_capacity = target > UINT16_MAX + 1u ? UINT16_MAX + 1u : target;
++    const uint32_t initialized_uptill = p_reg->array.capacity;
++    if (!register_array_grow(&p_reg->array, new_capacity)) {
++      runtime_error(p_vm, "out of memory: failed to grow register file.");
++      return false;
++    }
++    for (uint32_t i = initialized_uptill; i < new_capacity; ++i) {
++      p_reg->array.data[i] = NULL_AS_VALUE();
++    }
++  }
++  // root the element window before anything allocates: the copied elements sit
++  // at [array_at, need), possibly above the caller's top, and call() itself
++  // allocates (register file growth) before raising top to cover them. every
++  // slot we just raised top over holds either a copied element or an old
++  // frame's dead-but-valid value — both walk fine under mark_vm.
++  if (p_reg->top < need) {
++    p_reg->top = need;
++  }
++  gc_guard_up(p_vm->alloc->gc, spread);
++  for (uint32_t i = 0; i < len; ++i) {
++    p_reg->array.data[array_at + i] = arr->values.data[i];
++  }
++  gc_guard_down(p_vm->alloc->gc);
++  return call_value(p_vm, p_exe, p_reg, p_base, p_callee, (uint16_t)(p_fixed + len), p_retc);
++}
++
+ static bool call_value(vm* p_vm,
+                        execution_state* p_exe,
+                        register_file* p_reg,
+diff --git a/tests/e2e/tests/spans/varargs/arity_errors.ok b/tests/e2e/tests/spans/varargs/arity_errors.ok
+new file mode 100644
+index 0000000..449aaca
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/arity_errors.ok
+@@ -0,0 +1,6 @@
++// the floor: fixed parameters are still required
++fu f(a, b, rest...) {
++  return a;
++}
++
++print f(1); // expect error: expected at least 2 arguments
+diff --git a/tests/e2e/tests/spans/varargs/empty_varargs.ok b/tests/e2e/tests/spans/varargs/empty_varargs.ok
+new file mode 100644
+index 0000000..7828f97
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/empty_varargs.ok
+@@ -0,0 +1,8 @@
++// zero trailing arguments: the pack is an empty array, len 0, iteration no-op
++fu count(rest...) {
++  return len(rest);
++}
++
++print count(); // expect: 0
++print count(1); // expect: 1
++print count(1, 2, 3, 4, 5); // expect: 5
+diff --git a/tests/e2e/tests/spans/varargs/errors/fixed_arity_spread_count.ok b/tests/e2e/tests/spans/varargs/errors/fixed_arity_spread_count.ok
+new file mode 100644
+index 0000000..7986a5d
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/errors/fixed_arity_spread_count.ok
+@@ -0,0 +1,5 @@
++// spreading the wrong count into a fixed-arity function is an arity error
++fu add(a, b) {
++  return a + b;
++}
++print add([1, 2, 3]...); // expect error: expected 2 arguments
+diff --git a/tests/e2e/tests/spans/varargs/errors/not_last.ok b/tests/e2e/tests/spans/varargs/errors/not_last.ok
+new file mode 100644
+index 0000000..3e68a86
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/errors/not_last.ok
+@@ -0,0 +1,5 @@
++// the varargs parameter must be the last one
++fu f(rest..., a) {
++  return a;
++}
++print f(1, 2); // expect error: must be the last
+diff --git a/tests/e2e/tests/spans/varargs/errors/spread_in_array_literal.ok b/tests/e2e/tests/spans/varargs/errors/spread_in_array_literal.ok
+new file mode 100644
+index 0000000..a7b2b97
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/errors/spread_in_array_literal.ok
+@@ -0,0 +1,7 @@
++// array literals have no spread form (yet)
++fu f(rest...) {
++  return rest;
++}
++let args = [1, 2];
++let combined = [0, args...];
++print len(combined); // expect error: only allowed as the last argument of a call
+diff --git a/tests/e2e/tests/spans/varargs/errors/spread_in_map_literal.ok b/tests/e2e/tests/spans/varargs/errors/spread_in_map_literal.ok
+new file mode 100644
+index 0000000..7264444
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/errors/spread_in_map_literal.ok
+@@ -0,0 +1,4 @@
++// map literals have no spread form either
++let args = ["k"];
++let m = {[args...]: 1};
++print len(m); // expect error: only allowed as the last argument of a call
+diff --git a/tests/e2e/tests/spans/varargs/errors/spread_let_rejected.ok b/tests/e2e/tests/spans/varargs/errors/spread_let_rejected.ok
+new file mode 100644
+index 0000000..89f43a0
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/errors/spread_let_rejected.ok
+@@ -0,0 +1,5 @@
++// '...' has no meaning in a destructuring binding list
++fu f() {
++  return 1, 2;
++}
++let (a..., b) = f(); // expect error: not allowed in this binding list
+diff --git a/tests/e2e/tests/spans/varargs/errors/spread_not_last.ok b/tests/e2e/tests/spans/varargs/errors/spread_not_last.ok
+new file mode 100644
+index 0000000..9d30863
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/errors/spread_not_last.ok
+@@ -0,0 +1,6 @@
++// a spread must be the LAST argument of a call
++fu f(a, b) {
++  return a + b;
++}
++let args = [1];
++print f(args..., 2); // expect error: only allowed as the last argument of a call
+diff --git a/tests/e2e/tests/spans/varargs/errors/two_varargs.ok b/tests/e2e/tests/spans/varargs/errors/two_varargs.ok
+new file mode 100644
+index 0000000..6c97cb3
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/errors/two_varargs.ok
+@@ -0,0 +1,6 @@
++// two varargs parameters: the first one already violates "must be last"
++// (the "only one varargs" guard is defense-in-depth behind it)
++fu f(a..., b...) {
++  return a;
++}
++print f(1); // expect error: must be the last
+diff --git a/tests/e2e/tests/spans/varargs/errors/varargs_default.ok b/tests/e2e/tests/spans/varargs/errors/varargs_default.ok
+new file mode 100644
+index 0000000..da33b96
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/errors/varargs_default.ok
+@@ -0,0 +1,5 @@
++// a varargs parameter cannot have a default — it always defaults to []
++fu f(rest... = [1]) {
++  return rest;
++}
++print f(); // expect error: cannot have a default
+diff --git a/tests/e2e/tests/spans/varargs/fixed_plus_varargs.ok b/tests/e2e/tests/spans/varargs/fixed_plus_varargs.ok
+new file mode 100644
+index 0000000..5429a32
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/fixed_plus_varargs.ok
+@@ -0,0 +1,12 @@
++// fixed parameters first, the remainder is the pack
++fu labeled(tag, values...) {
++  let mut out = tag + ":";
++  for let v : values {
++    out = out + " " + (v as str);
++  }
++  return out;
++}
++
++print labeled("nums", 1, 2, 3); // expect: nums: 1 2 3
++print labeled("none"); // expect: none:
++print labeled("x", 42); // expect: x: 42
+diff --git a/tests/e2e/tests/spans/varargs/gc_churn.ok b/tests/e2e/tests/spans/varargs/gc_churn.ok
+new file mode 100644
+index 0000000..aa7b776
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/gc_churn.ok
+@@ -0,0 +1,28 @@
++// varargs + spread under allocation pressure: the pack allocates on every
++// call, the widened frame roots the trailing arguments, and the spread copies
++// elements through a guard. maps and arrays as trailing arguments force the
++// collector to walk them mid-window.
++fu collect(tag, rest...) {
++  let out = [tag];
++  for let v : rest {
++    push(out, v);
++  }
++  return out;
++}
++
++fu churn(n) {
++  let mut acc = 0;
++  let mut i = 0;
++  while i < n {
++    let m = {"i": i, "sq": i * i};
++    let arr = [i, i + 1, i + 2];
++    let packed = collect(i, m, arr, m["sq"], [i]);
++    acc = acc + len(packed) + packed[1]["sq"];
++    let spread_back = collect(0, packed...);
++    acc = acc + len(spread_back);
++    i = i + 1;
++  }
++  return acc;
++}
++
++print churn(50); // expect: 40975
+diff --git a/tests/e2e/tests/spans/varargs/pack_is_a_local.ok b/tests/e2e/tests/spans/varargs/pack_is_a_local.ok
+new file mode 100644
+index 0000000..2712ba4
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/pack_is_a_local.ok
+@@ -0,0 +1,13 @@
++// the packed array is an ordinary local: indexable, mutable, capturable
++fu stats(nums...) {
++  print len(nums); // expect: 3
++  print nums[0]; // expect: 5
++  print nums[2]; // expect: 7
++  nums[0] = 100;
++  print nums[0]; // expect: 100
++
++  let capture = fu() { return len(nums); };
++  return capture();
++}
++
++print stats(5, 6, 7); // expect: 3
+diff --git a/tests/e2e/tests/spans/varargs/spread.ok b/tests/e2e/tests/spans/varargs/spread.ok
+new file mode 100644
+index 0000000..5961b14
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/spread.ok
+@@ -0,0 +1,28 @@
++// the spread: an array's elements become the trailing arguments
++fu sum_all(nums...) {
++  let mut total = 0;
++  for let n : nums {
++    total = total + n;
++  }
++  return total;
++}
++
++print sum_all([1, 2, 3, 4]...); // expect: 10
++print sum_all([]...); // expect: 0
++
++let args = [10, 20, 30];
++print sum_all(args...); // expect: 60
++
++// mixed: fixed arguments then the spread
++print sum_all(1, args...); // expect: 61
++print sum_all(1, 2, [3, 4]...); // expect: 10
++
++// spread into a fixed-arity function: the count must match
++fu add(a, b) {
++  return a + b;
++}
++print add([30, 12]...); // expect: 42
++
++// a computed spread source: the inner expression is any array-valued expr
++let pairs = [[1, 2], [3, 4]];
++print sum_all(pairs[0]...); // expect: 3
+diff --git a/tests/e2e/tests/spans/varargs/spread_empty_fixed.ok b/tests/e2e/tests/spans/varargs/spread_empty_fixed.ok
+new file mode 100644
+index 0000000..8a26d11
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/spread_empty_fixed.ok
+@@ -0,0 +1,11 @@
++// edge: spread of the empty array into a varargs function
++fu count(rest...) {
++  return len(rest);
++}
++
++print count([]...); // expect: 0
++
++fu two(a, b) {
++  return a * b;
++}
++print two([3, 4]...); // expect: 12
+diff --git a/tests/e2e/tests/spans/varargs/spread_not_array.ok b/tests/e2e/tests/spans/varargs/spread_not_array.ok
+new file mode 100644
+index 0000000..e3b0059
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/spread_not_array.ok
+@@ -0,0 +1,6 @@
++// spreading a non-array is a runtime error
++fu f(rest...) {
++  return len(rest);
++}
++
++print f(42...); // expect error: can only spread an array
+diff --git a/tests/e2e/tests/spans/varargs/sum_all.ok b/tests/e2e/tests/spans/varargs/sum_all.ok
+new file mode 100644
+index 0000000..2a09ea5
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/sum_all.ok
+@@ -0,0 +1,13 @@
++// the canonical varargs shape
++fu sum_all(nums...) {
++  let mut total = 0;
++  for let n : nums {
++    total = total + n;
++  }
++  return total;
++}
++
++print sum_all(1, 2, 3, 4); // expect: 10
++print sum_all(); // expect: 0
++print sum_all(7); // expect: 7
++print sum_all(1, 1, 1, 1, 1, 1, 1, 1, 1, 1); // expect: 10
+diff --git a/tests/e2e/tests/spans/varargs/varargs_with_spans.ok b/tests/e2e/tests/spans/varargs/varargs_with_spans.ok
+new file mode 100644
+index 0000000..def8543
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/varargs_with_spans.ok
+@@ -0,0 +1,18 @@
++// varargs and multi-return compose: span the pack, destructure the result
++fu minmax(nums...) {
++  let mut lo = null;
++  let mut hi = null;
++  for let n : nums {
++    if lo == null or n < lo { lo = n; }
++    if hi == null or n > hi { hi = n; }
++  }
++  return lo, hi;
++}
++
++let (lo, hi) = minmax(3, 1, 4, 1, 5, 9, 2, 6);
++print lo; // expect: 1
++print hi; // expect: 9
++
++let (lo2, hi2) = minmax();
++print lo2; // expect: null
++print hi2; // expect: null
+diff --git a/tests/e2e/tests/spans/varargs/with_defaults.ok b/tests/e2e/tests/spans/varargs/with_defaults.ok
+new file mode 100644
+index 0000000..6313f9d
+--- /dev/null
++++ b/tests/e2e/tests/spans/varargs/with_defaults.ok
+@@ -0,0 +1,23 @@
++// the R3+defaults interaction: fixed, defaulted, then the pack
++fu f(a, b = 2, c...) {
++  print a;
++  print b;
++  print len(c);
++}
++
++f(1); // expect: 1
++      // expect: 2
++      // expect: 0
++f(1, 9); // expect: 1
++         // expect: 9
++         // expect: 0
++f(1, 9, 5, 6, 7); // expect: 1
++                  // expect: 9
++                  // expect: 3
++
++fu g(a = 10, rest...) {
++  print a + len(rest);
++}
++g(); // expect: 10
++g(1); // expect: 1
++g(1, 2, 3); // expect: 3
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index c801fb3..f79e929 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -257,6 +257,18 @@ int main() {
+     let (lo, hi) = minmax(3, 9);
+     if lo != 3 { print "bad: lo"; }
+     if hi != 9 { print "bad: hi"; }
++
++    // SPANS R3/R5: varargs + spread on the script side
++    glob fu sum_all(nums...) {
++      let mut total = 0;
++      for let n : nums {
++        total = total + n;
++      }
++      return total;
++    }
++
++    if sum_all(1, 2, 3, 4) != 10 { print "bad: sum_all"; }
++    if sum_all([1, 2, 3]...) != 6 { print "bad: spread"; }
+   )";
+ 
+   ok_source source = {
+@@ -305,6 +317,26 @@ int main() {
+   assert(ok_value_is_number(minmax_result));
+   assert(ok_value_as_number(minmax_result) == 3); // the first of (3, 9)
+ 
++  // SPANS R3: ok_call on a varargs function — argument count is the host's
++  // choice, the pack is the callee's business.
++  ok_value sum_all = ok_value_null();
++
++  assert(ok_global_get(vm, ok_create_string_view("sum_all", OK_STRING_VIEW_CALCULATE_LENGTH, true), &sum_all));
++
++  ok_value sum_args[] = {
++      ok_value_number(1),
++      ok_value_number(2),
++      ok_value_number(3),
++      ok_value_number(4),
++  };
++
++  ok_value sum_result = ok_value_null();
++
++  assert(ok_call(vm, sum_all, 4, sum_args, &sum_result));
++
++  assert(ok_value_is_number(sum_result));
++  assert(ok_value_as_number(sum_result) == 10);
++
+   ok_value host_add = ok_value_null();
+ 
+   assert(ok_global_get(vm, ok_create_string_view("host_add", OK_STRING_VIEW_CALCULATE_LENGTH, true), &host_add));

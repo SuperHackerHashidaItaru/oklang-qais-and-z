@@ -1,0 +1,12 @@
+// multi-result call + destructuring in a loop (SPANS bench)
+fu pair(a, b) {
+  return b, a;
+}
+let mut acc = 0;
+let mut i = 0;
+while i < 1000000 {
+  let (x, y) = pair(i, i + 1);
+  acc = acc + x - y;
+  i = i + 1;
+}
+print acc;

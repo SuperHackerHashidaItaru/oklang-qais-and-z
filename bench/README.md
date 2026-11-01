@@ -49,6 +49,8 @@ The old stack VM is deliberately skipped for these because it does not implement
 | `map_lookup` | Lookup-heavy maps: 8 million string-key reads over a prebuilt 8-entry map; the map sibling of `array_index_sum`. | 1,000,000 passes (8M reads) | `36000000` |
 | `map_churn` | Churn-heavy maps: interleaved insert/remove (odd keys survive), exercising backward-shift deletion and slot reuse. | 200,000 | `199999` |
 | `map_for_in_sum` | Map iteration: Oklang `for let k, v :`, Lua `pairs`, Python key iteration + value lookup; 8M visited entries. | 1,000,000 passes (8M visited) | `36000000` |
+| `mr_call` | Multi-result calls: two-value return destructured per trip (`let (x, y) = pair(...)`), vs Lua multi-return and Python tuple-return + unpacking. | 1,000,000 | `1000000` |
+| `varargs_pack` | Varargs packing: `sum_all(i, i+1, i+2)` per trip (one pack allocation per call), vs Lua `...` (also packs a table) and Python `*args`. | 200,000 | `60000300000` |
 
 ## Run it
 
@@ -95,6 +97,8 @@ The multiplication/division benchmarks use a factor of `1.0000001` over two mill
 - `array_index_sum` uses explicit indexing. `array_for_in_sum` uses Oklang's `for-in`, Lua's `ipairs`, and Python's native list iteration; those are idiomatic counterparts, not identical implementation strategies.
 - Oklang uses `%g` formatting in the register VM while an older build may use `%f`. Output formatting can differ; validate numeric results, not exact text, and the single final print has negligible influence on these loop timings.
 - `map_for_in_sum` compares Oklang's two-binding form (k and v delivered by the loop op) against Lua's `pairs` (also k + v) and Python's `for key in m: m[key]` - the idiomatic way to get both key and value per trip in each language. Python's `.values()` would only be a fair comparison for a keys-discarding variant.
+- `mr_call` is the spans milestone's honesty check: the destructuring `let` binds the call's result window in place (zero MOVEs), so Oklang should hold its own against Lua's stack-slot multi-return and beat Python's tuple allocation. Sandbox preview (-O2): Oklang ~82ms vs Python ~345ms (4.2x); the Lua side needs the CI runner.
+- `varargs_pack` allocates one packed array per call, same as Lua's `{...}` table and Python's `*args` tuple - an honest comparison of the always-pack v1 semantics. Sandbox preview: Oklang ~47ms vs Python ~94ms (2x).
 - `array_for_in_sum` timings across Oklang versions: since the maps patch, the ranged for-in is lowered onto the ITER op trio (no more `len` call at loop entry). On the sandbox preview the array for-in benchmarks improved ~11-12% from this; the numbers below were taken with the new lowering.
 - The static indexed-global test measures Oklang's compile-time-resolved global slots, not dynamic name lookup. Do not interpret it as a generic comparison of global-name resolution.
 - Make sure every benchmark finishes successfully and produces the documented result before trusting timings. The runner checks command exit status through Hyperfine but does not automatically compare output values.

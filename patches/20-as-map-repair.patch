@@ -1,0 +1,67 @@
+diff --git a/src/ok.c b/src/ok.c
+index e0d9e61..1260d7e 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -246,6 +246,8 @@ static bool ok_define_temporary_types(ok* p_ok) {
+       p_ok, ok_create_string_view(" num", OK_STRING_VIEW_CALCULATE_LENGTH, true), RESERVED_1_AS_VALUE(TT_NUM), false);
+   status &= ok_global_define(
+       p_ok, ok_create_string_view(" bool", OK_STRING_VIEW_CALCULATE_LENGTH, true), RESERVED_1_AS_VALUE(TT_BOOL), false);
++  status &= ok_global_define(
++      p_ok, ok_create_string_view(" map", OK_STRING_VIEW_CALCULATE_LENGTH, true), RESERVED_1_AS_VALUE(TT_MAP), false);
+   return status;
+ }
+ 
+@@ -259,7 +261,8 @@ static top_level_declarations ok_get_top_level_declarations(ok* p_ok, bool* p_er
+                                       {ok_create_string_view("get", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+                                       {ok_create_string_view("str", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+                                       {ok_create_string_view("num", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+-                                      {ok_create_string_view("bool", OK_STRING_VIEW_CALCULATE_LENGTH, true)}};
++                                      {ok_create_string_view("bool", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
++                                      {ok_create_string_view("map", OK_STRING_VIEW_CALCULATE_LENGTH, true)}};
+ 
+   *p_error = !top_level_declarations_append_n(&decls, raw_decls, sizeof(raw_decls) / sizeof(variable_declaration));
+   return decls;
+@@ -273,7 +276,8 @@ static value_array ok_get_top_level_values(ok* p_ok, bool* p_error) {
+                                  ok_create_string_view(" get", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+                                  ok_create_string_view(" str", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+                                  ok_create_string_view(" num", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                 ok_create_string_view(" bool", OK_STRING_VIEW_CALCULATE_LENGTH, true)};
++                                 ok_create_string_view(" bool", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                                 ok_create_string_view(" map", OK_STRING_VIEW_CALCULATE_LENGTH, true)};
+ 
+   value_array vals;
+   value_array_init(&vals, &p_ok->alloc);
+diff --git a/src/okvm.c b/src/okvm.c
+index 439f202..85ac089 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -1288,6 +1288,17 @@ perform_as(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest,
+     }
+     break;
+   }
++  case TT_MAP: {
++    // a checked identity, not a conversion: nothing sensibly converts to a map.
++    // this is the doc's type check (`m as map`), the bridge to 0.5.0's real types.
++    if (IS_VALUE_MAP(p_lhs)) {
++      *dest = p_lhs;
++      res.status = RUNTIME_OK;
++    } else {
++      runtime_error(p_vm, "value is not a map.");
++    }
++    break;
++  }
+   }
+   return res;
+ }
+diff --git a/tests/e2e/tests/maps/as_map.ok b/tests/e2e/tests/maps/as_map.ok
+new file mode 100644
+index 0000000..d084d2f
+--- /dev/null
++++ b/tests/e2e/tests/maps/as_map.ok
+@@ -0,0 +1,6 @@
++let m = {"a": 1};
++let checked = m as map;
++print checked["a"]; // expect: 1
++// objects are truthy, like arrays
++print m as bool; // expect: true
++print {:} as bool; // expect: true
