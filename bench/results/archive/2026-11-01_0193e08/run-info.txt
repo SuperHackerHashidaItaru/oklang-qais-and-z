@@ -1,0 +1,10 @@
+date: 2026-11-01T05:10:50Z
+oklang_ref: master (0193e08b176b0edd20e9a50a10f53cf67be34e24)
+runner: github ubuntu-latest (x86_64)
+lua: Lua 5.4.8  Copyright (C) 1994-2025 Lua.org, PUC-Rio
+python: Python 3.14.4
+hyperfine: hyperfine 1.19.0
+protocol: warmup=5 runs=15
+benchmark_count: 36
+note: ok-register was built from source at the ref above.
+note: ok-stack is included only for benchmarks listed in stack-compatible.txt when OK_STACK is configured.
