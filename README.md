@@ -13,7 +13,6 @@ lives at `github.com/QaisAlsaid/dorg3`. this repo is only the
 process/documentation/drafting layer that makes the collaboration survive
 round boundaries.
 
-
 ## map
 
 - `Z-GUIDE.md` — the first thing Z reads in any round. who we are, how we
