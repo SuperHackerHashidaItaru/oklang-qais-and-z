@@ -322,7 +322,7 @@ index d8e959e..fee454c 100644
    }
  
 diff --git a/src/okvm.c b/src/okvm.c
-index eccaa8d..af02de5 100644
+index eccaa8d..f61f65f 100644
 --- a/src/okvm.c
 +++ b/src/okvm.c
 @@ -25,7 +25,7 @@
@@ -334,7 +334,21 @@ index eccaa8d..af02de5 100644
  static void reset_error_state(vm* p_vm);
  
  // R10: "expected 1 arguments" is rot. one helper, every arity message rides it.
-@@ -90,8 +90,18 @@ static inline void vm_consume_pending_error(execution_state* p_exe) {
+@@ -76,22 +76,23 @@ static interpret_result create_closure(
+ void interpret_result_deinit(interpret_result* p_interpret_result) {
+ }
+ 
+-// the flag must stay visible to enclosing call_native frames while a native
+-// is still unwinding (native_call_depth > 0). only the outermost C entry
+-// point (depth == 0) consumes it so a subsequent ok_call starts clean.
+-static inline void vm_consume_pending_error(execution_state* p_exe) {
+-  if (p_exe->native_call_depth == 0) {
+-    p_exe->error_pending = false;
+-  }
+-}
+-
+ // a runtime error fired somewhere under the current C entry point. callers
+ // that resume interpretation after the error point (call_native returning to
  // an OP_CALL handler) must check this and fail instead: the error lane is
  // set, and continuing would run bytecode against a reported-and-reset state.
  // the outermost C entry point (depth == 0) reports-if-unreported and consumes.
@@ -355,7 +369,7 @@ index eccaa8d..af02de5 100644
    interpret_result result = {.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
    return result;
  }
-@@ -115,6 +125,7 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+@@ -115,6 +116,7 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
    p_vm->current_execution_state->error_is_script = false;
    p_vm->current_execution_state->error_value = NULL_AS_VALUE();
    p_vm->current_execution_state->error_kind = OK_EK_INTERNAL;
@@ -363,7 +377,7 @@ index eccaa8d..af02de5 100644
    p_vm->current_execution_state->error_what[0] = '\0';
    p_vm->current_execution_state->native_call_depth = 0;
    handler_stack_init(&p_vm->current_execution_state->handlers, p_vm->alloc);
-@@ -216,6 +227,48 @@ const vm_source_entry* vm_source_of(const vm* p_vm, uint32_t p_source_id) {
+@@ -216,6 +218,48 @@ const vm_source_entry* vm_source_of(const vm* p_vm, uint32_t p_source_id) {
    return &p_vm->sources.data[p_source_id];
  }
  
@@ -412,7 +426,7 @@ index eccaa8d..af02de5 100644
  interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
    execution_state* exe = p_vm->current_execution_state;
    register_file* reg = &exe->registers;
-@@ -246,7 +299,7 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+@@ -246,7 +290,7 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
    const uint32_t hidden_start = reg->top;
    gc_guard_down(p_vm->alloc->gc);
    if (!call_value(p_vm, p_vm->current_execution_state, reg, 0, 0, 0, 0)) {
@@ -421,7 +435,7 @@ index eccaa8d..af02de5 100644
    }
    for (uint16_t i = 0; i < p_specs.top_level_values.count; ++i) {
      reg->array.data[hidden_start + i] = p_specs.top_level_values.data[i];
-@@ -254,8 +307,10 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+@@ -254,8 +298,10 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
    interpret_result interpret_result = run_until(p_vm, 0);
    if (interpret_result.status != RUNTIME_OK) {
      // uncaught at the outermost level: FAIL_PATH already printed the report;
@@ -434,7 +448,7 @@ index eccaa8d..af02de5 100644
    }
    return interpret_result;
  }
-@@ -277,7 +332,7 @@ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc) {
+@@ -277,7 +323,7 @@ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc) {
    // first ("first of span") instead of tripping the arity check.
    // single-result callees are byte-for-byte the old behavior.
    if (!call_value(p_vm, exe, reg, base, 0, p_argc, RETURN_COUNT_DYNAMIC)) {
@@ -443,7 +457,7 @@ index eccaa8d..af02de5 100644
    }
    if (exe->call_stack.count == call_depth) {
      interpret_result result = {.status = RUNTIME_OK,
-@@ -290,8 +345,11 @@ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc) {
+@@ -290,8 +336,11 @@ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc) {
      // inside a native) leave the error pending AND THE FRAMES ALIVE so an
      // outer script level can still catch it (the cross-native lane), and the
      // enclosing call_native can fail the OP_CALL instead of resuming.
@@ -456,7 +470,7 @@ index eccaa8d..af02de5 100644
      }
    }
    return result;
-@@ -1718,14 +1776,23 @@ static unwind_resume __attribute__((noinline, cold)) attempt_unwind(vm* p_vm, ui
+@@ -1718,14 +1767,23 @@ static unwind_resume __attribute__((noinline, cold)) attempt_unwind(vm* p_vm, ui
      resume.frame = fr;
      resume.ip = fr->ip;
      resume.caught = true;
@@ -481,7 +495,7 @@ index eccaa8d..af02de5 100644
  interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
    execution_state* exe = p_vm->current_execution_state;
    call_frame* frame = &exe->call_stack.data[exe->call_stack.count - 1];
-@@ -1749,13 +1816,19 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+@@ -1749,13 +1807,19 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
  #define FAIL_PATH()                                                                                                  \
    do {                                                                                                               \
      frame->ip = ip;                                                                                                 \
@@ -503,7 +517,7 @@ index eccaa8d..af02de5 100644
    } while (0)
  
    for (;;) {
-@@ -2831,6 +2904,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+@@ -2831,6 +2895,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
        exe->error_value = REG_AT(A);
        exe->error_what[0] = '\0';
        exe->error_kind = OK_EK_INTERNAL;
@@ -511,7 +525,7 @@ index eccaa8d..af02de5 100644
        FAIL_PATH();
        break;
      }
-@@ -2859,6 +2933,7 @@ void runtime_error(vm* p_vm, ok_error_kind p_kind, const char* p_fmt, ...) {
+@@ -2859,6 +2924,7 @@ void runtime_error(vm* p_vm, ok_error_kind p_kind, const char* p_fmt, ...) {
    exe->error_hard = false;
    exe->error_pending = true;
    exe->error_reported = false;
@@ -519,7 +533,7 @@ index eccaa8d..af02de5 100644
  }
  
  // RAISE (hard): the OOM lane. out of memory is not a value and not
-@@ -2875,7 +2950,10 @@ void runtime_oom(vm* p_vm, const char* p_fmt, ...) {
+@@ -2875,7 +2941,10 @@ void runtime_oom(vm* p_vm, const char* p_fmt, ...) {
    exe->error_is_script = false;
    exe->error_hard = true;
    exe->error_pending = true;
@@ -531,7 +545,7 @@ index eccaa8d..af02de5 100644
  }
  
  // the report's value half: a script `throw v` prints the value itself, in
-@@ -3023,20 +3101,6 @@ static void reset_error_state(vm* p_vm) {
+@@ -3023,20 +3092,6 @@ static void reset_error_state(vm* p_vm) {
    exe->handlers.count = 0;
  }
  
