@@ -1,0 +1,2097 @@
+diff --git a/src/ok.c b/src/ok.c
+index 4929e79..d2b9418 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -241,11 +241,11 @@ static bool ok_define_core_natives(ok* p_ok) {
+ static bool ok_define_temporary_types(ok* p_ok) {
+   bool status = true;
+   status &= ok_global_define(
+-      p_ok, ok_create_string_view(" str", OK_STRING_VIEW_CALCULATE_LENGTH, true), RESERVED_1_AS_VALUE(TT_STR), false);
++      p_ok, ok_create_string_view(" str", OK_STRING_VIEW_CALCULATE_LENGTH, true), AS_TAG_AS_VALUE(TT_STR), false);
+   status &= ok_global_define(
+-      p_ok, ok_create_string_view(" num", OK_STRING_VIEW_CALCULATE_LENGTH, true), RESERVED_1_AS_VALUE(TT_NUM), false);
++      p_ok, ok_create_string_view(" num", OK_STRING_VIEW_CALCULATE_LENGTH, true), AS_TAG_AS_VALUE(TT_NUM), false);
+   status &= ok_global_define(
+-      p_ok, ok_create_string_view(" bool", OK_STRING_VIEW_CALCULATE_LENGTH, true), RESERVED_1_AS_VALUE(TT_BOOL), false);
++      p_ok, ok_create_string_view(" bool", OK_STRING_VIEW_CALCULATE_LENGTH, true), AS_TAG_AS_VALUE(TT_BOOL), false);
+   return status;
+ }
+ 
+diff --git a/src/okast.c b/src/okast.c
+index 8bceb9d..43fa7d5 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -48,6 +48,7 @@
+   X(AST_RETURN_STATEMENT, ast_return_statement)                                                                        \
+   X(AST_THROW_STATEMENT, ast_throw_statement)                                                       \
+   X(AST_TRY_STATEMENT, ast_try_statement)                                                           \
++  X(AST_DEFER_STATEMENT, ast_defer_statement)                                                       \
+   X(AST_EOF_STATEMENT, ast_eof_statement)                                                                              \
+   X(AST_LET_DECLARATION, ast_let_declaration)                                                                          \
+   X(AST_FUNCTION_DECLARATION, ast_function_declaration)                                                                \
+@@ -1459,16 +1460,10 @@ void ast_try_statement_init(ast_try_statement* p_try, token p_token, ast_specs*
+   p_try->body = NULL;
+   p_try->catch_binding = NULL;
+   p_try->catch_body = NULL;
+-  p_try->finalize_body = NULL;
+ }
+ 
+ void ast_try_statement_deinit(ast_try_statement* p_try) {
+   allocators* alloc = p_try->statement.node.alloc;
+-  if (p_try->finalize_body != NULL) {
+-    ast_dispatch_deinit((ast_node*)p_try->finalize_body);
+-    alloc->release(alloc, p_try->finalize_body);
+-    p_try->finalize_body = NULL;
+-  }
+   if (p_try->catch_body != NULL) {
+     ast_dispatch_deinit((ast_node*)p_try->catch_body);
+     alloc->release(alloc, p_try->catch_body);
+@@ -1492,10 +1487,6 @@ bool ast_try_statement_print(const ast_try_statement* p_try) {
+     res &= printf(" catch ") > 0;
+     res &= ast_dispatch_print((ast_node*)p_try->catch_body);
+   }
+-  if (p_try->finalize_body != NULL) {
+-    res &= printf(" finalize ") > 0;
+-    res &= ast_dispatch_print((ast_node*)p_try->finalize_body);
+-  }
+   return res;
+ }
+ 
+@@ -1511,13 +1502,55 @@ string ast_try_statement_asprint(const ast_try_statement* p_try) {
+     string_deinit(&res, alloc);
+     res = joined;
+   }
+-  if (p_try->finalize_body != NULL) {
+-    string part = ast_dispatch_asprint((ast_node*)p_try->finalize_body);
+-    string joined = asprint(alloc, "%s finalize %s", res.chars, part.chars);
+-    string_deinit(&part, alloc);
+-    string_deinit(&res, alloc);
+-    res = joined;
++  return res;
++}
++
++void ast_defer_statement_init(ast_defer_statement* p_defer,
++                               token p_token,
++                               ast_call_expression* p_call,
++                               ast_function_expression* p_thunk,
++                               char* p_names,
++                               ok_string_view p_slot_name,
++                               bool p_is_err,
++                               ast_specs* p_specs) {
++  ast_statement_init(&p_defer->statement, AST_DEFER_STATEMENT, p_token, p_specs);
++  p_defer->call = p_call;
++  p_defer->thunk = p_thunk;
++  p_defer->names = p_names;
++  p_defer->slot_name = p_slot_name;
++  p_defer->is_err = p_is_err;
++}
++
++void ast_defer_statement_deinit(ast_defer_statement* p_defer) {
++  allocators* alloc = p_defer->statement.node.alloc;
++  if (p_defer->thunk != NULL) {
++    ast_dispatch_deinit((ast_node*)p_defer->thunk);
++    alloc->release(alloc, p_defer->thunk);
++    p_defer->thunk = NULL;
++  }
++  if (p_defer->call != NULL) {
++    ast_dispatch_deinit((ast_node*)p_defer->call);
++    alloc->release(alloc, p_defer->call);
++    p_defer->call = NULL;
+   }
++  if (p_defer->names != NULL) {
++    alloc->release(alloc, p_defer->names);
++    p_defer->names = NULL;
++  }
++  ast_statement_deinit(&p_defer->statement);
++}
++
++bool ast_defer_statement_print(const ast_defer_statement* p_defer) {
++  bool res = printf(p_defer->is_err ? "deferr " : "defer ") > 0;
++  res &= ast_dispatch_print((ast_node*)p_defer->call);
++  return res;
++}
++
++string ast_defer_statement_asprint(const ast_defer_statement* p_defer) {
++  allocators* alloc = p_defer->statement.node.alloc;
++  string call = ast_dispatch_asprint((ast_node*)p_defer->call);
++  string res = asprint(alloc, "%s %s", p_defer->is_err ? "deferr" : "defer", call.chars);
++  string_deinit(&call, alloc);
+   return res;
+ }
+ 
+diff --git a/src/okast.h b/src/okast.h
+index bf0aa0e..fc4a02f 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -66,6 +66,7 @@ typedef enum {
+   AST_RETURN_STATEMENT,
+   AST_THROW_STATEMENT,
+   AST_TRY_STATEMENT,
++  AST_DEFER_STATEMENT,
+   AST_EOF_STATEMENT,
+   AST_RANGE_PURE_STATEMENT_END = AST_EOF_STATEMENT,
+ 
+@@ -592,17 +593,16 @@ void ast_throw_statement_deinit(ast_throw_statement* p_throw);
+ bool ast_throw_statement_print(const ast_throw_statement* p_throw);
+ string ast_throw_statement_asprint(const ast_throw_statement* p_throw);
+ 
+-// `try { B } catch e { H }` — one node, whole statement (catch/finalize are
+-// clauses, not statements). the catch binder is an immutable local scoped to
+-// the statement; a NULL catch_binding is the bare `catch { }`. at least one
+-// of catch_body / finalize_body is present (the parser enforces it);
+-// finalize_body is NULL until patch 27 flips the clause on.
++// `try { B } catch e { H }` — one node, whole statement (catch is a clause,
++// not a statement). the catch binder is an immutable local scoped to the
++// statement; a NULL catch_binding is the bare `catch { }`. the try block
++// must be followed by a catch clause (the parser enforces it). deferred
++// cleanup is NOT a try clause — it is the `defer` statement, per scope.
+ typedef struct {
+   ast_statement statement;
+   ast_statement* body;
+   ast_binding* catch_binding;    // nullable: `catch { }` discards the value
+-  ast_statement* catch_body;     // nullable (try/finalize only)
+-  ast_statement* finalize_body;  // nullable (patch 27)
++  ast_statement* catch_body;     // nullable (never: the parser requires one)
+ } ast_try_statement;
+ 
+ void ast_try_statement_init(ast_try_statement* p_try, token p_token, ast_specs* p_specs);
+@@ -610,6 +610,38 @@ void ast_try_statement_deinit(ast_try_statement* p_try);
+ bool ast_try_statement_print(const ast_try_statement* p_try);
+ string ast_try_statement_asprint(const ast_try_statement* p_try);
+ 
++// `defer f(a, b)` / `deferr f(a, b)` — the schedule statement. the callee and
++// the arguments are evaluated AT THE DEFER SITE into hidden locals (a
++// snapshot: reassigning `a` afterwards does not change what the deferred
++// call sees), and what runs at scope exit is `thunk` — a lambda over the
++// hidden names, built by the parser and compiled by the ordinary lambda
++// path. `is_err` marks deferr: identical registration, but the scope's
++// normal exits kill the slot instead of running it (the unwind scan runs
++// both — defer replaces finalize AND errdefer, one mechanism).
++typedef struct {
++  ast_statement statement;
++  ast_call_expression* call;      // the original call: the snapshot source
++  ast_function_expression* thunk; // fu() { <hidden>(<hidden>...) } over the names
++  char* names;                    // owned, NUL-separated: the hidden name block
++                                  // the thunk's identifier tokens view into
++  ok_string_view slot_name;       // view into names: the defer slot's own name
++                                  // (the block's last entry — the thunk never
++                                  // references it, the enclosing scope declares it)
++  bool is_err;                    // deferr
++} ast_defer_statement;
++
++void ast_defer_statement_init(ast_defer_statement* p_defer,
++                               token p_token,
++                               ast_call_expression* p_call,
++                               ast_function_expression* p_thunk,
++                               char* p_names,
++                               ok_string_view p_slot_name,
++                               bool p_is_err,
++                               ast_specs* p_specs);
++void ast_defer_statement_deinit(ast_defer_statement* p_defer);
++bool ast_defer_statement_print(const ast_defer_statement* p_defer);
++string ast_defer_statement_asprint(const ast_defer_statement* p_defer);
++
+ typedef struct {
+   ast_declaration declaration;
+   ast_binding* binding; // the single-binder form (`let x = v;`), NULL in the span form
+diff --git a/src/okchunk.h b/src/okchunk.h
+index 0d32ba4..13f5750 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -268,6 +268,18 @@ typedef enum {
+                          //                          record's register, jump to its catch_ip. no record: the uncaught
+                          //                          lane (report at the outermost C boundary). bare `throw;` inside
+                          //                          a catch compiles to OP_THROW on the binder's register.
++  OP_DEFER_MARK,         // w:    (A)             -> r[A] = defer_tagged(r[A]). the compiler's only writer of
++                         //                          the defer tag: the register must hold the thunk closure
++                         //                          just built by OP_CLOSURE (an internal error otherwise — the
++                         //                          tag is never user-forgeable). a marked slot is a pending
++                         //                          defer: OP_DEFER_RUN consumes it, the unwind scan consumes
++                         //                          it, and nothing else can ever see it.
++  OP_DEFER_RUN,          // w:    (A)             -> if r[A] is defer-tagged: nil the slot (consumed — a scope
++                         //                          instance runs each defer exactly once), stage the thunk at
++                         //                          the register file top (above every compile-time register, so
++                         //                          nothing live is clobbered) and call it, discard lane. a null
++                         //                          slot is a no-op: the defer statement never executed on this
++                         //                          path (conditional defer, loop iteration that skipped it).
+ } opcode;
+ 
+ // clang-format on
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index abab88a..bf11636 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -112,6 +112,7 @@ static void scope_init(scope* p_scope, uint32_t p_checkpoint, allocators* p_allo
+   scope_registers_init(&p_scope->registers_map, p_alloc);
+   uint16_array_init(&p_scope->registers, p_alloc);
+   declarations_init(&p_scope->declarations, p_alloc);
++  defer_slots_init(&p_scope->defers, p_alloc);
+   p_scope->registers_checkpoint = p_checkpoint;
+   p_scope->captures_any = false;
+ }
+@@ -120,6 +121,7 @@ static void scope_deinit(scope* p_scope, allocators* p_alloc) {
+   scope_registers_deinit(&p_scope->registers_map);
+   uint16_array_deinit(&p_scope->registers, p_alloc);
+   declarations_deinit(&p_scope->declarations, p_alloc);
++  defer_slots_deinit(&p_scope->defers, p_alloc);
+   p_scope->registers_checkpoint = 0;
+ }
+ 
+@@ -176,6 +178,7 @@ static void compile_context_deinit(compile_context* p_context, allocators* p_all
+ ARRAY_DEFINE_DEFAULT(registers, _register, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(upvalues, upvalue, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(declarations, scope_declaration, ARRAY_DEFAULT_TYPE_DEINIT)
++ARRAY_DEFINE_DEFAULT(defer_slots, defer_slot_entry, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(scopes, scope, scope_deinit)
+ ARRAY_DEFINE_DEFAULT(compile_contexts, compile_context, compile_context_deinit)
+ ARRAY_DEFINE_DEFAULT(uint16_array, uint16_t, ARRAY_DEFAULT_TYPE_DEINIT)
+@@ -279,7 +282,41 @@ static bool begin_scope(compiler* p_compiler, ast_node* p_author) {
+   return true;
+ }
+ 
++// the scope's defer exits, for the NORMAL paths: RUN every defer slot in
++// reverse declaration order (LIFO), then KILL every deferr slot (a deferr is
++// error-path-only — its tag must not survive the scope, or a later unwind
++// scan would run a defer whose scope exited cleanly). runs BEFORE the
++// upvalue close: a defer's thunk captures the snapshot locals as open
++// upvalues, and it must read them while they still point at live registers
++// — "one step of live code before the usual cleanup".
++static bool cleanup_scope_defers(compiler* p_compiler, scope* p_scope, ast_node* p_author) {
++  for (uint32_t i = p_scope->defers.count; i-- > 0;) {
++    if (p_scope->defers.data[i].is_err) {
++      continue;
++    }
++    if (!emit_word(p_compiler, encode_oppA(OP_DEFER_RUN, false, p_scope->defers.data[i].slot), p_author)) {
++      report_oom(p_compiler, p_author);
++      return false;
++    }
++  }
++  for (uint32_t i = 0; i < p_scope->defers.count; ++i) {
++    if (!p_scope->defers.data[i].is_err) {
++      continue;
++    }
++    if (!emit_word2(p_compiler,
++                    encode_OPPABCQ(OP_LOAD_NULL, false, p_scope->defers.data[i].slot, 1, 0, 0),
++                    p_author)) {
++      report_oom(p_compiler, p_author);
++      return false;
++    }
++  }
++  return true;
++}
++
+ static bool cleanup_scope(compiler* p_compiler, scope* p_scope, ast_node* p_author) {
++  if (!cleanup_scope_defers(p_compiler, p_scope, p_author)) {
++    return false;
++  }
+   if (p_scope->captures_any) {
+     if (!emit_word(p_compiler, encode_oppA(OP_CLOSE_UPVALUES, false, p_scope->registers_checkpoint), p_author)) {
+       report_oom(p_compiler, p_author);
+@@ -462,6 +499,7 @@ static bool compile_control_flow_statement(compiler* p_compiler, ast_control_flo
+ static bool compile_return_statement(compiler* p_compiler, ast_return_statement* p_return);
+ static bool compile_throw_statement(compiler* p_compiler, ast_throw_statement* p_throw);
+ static bool compile_try_statement(compiler* p_compiler, ast_try_statement* p_try);
++static bool compile_defer_statement(compiler* p_compiler, ast_defer_statement* p_defer);
+ 
+ static bool compile_identifier(compiler* p_compiler,
+                                ast_identifier_expression* p_identifier,
+@@ -607,8 +645,11 @@ compile_result compiler_compile(compiler* p_compiler, compile_specs p_specs) {
+   bool res = compile_root(p_compiler, p_specs.root);
+   result.function = current_context(p_compiler)->function.function;
+   result.function->registers = current_context(p_compiler)->register_allocator.registers_count;
+-  res &= emit_default_return(p_compiler, (ast_node*)p_specs.root);
++  // the user top-level scope ends BEFORE the fall-off return: its defers (and
++  // its upvalue closes) are live code. ending it after the return would make
++  // the whole epilogue dead bytes — a top-level `defer` would never run.
+   res &= end_scope(p_compiler, (ast_node*)p_specs.root); // user top-level scope
++  res &= emit_default_return(p_compiler, (ast_node*)p_specs.root);
+   res &= end_scope(p_compiler, (ast_node*)p_specs.root); // hidden scope
+   res &= end_scope(p_compiler, (ast_node*)p_specs.root);
+   end_context(p_compiler);
+@@ -711,6 +752,9 @@ static bool compile_statement(compiler* p_compiler, ast_statement* p_statement)
+   case AST_TRY_STATEMENT:
+     result = compile_try_statement(p_compiler, (ast_try_statement*)p_statement);
+     break;
++  case AST_DEFER_STATEMENT:
++    result = compile_defer_statement(p_compiler, (ast_defer_statement*)p_statement);
++    break;
+   case AST_LET_DECLARATION:
+     result = compile_let_declration(p_compiler, (ast_let_declaration*)p_statement);
+     break;
+@@ -2048,6 +2092,22 @@ fail:
+ #undef CTX
+ }
+ 
++// the defer exits for every scope a jump crosses, innermost first — the
++// order a natural unwind would tear them down. break/continue cross the
++// scopes between the jump and its loop's entry (the loop's own scope is
++// cleaned at the break target, by patch_loop_context's fall-through);
++// return crosses them all. emission only — the runtime owns nothing here,
++// which is the whole point of defer: the exits are compile-time-visible.
++static bool emit_defer_exits_from_innermost(compiler* p_compiler, uint32_t p_stop_depth, ast_node* p_author) {
++  compile_context* ctx = current_context(p_compiler);
++  for (uint32_t d = ctx->scopes.count; d-- > p_stop_depth;) {
++    if (!cleanup_scope_defers(p_compiler, &ctx->scopes.data[d], p_author)) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ bool compile_control_flow_statement(compiler* p_compiler, ast_control_flow_statement* p_control) {
+   compile_context* ctx = current_context(p_compiler);
+   if (ctx->loop_stack.count == 0) {
+@@ -2058,6 +2118,12 @@ bool compile_control_flow_statement(compiler* p_compiler, ast_control_flow_state
+     return false;
+   }
+   loop_context* lctx = &ctx->loop_stack.data[ctx->loop_stack.count - 1];
++  // the crossed scopes' defers run FIRST, still inside any try region the
++  // jump is leaving (a failing defer unwinds to a live catch, same as a
++  // defer at a scope's natural end). then the records pop.
++  if (!emit_defer_exits_from_innermost(p_compiler, lctx->scope_depth + 1, (ast_node*)p_control)) {
++    return false;
++  }
+   // leaving try regions behind: pop each active record the jump crosses
+   // (records between here and the loop's entry). a stale record would
+   // address a dead window and hijack a later error into it.
+@@ -2230,6 +2296,140 @@ fail_post_jump:
+   return false;
+ }
+ 
++// `defer f(a, b)` compiles to, inside the CURRENT scope (per-scope scheduling,
++// zig style — the scope that owns the resource runs the cleanup):
++//
++//   <hidden locals " dNc", " dNa0", " dNa1", " dNs" declared in the scope>
++//   <callee evaluated into a temp, moved to " dNc">      ; the SNAPSHOT:
++//   <arg evaluated into a temp, moved to " dNa0">        ; callee and args are
++//   ...                                                  ; read NOW, not at exit
++//   CLOSURE " dNs", k[thunk]                             ; fu() { dNc(dNa0, dNa1) }
++//   DEFER_MARK " dNs"                                    ; the slot is now a pending defer
++//
++// the thunk's identifiers resolve through the scope map onto the hidden
++// locals, captured as upvalues at CLOSURE time (open, pointing at the
++// registers — the snapshot values, written exactly once). every scope exit
++// then owns its own epilogue: normal end / break / continue / return emit
++// DEFER_RUN (reverse, LIFO) + LOAD_NULL kills for deferr, and the unwind
++// scan runs everything. deferr differs ONLY by never being RUN-emitted.
++static bool compile_defer_statement(compiler* p_compiler, ast_defer_statement* p_defer) {
++  compile_context* ctx = current_context(p_compiler);
++  scope* scp = current_scope(p_compiler);
++  register_allocator* regalloc = &ctx->register_allocator;
++  ast_node* author = (ast_node*)p_defer;
++  ast_call_expression* call = p_defer->call;
++  const uint32_t argc = call->arguments.count;
++  if (argc > UINT8_MAX) {
++    error_at_noted(p_compiler,
++                   author,
++                   ok_create_string_view("too many arguments to defer.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                   ok_create_string_view("limit is: 255.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return false;
++  }
++  for (uint32_t i = 0; i < argc; ++i) {
++    if (call->arguments.data[i]->node.node_type == AST_SPREAD_EXPRESSION) {
++      error_at_noted(p_compiler,
++                     author,
++                     ok_create_string_view("spread ('...') is not allowed in a defer call.",
++                                           OK_STRING_VIEW_CALCULATE_LENGTH,
++                                           true),
++                     ok_create_string_view(
++                         "defer a function that takes the array: defer run_all(items).",
++                         OK_STRING_VIEW_CALCULATE_LENGTH,
++                         true));
++      return false;
++    }
++  }
++
++  // the thunk carries the hidden names (its identifiers view into the defer
++  // node's owned block): callee, then one per argument.
++  ast_expression_statement* thunk_body = (ast_expression_statement*)p_defer->thunk->body;
++  ast_call_expression* thunk_call = (ast_call_expression*)thunk_body->expression;
++  if (thunk_call->arguments.count != argc) {
++    CRASH_MSG(false, "defer thunk arity mismatch.");
++  }
++
++  // hidden snapshot locals, declared in the scope in declaration order
++  // (dc, da0..da{n-1}) — then the slot last, so descending register order
++  // (the unwind scan's order) IS the LIFO order across defers.
++  _register hidden[UINT8_MAX + 1];
++  {
++    variable_declaration decl = {.identifier = ast_identifier_expression_get_value(
++                                     (ast_identifier_expression*)thunk_call->callable),
++                                 .flags = VARIABLE_DECLRATION_FLAGS_NONE};
++    hidden[0] = add_local(p_compiler, decl, true, author);
++    if (!IS_REGISTER_VALID(hidden[0])) {
++      return false;
++    }
++    for (uint32_t i = 0; i < argc; ++i) {
++      variable_declaration arg_decl = {.identifier = ast_identifier_expression_get_value(
++                                           (ast_identifier_expression*)thunk_call->arguments.data[i]),
++                                       .flags = VARIABLE_DECLRATION_FLAGS_NONE};
++      hidden[i + 1] = add_local(p_compiler, arg_decl, true, author);
++      if (!IS_REGISTER_VALID(hidden[i + 1])) {
++        return false;
++      }
++    }
++  }
++  variable_declaration slot_decl = {.identifier = p_defer->slot_name, .flags = VARIABLE_DECLRATION_FLAGS_NONE};
++  _register slot = add_local(p_compiler, slot_decl, true, author);
++  if (!IS_REGISTER_VALID(slot)) {
++    return false;
++  }
++
++  // the snapshot: evaluate callee and arguments now, into temps at the
++  // allocation top (a nested call inside an argument lands its window at the
++  // temp region — the hidden locals below stay untouched), then move each
++  // into its hidden register. this is the whole "evaluate at the defer site"
++  // ruling: later reassignments of the source variables change nothing.
++  {
++    ast_expression* sources[UINT8_MAX + 1];
++    sources[0] = call->callable;
++    for (uint32_t i = 0; i < argc; ++i) {
++      sources[i + 1] = call->arguments.data[i];
++    }
++    for (uint32_t i = 0; i <= argc; ++i) {
++      const uint32_t temps = regalloc->temp_top;
++      _register temp;
++      if (!register_allocator_allocate_temp(regalloc, &temp)) {
++        report_oom(p_compiler, author);
++        return false;
++      }
++      expression_result result;
++      if (!compile_expression(p_compiler, sources[i], temp, 1, &result)) {
++        return false;
++      }
++      if (!materialize_value(p_compiler, hidden[i], result.value, author)) {
++        return false;
++      }
++      register_allocator_reset_temps(regalloc, temps);
++    }
++  }
++
++  // the thunk itself, through the ordinary lambda path: the identifiers
++  // resolve to the hidden locals just declared and capture them as upvalues.
++  // dest is the slot directly — the parent-side emission is one OP_CLOSURE.
++  {
++    expression_result result;
++    if (!compile_function_expression(p_compiler, p_defer->thunk, slot, 1, &result)) {
++      return false;
++    }
++  }
++
++  // the slot becomes a pending defer. MARK is the only writer of the tag.
++  if (!emit_word(p_compiler, encode_oppA(OP_DEFER_MARK, false, (uint16_t)slot.index), author)) {
++    report_oom(p_compiler, author);
++    return false;
++  }
++
++  defer_slot_entry entry = {.slot = (uint16_t)slot.index, .is_err = p_defer->is_err};
++  if (!defer_slots_append(&scp->defers, entry)) {
++    report_oom(p_compiler, author);
++    return false;
++  }
++  return true;
++}
++
+ // record this return path's span width against the function's agreed width
+ // (inferenc, every path must agree, checked at compile).
+ // a bare `return;` counts as one null, matching the runtime's RETURNED_NULL.
+@@ -2273,6 +2473,11 @@ static bool compile_return_statement(compiler* p_compiler, ast_return_statement*
+     return false;
+   }
+   if (count == 0) {
++    // the crossed scopes' defers run before the frame dies (a bare return
++    // still exits every scope between here and the function body)
++    if (!emit_defer_exits_from_innermost(p_compiler, 0, (ast_node*)p_return)) {
++      return false;
++    }
+     return emit_default_return(p_compiler, (ast_node*)p_return);
+   }
+   if (count == 1) {
+@@ -2309,6 +2514,13 @@ static bool compile_return_statement(compiler* p_compiler, ast_return_statement*
+       break;
+     }
+ 
++    // the value's location (constant/global/upvalue, or a temp register) is
++    // stable across the defer calls: OP_DEFER_RUN stages its thunks at the
++    // RUNTIME register top, above every compile-time register — nothing the
++    // return reads is clobbered
++    if (!emit_defer_exits_from_innermost(p_compiler, 0, (ast_node*)p_return)) {
++      return false;
++    }
+     return emit_word(p_compiler, encode_oppAe(OP_RETURN_1, false, returned.value.index, e), (ast_node*)p_return);
+   }
+   // the span path (n >= 2): each expression lands in its own consecutive temp
+@@ -2335,6 +2547,9 @@ static bool compile_return_statement(compiler* p_compiler, ast_return_statement*
+       return false;
+     }
+   }
++  if (!emit_defer_exits_from_innermost(p_compiler, 0, (ast_node*)p_return)) {
++    return false;
++  }
+   if (first.index > aprime_MAX || count > bprime_MAX) {
+     if (!emit_word2(p_compiler, encode_OPPABCQ(OP_RETURN_LONG, false, first.index, count, 0, 0), (ast_node*)p_return)) {
+       report_oom(p_compiler, (ast_node*)p_return);
+diff --git a/src/okcompiler.h b/src/okcompiler.h
+index dfb59a0..0f41408 100644
+--- a/src/okcompiler.h
++++ b/src/okcompiler.h
+@@ -130,12 +130,26 @@ typedef struct {
+ 
+ ARRAY_DECLARE_DEFAULT(declarations, scope_declaration)
+ 
++// one pending defer: which register holds its tagged thunk, and whether it
++// is a deferr (error-path-only). see scope.defers.
++typedef struct {
++  uint16_t slot;
++  bool is_err;
++} defer_slot_entry;
++
++ARRAY_DECLARE_DEFAULT(defer_slots, defer_slot_entry)
++
+ typedef struct {
+   scope_registers registers_map; // indices into the scope's registers
+   uint16_array registers;        // indices into the function's registers
+   declarations declarations;     // binder receipts, parallel to the map's values
+   uint32_t registers_checkpoint;
+   bool captures_any;
++  // the scope's pending defers, in declaration order (cleanup emits them in
++  // REVERSE — LIFO). one entry per defer statement that EXECUTED-OR-MAY-EXECUTE
++  // in this scope instance: slot = the hidden local holding the tagged thunk,
++  // is_err = deferr (normal exits kill the slot; only the unwind scan runs it).
++  defer_slots defers;
+ } scope;
+ 
+ ARRAY_DECLARE_DEFAULT(scopes, scope)
+diff --git a/src/okdebug.c b/src/okdebug.c
+index ae86c9b..0496a1b 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -87,8 +87,10 @@ static const char* const OPCODE_NAMES[] = {
+     "TRY_ENTER",
+     "TRY_EXIT",
+     "THROW",
++    "DEFER_MARK",
++    "DEFER_RUN",
+ };
+-typedef char opcode_names_in_sync[(sizeof(OPCODE_NAMES) / sizeof(OPCODE_NAMES[0]) == (size_t)OP_THROW + 1) ? 1 : -1];
++typedef char opcode_names_in_sync[(sizeof(OPCODE_NAMES) / sizeof(OPCODE_NAMES[0]) == (size_t)OP_DEFER_RUN + 1) ? 1 : -1];
+ 
+ static const char* binop_symbol(const opcode p_op) {
+   switch (p_op) {
+@@ -393,6 +395,12 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+   case OP_THROW:
+     printf("throw r%u", A);
+     break;
++  case OP_DEFER_MARK:
++    printf("defer mark r%u", Alarge_of(instruction));
++    break;
++  case OP_DEFER_RUN:
++    printf("defer run r%u", Alarge_of(instruction));
++    break;
+   case OP_RETURN:
+     if (bp == 0) {
+       printf("return r%u..top (passthrough)", ap);
+diff --git a/src/okgc.c b/src/okgc.c
+index f6997b8..1ec4e10 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -176,6 +176,12 @@ static bool mark_value(gc* p_gc, value p_value) {
+   if (IS_VALUE_STRICTLY_OBJECT(p_value) && !mark_object(p_gc, VALUE_AS_OBJECT(p_value))) {
+     return false;
+   }
++  // a pending defer holds its thunk closure in the payload — the slot is a
++  // live register from mark's point of view, so the closure must root like
++  // any other object reference (the defer tag is not OBJ_*-typed).
++  if (IS_VALUE_STRICTLY_DEFER(p_value) && !mark_object(p_gc, (object*)VALUE_AS_DEFER(p_value))) {
++    return false;
++  }
+   return true;
+ }
+ 
+diff --git a/src/oklexer.c b/src/oklexer.c
+index 90b9e5b..84211ba 100644
+--- a/src/oklexer.c
++++ b/src/oklexer.c
+@@ -183,6 +183,18 @@ static token_type lookup_identifier(lexer* p_lexer) {
+     return check_keyword(p_lexer, 1, 4, "hile", TOKEN_WHILE);
+   case 'r':
+     return check_keyword(p_lexer, 1, 5, "eturn", TOKEN_RETURN);
++  case 'd': {
++    // defer vs deferr: exact-length matches, unambiguous ("defer" is 5
++    // bytes, "deferr" is 6 — the shared prefix costs nothing)
++    if (p_lexer->current - p_lexer->start > 1 && p_lexer->start[1] == 'e') {
++      token_type t = check_keyword(p_lexer, 2, 4, "ferr", TOKEN_DEFERR);
++      if (t != TOKEN_IDENTIFIER) {
++        return t;
++      }
++      return check_keyword(p_lexer, 2, 3, "fer", TOKEN_DEFER);
++    }
++    break;
++  }
+   case 'f': {
+     if (p_lexer->current - p_lexer->start > 1) {
+       switch (p_lexer->start[1]) {
+@@ -192,8 +204,6 @@ static token_type lookup_identifier(lexer* p_lexer) {
+         return check_keyword(p_lexer, 2, 3, "lse", TOKEN_FALSE);
+       case 'o':
+         return check_keyword(p_lexer, 2, 1, "r", TOKEN_FOR);
+-      case 'i':
+-        return check_keyword(p_lexer, 2, 6, "nalize", TOKEN_FINALIZE);
+       }
+     }
+     break;
+diff --git a/src/okobject.h b/src/okobject.h
+index 4e42df6..fea2801 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -32,6 +32,10 @@
+ #define VALUE_AS_NATIVE_FUNCTION(value) ((object_native_function*)VALUE_AS_OBJECT(value))
+ #define VALUE_AS_ARRAY(value) ((object_array*)VALUE_AS_OBJECT(value))
+ #define VALUE_AS_MAP(value) ((object_map*)VALUE_AS_OBJECT(value))
++// the defer tag's payload is an object_closure*, but it is NOT an object-tagged
++// value — unwrap through the payload directly (the tag check is
++// IS_VALUE_STRICTLY_DEFER, never IS_VALUE_CLOSURE).
++#define VALUE_AS_DEFER(value) ((object_closure*)(uintptr_t)(VALUE_PAYLOAD(value)))
+ 
+ typedef struct {
+   allocators* alloc;
+diff --git a/src/okparser.c b/src/okparser.c
+index d8e959e..c551519 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -29,6 +29,7 @@ static ast_control_flow_statement* parse_control_flow_statement(parser* p_parser
+ static ast_return_statement* parse_return_statement(parser* p_parser);
+ static ast_throw_statement* parse_throw_statement(parser* p_parser);
+ static ast_try_statement* parse_try_statement(parser* p_parser);
++static ast_defer_statement* parse_defer_statement(parser* p_parser, bool p_is_err);
+ 
+ static ast_bindings_list parse_bindings_list(parser* p_parser,
+                                              ast_binding_modifiers_t p_allowed_binds,
+@@ -161,12 +162,14 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_TRY] = {NULL, NULL, PREC_NONE},
+     [TOKEN_CATCH] = {NULL, NULL, PREC_NONE},
+     [TOKEN_THROW] = {NULL, NULL, PREC_NONE},
+-    [TOKEN_FINALIZE] = {NULL, NULL, PREC_NONE},
++    [TOKEN_DEFER] = {NULL, NULL, PREC_NONE},
++    [TOKEN_DEFERR] = {NULL, NULL, PREC_NONE},
+ };
+ 
+ void parser_init(parser* p_parser, parser_specs p_specs) {
+   p_parser->panic = false;
+   p_parser->had_error = false;
++  p_parser->defer_serial = 0;
+   p_parser->source = p_specs.source;
+   p_parser->alloc = p_specs.alloc;
+   lexer_init(&p_parser->lexer, p_parser->source->code);
+@@ -906,16 +909,15 @@ ast_statement* parse_statement(parser* p_parser) {
+     return (ast_statement*)parse_throw_statement(p_parser);
+   case TOKEN_TRY:
+     return (ast_statement*)parse_try_statement(p_parser);
++  case TOKEN_DEFER:
++    return (ast_statement*)parse_defer_statement(p_parser, false);
++  case TOKEN_DEFERR:
++    return (ast_statement*)parse_defer_statement(p_parser, true);
+   case TOKEN_CATCH:
+     error_at(p_parser,
+              p_parser->previous,
+              ok_create_string_view("'catch' can only follow a 'try' block.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+     return NULL;
+-  case TOKEN_FINALIZE:
+-    error_at(p_parser,
+-             p_parser->previous,
+-             ok_create_string_view("'finalize' can only follow a 'try' or 'catch' block.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+-    return NULL;
+   case TOKEN_SEMICOLON:
+     return (ast_statement*)parse_empty_statement(p_parser);
+   case TOKEN_EOF:
+@@ -2150,8 +2152,9 @@ static ast_throw_statement* parse_throw_statement(parser* p_parser) {
+ 
+ // `try { B } catch e { H }` / `catch { H }` — the binder is optional and
+ // immutable (E3: no parens anywhere, `catch e { }` reads like every other
+-// binding in the language). at least one clause must follow the try block.
+-// the finalize clause parses to a clean not-implemented error until patch 27.
++// binding in the language). the try block must be followed by a catch
++// clause; deferred cleanup is not a clause of try — it is the `defer`
++// statement, scoped to whatever block owns the resource.
+ static ast_try_statement* parse_try_statement(parser* p_parser) {
+   allocators* alloc = p_parser->alloc;
+   token try_tok = p_parser->previous;
+@@ -2211,13 +2214,6 @@ static ast_try_statement* parse_try_statement(parser* p_parser) {
+     catch_body = (ast_statement*)handler;
+   }
+ 
+-  if (p_parser->current.type == TOKEN_FINALIZE) {
+-    error_at(p_parser,
+-             p_parser->current,
+-             ok_create_string_view("finalize blocks are not implemented yet.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+-    goto fail_all;
+-  }
+-
+   if (catch_body == NULL) {
+     error_at(p_parser,
+              p_parser->current,
+@@ -2237,7 +2233,6 @@ static ast_try_statement* parse_try_statement(parser* p_parser) {
+     try_stmt->body = (ast_statement*)body;
+     try_stmt->catch_binding = catch_binding;
+     try_stmt->catch_body = catch_body;
+-    try_stmt->finalize_body = NULL;
+     return try_stmt;
+   }
+ 
+@@ -2257,6 +2252,192 @@ fail_body:
+   return NULL;
+ }
+ 
++// a synthetic TOKEN_IDENTIFIER over an owned hidden name: the position rides
++// the defer statement's (diagnostics inside the thunk point at the defer
++// site, which is the honest author), the bytes come from the names block.
++static token hidden_name_token(token p_source, const char* p_start, uint32_t p_length) {
++  token t = p_source;
++  t.type = TOKEN_IDENTIFIER;
++  t.start = p_start;
++  t.length = p_length;
++  return t;
++}
++
++// `defer f(a, b)` / `deferr f(a, b)`: schedule the call for the enclosing
++// scope's exit. the parsed call is kept WHOLE — it is the snapshot source
++// (callee and arguments compile into hidden locals at the defer site, so
++// later reassignments of `a` are not what the deferred call sees) — and the
++// thing that runs is `thunk`: a parser-built lambda over the hidden names,
++// `fu() { " d3c"(" d3a0", " d3a1") }`, compiled by the ordinary lambda path.
++// one mechanism for both spellings: the only difference is that the scope's
++// normal exits kill a deferr slot instead of running it — the unwind scan
++// runs both. defer replaces finalize (never shipped) and covers errdefer.
++static ast_defer_statement* parse_defer_statement(parser* p_parser, bool p_is_err) {
++  allocators* alloc = p_parser->alloc;
++  token defer_tok = p_parser->previous; // 'defer' / 'deferr' already in previous
++  ast_specs s = {alloc};
++
++  ast_expression* expression = NULL;
++  if (p_parser->current.type == TOKEN_SEMICOLON || p_parser->current.type == TOKEN_EOF) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("'defer' schedules a call, like: defer close(file).",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    return NULL;
++  }
++  advance(p_parser); // first expression token into previous
++  expression = parse_expression(p_parser, PREC_NONE);
++  if (expression == NULL) {
++    return NULL;
++  }
++  if (expression->node.node_type != AST_CALL_EXPRESSION) {
++    error_at(p_parser,
++             defer_tok,
++             ok_create_string_view("'defer' schedules a call, like: defer close(file).",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    goto fail_expression;
++  }
++  ast_call_expression* call = (ast_call_expression*)expression;
++  const uint32_t argc = call->arguments.count;
++
++  // the hidden names, one owned NUL-separated block the thunk's identifier
++  // tokens view into (the defer node outlives compilation, so the views stay
++  // valid as long as the AST does; the compiler's scope maps copy their keys).
++  const uint32_t serial = p_parser->defer_serial++;
++  uint32_t total = 0;
++  char piece[48];
++  int n = snprintf(piece, sizeof(piece), " d%uc", serial);
++  total += (uint32_t)n + 1;
++  for (uint32_t i = 0; i < argc; ++i) {
++    n = snprintf(piece, sizeof(piece), " d%ua%u", serial, i);
++    total += (uint32_t)n + 1;
++  }
++  n = snprintf(piece, sizeof(piece), " d%us", serial);
++  total += (uint32_t)n + 1;
++  char* names = (char*)alloc->allocate(alloc, total);
++  if (names == NULL) {
++    error_at(p_parser,
++             defer_tok,
++             ok_create_string_view("failed to allocate memory for defer names.",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    goto fail_expression;
++  }
++
++  // the thunk: identifiers over the block, one call, one expression statement,
++  // one zero-arity function. built bottom-up; on failure everything not yet
++  // handed to a parent is released here, everything that has been is the
++  // parent's (single-owner discipline).
++  ast_expressions_list thunk_args;
++  ast_expressions_list_init(&thunk_args, alloc);
++  ok_string_view slot_name = ok_create_string_view(NULL, 0, false);
++  ast_identifier_expression* callee_ident = NULL;
++  char* cursor = names;
++  {
++    n = snprintf(cursor, (size_t)(total - (uint32_t)(cursor - names)), " d%uc", serial);
++    if (n < 0) {
++      goto fail_thunk_oom;
++    }
++    callee_ident = (ast_identifier_expression*)alloc->allocate(alloc, sizeof(ast_identifier_expression));
++    if (callee_ident == NULL) {
++      goto fail_thunk_oom;
++    }
++    ast_identifier_expression_init(callee_ident, hidden_name_token(defer_tok, cursor, (uint32_t)n), &s);
++    cursor += n + 1;
++    for (uint32_t i = 0; i < argc; ++i) {
++      n = snprintf(cursor, (size_t)(total - (uint32_t)(cursor - names)), " d%ua%u", serial, i);
++      if (n < 0 || ast_expressions_list_append(&thunk_args, NULL) == false) {
++        goto fail_thunk_oom;
++      }
++      ast_identifier_expression* arg_ident = (ast_identifier_expression*)alloc->allocate(alloc, sizeof(ast_identifier_expression));
++      if (arg_ident == NULL) {
++        thunk_args.count--; // the NULL placeholder never owned anything
++        goto fail_thunk_oom;
++      }
++      thunk_args.data[thunk_args.count - 1] = (ast_expression*)arg_ident;
++      ast_identifier_expression_init(arg_ident, hidden_name_token(defer_tok, cursor, (uint32_t)n), &s);
++      cursor += n + 1;
++    }
++    // the slot's own name: written last, never referenced by the thunk — the
++    // ENCLOSING scope declares it (the compiler reads the view off the node).
++    n = snprintf(cursor, (size_t)(total - (uint32_t)(cursor - names)), " d%us", serial);
++    slot_name = ok_create_string_view(cursor, (uint32_t)n, false);
++  }
++  {
++    ast_call_expression* thunk_call = (ast_call_expression*)alloc->allocate(alloc, sizeof(ast_call_expression));
++    if (thunk_call == NULL) {
++      goto fail_thunk_oom;
++    }
++    ast_call_expression_init(thunk_call, defer_tok, (ast_expression*)callee_ident, thunk_args, &s);
++    thunk_args.count = 0; // ownership moved into the call node
++    callee_ident = NULL;
++    ast_expression_statement* thunk_body = (ast_expression_statement*)alloc->allocate(alloc, sizeof(ast_expression_statement));
++    if (thunk_body == NULL) {
++      ast_dispatch_deinit((ast_node*)thunk_call);
++      alloc->release(alloc, thunk_call);
++      goto fail_thunk_list;
++    }
++    ast_expression_statement_init(thunk_body, defer_tok, (ast_expression*)thunk_call, &s);
++    ast_bindings_list thunk_params;
++    ast_bindings_list_init(&thunk_params, alloc);
++    ast_function_expression* thunk = (ast_function_expression*)alloc->allocate(alloc, sizeof(ast_function_expression));
++    if (thunk == NULL) {
++      ast_expression_statement_deinit(thunk_body);
++      alloc->release(alloc, thunk_body);
++      goto fail_thunk_list;
++    }
++    ast_function_expression_init(thunk, defer_tok, thunk_params, (ast_statement*)thunk_body, &s);
++
++    if (p_parser->current.type != TOKEN_SEMICOLON) {
++      error_at(p_parser,
++               p_parser->current,
++               ok_create_string_view("expected ';' after defer statement.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      ast_function_expression_deinit(thunk);
++      alloc->release(alloc, thunk);
++      goto fail_thunk_list;
++    }
++    advance(p_parser); // ';'
++
++    ast_defer_statement* defer = (ast_defer_statement*)alloc->allocate(alloc, sizeof(ast_defer_statement));
++    if (defer == NULL) {
++      error_at(p_parser,
++               defer_tok,
++               ok_create_string_view("failed to allocate memory for defer node.",
++                                     OK_STRING_VIEW_CALCULATE_LENGTH,
++                                     true));
++      ast_function_expression_deinit(thunk);
++      alloc->release(alloc, thunk);
++      goto fail_thunk_list;
++    }
++    ast_defer_statement_init(defer, defer_tok, call, thunk, names, slot_name, p_is_err, &s);
++    return defer;
++  }
++
++fail_thunk_oom:
++  error_at(p_parser,
++           defer_tok,
++           ok_create_string_view("failed to allocate memory for defer thunk.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++fail_thunk_list:
++  if (callee_ident != NULL) {
++    ast_identifier_expression_deinit(callee_ident);
++    alloc->release(alloc, callee_ident);
++  }
++  for (uint32_t i = 0; i < thunk_args.count; ++i) {
++    if (thunk_args.data[i] != NULL) {
++      ast_dispatch_deinit((ast_node*)thunk_args.data[i]);
++      alloc->release(alloc, thunk_args.data[i]);
++    }
++  }
++  ast_expressions_list_deinit(&thunk_args, alloc);
++  alloc->release(alloc, names);
++fail_expression:
++  ast_dispatch_deinit((ast_node*)expression);
++  alloc->release(alloc, expression);
++  return NULL;
++}
++
+ 
+ 
+ ast_bindings_list parse_bindings_list(parser* p_parser,
+diff --git a/src/okparser.h b/src/okparser.h
+index f6ed7c1..ce8168b 100644
+--- a/src/okparser.h
++++ b/src/okparser.h
+@@ -39,6 +39,11 @@ typedef struct {
+   token previous;
+   bool panic;
+   bool had_error;
++  // the hidden-name serial for defer statements: every `defer`/`deferr` in a
++  // compilation unit gets a unique mangle (" dNs", " dNc", " dNa<i>"), so
++  // hidden locals never collide across scopes — the parser is scope-blind,
++  // the compiler's scope maps are not, and unique names make both agree.
++  uint32_t defer_serial;
+ } parser;
+ 
+ typedef enum { PARSE_OK, PARSE_ERROR } parse_status;
+diff --git a/src/oktoken.h b/src/oktoken.h
+index 2fff777..66e62c8 100644
+--- a/src/oktoken.h
++++ b/src/oktoken.h
+@@ -84,7 +84,8 @@
+   X(TOKEN_TRY, "try")                                                                                                  \
+   X(TOKEN_CATCH, "catch")                                                                                              \
+   X(TOKEN_THROW, "throw")                                                                                              \
+-  X(TOKEN_FINALIZE, "finalize")
++  X(TOKEN_DEFER, "defer")                                                                                              \
++  X(TOKEN_DEFERR, "deferr")
+ 
+ typedef enum {
+   TOKEN_ERROR = 0,
+@@ -167,7 +168,8 @@ typedef enum {
+   TOKEN_TRY,
+   TOKEN_CATCH,
+   TOKEN_THROW,
+-  TOKEN_FINALIZE,
++  TOKEN_DEFER,
++  TOKEN_DEFERR,
+ } token_type;
+ 
+ typedef struct {
+diff --git a/src/okvalue.c b/src/okvalue.c
+index 1f1d664..e683c1d 100644
+--- a/src/okvalue.c
++++ b/src/okvalue.c
+@@ -9,6 +9,10 @@ void value_debug_print(value p_value) {
+     printf("%g", VALUE_AS_NUMBER(p_value));
+   } else if (IS_VALUE_BOOL(p_value)) {
+     printf("%s", VALUE_AS_BOOL(p_value) ? "true" : "false");
++  } else if (IS_VALUE_STRICTLY_DEFER(p_value)) {
++    // only reachable from OK_TRACE_EXECUTION register dumps and gc logging —
++    // user code can never name a defer slot
++    printf("<defer>");
+   } else if (IS_VALUE_OBJECT(p_value)) {
+     object_debug_print(VALUE_AS_OBJECT(p_value));
+   } else {
+diff --git a/src/okvalue.h b/src/okvalue.h
+index 025834a..503e99a 100644
+--- a/src/okvalue.h
++++ b/src/okvalue.h
+@@ -19,6 +19,13 @@
+  *
+  * tag = { T3, T2, T1 }
+  *
++ * the three tag bits are deliberately SCATTERED (bit 63 + bits 49-48): the
++ * payload must stay 48 bits (pointers, and INT sign-extends across all of
++ * them), bit 51 must stay set (quiet-NaN hygiene), and bit 50 must stay set
++ * so hardware-produced NaNs (0x7ff8..., bit 50 clear) fail IS_VALUE_NUMBER's
++ * exact-pattern test and stay numbers. that leaves exactly bit 63 and bits
++ * 49-48 — there is no better way to spend them.
++ *
+  *=========================*/
+ 
+ #define QNAN (UINT64_C(0x7ffc000000000000))
+@@ -39,8 +46,8 @@
+ #define TAG_OBJECT 3
+ #define TAG_INT 4
+ #define TAG_USER 5       // pointer or whatever as long as it is 48bits
+-#define TAG_RESERVED_1 6 // not used yet
+-#define TAG_RESERVED_2 7 // not used yet
++#define TAG_AS 6          // the `as` conversion type carrier (TT_STR/TT_NUM/TT_BOOL)
++#define TAG_DEFER 7       // a pending defer: the payload is an object_closure*
+ 
+ #define TAG_NULL_MASK UINT64_C(0x0000000000000000)
+ #define TAG_FALSE_MASK UINT64_C(0x0001000000000000)
+@@ -48,8 +55,8 @@
+ #define TAG_OBJECT_MASK UINT64_C(0x0003000000000000)
+ #define TAG_INT_MASK UINT64_C(0x8000000000000000)
+ #define TAG_USER_MASK UINT64_C(0x8001000000000000)
+-#define TAG_RESERVED_1_MASK UINT64_C(0x8002000000000000)
+-#define TAG_RESERVED_2_MASK UINT64_C(0x8003000000000000)
++#define TAG_AS_MASK UINT64_C(0x8002000000000000)
++#define TAG_DEFER_MASK UINT64_C(0x8003000000000000)
+ 
+ #define VALUE_TAG(v) ((v) & TAG_MASK)
+ #define VALUE_PAYLOAD(v) ((v) & PAYLOAD_MASK)
+@@ -62,16 +69,16 @@
+ #define IS_VALUE_OBJECT(v) (VALUE_TAG(v) == TAG_OBJECT_MASK)
+ #define IS_VALUE_INT(v) (VALUE_TAG(v) == TAG_INT_MASK)
+ #define IS_VALUE_USER(v) (VALUE_TAG(v) == TAG_USER_MASK)
+-#define IS_VALUE_RESERVED_1(v) (VALUE_TAG(v) == TAG_RESERVED_1_MASK)
+-#define IS_VALUE_RESERVED_2(v) (VALUE_TAG(v) == TAG_RESERVED_2_MASK)
++#define IS_VALUE_AS(v) (VALUE_TAG(v) == TAG_AS_MASK)
++#define IS_VALUE_DEFER(v) (VALUE_TAG(v) == TAG_DEFER_MASK)
+ 
+ #define IS_VALUE_STRICTLY_NULL(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_NULL(v))
+ #define IS_VALUE_STRICTLY_BOOL(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_BOOL(v))
+ #define IS_VALUE_STRICTLY_OBJECT(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_OBJECT(v))
+ #define IS_VALUE_STRICTLY_INT(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_INT(v))
+ #define IS_VALUE_STRICTLY_USER(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_USER(v))
+-#define IS_VALUE_STRICTLY_RESERVED_1(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_RESERVED_1(v))
+-#define IS_VALUE_STRICTLY_RESERVED_2(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_RESERVED_2(v))
++#define IS_VALUE_STRICTLY_AS(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_AS(v))
++#define IS_VALUE_STRICTLY_DEFER(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_DEFER(v))
+ 
+ #define NUMBER_AS_VALUE(n) number_to_value(n)
+ #define NULL_AS_VALUE() TAGGED_VALUE(TAG_NULL_MASK, 0)
+@@ -80,8 +87,12 @@
+ #define INT_AS_VALUE(i) TAGGED_VALUE(TAG_INT_MASK, int_to_payload(i))
+ #define USER_AS_VALUE(u) TAGGED_VALUE(TAG_USER_MASK, (uint64_t)u)
+ #define USER_PTR_AS_VALUE(u) TAGGED_VALUE(TAG_USER_MASK, (uint64_t)(uintptr_t)(u))
+-#define RESERVED_1_AS_VALUE(r1) TAGGED_VALUE(TAG_RESERVED_1_MASK, (uint64_t)(r1))
+-#define RESERVED_2_AS_VALUE(r2) TAGGED_VALUE(TAG_RESERVED_2_MASK, (uint64_t)(r2))
++#define AS_TAG_AS_VALUE(t) TAGGED_VALUE(TAG_AS_MASK, (uint64_t)(t))
++// the defer wrapper: ONLY the compiler's hidden defer slots ever hold one,
++// and the payload is ONLY ever an object_closure* (OP_DEFER_MARK validates).
++// a tagged value never exists anywhere else — not on the expression stack,
++// not in user-visible bindings — so no generic operation ever sees it.
++#define DEFER_AS_VALUE(c) TAGGED_VALUE(TAG_DEFER_MASK, (uint64_t)(uintptr_t)(c))
+ 
+ #define VALUE_AS_NUMBER(v) value_to_number(v)
+ #define VALUE_AS_NULL(v) NULL
+@@ -90,8 +101,7 @@
+ #define VALUE_AS_INT(v) (payload_to_int(VALUE_PAYLOAD(v)))
+ #define VALUE_AS_USER(v) VALUE_PAYLOAD(v)
+ #define VALUE_AS_USER_PTR(v) ((void*)(uintptr_t)VALUE_PAYLOAD(v))
+-#define VALUE_AS_RESERVED_1(v) VALUE_PAYLOAD(v)
+-#define VALUE_AS_RESERVED_2(v) VALUE_PAYLOAD(v)
++#define VALUE_AS_AS_TAG(v) ((uint64_t)VALUE_PAYLOAD(v))
+ 
+ typedef uint64_t value;
+ 
+diff --git a/src/okvm.c b/src/okvm.c
+index f61f65f..b319190 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -71,6 +71,16 @@ static bool call_value(vm* p_vm,
+ static object_upvalue* capture_upvalue(vm* p_vm, execution_state* p_exe, uint32_t p_register);
+ static void close_upvalues(execution_state* p_exe, uint32_t p_uptill);
+ static interpret_result run_until(vm* p_vm, uint32_t p_call_depth);
++static inline bool call(vm* p_vm,
++                        execution_state* p_exe,
++                        register_file* p_reg,
++                        object_closure* p_closure,
++                        uint32_t p_callee,
++                        uint16_t p_argc,
++                        uint32_t p_retc);
++static bool stage_defer_thunk(vm* p_vm, execution_state* p_exe, register_file* p_reg, object_closure* p_thunk);
++static void nil_pending_defers(execution_state* p_exe, uint32_t p_from, uint32_t p_uptill);
++static bool run_pending_defers(vm* p_vm, uint32_t p_from, uint32_t p_uptill);
+ static interpret_result create_closure(
+     vm* p_vm, execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_src);
+ void interpret_result_deinit(interpret_result* p_interpret_result) {
+@@ -119,6 +129,7 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->current_execution_state->has_error = false;
+   p_vm->current_execution_state->error_what[0] = '\0';
+   p_vm->current_execution_state->native_call_depth = 0;
++  p_vm->current_execution_state->defer_cascade = false;
+   handler_stack_init(&p_vm->current_execution_state->handlers, p_vm->alloc);
+   string_init(&p_vm->current_execution_state->native_error_message, NULL, 0, false, p_vm->alloc);
+   register_file_init_warm(&p_vm->current_execution_state->registers, STACK_SIZE, p_specs.alloc);
+@@ -237,6 +248,7 @@ void vm_clear_error(vm* p_vm) {
+   exe->error_reported = false;
+   exe->error_is_script = false;
+   exe->error_hard = false;
++  exe->defer_cascade = false;
+   exe->error_value = NULL_AS_VALUE();
+ }
+ 
+@@ -1433,13 +1445,13 @@ perform_as(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest,
+   res.status = RUNTIME_ERROR;
+   res.top_level_return = NULL_AS_VALUE();
+ 
+-  if (!IS_VALUE_STRICTLY_RESERVED_1(p_rhs)) {
++  if (!IS_VALUE_STRICTLY_AS(p_rhs)) {
+     runtime_error(p_vm, OK_EK_CONVERSION, "invalid type: expected a type in 'as' conversion.");
+     return res;
+   }
+   value* dest = &p_reg->array.data[base + p_dest];
+ 
+-  switch (VALUE_AS_RESERVED_1(p_rhs)) {
++  switch (VALUE_AS_AS_TAG(p_rhs)) {
+   case TT_STR: {
+     if (as_str(p_vm, p_lhs, dest)) {
+       res.status = RUNTIME_OK;
+@@ -1714,17 +1726,172 @@ static value materialize_error_value(vm* p_vm) {
+   return OBJECT_AS_VALUE(map);
+ }
+ 
++// THE DEFER MACHINERY. three pieces: stage (put a thunk closure in a fresh
++// frame at the register file top — above every compile-time register, so
++// nothing live is ever clobbered), scan (find tagged slots in a register
++// range and run them, LIFO = descending), and the unwind integration below.
++// the two entry points that run script from C: OP_DEFER_RUN's arm (the
++// dispatch loop itself resumes into the thunk, OP_CALL-style) and the scan
++// (a nested run_until that returns when the thunk's frame pops).
++
++// stage a defer thunk at the register file top and call it, discard lane.
++// arity cannot fail (the compiler built the thunk); register-file growth
++// can OOM (the hard lane). the slot was nil'd by the caller, so the closure
++// is otherwise unreferenced between that nil and top rising — guarded here,
++// the vm_interpret staging discipline.
++static bool stage_defer_thunk(vm* p_vm, execution_state* p_exe, register_file* p_reg, object_closure* p_thunk) {
++  const uint32_t staged = p_reg->top;
++  if (staged + 1u + p_thunk->function->registers > UINT16_MAX + 1u) {
++    runtime_error(p_vm, OK_EK_INTERNAL, "defer: register file exhausted.");
++    return false;
++  }
++  // the closure is rooted by the guard until call() appends its frame (the
++  // frame's own closure marking takes over), and NEVER touches the register
++  // file as a plain value: the staging slot gets a NULL. this matters — top
++  // is the DEEPEST live frame's window, which can sit below an outer frame's
++  // compile-time window (a callee reuses the caller's temp region); a thunk
++  // pointer parked at top would be swept while uncovered and then resurrected
++  // as a dangling mark when the outer frame's window re-covers the slot.
++  gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(p_thunk));
++  if (staged + 1u > p_reg->array.capacity) {
++    // same contract as call()'s growth: fresh slots must read as null
++    const uint32_t target = staged + 1u + ((staged + 1u) >> 1u);
++    const uint32_t new_capacity = target > UINT16_MAX + 1u ? UINT16_MAX + 1u : target;
++    const uint32_t initialized_uptill = p_reg->array.capacity;
++    if (!register_array_grow(&p_reg->array, new_capacity)) {
++      gc_guard_down(p_vm->alloc->gc);
++      runtime_oom(p_vm, "out of memory: failed to grow register file.");
++      return false;
++    }
++    for (uint32_t i = initialized_uptill; i < new_capacity; ++i) {
++      p_reg->array.data[i] = NULL_AS_VALUE();
++    }
++  }
++  p_reg->array.data[staged] = NULL_AS_VALUE(); // the thunk's r0: written by its body or dead
++  p_reg->top = staged + 1; // call() raises this to the thunk's full window
++  const bool called = call(p_vm, p_exe, p_reg, p_thunk, staged, 0, 0);
++  gc_guard_down(p_vm->alloc->gc);
++  if (!called) {
++    return false;
++  }
++  // flag the pushed frame (call() clears it): both entry points — OP_DEFER_RUN's
++  // arm and the unwind scan — stage through here, so every defer thunk frame
++  // carries the mark the unwinder's cascade check reads
++  p_exe->call_stack.data[p_exe->call_stack.count - 1].defer_thunk = true;
++  return true;
++}
++
++// nil every pending defer in [p_from, p_uptill) without running any — the
++// cascade lane (a defer already failed; the chain stops) and the teardown
++// lane (the frames are dying regardless). keeps the invariant that no
++// tagged value ever outlives its scope's exit, whatever the exit was.
++static void nil_pending_defers(execution_state* p_exe, uint32_t p_from, uint32_t p_uptill) {
++  for (uint32_t at = p_uptill; at-- > p_from;) {
++    if (IS_VALUE_STRICTLY_DEFER(p_exe->registers.array.data[at])) {
++      p_exe->registers.array.data[at] = NULL_AS_VALUE();
++    }
++  }
++}
++
++// run every pending defer in [p_from, p_uptill), descending — LIFO, because
++// later declarations hold higher registers (hidden locals allocate in order,
++// the slot last). a defer that fails (or anything it calls failing uncaught)
++// tears its leftover frames down, sets the cascade, nils the rest of the
++// range, and returns false: the in-flight error is the defer's now, and the
++// caller must restart its walk for it.
++static bool run_pending_defers(vm* p_vm, uint32_t p_from, uint32_t p_uptill) {
++  execution_state* exe = p_vm->current_execution_state;
++  register_file* reg = &exe->registers;
++  if (exe->error_hard) {
++    return true; // OOM: no script may run, the hard lane owns the teardown
++  }
++  if (exe->defer_cascade) {
++    nil_pending_defers(exe, p_from, p_uptill);
++    return true;
++  }
++  // root the whole scanned range for the scan's duration: top is the
++  // throw-point's watermark, which can sit below the scanned frame's full
++  // compile-time window (the walk restores it only at the park) — a tagged
++  // slot above top would be sweepable by the very collections the scan's
++  // own thunks trigger. every slot in a frame's window is null-or-valid
++  // (call()'s null-fill discipline), so raising top only ever roots more.
++  if (reg->top < p_uptill) {
++    reg->top = p_uptill;
++  }
++  for (uint32_t at = p_uptill; at-- > p_from;) {
++    value* slot = &reg->array.data[at];
++    if (!IS_VALUE_STRICTLY_DEFER(*slot)) {
++      continue;
++    }
++    object_closure* thunk = VALUE_AS_DEFER(*slot);
++    *slot = NULL_AS_VALUE(); // consumed: exactly once per scope instance
++    const uint32_t depth = exe->call_stack.count;
++    const uint32_t saved_top = reg->top;
++    if (!stage_defer_thunk(p_vm, exe, reg, thunk)) {
++      reg->top = saved_top;
++      if (!exe->error_hard) {
++        exe->defer_cascade = true;
++      }
++      nil_pending_defers(exe, p_from, at);
++      return !exe->error_hard;
++    }
++    // the thunk must run with a CLEAN propagation lane: the in-flight error
++    // is parked here in C, and call_native's post-flight error_pending check
++    // cannot tell "raised inside the native" from "pending since before the
++    // native" — without this, every deferred native call fails spuriously.
++    // has_error and error_value stay set: the in-flight value must keep
++    // rooting across the thunk's allocations either way.
++    const bool saved_pending = exe->error_pending;
++    exe->error_pending = false;
++    const interpret_result result = run_until(p_vm, depth);
++    if (result.status == RUNTIME_OK) {
++      // the thunk survived (its own catches, if any, consumed their errors):
++      // the in-flight error continues outward exactly as it was
++      exe->error_pending = saved_pending;
++    }
++    // on failure the lane holds the thunk's error: the replacement — the
++    // same rule a failing finalize had, now earned by the scan
++    reg->top = saved_top;
++    if (result.status != RUNTIME_OK) {
++      // nothing inside the thunk caught it: tear its leftover frames down
++      // exactly like the unwinder's dying-frame loop, minus their defers
++      // (cascade — they are subsequent in the chain, nilled not run).
++      while (exe->call_stack.count > depth) {
++        call_frame* dying = &exe->call_stack.data[exe->call_stack.count - 1];
++        nil_pending_defers(exe,
++                           dying->registers_base,
++                           dying->registers_base + dying->closure->function->registers);
++        close_upvalues(exe, dying->registers_base);
++        exe->call_stack.count--;
++        while (exe->handlers.count > 0 && exe->handlers.data[exe->handlers.count - 1].frame >= exe->call_stack.count) {
++          exe->handlers.count--;
++        }
++      }
++      exe->defer_cascade = true;
++      nil_pending_defers(exe, p_from, at);
++      return false;
++    }
++  }
++  return true;
++}
++
+ // THE UNWIND (D7: unwinding is a loop, not a longjmp). walk the handler
+ // stack top-down; the first live record above this run_until's depth wins:
+-// pop the frames above it (closing their upvalues and dropping their
+-// records), close upvalues above the record's floor, restore the watermark
+-// to the handler frame's full window, materialize + park the error value at
+-// the record's register, jump. records below the depth belong to outer C
+-// levels — theirs to take, not ours. entering the handler consumes the
+-// record, so a rethrow naturally finds only outer handlers. the walk itself
+-// never allocates (frames pop, upvalues close); the single allocation is the
+-// caught-value map, built under guards while the dying frames are still
+-// markable.
++// pop the frames above it (RUNNING THEIR DEFERS first — cleanup on the way
++// out is defer's whole job), consume the record, run the handler frame's
++// defers at/above the record's floor (before the catch — the finalize
++// ordering defer inherited), close upvalues above the floor, restore the
++// watermark to the handler frame's full window, materialize + park the
++// error value at the record's register, jump. records below the depth
++// belong to outer C levels — theirs to take, not ours.
++//
++// a defer failing anywhere in here returns false from its scan: the walk
++// RESTARTS for the defer's error (it replaced the in-flight one — the same
++// replacement rule finalize had). the restarted walk can only find records
++// the failing defer's own scope did not consume — the try whose catch was
++// about to run never sees a defer's failure (its record was consumed before
++// the scan), but outer trys in the same frame can. cascade: the remaining
++// defers in the dying region are nilled, not run.
+ // the resume state, returned BY VALUE: taking &frame/&ip in the FAIL_PATH
+ // macro would make the dispatch loop's hottest locals address-taken (forced
+ // to memory, measured +15% on numeric_for_sum) — the struct keeps them
+@@ -1742,23 +1909,56 @@ static unwind_resume __attribute__((noinline, cold)) attempt_unwind(vm* p_vm, ui
+     return resume; // OOM: not a value, not catchable — the hard lane already reported
+   }
+   while (exe->handlers.count > 0) {
+-    handler_record* rec = &exe->handlers.data[exe->handlers.count - 1];
+-    if (rec->frame < p_depth) {
++    // copied by value: the defer scans below run script, which can grow (and
++    // thus move) the handler array — a held pointer would dangle.
++    const handler_record taken = exe->handlers.data[exe->handlers.count - 1];
++    if (taken.frame < p_depth) {
+       break; // an outer C level's try: leave it for the outer walk
+     }
+-    // pop the frames above the handler's frame
+-    while (exe->call_stack.count > rec->frame + 1) {
++    // THE CASCADE CHECK: did this error pass through a defer invocation on
++    // its way here (raised in a thunk, or in anything a thunk called, and
++    // uncaught on the way)? then the chain stops — every scan below nils
++    // instead of running, and the error (the defer's) is what lands in the
++    // catch. a thunk frame that already returned normally is long gone, and
++    // an error from a SIBLING ordinary call never sees a live thunk frame —
++    // both correctly keep the chain alive.
++    for (uint32_t f = exe->call_stack.count; f-- > taken.frame + 1;) {
++      if (exe->call_stack.data[f].defer_thunk) {
++        exe->defer_cascade = true;
++        break;
++      }
++    }
++    // pop the frames above the handler's frame, defers first (their upvalues
++    // close after — one step of live code before the usual cleanup)
++    bool defer_failed = false;
++    while (exe->call_stack.count > taken.frame + 1) {
+       call_frame* dying = &exe->call_stack.data[exe->call_stack.count - 1];
++      if (!run_pending_defers(p_vm,
++                              dying->registers_base,
++                              dying->registers_base + dying->closure->function->registers)) {
++        defer_failed = true;
++        break;
++      }
+       close_upvalues(exe, dying->registers_base);
+       exe->call_stack.count--;
+       while (exe->handlers.count > 0 && exe->handlers.data[exe->handlers.count - 1].frame >= exe->call_stack.count) {
+         exe->handlers.count--;
+       }
+     }
++    if (defer_failed) {
++      continue; // restart the walk for the defer's error (cascade is set)
++    }
+     // consume the record and restore the handler frame
+-    const handler_record taken = *rec;
+     exe->handlers.count--;
+     call_frame* fr = &exe->call_stack.data[taken.frame];
++    // the handler frame's own region: defers at/above the floor run BEFORE
++    // the catch. a failure here restarts the walk — the consumed record (the
++    // catch this frame was about to run) never sees it, outer records may.
++    if (!run_pending_defers(p_vm,
++                            fr->registers_base + taken.floor,
++                            fr->registers_base + fr->closure->function->registers)) {
++      continue;
++    }
+     close_upvalues(exe, fr->registers_base + taken.floor);
+     exe->registers.top = fr->registers_base + fr->closure->function->registers;
+     const value error = materialize_error_value(p_vm);
+@@ -1768,10 +1968,11 @@ static unwind_resume __attribute__((noinline, cold)) attempt_unwind(vm* p_vm, ui
+     resume.ip = fr->ip;
+     resume.caught = true;
+     // consumed: the catch owns it now (and the run recovered: last_error
+-    // reads nothing once a catch took it)
++    // reads nothing once a catch took it, and the defer chain un-cascades)
+     exe->error_pending = false;
+     exe->error_reported = false;
+     exe->has_error = false;
++    exe->defer_cascade = false;
+     return resume;
+   }
+   return resume;
+@@ -2899,6 +3100,39 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       FAIL_PATH();
+       break;
+     }
++    case OP_DEFER_MARK: {
++      const uint16_t A = Alarge_of(instruction);
++      value* slot = &reg->array.data[frame->registers_base + A];
++      if (!IS_VALUE_STRICTLY_OBJECT(*slot) || object_get_type(VALUE_AS_OBJECT(*slot)) != OBJ_CLOSURE) {
++        runtime_error(p_vm, OK_EK_INTERNAL, "internal: defer mark on a non-closure.");
++        FAIL_PATH();
++        break;
++      }
++      *slot = DEFER_AS_VALUE((object_closure*)VALUE_AS_OBJECT(*slot));
++      break;
++    }
++    case OP_DEFER_RUN: {
++      const uint16_t A = Alarge_of(instruction);
++      value* slot = &reg->array.data[frame->registers_base + A];
++      if (IS_VALUE_STRICTLY_DEFER(*slot)) {
++        object_closure* thunk = VALUE_AS_DEFER(*slot);
++        *slot = NULL_AS_VALUE(); // consumed: exactly once per scope instance
++        frame->ip = ip;
++        if (!stage_defer_thunk(p_vm, exe, reg, thunk)) {
++          FAIL_PATH();
++          break;
++        }
++        // the OP_CALL refresh: the thunk's frame returned into this one, or
++        // an unwind resumed us elsewhere entirely
++        exe = p_vm->current_execution_state;
++        reg = &exe->registers;
++        frame = &exe->call_stack.data[exe->call_stack.count - 1];
++        ip = frame->ip;
++      }
++      // a null slot is the no-op: the defer statement never executed on
++      // this path (conditional defer, a loop iteration that skipped it)
++      break;
++    }
+     }
+   next_instruction:; // FAIL_PATH resumes here: the catch's first instruction is next
+   }
+@@ -3084,12 +3318,28 @@ static interpret_result __attribute__((cold)) vm_report_error(vm* p_vm) {
+ // frame's captured locals must not stay open pointing into a register file
+ // the next run reuses (stale-open-upvalue bug, found while building this
+ // lane). the handler stack empties with the frames it tags.
++// the uncaught DEFER SWEEP runs first: every frame's pending defers, innermost
++// frame first, descending registers within a frame — cleanup on the way out
++// is defer's whole job, and the report already printed (the sweep's stdout
++// lands after it). a defer failing during the sweep cascades: the rest are
++// skipped, the lane keeps the failing defer's error (ok_last_error reads the
++// replacement — the uniform rule). OOM never sweeps (the hard lane).
+ static void reset_error_state(vm* p_vm) {
+   execution_state* exe = p_vm->current_execution_state;
++  if (!exe->error_hard && exe->call_stack.count > 0) {
++    for (uint32_t f = exe->call_stack.count; f-- > 0;) {
++      call_frame* fr = &exe->call_stack.data[f];
++      (void)run_pending_defers(p_vm,
++                               fr->registers_base,
++                               fr->registers_base + fr->closure->function->registers);
++      // cascade stops the chain; the teardown below is unconditional
++    }
++  }
+   close_upvalues(exe, 0);
+   exe->registers.top = 0;
+   exe->call_stack.count = 0;
+   exe->handlers.count = 0;
++  exe->defer_cascade = false;
+ }
+ 
+ static inline bool call(vm* p_vm,
+@@ -3214,6 +3464,7 @@ static inline bool call(vm* p_vm,
+   frame.return_base = p_callee;
+   frame.return_count = p_retc;
+   frame.argc = p_argc;
++  frame.defer_thunk = false;
+   return call_stack_append(&p_exe->call_stack, frame);
+ }
+ 
+diff --git a/src/okvm.h b/src/okvm.h
+index 7bb042f..288f9ab 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -74,6 +74,12 @@ typedef struct {
+   uint32_t return_base;
+   uint32_t return_count;
+   uint16_t argc; // set by call(): the callee's own prologue (defaults ladder) reads it
++  // set by stage_defer_thunk: this frame runs a defer thunk. the unwinder
++  // reads it to decide the cascade — an error that passed through a defer
++  // invocation (raised in the thunk or anything under it, uncaught on the
++  // way) stops the defer chain: subsequent defers in the dying region are
++  // nilled, not run.
++  bool defer_thunk;
+ } call_frame;
+ 
+ ARRAY_DECLARE_DEFAULT(call_stack, call_frame)
+@@ -114,6 +120,13 @@ typedef struct {
+   bool error_pending;
+   uint32_t native_call_depth;
+ 
++  // the defer cascade: once a defer fails during an unwind scan, subsequent
++  // defers in the dying region are nilled, not run (one failure stops the
++  // cleanup chain — the failing defer's error replaces the in-flight one).
++  // cleared when a catch takes an error, when the lane is cleared, and at the
++  // final reset.
++  bool defer_cascade;
++
+   // the live try regions, vm-wide, frame-tagged (see handler_record).
+   handler_stack handlers;
+ } execution_state;
+diff --git a/tests/e2e/tests/errors/defer_basic.ok b/tests/e2e/tests/errors/defer_basic.ok
+new file mode 100644
+index 0000000..8b3c06d
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_basic.ok
+@@ -0,0 +1,31 @@
++fu close(tag) {
++  print("closing " + tag);
++  return true;
++}
++
++// runs at scope exit, LIFO within the scope
++{
++  defer close("a");
++  defer close("b");
++  defer close("c");
++  print("body"); // expect: body
++}
++// expect: closing c
++// expect: closing b
++// expect: closing a
++
++// nested scopes: inner first
++{
++  defer close("outer");
++  {
++    defer close("inner");
++    print("mid"); // expect: mid
++  }
++  // expect: closing inner
++}
++// expect: closing outer
++
++// top-level defers run at the end of the run
++defer close("top-level");
++print("end"); // expect: end
++// expect: closing top-level
+diff --git a/tests/e2e/tests/errors/defer_break_continue.ok b/tests/e2e/tests/errors/defer_break_continue.ok
+new file mode 100644
+index 0000000..9309e1c
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_break_continue.ok
+@@ -0,0 +1,33 @@
++fu close(tag) {
++  print("closing " + tag);
++  return true;
++}
++
++for let mut i = 0; i < 4; i = i + 1 {
++  {
++    defer close("iter-" + (i as str));
++    if i == 1 { continue; }
++    if i == 2 { break; }
++    print("body " + (i as str)); // expect: body 0
++  }
++  // per-iteration scope exit: the defer fires on every path out
++}
++// expect: closing iter-0
++// expect: closing iter-1
++// expect: closing iter-2
++print("after"); // expect: after
++
++// while loops: same story
++let mut n = 0;
++while n < 3 {
++  {
++    defer close("w" + (n as str));
++    n = n + 1;
++    if n == 2 { continue; }
++    if n == 3 { break; }
++  }
++}
++print("done"); // expect: closing w0
++// expect: closing w1
++// expect: closing w2
++// expect: done
+diff --git a/tests/e2e/tests/errors/defer_cascade.ok b/tests/e2e/tests/errors/defer_cascade.ok
+new file mode 100644
+index 0000000..dd0d689
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_cascade.ok
+@@ -0,0 +1,35 @@
++fu boom() {
++  throw "cleanup-failed";
++  return true;
++}
++fu ok_close() {
++  print("ok close");
++  return true;
++}
++
++// cascade at a normal scope exit: when a defer fails, subsequent
++// defers in the dying region are skipped (ok_close never runs)
++try {
++  {
++    defer ok_close();
++    defer boom();
++  }
++} catch e {
++  print("caught: " + e); // expect: caught: cleanup-failed
++}
++
++// cascade on the unwind path: the in-flight error plus a failing defer
++// -> the defer's error replaces it, the second defer is skipped, and the
++// error flies PAST the catch whose region was unwinding (its record was
++// consumed before the defers ran — the defer-owning function cannot catch
++// its own defer's failure; only handlers further out can)
++try {
++  {
++    defer ok_close();
++    defer boom();
++    throw "original";
++  }
++} catch e {
++  print("never: " + e);
++}
++// expect error: uncaught error: cleanup-failed
+diff --git a/tests/e2e/tests/errors/defer_closures_and_calls.ok b/tests/e2e/tests/errors/defer_closures_and_calls.ok
+new file mode 100644
+index 0000000..e5ced03
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_closures_and_calls.ok
+@@ -0,0 +1,58 @@
++// the deferred call is an ordinary call: lambdas, defaults,
++// multi-result callees (results discarded) all work
++fu say(what) {
++  print(what);
++  return true;
++}
++
++let counter = fu() {
++  let mut n = 0;
++  return fu() {
++    n = n + 1;
++    print("tick " + (n as str));
++    return true;
++  };
++};
++let tick = counter();
++{
++  defer tick();
++  defer tick();
++  print("armed"); // expect: armed
++}
++// expect: tick 1
++// expect: tick 2
++
++fu defaulted(a, b = "def") {
++  print("defaulted " + a + " " + b);
++  return true;
++}
++{
++  defer defaulted("x");
++}
++// expect: defaulted x def
++
++fu multi() {
++  print("multi ran");
++  return 1, 2, 3;
++}
++{
++  defer multi();
++}
++// expect: multi ran
++
++// a defer inside a defer's own cleanup (nested defers, LIFO)
++fu nested() {
++  print("nested start");
++  {
++    defer say("nested cleanup");
++  }
++  print("nested end");
++  return true;
++}
++{
++  defer nested();
++}
++// expect: nested start
++// expect: nested cleanup
++// expect: nested end
++print("fin"); // expect: fin
+diff --git a/tests/e2e/tests/errors/defer_error_replaces.ok b/tests/e2e/tests/errors/defer_error_replaces.ok
+new file mode 100644
+index 0000000..9ac4895
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_error_replaces.ok
+@@ -0,0 +1,32 @@
++fu boom() {
++  throw "cleanup-failed";
++  return true;
++}
++fu ok_close() {
++  print("ok close");
++  return true;
++}
++
++// a failing defer's error replaces the in-flight one and escapes
++// the defer-owning function: the CALLER catches it
++fu failing_cleanup() {
++  defer boom();
++  throw "original";
++}
++try {
++  failing_cleanup();
++} catch e {
++  print("outer got: " + e); // expect: outer got: cleanup-failed
++}
++
++// a defer error at a NORMAL scope exit unwinds to an enclosing
++// try in the same function (the exit point is inside its region)
++try {
++  {
++    defer boom();
++    print("body ran"); // expect: body ran
++  }
++  print("never");
++} catch e {
++  print("same-frame caught: " + e); // expect: same-frame caught: cleanup-failed
++}
+diff --git a/tests/e2e/tests/errors/defer_gc_churn.ok b/tests/e2e/tests/errors/defer_gc_churn.ok
+new file mode 100644
+index 0000000..ab9d3f3
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_gc_churn.ok
+@@ -0,0 +1,36 @@
++// defer under allocation pressure: thunks are closures, their captured
++// snapshots are upvalues, and the slots hold tagged payloads — the GC must
++// trace all of it. loops churn scopes so slots and registers get reused.
++fu consume(a, b) {
++  return len(a) + len(b);
++}
++
++let mut total = 0;
++for let mut i = 0; i < 200; i = i + 1 {
++  {
++    let sink = [];
++    let m = {:};
++    for let mut j = 0; j < 10; j = j + 1 {
++      push(sink, j * i);
++      m["k" + ((j * i) as str)] = j;
++    }
++    defer consume(sink, m);
++    total = total + len(sink);
++  }
++}
++print(total); // expect: 2000
++
++// error-path churn: every unwind scan allocates nothing, but the caught
++// maps and the thunks under aggressive collection do
++let mut caught = 0;
++for let mut i = 0; i < 100; i = i + 1 {
++  try {
++    {
++      defer consume([1, 2, 3], {"a": 1});
++      throw i;
++    }
++  } catch e {
++    caught = caught + e;
++  }
++}
++print(caught); // expect: 4950
+diff --git a/tests/e2e/tests/errors/defer_in_loop.ok b/tests/e2e/tests/errors/defer_in_loop.ok
+new file mode 100644
+index 0000000..9246765
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_in_loop.ok
+@@ -0,0 +1,31 @@
++fu close(tag) {
++  print("closing " + tag);
++  return true;
++}
++
++// the defer lives in the loop BODY's scope: one registration slot,
++// reused per iteration, consumed at every exit — the body scope ends
++// (and the defer fires) at the '}' of each iteration
++for let mut i = 0; i < 3; i = i + 1 {
++  defer close("d" + (i as str));
++  print("iter " + (i as str)); // expect: iter 0
++}
++// expect: closing d0
++// expect: iter 1
++// expect: closing d1
++// expect: iter 2
++// expect: closing d2
++print("end"); // expect: end
++
++// a break BEFORE the defer statement crosses the scope without the
++// defer ever executing: the RUN is a no-op on a null slot
++let mut n = 0;
++while n < 4 {
++  if n == 2 { break; }
++  if n == 3 { continue; }
++  defer close("late-" + (n as str));
++  n = n + 1;
++}
++// expect: closing late-0
++// expect: closing late-1
++print("done"); // expect: done
+diff --git a/tests/e2e/tests/errors/defer_not_a_call_error.ok b/tests/e2e/tests/errors/defer_not_a_call_error.ok
+new file mode 100644
+index 0000000..27084f8
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_not_a_call_error.ok
+@@ -0,0 +1,2 @@
++let x = 1;
++defer x; // expect error: 'defer' schedules a call, like: defer close(file).
+diff --git a/tests/e2e/tests/errors/defer_return.ok b/tests/e2e/tests/errors/defer_return.ok
+new file mode 100644
+index 0000000..97aba74
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_return.ok
+@@ -0,0 +1,42 @@
++fu close(tag) {
++  print("closing " + tag);
++  return true;
++}
++
++fu bare() {
++  defer close("bare");
++  return;
++}
++bare();
++// expect: closing bare
++
++fu valued() {
++  defer close("valued");
++  return 42;
++}
++print(valued()); // expect: closing valued
++// expect: 42
++
++fu two() {
++  defer close("two");
++  return 1, 2;
++}
++let (a, b) = two();
++print(a + b); // expect: closing two
++// expect: 3
++
++// defers of every enclosing scope run on return, innermost first
++fu scopes() {
++  defer close("function-scope");
++  {
++    defer close("block-scope");
++    {
++      defer close("inner-block");
++      return "returned";
++    }
++  }
++}
++print(scopes()); // expect: closing inner-block
++// expect: closing block-scope
++// expect: closing function-scope
++// expect: returned
+diff --git a/tests/e2e/tests/errors/defer_snapshot.ok b/tests/e2e/tests/errors/defer_snapshot.ok
+new file mode 100644
+index 0000000..1223832
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_snapshot.ok
+@@ -0,0 +1,34 @@
++fu note(x) {
++  print("saw " + (x as str));
++  return true;
++}
++
++// arguments are evaluated AT THE DEFER SITE: later reassignments
++// are not what the deferred call sees
++let mut x = 1;
++{
++  defer note(x);
++  x = 99;
++}
++// expect: saw 1
++
++// the callee too
++let mut f = fu(v) { print("first " + (v as str)); return true; };
++{
++  defer f(7);
++  f = fu(v) { print("second " + (v as str)); return true; };
++}
++// expect: first 7
++
++// complex argument expressions evaluate once, immediately
++let mut calls = 0;
++fu counted() {
++  calls = calls + 1;
++  return "arg";
++}
++{
++  defer note(counted());
++  print("calls so far " + (calls as str)); // expect: calls so far 1
++}
++print("calls after " + (calls as str)); // expect: saw arg
++// expect: calls after 1
+diff --git a/tests/e2e/tests/errors/defer_spread_rejected.ok b/tests/e2e/tests/errors/defer_spread_rejected.ok
+new file mode 100644
+index 0000000..ed3f4fb
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_spread_rejected.ok
+@@ -0,0 +1,5 @@
++fu sum_all(nums...) {
++  return 0;
++}
++let arr = [1, 2, 3];
++defer sum_all(arr...); // expect error: spread ('...') is not allowed in a defer call
+diff --git a/tests/e2e/tests/errors/defer_uncaught_sweep.ok b/tests/e2e/tests/errors/defer_uncaught_sweep.ok
+new file mode 100644
+index 0000000..9ab6952
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_uncaught_sweep.ok
+@@ -0,0 +1,18 @@
++fu close(tag) {
++  print("closing " + tag);
++  return true;
++}
++
++// uncaught: every frame's defers run before the interpreter gives up
++fu deep() {
++  defer close("deep");
++  throw "to the top";
++}
++fu middle() {
++  defer close("middle");
++  deep();
++}
++middle();
++// expect: closing deep
++// expect: closing middle
++// expect error: uncaught error: to the top
+diff --git a/tests/e2e/tests/errors/defer_unwind_before_catch.ok b/tests/e2e/tests/errors/defer_unwind_before_catch.ok
+new file mode 100644
+index 0000000..dcfbd35
+--- /dev/null
++++ b/tests/e2e/tests/errors/defer_unwind_before_catch.ok
+@@ -0,0 +1,43 @@
++fu close(tag) {
++  print("closing " + tag);
++  return true;
++}
++fu boom() {
++  throw "kapow";
++  return true;
++}
++
++// the defer runs BEFORE the catch that receives the error
++try {
++  {
++    defer close("guarded");
++    boom();
++  }
++  print("unreachable");
++} catch e {
++  print("caught: " + e); // expect: closing guarded
++}
++// expect: caught: kapow
++
++// defers of the try body run before the catch, LIFO
++try {
++  defer close("first");
++  defer close("second");
++  throw "x";
++} catch e {
++  print("caught x"); // expect: closing second
++}
++// expect: closing first
++// expect: caught x
++
++// across calls: the callee's defers run before the caller's catch
++fu inner() {
++  defer close("inner-cleanup");
++  throw "from-inner";
++}
++try {
++  inner();
++} catch e {
++  print("caller caught: " + e); // expect: closing inner-cleanup
++}
++// expect: caller caught: from-inner
+diff --git a/tests/e2e/tests/errors/deferr_only_on_error.ok b/tests/e2e/tests/errors/deferr_only_on_error.ok
+new file mode 100644
+index 0000000..2c6753c
+--- /dev/null
++++ b/tests/e2e/tests/errors/deferr_only_on_error.ok
+@@ -0,0 +1,55 @@
++fu close(tag) {
++  print("closing " + tag);
++  return true;
++}
++
++// deferr runs ONLY when an error unwinds out of its scope
++fu normal() {
++  deferr close("never-on-normal");
++  defer close("always");
++  print("in normal"); // expect: in normal
++}
++normal();
++// expect: closing always
++
++fu returns() {
++  deferr close("never-on-return");
++  return 1;
++}
++print(returns()); // expect: 1
++
++fu breaks() {
++  for let mut i = 0; i < 3; i = i + 1 {
++    {
++      deferr close("never-on-continue");
++      continue;
++    }
++  }
++  return 2;
++}
++print(breaks()); // expect: 2
++
++// the error path: deferr runs, LIFO interleaved with defer by
++// declaration order
++try {
++  {
++    deferr close("errdefer");
++    defer close("defer");
++    throw "x";
++  }
++} catch e {
++  print("caught"); // expect: closing defer
++}
++// expect: closing errdefer
++// expect: caught
++
++// caught INSIDE the scope: the scope exits normally, deferr does not run
++{
++  deferr close("not-this-time");
++  try {
++    throw "inner";
++  } catch e {
++    print("inner caught"); // expect: inner caught
++  }
++}
++print("done"); // expect: done
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index ca6f367..4483669 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -1022,6 +1022,46 @@ int main() {
+     std::string loud = capture_stderr([&] { assert(ok_run(host, usrc) == OK_RUNTIME_ERROR); });
+     assert(loud.find("uncaught_host.ok:1:1: error: uncaught error: to the top") != std::string::npos);
+ 
++    // --- defer (0.4.0): the uncaught sweep through the host lane ---
++    // an uncaught error still runs every frame's defers before the report:
++    // cleanup on the way out is defer's whole job, even at the C boundary.
++    {
++      std::vector<std::string> printed;
++      ok_set_print(
++          host,
++          [](void* p_ctx, ok_value p_value) {
++            auto* sink = static_cast<std::vector<std::string>*>(p_ctx);
++            if (ok_value_is_string(p_value)) {
++              ok_cstring_view text = ok_value_as_string(p_value);
++              sink->emplace_back(text.chars, std::strlen(text.chars));
++              ok_cstring_view_deinit(&text);
++            }
++          },
++          &printed);
++      const char* sweep_code = R"(
++        fu close(tag) {
++          print("closed " + tag);
++          return true;
++        }
++        fu inner() {
++          defer close("inner");
++          throw "host sweep";
++        }
++        fu outer() {
++          defer close("outer");
++          inner();
++        }
++        outer();
++      )";
++      ok_source ssrc = {sweep_code, "defer_host.ok"};
++      std::string sweep_report = capture_stderr([&] { assert(ok_run(host, ssrc) == OK_RUNTIME_ERROR); });
++      ok_set_print(host, nullptr, nullptr);
++      assert(sweep_report.find("uncaught error: host sweep") != std::string::npos);
++      assert(printed.size() == 2);
++      assert(printed[0] == "closed inner"); // innermost frame's defer first
++      assert(printed[1] == "closed outer");
++    }
++
+     ok_free(host);
+   }
+ 
+diff --git a/tests/unit/src/oktest_nan.c b/tests/unit/src/oktest_nan.c
+index d5a2ac2..68c639d 100644
+--- a/tests/unit/src/oktest_nan.c
++++ b/tests/unit/src/oktest_nan.c
+@@ -20,8 +20,8 @@ void test_tag_logical_vs_physical() {
+   TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_OBJECT), TAG_OBJECT_MASK);
+   TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_INT), TAG_INT_MASK);
+   TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_USER), TAG_USER_MASK);
+-  TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_RESERVED_1), TAG_RESERVED_1_MASK);
+-  TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_RESERVED_2), TAG_RESERVED_2_MASK);
++  TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_AS), TAG_AS_MASK);
++  TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_DEFER), TAG_DEFER_MASK);
+ }
+ 
+ static void boxed_number() {

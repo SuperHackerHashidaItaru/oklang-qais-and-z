@@ -201,23 +201,57 @@ conversion/native/internal). two perf bugs found + fixed on the way (see
 §11). 11 e2e + the cross-native embed section (throw through ok_call into
 a native that ignores the failure — the catch still takes it).
 
-**27 — finalize + C API.** finalize with NO new opcode: LOAD_TRUE/FALSE
-stage the entry path, a plain JUMP_IF re-dispatches after F, and the record
-covering F reuses the park register — an error in F replaces the in-flight
-error by construction (E4 as ruled: runs on normal + unwind, before catch).
-`try {} finalize {}` (no catch) re-raises outward. the C boundary (E7):
-`ok_last_error` (your thrown value as-is, or a fresh {:kind:,:what:} map —
-unrooted, root it or allocate before fetching), `ok_clear_error`,
-`ok_native_throw` (the host's value crosses into script catch as itself;
-ok_native_error stays as message sugar). host-caught ok_call failures print
-NOTHING — the uncaught-to-top report stays ok_run's. 6 finalize e2e + embed
-sections (rooting contract demonstrated with ok_root, the E7 silent lane,
-native_throw, the ok_run report).
+**27 — the C boundary (v2: finalize is dead).** Q killed finalize before
+it ever shipped ("kill finally, embrace defer — why have 2 ways if one do
+trick"), so this patch is the C API alone: `ok_last_error` (your thrown
+value as-is, or a fresh {:kind:,:what:} map — unrooted, root it or
+allocate before fetching), `ok_clear_error`, `ok_native_throw` (the host's
+value crosses into script catch as itself; ok_native_error stays as message
+sugar). host-caught ok_call failures print NOTHING — the uncaught-to-top
+report stays ok_run's (E7). embed sections: the rooting contract
+demonstrated with ok_root, the E7 silent lane, native_throw, the ok_run
+report lane.
 
-gates: e2e 333x4 (305 at master, +28), unit x3, embed x3, spans corpus
-disassembles identically (verified by diff). v1 limitations deliberate and
-listed in §11 (break/continue/return skip finalize; REPL per-line
-numbering; rethrow's report span). honest note: my first cut of the
-ok_last_error embed test violated the API's own rooting contract under
-aggressive GC — the test now demonstrates the contract instead of dodging
-it, which is the review-worthy part.
+**28 — defer + deferr.** the replacement, zig style: per-scope scheduling,
+one mechanism for both spellings. `defer f(args)` snapshots the callee and
+arguments into hidden locals AT THE DEFER SITE (Go semantics — later
+reassignment changes nothing), and the thing that runs is a parser-built
+thunk (`fu() { dc(da0, ...) }` over the hidden names) compiled by the
+ordinary lambda path — defaults, closures, multi-result callees all work
+for free. the schedule itself is the LAST NaN-box tag (TAG_DEFER, payload
+= the thunk closure, only ever lives in the hidden slot, GC traces it).
+normal exits are COMPILE-TIME visible: scope end / break / continue /
+return / fall-off emit OP_DEFER_RUN (LIFO) + LOAD_NULL kills for deferr.
+unwind exits are the runtime's: the unwinder scans register ranges (each
+dying frame, then the handler region above the record's floor), running
+tagged slots descending — thunks stage at the register-file top under a gc
+guard, with the error lane parked in C so deferred NATIVES don't trip
+call_native's pending-error check (found via `defer len(...)` + throw).
+deferr registers identically but is never RUN-emitted: only the unwind
+scan executes it (errdefer). cascade: an error that passed through a defer
+invocation stops the chain (remaining defers nilled), and the defer's
+error replaces the in-flight one — the catch whose region was unwinding
+never sees it, handlers further out can. uncaught: the final reset sweeps
+every frame's defers before tearing down. THREE real bugs found and fixed
+on the way, all aggressive-GC/ASan finds: (1) the main chunk's user scope
+ended AFTER the fall-off return — top-level defers (and upvalue closes)
+were dead code; (2) the staging slot parked the thunk as a plain value at
+`top`, which can sit BELOW an outer frame's compile-time window — the
+swept closure gets resurrected as a dangling mark when the outer window
+re-covers it (staging writes NULL now, the guard + the pushed frame root
+the closure); (3) the scan range could extend above the throw-point's
+watermark — unrooted mid-scan slots (the scan now roots its whole range).
+14 e2e + an embed section (the uncaught sweep through ok_run with print
+routing). bytecode note: the spans corpus is byte-identical EXCEPT
+top-level CLOSE_UPVALUES now precedes the fall-off RETURN (was dead code,
+now live — that's fix (1), visible and intended).
+
+gates: e2e 342x4 (328 at patch 27, +14), unit x3, embed x3, fresh-apply
+of the whole series 23-28 on clean master verified (sequential apply,
+pedantic-clean build, 342/342). v1 limitations, deliberate: no spread in
+a defer call (clean compile error, wrap it in a function that takes the
+array); defer errors are catchable by handlers further out — including
+same-frame ones that lexically enclose a NORMAL-exit defer (the ruled
+exception: the catch whose region was unwinding never sees one); a defer
+failing during the uncaught sweep is dropped after the report (nothing
+left to consume it).

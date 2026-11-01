@@ -1,8 +1,9 @@
 # ERRORS — 0.4.0, ruled and shipped (patches 23-27 awaiting hand-application)
 
-status: RULED (E1-E8, session 24) + IMPLEMENTED. carries D7 (DECISIONS.md — lua-model values + bytecode
-handler frames, NO setjmp/longjmp) forward against the code as it stands
-after spans (master 0193e08), and adds what D7 didn't have to decide: the
+status: RULED (E1-E8, session 24; E4 SUPERSEDED session 25) + IMPLEMENTED. carries D7
+(DECISIONS.md — lua-model values + bytecode handler frames, NO setjmp/longjmp) forward
+against the code as it stands after spans (master 0193e08), and adds what D7 didn't
+have to decide: the
 diagnostics half (Q's ask this session: pull `error_at*` into this round —
 "they are bad and been broken since i wrote them"), gcc-style notes with
 secondary locations, the source-ownership fix (the vm-retains-one-source
@@ -47,12 +48,17 @@ try {
   until classes exist (D7's argument: don't front-load class decisions).
 - `throw;` — bare rethrow, legal only inside a catch block: rethrows the
   in-flight value without touching it.
-- `finalize { }` — semantics RULED here (E4), implementation may trail:
-  runs on normal exit AND on unwind, before the catch / before the error
-  continues outward. never swallows: an error raised inside a finalizing
-  block replaces the in-flight one (same as every mainstream precedent).
-  the token stays reserved until its patch lands — the parser's current
-  "error handling is not implemented yet" message keeps covering it.
+- `defer f(args);` — SUPERSEDED E4 (session 25: "kill finally, embrace
+  defer — why have 2 ways if one do trick?!"). scoped cleanup, zig style:
+  the callee and arguments are evaluated AT THE DEFER SITE (a snapshot),
+  and the call runs when its scope exits — normal end, break, continue,
+  return, fall-off, and every unwind. LIFO within a scope. a failing defer
+  cascades: subsequent defers in the dying region are skipped, its error
+  replaces any in-flight one, and the catch whose region was unwinding
+  never sees it (handlers further out can).
+- `deferr f(args);` — the errdefer spelling (Q's name): registers
+  identically, but only the unwind runs it. a scope that exits normally —
+  including an error caught INSIDE it — kills the slot without calling.
 - **every runtime error is catchable**: type errors, arity, out of bounds,
   bad keys, div by zero — all funnel through the same lane as `throw`.
   ONE exception: **out of memory is not a value and not catchable** — you
@@ -369,10 +375,14 @@ identically throughout.
   reset-to-zero); caught-value synthesis per E2; e2e: throw-any-value,
   nested try, try-in-loop, throw across native ok_call boundary,
   catch-then-recover-then-continue, uncaught report; embed section.
-- **patch 27 — finalize + C API.** finalize blocks per E4 ruling;
-  `ok_last_error` / `ok_clear_error` / `ok_native_throw`; host-caught
-  auto-print removal per E7; embed section. (if E4 rules finalize out of
-  0.4.0, this patch shrinks to the C API and the token stays reserved.)
+- **patch 27 — the C boundary.** `ok_last_error` / `ok_clear_error` /
+  `ok_native_throw`; host-caught auto-print removal per E7; embed section.
+  (v2: the E4-shrink scenario happened — finalize was killed before
+  shipping, defer replaces it, and the C API stands alone in this patch.)
+- **patch 28 — defer + deferr.** per-scope scheduling: snapshot hidden
+  locals + a parser-built thunk compiled by the lambda path + the last
+  NaN-box tag (TAG_DEFER) + OP_DEFER_MARK / OP_DEFER_RUN + the unwind
+  scan + the cascade + the uncaught sweep + deferr. see §12.
 
 ## 8. what we are NOT doing (and the oklangcpp verdict)
 
@@ -403,11 +413,14 @@ identically throughout.
   no ambiguity (`catch` is a keyword; after it an identifier is always the
   binder). shipped as `catch e { }` and bare `catch { }`. `catch mut e`
   errors with its own message ("the catch binder is immutable.").
-- **E4 finalize**: RULED ship-if-budget — the budget held. shipped in
-  patch 27 exactly as ruled: runs on normal completion AND on unwind, BEFORE
-  the catch (the C++ destructor model); an error raised inside finalize
-  replaces the in-flight one; `try {} finalize {}` without catch re-raises
-  outward.
+- **E4 finalize**: RULED ship-if-budget — the budget held, it shipped —
+  and then Q SUPERSEDED it before application (session 25): "kill finally,
+  embrace defer. why have 2 ways if one do trick?!" finalize never landed
+  on any branch of record; patch 27 v2 is the C API alone and patch 28 is
+  defer/deferr. the semantics E4 ruled carry over BY DESIGN: defer runs on
+  normal completion AND on unwind, before the catch; an error raised inside
+  a defer replaces the in-flight one; break/continue/return — which skipped
+  finalize in v1 — now run defers (that gap was half the reason defer won).
 - **E5 columns**: RULED byte-based, tab = 1 column, caret aligns to raw
   text. shipped — plus one deviation from the draft's letter: the column is
   now STORED in `ok_line_info` (computed by the lexer from a tracked line
@@ -516,3 +529,115 @@ identically throughout.
 - the debug/disassembler infrastructure: the RLE assert and the
   instruction-level line printing it already does become the test
   fixtures for patch 23/24.
+
+## 12. defer (patch 28) — the design record
+
+Q's ruling, verbatim in spirit: **"kill finally, embrace defer. why have 2
+ways if one do trick?!"** — and the two design asks: keep it BORING
+("special local variable with a special value, a closure to call"), and
+per-scope, zig style ("i take it back, zig style is superior — why function
+level where they accumulate"). both held to the letter.
+
+### the mechanism (all of it boring, all of it reused)
+
+- **the snapshot**: `defer f(a, b)` compiles the callee and each argument
+  into hidden locals of the CURRENT scope (`" d7c"`, `" d7a0"`, `" d7a1"` —
+  the leading-space trick, unique per statement via a parser serial).
+  evaluation happens AT THE DEFER SITE: reassigning `a` afterwards changes
+  nothing (Go semantics, the "expression should definitely evaluate" ask).
+- **the thunk**: the parser builds `fu() { " d7c"(" d7a0", " d7a1") }` —
+  identifiers over the hidden names, one call, zero parameters — and the
+  compiler compiles it through the ORDINARY lambda path. everything a call
+  can do (defaults, closures over outer mutables, multi-result callees in
+  the discard lane) is inherited for free. the thunk's identifiers resolve
+  through the scope map onto the snapshot locals and capture them as
+  upvalues — open, pointing at the registers, closed by the scope's
+  ordinary CLOSE_UPVALUES after the defers run ("one step of live code
+  before the usual cleanup" — Q's ordering, kept exactly).
+- **the slot + the tag**: one more hidden local (`" d7s"`) holds the thunk,
+  wrapped by OP_DEFER_MARK in the LAST NaN-box tag (TAG_DEFER — see §13).
+  the tagged value exists ONLY in that slot: not on the expression stack,
+  not in user bindings, not even in the runtime's staging window. a null
+  slot is a defer that never executed on this path (a loop iteration that
+  skipped the statement) — OP_DEFER_RUN is a no-op on it.
+- **the normal exits are compile-time visible** (Q's core ask — "no one can
+  skip it, not continue, break"): scope end, break, continue, return
+  (all three return shapes), and falling off the end each emit
+  OP_DEFER_RUN per pending defer, reverse declaration order (LIFO), plus
+  LOAD_NULL kills for deferr slots. NO new exit path exists that the
+  compiler doesn't own — which is precisely why defer replaces finalize
+  (finalize v1 skipped break/continue/return).
+- **the unwind exits are the runtime's**: the unwinder scans register
+  ranges for tagged slots — each dying frame's full window (innermost
+  frame first), then the handler frame's region at/above the record's
+  floor — running them descending (LIFO falls out of register order:
+  later declarations hold higher registers). thunks stage at the
+  register-file top under a gc guard; the error lane is PARKED in C while
+  a thunk runs (see the native bug below); a thunk's error tears its
+  leftover frames down, sets the cascade, and the walk restarts for it.
+- **deferr** is the same machinery with one flag: never RUN-emitted. only
+  the unwind scan executes it. a scope that exits normally — including an
+  error caught INSIDE it — kills the slot without calling.
+
+### the semantics (the part to review hardest)
+
+- **LIFO everywhere**: within a scope, reverse declaration; across scopes,
+  innermost first; across frames, dying frames before the handler's
+  region. defer + deferr interleave by declaration position.
+- **cascade**: an error that passed through a defer invocation (raised in
+  the thunk or anything under it) stops the chain — remaining defers in
+  the dying region are nilled, not run. the failing defer's error REPLACES
+  any in-flight one (finalize's E4 rule, inherited).
+- **who can catch a defer's failure**: NOT the catch whose region was
+  unwinding (its record is consumed before the scan runs — Q's "can't be
+  catched by the function where defer was made", holding exactly where it
+  was intuited). handlers further OUT — same frame or caller — can. the
+  one deliberate deviation from Q's phrasing: a defer failing at a NORMAL
+  scope exit inside a lexically-enclosing try IS catchable by it (the
+  exit point is inside its region); special-casing that would cost a frame
+  flag on the hot return path for a corner — declined, documented here.
+- **uncaught**: before the final reset, every frame's defers run (the
+  sweep), the report having already printed. a defer failing during the
+  sweep is dropped — nothing is left to consume it.
+- **OOM**: the hard lane, no defers (the interpreter cannot be trusted to
+  build error values, let alone run script, when allocation failed).
+
+### the three bugs the gates caught (all fixed, all worth Q's eyes)
+
+1. **the main chunk's epilogue was dead code.** compile_impl emitted the
+   fall-off RETURN before ending the user top-level scope — so a
+   top-level `defer` (and any top-level upvalue close) compiled to bytes
+   after the return. fix: end the user scope first. this is the ONE
+   bytecode-visible change to existing programs: top-level CLOSE_UPVALUES
+   now precedes the fall-off RETURN (verified: the spans corpus is
+   otherwise byte-identical).
+2. **the staging resurrection.** staging a thunk wrote its pointer at the
+   register-file top — but `top` is the DEEPEST live frame's window,
+   which can sit below an outer frame's compile-time window (a callee
+   reuses the caller's temp region). the parked pointer got swept while
+   uncovered, then re-covered — and marked — as a dangling reference by
+   the outer frame's window. fix: staging writes NULL; the closure roots
+   through the gc guard and then the pushed frame's own marking. a plain
+   thunk value now never exists outside its slot and the frame.
+3. **the deferred-native spurious failure.** call_native's post-flight
+   check ("a native returning after an inner error must fail its
+   OP_CALL") cannot tell an error raised DURING the native from one
+   pending since BEFORE it — and the unwind scan always runs with an
+   error in flight. every `defer len(x)`-shaped defer failed spuriously
+   and turned catches into uncaughts. fix: the scan parks the propagation
+   flag in C (has_error/error_value stay, for rooting) while the thunk
+   runs. found by `defer len([1, 2, 3])` + throw — the section 2 test
+   that wouldn't die.
+
+### v1 notes (deliberate)
+
+- no spread in a defer call (`defer f(xs...)` is a clean compile error —
+  wrap it: `defer run_all(xs)`). the thunk's call COULD carry it; the
+  snapshot would need the parser to mirror the spread into the thunk, and
+  nothing needs it yet.
+- a defer in a braceless position: there is no braceless if in oklang, so
+  a conditional defer always lives in the branch's own scope and runs at
+  that scope's exit — immediate, and correct. the null-slot RUN path (a
+  break that crosses a scope before its defer statement) is tested.
+- tree-sitter: defer_stmt/deferr_stmt added, finalize removed, corpus
+  updated (the sandbox has no tree-sitter CLI — regenerate on your side).
