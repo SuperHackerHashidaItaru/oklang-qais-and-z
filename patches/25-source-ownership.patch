@@ -1,0 +1,872 @@
+diff --git a/cli/src/main.c b/cli/src/main.c
+index 3fdb50b..cc2cca0 100644
+--- a/cli/src/main.c
++++ b/cli/src/main.c
+@@ -29,6 +29,11 @@ int main(int argc, char** argv) {
+ 
+ void repl(ok* p_ok) {
+   char line[1024];
++  // the line buffer is REUSED across iterations: without retention, a
++  // leftover function from line N would report against line M's text (or a
++  // dangling stack frame). retention keeps every line's source alive for
++  // ok_free — the REPL's excerpts always name the right text.
++  ok_retain_source(p_ok, true);
+   for (;;) {
+     printf("> ");
+     if (!fgets(line, sizeof(line), stdin)) {
+@@ -36,7 +41,6 @@ void repl(ok* p_ok) {
+       break;
+     }
+     ok_source source;
+-    source.from = OK_FROM_REPL;
+     source.code = line;
+     source.path = "stdin";
+     ok_result result = ok_run(p_ok, source);
+@@ -58,7 +62,6 @@ void run_file(ok* p_ok, const char* p_path) {
+     exit(1);
+   }
+   ok_source source;
+-  source.from = OK_FROM_FILE;
+   source.code = src;
+   source.path = p_path;
+   ok_result result = ok_run(p_ok, source);
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index d872b1a..05d9443 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -25,10 +25,23 @@ typedef enum {
+ // creates parser + compiler + vm, sets up pipline
+ ok* ok_create(ok_specs p_specs);
+ void ok_free(ok* p_ok);
+-// runs the pipline with the source.
+-// takes ownership of code and path strings.
++// runs the pipline with the source. reads p_source.code and p_source.path
++// during the call — your buffers are yours (the old "takes ownership" comment
++// was fiction: nobody took ownership, and the REPL passes a reused stack
++// buffer). the path is interned (copied) so diagnostics can name it after the
++// run; the code is copied only when source retention is on.
+ ok_result ok_run(ok* p_ok, ok_source p_source);
+ 
++// opt-in source retention (default OFF). when on, every ok_run's source is
++// copied into the ok state and kept alive until ok_free: runtime reports can
++// excerpt source text for functions compiled by EARLIER runs (the REPL's
++// stack buffers, embedders that ok_call leftovers after ok_run returns).
++// when off, the code is borrowed for the duration of each ok_run call only —
++// later reports on leftover functions print the right path and line:col,
++// without the excerpt, and never read freed memory. embedders that never
++// reuse buffers past ok_run pay nothing.
++void ok_retain_source(ok* p_ok, bool p_retain);
++
+ /* values */
+ typedef uint64_t ok_value;
+ 
+diff --git a/include/ok/ok_source.h b/include/ok/ok_source.h
+index 73aff6b..783a9f1 100644
+--- a/include/ok/ok_source.h
++++ b/include/ok/ok_source.h
+@@ -7,24 +7,27 @@
+ extern "C" {
+ #endif // __cplusplus
+ 
+-typedef enum {
+-  OK_FROM_FILE,
+-  OK_FROM_REPL,
+-} ok_from;
+-
++// the source handed to ok_run. ok reads both fields during the call — your
++// buffers are yours. the path is interned (copied) internally so diagnostics
++// can name it after the run; the code is copied too, but only when source
++// retention is on (ok_retain_source).
+ typedef struct {
+-  ok_from from;
+   const char* code;
+   const char* path;
+ } ok_source;
+ 
+ // a location in the source. `offset` is the FILE-ABSOLUTE byte offset of
+-// the token start (computed by pointer arithmetic at token creation —
+-// columns are DERIVED from it by scanning back to the previous newline,
+-// never stored). `line` is the 1-based line from the lexer's counter.
++// the token start and `column` its 1-based column (both computed by pointer
++// arithmetic at token creation — never by an accumulated counter). the
++// column is STORED here (not derived at render time) so runtime reports can
++// print `path:line:col` even after the source text itself is gone (an
++// expired borrow: right coordinates, no excerpt — degraded, never wrong).
++// byte = char until the 0.8.0 utf8 pass, which revisits exactly the lexer's
++// column computation and the renderer's caret spacing.
+ typedef struct {
+   uint32_t offset;
+   uint32_t line;
++  uint32_t column;
+ } ok_line_info;
+ 
+ typedef struct {
+diff --git a/src/ok.c b/src/ok.c
+index e0d9e61..bfcb2e7 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -329,8 +329,42 @@ ok* ok_create(ok_specs p_specs) {
+   return okay;
+ }
+ 
++static ok_result ok_run_inner(ok* p_ok, uint32_t p_source_id);
++
++// stamp the freshly compiled tree with its source id: the main function and
++// every nested proto (function protos live in the constants arrays). proto
++// trees grow downward only (a proto's constants are built before it is
++// finished), so the walk terminates. shared protos stamp idempotently.
++static void stamp_source_ids(object_function* p_function, uint32_t p_source_id) {
++  p_function->chunk.source_id = p_source_id;
++  for (uint32_t i = 0; i < p_function->chunk.constants.count; ++i) {
++    const value v = p_function->chunk.constants.data[i];
++    if (IS_VALUE_FUNCTION(v)) {
++      stamp_source_ids(VALUE_AS_FUNCTION(v), p_source_id);
++    }
++  }
++}
++
+ ok_result ok_run(ok* p_ok, ok_source p_source) {
++  // register the run's source: the path is interned (ok's copy, so chunks
++  // can name it after the run), the code is borrowed for the call — or
++  // ok's copy when retention is on (ok_retain_source). the borrow expires
++  // at every exit below, one way or another.
++  const uint32_t source_id = vm_begin_source(&p_ok->vm, p_source.code, p_source.path);
++  if (source_id == VM_SOURCE_UNSTAMPED) {
++    return OK_INIT_ERROR;
++  }
+   p_ok->source = p_source;
++  const ok_result result = ok_run_inner(p_ok, source_id);
++  vm_end_source(&p_ok->vm, source_id);
++  return result;
++}
++
++void ok_retain_source(ok* p_ok, bool p_retain) {
++  p_ok->vm.retain_source = p_retain;
++}
++
++static ok_result ok_run_inner(ok* p_ok, uint32_t p_source_id) {
+   parser parser;
+   parser_specs specs = {.alloc = &p_ok->alloc, .source = &p_ok->source};
+   parser_init(&parser, specs);
+@@ -363,6 +397,10 @@ ok_result ok_run(ok* p_ok, ok_source p_source) {
+   if (compile_result.status != COMPILE_OK) {
+     return OK_COMPILE_ERROR;
+   }
++  // the freshly compiled tree remembers its source: main + every nested
++  // proto (they live in the constants arrays). runtime reports read it back
++  // per frame — the R8 fix.
++  stamp_source_ids(compile_result.function, p_source_id);
+   if (p_ok->dump_bytecode) {
+     gc_pause(&p_ok->gc);
+     disassembler disassembler;
+@@ -378,7 +416,7 @@ ok_result ok_run(ok* p_ok, ok_source p_source) {
+   }
+   interpret_specs interpret_specs;
+   interpret_specs.function = compile_result.function;
+-  interpret_specs.source = &p_ok->source;
++  interpret_specs.source_id = p_source_id;
+   if (!gc_guard_up(&p_ok->gc, OBJECT_AS_VALUE(compile_result.function))) {
+     return OK_INIT_ERROR;
+   }
+diff --git a/src/okchunk.c b/src/okchunk.c
+index 907933d..44ac880 100644
+--- a/src/okchunk.c
++++ b/src/okchunk.c
+@@ -32,6 +32,7 @@ void chunk_init(chunk* p_chunk, allocators* p_alloc) {
+   identifiers_init(&p_chunk->identifiers, p_alloc);
+   value_array_init(&p_chunk->constants, p_alloc);
+   source_info_init(&p_chunk->source_info, p_alloc);
++  p_chunk->source_id = VM_SOURCE_UNSTAMPED;
+ }
+ 
+ void chunk_deinit(chunk* p_chunk) {
+diff --git a/src/okchunk.h b/src/okchunk.h
+index ee3789e..ae15c9e 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -412,11 +412,22 @@ static inline uint16_t Q_of(const word2 p_word) {
+   return (p_word & Q_MASK) >> Q_LOFFSET;
+ }
+ 
++// chunks reference their source by index into the vm's source table (the
++// table lives in okvm.h). UINT32_MAX = unstamped: a chunk compiled outside
++// ok_run — none today, but the guard keeps reports honest instead of
++// accidentally reading entry 0.
++#define VM_SOURCE_UNSTAMPED UINT32_MAX
++
+ struct chunk {
+   code code;
+   identifiers identifiers;
+   value_array constants;
+   source_info source_info;
++  // index into the vm's source table (VM_SOURCE_UNSTAMPED until ok_run
++  // stamps the freshly compiled tree). runtime reports read the frame's
++  // chunk's entry — the R8 fix: A-compiled functions called during source
++  // B's run report A's path with A's line numbers.
++  uint32_t source_id;
+   allocators* alloc;
+ };
+ 
+diff --git a/src/okdiag.c b/src/okdiag.c
+index 0f81b65..4a25ea2 100644
+--- a/src/okdiag.c
++++ b/src/okdiag.c
+@@ -4,15 +4,13 @@
+ 
+ #include "okdiag.h"
+ 
+-// the source line containing p_offset. returns the line's bounds and, through
+-// p_column, the 1-based column of p_offset within it (byte = char for now,
+-// tab = one column, see okdiag_column_of — the whole utf8 story is one
+-// function away by design).
++// the source line containing p_offset. returns the line's bounds; the caret
++// column comes from the span (precomputed by the lexer — the utf8 pass
++// revisits exactly that computation and this spacing).
+ static void line_bounds_of(const char* p_source,
+                            const ok_span* p_span,
+                            uint32_t* p_line_start,
+-                           uint32_t* p_line_end,
+-                           uint32_t* p_column) {
++                           uint32_t* p_line_end) {
+   uint32_t line_start = p_span->offset;
+   while (line_start > 0 && p_source[line_start - 1] != '\n') {
+     line_start--;
+@@ -23,25 +21,16 @@ static void line_bounds_of(const char* p_source,
+   }
+   *p_line_start = line_start;
+   *p_line_end = line_end;
+-  *p_column = p_span->offset - line_start + 1;
+-}
+-
+-uint32_t okdiag_column_of(const char* p_source, uint32_t p_offset) {
+-  uint32_t column = 1;
+-  while (p_offset > 0 && p_source[p_offset - 1] != '\n') {
+-    p_offset--;
+-    column++;
+-  }
+-  return column;
+ }
+ 
+ ok_span ok_span_of_token(const token* p_token) {
+   ok_span span;
+   span.line = p_token->line_info.line;
++  span.column = p_token->line_info.column;
+   span.offset = p_token->line_info.offset;
+   // TOKEN_ERROR's .start is the message (create_error_token), not source: the
+-  // old renderer printed the message as if it were the line. one caret on the
+-  // offending byte instead — the offset is already right.
++  // old renderer printed the message as if it were the line. one caret on
++  // the offending byte instead — the offset is already right.
+   span.length = p_token->type == TOKEN_ERROR ? 1 : p_token->length;
+   return span;
+ }
+@@ -57,8 +46,7 @@ void okdiag_print_header(const char* p_path, uint32_t p_line, uint32_t p_column,
+ static bool print_snippet(const char* p_source, const ok_span* p_span, uint32_t p_width) {
+   uint32_t line_start = 0;
+   uint32_t line_end = 0;
+-  uint32_t column = 0;
+-  line_bounds_of(p_source, p_span, &line_start, &line_end, &column);
++  line_bounds_of(p_source, p_span, &line_start, &line_end);
+   if (fprintf(stderr, "    %*u | ", (int)p_width, p_span->line) < 0) {
+     return false;
+   }
+@@ -71,7 +59,9 @@ static bool print_snippet(const char* p_source, const ok_span* p_span, uint32_t
+   if (fprintf(stderr, "    %*s | ", (int)p_width, "") < 0) {
+     return false;
+   }
+-  for (uint32_t i = 1; i < column; ++i) {
++  // a tab counts as one column and renders raw — the caret aligns to the raw
++  // text, which is the only thing that stays true on every terminal.
++  for (uint32_t i = 1; i < p_span->column; ++i) {
+     if (fputc(' ', stderr) == EOF) {
+       return false;
+     }
+@@ -118,18 +108,16 @@ report_status okdiag_report(bool* p_panic,
+   *p_had_error = true;
+   const char* kind = p_severity == REPORT_SEVERITY_WARN ? "warning" : "error";
+ 
+-  // a real span always has line >= 1. no span (or no source text to excerpt
+-  // from): the message still prints, degraded but never wrong.
++  // a real span always has line >= 1. with source text: header + snippet.
++  // without: located header only (right coordinates, no excerpt).
++  // no span at all: bare `error: message`, like the no-location lanes.
+   const ok_span* span = p_span != NULL && p_span->line > 0 ? p_span : NULL;
+-  if (p_source == NULL) {
+-    span = NULL;
+-  }
+ 
+   uint32_t width = 1;
+   if (span != NULL) {
+     width = digits_of(span->line);
+   }
+-  if (p_note != NULL && p_note->has_span && p_source != NULL) {
++  if (p_note != NULL && p_note->has_span && p_note->span.line > 0) {
+     const uint32_t note_width = digits_of(p_note->span.line);
+     if (note_width > width) {
+       width = note_width;
+@@ -137,11 +125,9 @@ report_status okdiag_report(bool* p_panic,
+   }
+ 
+   // header. EOF spans point one past the last byte and say so, on the message
+-  // line (gcc's placement), instead of rendering nothing. no span: bare
+-  // `error: message`, like the old no-location runtime path.
++  // line (gcc's placement), instead of rendering nothing.
+   if (span != NULL) {
+-    const uint32_t column = okdiag_column_of(p_source, span->offset);
+-    printf_fail |= fprintf(stderr, "%s:%u:%u: %s: %.*s", p_path, span->line, column, kind,
++    printf_fail |= fprintf(stderr, "%s:%u:%u: %s: %.*s", p_path, span->line, span->column, kind,
+                            (int)ok_string_view_get_length(&p_message), p_message.chars) < 0;
+   } else {
+     printf_fail |= fprintf(stderr, "%s: %.*s", kind, (int)ok_string_view_get_length(&p_message), p_message.chars) < 0;
+@@ -151,18 +137,19 @@ report_status okdiag_report(bool* p_panic,
+   }
+   printf_fail |= fputc('\n', stderr) == EOF;
+ 
+-  // snippet
+-  if (span != NULL) {
++  // snippet (only with the source text alive)
++  if (span != NULL && p_source != NULL) {
+     printf_fail |= !print_snippet(p_source, span, width);
+   }
+ 
+   // note
+   if (p_note != NULL && p_note->text.chars != NULL) {
+-    if (p_note->has_span && p_source != NULL) {
+-      const uint32_t note_column = okdiag_column_of(p_source, p_note->span.offset);
+-      printf_fail |= fprintf(stderr, "%s:%u:%u: note: %.*s\n", p_path, p_note->span.line, note_column,
++    if (p_note->has_span && p_note->span.line > 0) {
++      printf_fail |= fprintf(stderr, "%s:%u:%u: note: %.*s\n", p_path, p_note->span.line, p_note->span.column,
+                              (int)ok_string_view_get_length(&p_note->text), p_note->text.chars) < 0;
+-      printf_fail |= !print_snippet(p_source, &p_note->span, width);
++      if (p_source != NULL) {
++        printf_fail |= !print_snippet(p_source, &p_note->span, width);
++      }
+     } else {
+       printf_fail |= fprintf(stderr, "    %*s | note: %.*s\n", (int)width, "",
+                              (int)ok_string_view_get_length(&p_note->text), p_note->text.chars) < 0;
+diff --git a/src/okdiag.h b/src/okdiag.h
+index 63df7ae..c162294 100644
+--- a/src/okdiag.h
++++ b/src/okdiag.h
+@@ -24,9 +24,12 @@ typedef enum {
+ } report_status;
+ 
+ // a byte span into the source. computed by pointer arithmetic at token
+-// creation, never by an accumulated counter — that was the old R1 bug.
++// creation, never by an accumulated counter — that was the old R1 bug. the
++// column rides along (precomputed by the lexer) so headers can render even
++// without the source text (expired borrow: right coordinates, no excerpt).
+ typedef struct {
+   uint32_t line;   // 1-based, straight from the lexer's line counter
++  uint32_t column; // 1-based, byte = char, tab = one column
+   uint32_t offset; // file-absolute byte offset of the span start
+   uint32_t length; // span length in bytes; 0 renders one caret (EOF)
+ } ok_span;
+@@ -45,14 +48,11 @@ typedef struct {
+ // offending byte instead of the message's length.
+ ok_span ok_span_of_token(const token* p_token);
+ 
+-// THE one function the 0.8.0 utf8 pass revisits. byte = char for now: a tab
+-// counts as one column and renders raw — the caret aligns to the raw text,
+-// which is the only thing that stays true on every terminal.
+-uint32_t okdiag_column_of(const char* p_source, uint32_t p_offset);
+-
+-// renders one diagnostic. p_source may be NULL (or p_span): header-only,
+-// degraded but never wrong. p_note may be NULL. first error wins: *p_panic
+-// gates (REPORT_STATUS_SKIPPED), matching the v1 panic-mode ruling.
++// renders one diagnostic. p_source may be NULL: located header, no
++// snippet (right coordinates, no excerpt — degraded but never wrong).
++// p_span may be NULL: bare `error: message`, like the no-location lanes.
++// p_note may be NULL. first error wins: *p_panic gates
++// (REPORT_STATUS_SKIPPED), matching the v1 panic-mode ruling.
+ report_status okdiag_report(bool* p_panic,
+                             bool* p_had_error,
+                             const char* p_path,
+diff --git a/src/oklexer.c b/src/oklexer.c
+index 80ee72a..90b9e5b 100644
+--- a/src/oklexer.c
++++ b/src/oklexer.c
+@@ -9,16 +9,20 @@ void lexer_init(lexer* p_lexer, const char* p_src) {
+   p_lexer->src = p_src;
+   p_lexer->start = p_src;
+   p_lexer->current = p_src;
++  p_lexer->line_start = p_src;
+   p_lexer->line_info.line = 1;
+   p_lexer->line_info.offset = 0;
++  p_lexer->line_info.column = 1;
+ }
+ 
+ void lexer_deinit(lexer* p_lexer) {
+   p_lexer->src = NULL;
+   p_lexer->start = NULL;
+   p_lexer->current = NULL;
++  p_lexer->line_start = NULL;
+   p_lexer->line_info.line = 0;
+   p_lexer->line_info.offset = 0;
++  p_lexer->line_info.column = 0;
+ }
+ 
+ static bool at_end(lexer* p_lexer) {
+@@ -29,11 +33,13 @@ static token create_token(lexer* p_lexer, token_type p_type) {
+   token token;
+   token.type = p_type;
+   token.line_info = p_lexer->line_info;
+-  // the offset is a true file-absolute byte offset, computed from pointers.
+-  // the old accumulated counter never reset on '\n' and match() never
+-  // counted at all, so "column" was "advance() calls since file start" —
+-  // columns are DERIVED from this offset now, never stored.
++  // the offset is a true file-absolute byte offset and the column its
++  // position on the line, both computed from pointers. the old accumulated
++  // counter never reset on '\n' and match() never counted at all, so
++  // "column" was "advance() calls since file start". (this arithmetic is
++  // the one place the 0.8.0 utf8 pass revisits: byte = char for now.)
+   token.line_info.offset = (uint32_t)(p_lexer->start - p_lexer->src);
++  token.line_info.column = (uint32_t)(p_lexer->start - p_lexer->line_start) + 1;
+   token.length = (uint32_t)(p_lexer->current - p_lexer->start);
+   token.start = p_lexer->start;
+   return token;
+@@ -44,6 +50,7 @@ static token create_error_token(lexer* p_lexer, const char* p_message) {
+   token.type = TOKEN_ERROR;
+   token.line_info = p_lexer->line_info;
+   token.line_info.offset = (uint32_t)(p_lexer->start - p_lexer->src);
++  token.line_info.column = (uint32_t)(p_lexer->start - p_lexer->line_start) + 1;
+   // .start carries the MESSAGE (the parser reads it there), so any
+   // print-the-line-at-token.start logic would print the message as source.
+   // the renderer takes spans instead and forces error-token length to one
+@@ -82,6 +89,9 @@ static token string(lexer* p_lexer, char p_start, bool p_multiline) {
+       return error;
+     } else if (peek(p_lexer) == '\n') {
+       p_lexer->line_info.line++;
++      advance(p_lexer);
++      p_lexer->line_start = p_lexer->current;
++      continue;
+     }
+     advance(p_lexer);
+   }
+@@ -390,6 +400,7 @@ start:
+   }
+   case '\n':
+     p_lexer->line_info.line++;
++    p_lexer->line_start = p_lexer->current; // current already stepped past the newline
+     goto start;
+   case ' ':
+   case '\t':
+diff --git a/src/oklexer.h b/src/oklexer.h
+index c48ef6e..d64f5e4 100644
+--- a/src/oklexer.h
++++ b/src/oklexer.h
+@@ -10,6 +10,7 @@ typedef struct {
+   const char* src; // the source begin: token offsets are (start - src), see create_token
+   const char* start;
+   const char* current;
++  const char* line_start; // first byte of the current line: columns are (start - line_start + 1)
+   ok_line_info line_info;
+ } lexer;
+ 
+diff --git a/src/okvm.c b/src/okvm.c
+index 3e38883..4e4c29c 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -81,7 +81,8 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->alloc = p_specs.alloc;
+   p_vm->objects_store = p_specs.objects_store;
+   p_vm->globals_store = p_specs.globals_store;
+-  p_vm->source = NULL;
++  vm_sources_init(&p_vm->sources, p_vm->alloc);
++  p_vm->retain_source = false;
+   p_vm->ok = p_specs.ok;
+   p_vm->print_cb = NULL;
+   p_vm->print_ctx = NULL;
+@@ -99,7 +100,17 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+ }
+ 
+ void vm_deinit(vm* p_vm) {
+-  p_vm->source = NULL;
++  for (uint32_t i = 0; i < p_vm->sources.count; ++i) {
++    vm_source_entry* entry = &p_vm->sources.data[i];
++    p_vm->alloc->release(p_vm->alloc, entry->path);
++    if (entry->owns_code && entry->code != NULL) {
++      p_vm->alloc->release(p_vm->alloc, (void*)entry->code);
++    }
++    entry->path = NULL;
++    entry->code = NULL;
++    entry->owns_code = false;
++  }
++  vm_sources_deinit(&p_vm->sources, p_vm->alloc);
+   p_vm->globals_store = NULL;
+   p_vm->objects_store = NULL;
+   p_vm->ok = NULL;
+@@ -125,10 +136,62 @@ bool vm_native_error(vm* p_vm, ok_string_view p_message) {
+   return true;
+ }
+ 
++uint32_t vm_begin_source(vm* p_vm, const char* p_code, const char* p_path) {
++  // the path is always ok's: chunks name their source after the run ends.
++  // the code is the caller's for the run, or ok's copy when retention is on.
++  allocators* alloc = p_vm->alloc;
++  const size_t path_len = strlen(p_path) + 1;
++  char* path_copy = alloc->allocate(alloc, path_len);
++  if (path_copy == NULL) {
++    return VM_SOURCE_UNSTAMPED;
++  }
++  memcpy(path_copy, p_path, path_len);
++  const char* code = p_code;
++  bool owns_code = false;
++  if (p_vm->retain_source) {
++    const size_t code_len = strlen(p_code) + 1;
++    char* code_copy = alloc->allocate(alloc, code_len);
++    if (code_copy == NULL) {
++      alloc->release(alloc, path_copy);
++      return VM_SOURCE_UNSTAMPED;
++    }
++    memcpy(code_copy, p_code, code_len);
++    code = code_copy;
++    owns_code = true;
++  }
++  vm_source_entry entry = {path_copy, code, owns_code};
++  if (!vm_sources_append(&p_vm->sources, entry)) {
++    if (owns_code) {
++      alloc->release(alloc, (void*)code);
++    }
++    alloc->release(alloc, path_copy);
++    return VM_SOURCE_UNSTAMPED;
++  }
++  return p_vm->sources.count - 1;
++}
++
++void vm_end_source(vm* p_vm, uint32_t p_source_id) {
++  if (p_source_id == VM_SOURCE_UNSTAMPED || p_source_id >= p_vm->sources.count) {
++    return;
++  }
++  vm_source_entry* entry = &p_vm->sources.data[p_source_id];
++  if (!entry->owns_code) {
++    // the borrow expired with the ok_run call: nothing may excerpt from it
++    // anymore (the caller's buffer is theirs again). the path stays.
++    entry->code = NULL;
++  }
++}
++
++const vm_source_entry* vm_source_of(const vm* p_vm, uint32_t p_source_id) {
++  if (p_source_id == VM_SOURCE_UNSTAMPED || p_source_id >= p_vm->sources.count) {
++    return NULL;
++  }
++  return &p_vm->sources.data[p_source_id];
++}
++
+ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+   execution_state* exe = p_vm->current_execution_state;
+   register_file* reg = &exe->registers;
+-  p_vm->source = p_specs.source; // TODO: having it this way means only one source per vm. but it's ok will fix soon.
+   value vfn = OBJECT_AS_VALUE(p_specs.function);
+   gc_guard_up(p_vm->alloc->gc, vfn); // TODO array based gc guard
+   // reg->array.data[exe->registers.top] = vfn;
+@@ -2624,20 +2687,32 @@ static interpret_result __attribute__((cold)) vm_report_error(vm* p_vm) {
+       call_frame* frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       size_t instruction = frame->ip - frame->closure->function->chunk.code.data - 1;
+       ok_line_info_repeated* info = chunk_find_line_info(&frame->closure->function->chunk, instruction);
+-      if (info != NULL && p_vm->source != NULL) {
++      // the source is the FRAME's (by chunk source id), not "the current
++      // run's": an A-compiled function still callable during source B's run
++      // reports A's path with A's line numbers. excerpts only when the text
++      // is alive (retained, or mid-run borrow).
++      const vm_source_entry* entry = vm_source_of(p_vm, frame->closure->function->chunk.source_id);
++      if (info != NULL && entry != NULL && entry->code != NULL) {
+         // the span is the token that authored the raising instruction: one
+         // caret on it. the snippet comes from the source text the renderer
+         // reads — the old code printed the token text as the line.
+-        const ok_span span = {.line = info->line_info.line, .offset = info->line_info.offset, .length = 1};
++        const ok_span span = {
++            .line = info->line_info.line, .column = info->line_info.column, .offset = info->line_info.offset, .length = 1};
+         okdiag_report(&panic,
+                       &had_error,
+-                      p_vm->source->path,
+-                      p_vm->source->code,
++                      entry->path,
++                      entry->code,
+                       &span,
+                       false,
+                       REPORT_SEVERITY_ERROR,
+                       message,
+                       NULL);
++      } else if (info != NULL && entry != NULL) {
++        // right path + right line:col, no excerpt: the borrowed code expired
++        // (degraded, never wrong).
++        const ok_span span = {
++            .line = info->line_info.line, .column = info->line_info.column, .offset = info->line_info.offset, .length = 1};
++        okdiag_report(&panic, &had_error, entry->path, NULL, &span, false, REPORT_SEVERITY_ERROR, message, NULL);
+       } else {
+         okdiag_report(&panic, &had_error, "", NULL, NULL, false, REPORT_SEVERITY_ERROR, message, NULL);
+       }
+@@ -2651,17 +2726,18 @@ static interpret_result __attribute__((cold)) vm_report_error(vm* p_vm) {
+         call_frame* frame = &exe->call_stack.data[i];
+         uint32_t instruction = frame->ip - frame->closure->function->chunk.code.data - 1;
+         ok_line_info_repeated* info = chunk_find_line_info(&frame->closure->function->chunk, instruction);
+-        if (info != NULL && p_vm->source != NULL) {
++        const vm_source_entry* entry = vm_source_of(p_vm, frame->closure->function->chunk.source_id);
++        if (info != NULL && entry != NULL) {
+           fprintf(stderr,
+                   "%s:%u:%u in %s\n",
+-                  p_vm->source->path,
++                  entry->path,
+                   info->line_info.line,
+-                  okdiag_column_of(p_vm->source->code, info->line_info.offset),
++                  info->line_info.column,
+                   frame->closure->function->name->string.chars);
+         } else {
+           fprintf(stderr,
+                   "%s in %s\n",
+-                  p_vm->source != NULL ? p_vm->source->path : "<host>",
++                  entry != NULL ? entry->path : "<host>",
+                   frame->closure->function->name->string.chars);
+         }
+       }
+@@ -3030,6 +3106,7 @@ static void close_upvalues(execution_state* p_exe, uint32_t p_uptill) {
+ }
+ 
+ ARRAY_DEFINE_DEFAULT(register_array, value, ARRAY_DEFAULT_TYPE_DEINIT)
++ARRAY_DEFINE_DEFAULT(vm_sources, vm_source_entry, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(call_stack, call_frame, ARRAY_DEFAULT_TYPE_DEINIT);
+ 
+ void register_file_init(register_file* p_registers, allocators* p_alloc) {
+diff --git a/src/okvm.h b/src/okvm.h
+index ed5e8ec..4176e9e 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -8,6 +8,24 @@
+ 
+ ARRAY_DECLARE_DEFAULT(register_array, value)
+ 
++// one per ok_run, appended for the run's lifetime. the path is ALWAYS ok's
++// (copied): a chunk can name its source after the run that compiled it ended.
++// the code is the caller's buffer for the duration of the run and NULL after,
++// UNLESS retention is on (ok_retain_source) — then it's an ok-owned copy,
++// alive until ok_free. this is the honest v1 of the multi-source story: right
++// path + right lines always, source excerpts when the text is alive, never a
++// dangling read. the 0.7.0 registry (keyed, deduped) replaces it wholesale.
++typedef struct {
++  char* path;
++  const char* code;
++  bool owns_code;
++} vm_source_entry;
++
++ARRAY_DECLARE_DEFAULT(vm_sources, vm_source_entry)
++
++// chunks reference their source by index into the vm's table. see okchunk.h
++// (VM_SOURCE_UNSTAMPED lives next to the chunk that carries the index).
++
+ typedef struct {
+   uint32_t top;
+   register_array array;
+@@ -53,7 +71,11 @@ typedef struct {
+ 
+ struct vm {
+   execution_state* current_execution_state;
+-  ok_source* source;
++  // the source table: one entry per ok_run, chunks carry the index. reports
++  // read per-frame (a function compiled from source A and called during
++  // source B's run reports A's path with A's line numbers — the R8 fix).
++  vm_sources sources;
++  bool retain_source;
+   object_store* objects_store;
+   globals_store* globals_store;
+   allocators* alloc;
+@@ -83,7 +105,7 @@ typedef struct {
+ } vm_specs;
+ 
+ typedef struct {
+-  ok_source* source;
++  uint32_t source_id;
+   object_function* function;
+   value_array top_level_values;
+ } interpret_specs;
+@@ -94,6 +116,15 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs);
+ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc);
+ bool vm_native_error(vm* p_vm, ok_string_view p_message);
+ 
++// the source table. vm_begin_source registers the run's source (path always
++// copied; code copied when retention is on, borrowed for the run otherwise)
++// and returns its id, or VM_SOURCE_UNSTAMPED on allocation failure.
++// vm_end_source expires the borrow when the entry doesn't own its code —
++// called at every ok_run exit. vm_source_of reads an entry for diagnostics.
++uint32_t vm_begin_source(vm* p_vm, const char* p_code, const char* p_path);
++void vm_end_source(vm* p_vm, uint32_t p_source_id);
++const vm_source_entry* vm_source_of(const vm* p_vm, uint32_t p_source_id);
++
+ typedef enum { TT_STR, TT_NUM, TT_BOOL } temporary_type_tags;
+ 
+ #endif // OK_VM_H
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index 3d9f940..09e386a 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -1,14 +1,39 @@
+ #include <ok/ok.h>
+ 
++#include <unistd.h>
++
+ #include <cassert>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <functional>
+ #include <string>
+ #include <vector>
+ 
+ static int g_destructor_calls = 0;
+ 
++// captures everything the embedded ok writes to stderr while p_fn runs
++// (dup2 swap, restored even on assert death — the fds leak then, which the
++// sanitizer runs forgive for a test binary).
++static std::string capture_stderr(const std::function<void()>& p_fn) {
++  fflush(stderr);
++  const int saved_fd = dup(fileno(stderr));
++  FILE* capture = tmpfile();
++  dup2(fileno(capture), fileno(stderr));
++  p_fn();
++  fflush(stderr);
++  dup2(saved_fd, fileno(stderr));
++  close(saved_fd);
++  rewind(capture);
++  std::string out;
++  int c;
++  while ((c = fgetc(capture)) != EOF) {
++    out += static_cast<char>(c);
++  }
++  fclose(capture);
++  return out;
++}
++
+ static ok_value native_add(ok* p_ok, uint8_t argc, const ok_value* argv) {
+   (void)p_ok;
+ 
+@@ -271,7 +296,6 @@ int main() {
+   )";
+ 
+   ok_source source = {
+-      .from = OK_FROM_FILE,
+       .code = code,
+       .path = "embed",
+   };
+@@ -388,7 +412,6 @@ int main() {
+   const char* error_code = "host_fail();\n";
+ 
+   ok_source error_source = {
+-      .from = OK_FROM_FILE,
+       .code = error_code,
+       .path = "embed",
+   };
+@@ -415,7 +438,6 @@ int main() {
+   )";
+ 
+   ok_source callback_error_source = {
+-      .from = OK_FROM_FILE,
+       .code = callback_error_code,
+       .path = "embed",
+   };
+@@ -497,7 +519,6 @@ int main() {
+   )";
+ 
+   ok_source churn_source = {
+-      .from = OK_FROM_FILE,
+       .code = churn_code,
+       .path = "churn",
+   };
+@@ -569,7 +590,6 @@ int main() {
+   )";
+ 
+   ok_source array_source = {
+-      .from = OK_FROM_FILE,
+       .code = array_code,
+       .path = "array",
+   };
+@@ -695,7 +715,6 @@ int main() {
+   )";
+ 
+   ok_source map_source = {
+-      .from = OK_FROM_FILE,
+       .code = map_code,
+       .path = "map",
+   };
+@@ -760,7 +779,6 @@ int main() {
+   )";
+ 
+   ok_source print_source = {
+-      .from = OK_FROM_FILE,
+       .code = print_code,
+       .path = "print",
+   };
+@@ -779,6 +797,74 @@ int main() {
+ 
+   ok_free(vm);
+ 
++  // --- source ownership (0.4.0): A/B cross-source reporting ---
++  // R8's disqualifying bug: one borrowed source per vm meant a function
++  // compiled by run A and called during/after run B reported B's path with
++  // A's line numbers, and a freed buffer was a segfault once reports started
++  // printing excerpts. the fix: the vm owns a per-run source table, chunks
++  // carry their source id, and the code is borrowed for the ok_run call only
++  // (retention is opt-in). expectations: A's path with A's line:col ALWAYS;
++  // an excerpt only while the text is alive.
++  {
++    ok* own = ok_create(ok_specs{});
++
++    const char* source_a = "glob fu a_err() {\n  return 1 + \"x\";\n}\n";
++    ok_source sa = {source_a, "a_embed_source.ok"};
++    assert(ok_run(own, sa) == OK);
++    ok_source sb = {"let b = 1;\n", "b_embed_source.ok"};
++    assert(ok_run(own, sb) == OK);
++
++    ok_value f = ok_value_null();
++    assert(ok_global_get(own, ok_create_string_view("a_err", 5, true), &f));
++
++    // capture stderr: the default (borrowed) lane reports the right path and
++    // coordinates with NO excerpt — the borrow expired with ok_run.
++    std::string report = capture_stderr([&] {
++      ok_value out = ok_value_null();
++      assert(!ok_call(own, f, 0, nullptr, &out));
++    });
++    assert(report.find("a_embed_source.ok:2:12") != std::string::npos);
++    assert(report.find("    2 |") == std::string::npos); // no snippet: borrowed
++
++    // the stack-buffer shape the REPL rides: excerpts work DURING the run,
++    // and reusing the buffer right after must not corrupt anything.
++    char line[64];
++    snprintf(line, sizeof(line), "print(1 + \"boom\");\n");
++    ok_source stack_src = {line, "stack_embed.ok"};
++    assert(ok_run(own, stack_src) == OK_RUNTIME_ERROR);
++    snprintf(line, sizeof(line), "let after = 1;\n");
++    ok_source stack_src2 = {line, "stack_embed2.ok"};
++    assert(ok_run(own, stack_src2) == OK);
++
++    ok_free(own);
++  }
++
++  // retention on: same A-then-B-then-call dance, but the excerpt survives —
++  // every ok_run's source is ok's copy until ok_free.
++  {
++    ok* own = ok_create(ok_specs{});
++    ok_retain_source(own, true);
++
++    const char* source_a = "glob fu a_err() {\n  return 1 + \"x\";\n}\n";
++    ok_source sa = {source_a, "a_retained.ok"};
++    assert(ok_run(own, sa) == OK);
++    ok_source sb = {"let b = 1;\n", "b_retained.ok"};
++    assert(ok_run(own, sb) == OK);
++
++    ok_value f = ok_value_null();
++    assert(ok_global_get(own, ok_create_string_view("a_err", 5, true), &f));
++
++    std::string report = capture_stderr([&] {
++      ok_value out = ok_value_null();
++      assert(!ok_call(own, f, 0, nullptr, &out));
++    });
++    assert(report.find("a_retained.ok:2:12") != std::string::npos);
++    assert(report.find("return 1 + \"x\";") != std::string::npos); // the excerpt is alive
++    assert(report.find("    2 |") != std::string::npos);           // snippet rendered
++
++    ok_free(own);
++  }
++
+   assert(g_destructor_calls == 1);
+   assert(bag_destructor_calls == 1);
+ 

@@ -53,25 +53,26 @@ syntax ruling: destructuring shape (R4).
 
 ### 0.4.0 — ERRORS (the user-facing model)
 
-draft: `docs/drafts/ERRORS.md` (E1–E8 open). D7 sketch stands: errors as
-values, bytecode handler frames, **NO setjmp / no longjmp** (Q's explicit
-ruling — don't inherit lua's bad parts; also wasm-safe), lazy tracebacks.
-try/catch-vs-pcall is answered ON PAPER in the draft (both, split by
-boundary: try/catch for oklang code, status-shaped ok_call +
-ok_last_error for C) so the coro session inherits it closed. Q's
-session-23 additions, riding THIS phase: the `error_at*` overhaul
-(source-line excerpts + carets — the "message quality" half pulled
-forward from 0.9.0; recovery/multi-error stays 0.9.0), gcc-style notes
-with secondary locations ("previously declared here"), and **source
-ownership v1**: ok_run copies code+path, chunks carry a source identity,
-the write-only `ok_source.from` dies — this kills the dangling-pointer
-class the VM's single borrowed source created (REPL stack buffers,
-embedder-freed heaps). the FULL multi-source registry (many
-simultaneously-live sources) stays 0.7.0 — see below. lands BEFORE
-classes because class methods, stdlib API shape, and every native's
-error path (dorg3's three missing-return bugs were this class) hang off
-the philosophy. the coro⟷error interplay is SETTLED ON PAPER here, even
-though coros ship later. touches ok_call — the surgical phase.
+**RULED (E1-E8) + IMPLEMENTED — patches 23-27 awaiting Q's hand-application**
+(`patches/`, rulings + honest deltas in `docs/drafts/ERRORS.md` §9/§11).
+D7 sketch stands: errors as values, bytecode handler frames, **NO setjmp /
+no longjmp** (Q's explicit ruling — don't inherit lua's bad parts; also
+wasm-safe), lazy tracebacks. try/catch-vs-pcall is answered AND SHIPPED,
+split by boundary: try/catch/finalize for oklang code, status-shaped
+ok_call + ok_last_error/ok_native_throw for C (E7: host-caught errors
+print nothing). source ownership shipped as OPT-IN retention (E8's catch:
+ok_retain_source, default off — borrow for the call, intern the path
+forever, chunks carry source ids; the full keyed registry stays 0.7.0
+below). the error_at* overhaul, gcc-style located notes, and the from-field
+deletion all landed (patches 23/24/25). v1 limitations deliberate (§11):
+break/continue/return skip finalize, REPL per-line numbering (0.9.0 REPL
+pass owns it — the deleted from-field's future consumer).
+lands BEFORE classes because class methods, stdlib API shape, and every
+native's error path (dorg3's three missing-return bugs were this class) hang
+off the philosophy — the caught-value {:kind:,:what:} map is the exact
+shape 0.5.0's std.exception wraps. the coro⟷error interplay is SETTLED ON
+PAPER here (handler records live in frames, coros own their stacks,
+unwinding is coro-local by construction), even though coros ship later.
 
 ### 0.5.0 — CLASSES + THE TYPE SYSTEM (the 1.0 centerpiece)
 

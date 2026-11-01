@@ -1,0 +1,615 @@
+diff --git a/.gitignore b/.gitignore
+index a4fb4fb..648029d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,3 @@
+ build/
+ .cache/
++build*/
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d0720f6..0f770ab 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -42,6 +42,7 @@ target_sources(ok PRIVATE
+   src/okchunk.c
+   src/okcompiler.c
+   src/okdebug.c
++  src/okdiag.c
+   src/okglobals_store.c
+   src/oklexer.c
+   src/okmm.c
+diff --git a/include/ok/ok_source.h b/include/ok/ok_source.h
+index 018920b..73aff6b 100644
+--- a/include/ok/ok_source.h
++++ b/include/ok/ok_source.h
+@@ -18,6 +18,10 @@ typedef struct {
+   const char* path;
+ } ok_source;
+ 
++// a location in the source. `offset` is the FILE-ABSOLUTE byte offset of
++// the token start (computed by pointer arithmetic at token creation —
++// columns are DERIVED from it by scanning back to the previous newline,
++// never stored). `line` is the 1-based line from the lexer's counter.
+ typedef struct {
+   uint32_t offset;
+   uint32_t line;
+diff --git a/src/okchunk.c b/src/okchunk.c
+index 8f6fda5..907933d 100644
+--- a/src/okchunk.c
++++ b/src/okchunk.c
+@@ -4,6 +4,7 @@
+ #include <string.h>
+ 
+ #include "okchunk.h"
++#include "okdef.h"
+ #include "okutils.h"
+ 
+ ARRAY_DEFINE_DEFAULT(code, word, ARRAY_DEFAULT_TYPE_DEINIT)
+@@ -95,6 +96,18 @@ index_wrapper chunk_add_identifier(chunk* p_chunk, const ok_string_view p_identi
+ }
+ 
+ ok_line_info_repeated* chunk_find_line_info(const chunk* p_chunk, const uint32_t p_instruction_index) {
++#if !defined(NDEBUG)
++  // invariant guard: the RLE table must cover exactly [0, code.count)
++  // instructions. a wrapped/stale index once made this return NULL silently
++  // (the R4 receipt); the assert turns the next such bug into a loud one.
++  {
++    uint32_t total = 0;
++    for (uint32_t i = 0; i < p_chunk->source_info.count; ++i) {
++      total += p_chunk->source_info.data[i].reps;
++    }
++    ASSERT(total == p_chunk->code.count);
++  }
++#endif // !defined(NDEBUG)
+   for (uint32_t num_instructions = 0, i = 0; i < p_chunk->source_info.count; ++i) {
+     ok_line_info_repeated* info = &p_chunk->source_info.data[i];
+     num_instructions += info->reps;
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index fa20016..009cb94 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -176,6 +176,12 @@ static void error_at_noted(compiler* p_compiler,
+                            const ast_node* p_author,
+                            const ok_string_view p_message,
+                            const ok_string_view p_note) {
++  ok_note note;
++  note.text = p_note;
++  note.has_span = false;
++  note.span.line = 0;
++  note.span.offset = 0;
++  note.span.length = 0;
+   report_at_noted(&p_compiler->panic,
+                   &p_compiler->had_error,
+                   p_author->node_type == AST_EOF_STATEMENT,
+@@ -183,7 +189,7 @@ static void error_at_noted(compiler* p_compiler,
+                   &p_author->token,
+                   REPORT_SEVERITY_ERROR,
+                   p_message,
+-                  p_note);
++                  p_note.chars != NULL ? &note : NULL);
+ }
+ 
+ static void error_at(compiler* p_compiler, const ast_node* p_author, const ok_string_view p_message) {
+diff --git a/src/okdiag.c b/src/okdiag.c
+new file mode 100644
+index 0000000..0f81b65
+--- /dev/null
++++ b/src/okdiag.c
+@@ -0,0 +1,172 @@
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "okdiag.h"
++
++// the source line containing p_offset. returns the line's bounds and, through
++// p_column, the 1-based column of p_offset within it (byte = char for now,
++// tab = one column, see okdiag_column_of — the whole utf8 story is one
++// function away by design).
++static void line_bounds_of(const char* p_source,
++                           const ok_span* p_span,
++                           uint32_t* p_line_start,
++                           uint32_t* p_line_end,
++                           uint32_t* p_column) {
++  uint32_t line_start = p_span->offset;
++  while (line_start > 0 && p_source[line_start - 1] != '\n') {
++    line_start--;
++  }
++  uint32_t line_end = p_span->offset;
++  while (p_source[line_end] != '\0' && p_source[line_end] != '\n') {
++    line_end++;
++  }
++  *p_line_start = line_start;
++  *p_line_end = line_end;
++  *p_column = p_span->offset - line_start + 1;
++}
++
++uint32_t okdiag_column_of(const char* p_source, uint32_t p_offset) {
++  uint32_t column = 1;
++  while (p_offset > 0 && p_source[p_offset - 1] != '\n') {
++    p_offset--;
++    column++;
++  }
++  return column;
++}
++
++ok_span ok_span_of_token(const token* p_token) {
++  ok_span span;
++  span.line = p_token->line_info.line;
++  span.offset = p_token->line_info.offset;
++  // TOKEN_ERROR's .start is the message (create_error_token), not source: the
++  // old renderer printed the message as if it were the line. one caret on the
++  // offending byte instead — the offset is already right.
++  span.length = p_token->type == TOKEN_ERROR ? 1 : p_token->length;
++  return span;
++}
++
++void okdiag_print_header(const char* p_path, uint32_t p_line, uint32_t p_column, const char* p_kind, const char* p_text) {
++  fprintf(stderr, "%s:%u:%u: %s: %s", p_path, p_line, p_column, p_kind, p_text);
++}
++
++// `    NNN | the source line` + `        | ^~~~~`
++// p_width is the shared line-number gutter width so a diagnostic and its
++// notes align. returns false on printf failure (the caller folds it into the
++// report status).
++static bool print_snippet(const char* p_source, const ok_span* p_span, uint32_t p_width) {
++  uint32_t line_start = 0;
++  uint32_t line_end = 0;
++  uint32_t column = 0;
++  line_bounds_of(p_source, p_span, &line_start, &line_end, &column);
++  if (fprintf(stderr, "    %*u | ", (int)p_width, p_span->line) < 0) {
++    return false;
++  }
++  if (fwrite(p_source + line_start, 1, line_end - line_start, stderr) < line_end - line_start) {
++    return false;
++  }
++  if (fputc('\n', stderr) == EOF) {
++    return false;
++  }
++  if (fprintf(stderr, "    %*s | ", (int)p_width, "") < 0) {
++    return false;
++  }
++  for (uint32_t i = 1; i < column; ++i) {
++    if (fputc(' ', stderr) == EOF) {
++      return false;
++    }
++  }
++  // the caret underlines the span's full length, clamped to the line, min one
++  uint32_t carets = p_span->length;
++  if (carets > line_end - p_span->offset) {
++    carets = line_end - p_span->offset;
++  }
++  if (carets == 0) {
++    carets = 1;
++  }
++  for (uint32_t i = 0; i < carets; ++i) {
++    if (fputc('^', stderr) == EOF) {
++      return false;
++    }
++  }
++  return fputc('\n', stderr) != EOF;
++}
++
++static uint32_t digits_of(uint32_t p_value) {
++  uint32_t digits = 1;
++  while (p_value >= 10) {
++    p_value /= 10;
++    digits++;
++  }
++  return digits;
++}
++
++report_status okdiag_report(bool* p_panic,
++                            bool* p_had_error,
++                            const char* p_path,
++                            const char* p_source,
++                            const ok_span* p_span,
++                            bool p_is_eof,
++                            report_severity p_severity,
++                            const ok_string_view p_message,
++                            const ok_note* p_note) {
++  if (*p_panic) {
++    return REPORT_STATUS_SKIPPED;
++  }
++  bool printf_fail = false;
++  *p_panic = true;
++  *p_had_error = true;
++  const char* kind = p_severity == REPORT_SEVERITY_WARN ? "warning" : "error";
++
++  // a real span always has line >= 1. no span (or no source text to excerpt
++  // from): the message still prints, degraded but never wrong.
++  const ok_span* span = p_span != NULL && p_span->line > 0 ? p_span : NULL;
++  if (p_source == NULL) {
++    span = NULL;
++  }
++
++  uint32_t width = 1;
++  if (span != NULL) {
++    width = digits_of(span->line);
++  }
++  if (p_note != NULL && p_note->has_span && p_source != NULL) {
++    const uint32_t note_width = digits_of(p_note->span.line);
++    if (note_width > width) {
++      width = note_width;
++    }
++  }
++
++  // header. EOF spans point one past the last byte and say so, on the message
++  // line (gcc's placement), instead of rendering nothing. no span: bare
++  // `error: message`, like the old no-location runtime path.
++  if (span != NULL) {
++    const uint32_t column = okdiag_column_of(p_source, span->offset);
++    printf_fail |= fprintf(stderr, "%s:%u:%u: %s: %.*s", p_path, span->line, column, kind,
++                           (int)ok_string_view_get_length(&p_message), p_message.chars) < 0;
++  } else {
++    printf_fail |= fprintf(stderr, "%s: %.*s", kind, (int)ok_string_view_get_length(&p_message), p_message.chars) < 0;
++  }
++  if (p_is_eof) {
++    printf_fail |= fprintf(stderr, " (at end of file)") < 0;
++  }
++  printf_fail |= fputc('\n', stderr) == EOF;
++
++  // snippet
++  if (span != NULL) {
++    printf_fail |= !print_snippet(p_source, span, width);
++  }
++
++  // note
++  if (p_note != NULL && p_note->text.chars != NULL) {
++    if (p_note->has_span && p_source != NULL) {
++      const uint32_t note_column = okdiag_column_of(p_source, p_note->span.offset);
++      printf_fail |= fprintf(stderr, "%s:%u:%u: note: %.*s\n", p_path, p_note->span.line, note_column,
++                             (int)ok_string_view_get_length(&p_note->text), p_note->text.chars) < 0;
++      printf_fail |= !print_snippet(p_source, &p_note->span, width);
++    } else {
++      printf_fail |= fprintf(stderr, "    %*s | note: %.*s\n", (int)width, "",
++                             (int)ok_string_view_get_length(&p_note->text), p_note->text.chars) < 0;
++    }
++  }
++  return printf_fail ? REPORT_STATUS_FAILED : REPORT_STATUS_OK;
++}
+diff --git a/src/okdiag.h b/src/okdiag.h
+new file mode 100644
+index 0000000..63df7ae
+--- /dev/null
++++ b/src/okdiag.h
+@@ -0,0 +1,70 @@
++#ifndef OK_DIAG_H
++#define OK_DIAG_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "ok/ok_source.h"
++#include "okstring.h"
++#include "oktoken.h"
++
++// the diagnostics renderer. parse errors, compile errors and runtime reports
++// all print through here (gcc-parseable `path:line:col:` headers plus a
++// rustc-style source snippet), so the format is a contract, not an accident.
++
++typedef enum {
++  REPORT_SEVERITY_WARN,
++  REPORT_SEVERITY_ERROR,
++} report_severity;
++
++typedef enum {
++  REPORT_STATUS_OK,
++  REPORT_STATUS_FAILED,
++  REPORT_STATUS_SKIPPED,
++} report_status;
++
++// a byte span into the source. computed by pointer arithmetic at token
++// creation, never by an accumulated counter — that was the old R1 bug.
++typedef struct {
++  uint32_t line;   // 1-based, straight from the lexer's line counter
++  uint32_t offset; // file-absolute byte offset of the span start
++  uint32_t length; // span length in bytes; 0 renders one caret (EOF)
++} ok_span;
++
++// a note with an optional location: text alone renders as today's notes
++// (`    | note: text`), text + span renders a full secondary diagnostic with
++// its own header and snippet ("note: previously declared here").
++typedef struct {
++  ok_string_view text;
++  bool has_span;
++  ok_span span;
++} ok_note;
++
++// the span of a token. TOKEN_ERROR tokens carry the message in .start (the
++// parser reads it from there), so their span length is forced to the single
++// offending byte instead of the message's length.
++ok_span ok_span_of_token(const token* p_token);
++
++// THE one function the 0.8.0 utf8 pass revisits. byte = char for now: a tab
++// counts as one column and renders raw — the caret aligns to the raw text,
++// which is the only thing that stays true on every terminal.
++uint32_t okdiag_column_of(const char* p_source, uint32_t p_offset);
++
++// renders one diagnostic. p_source may be NULL (or p_span): header-only,
++// degraded but never wrong. p_note may be NULL. first error wins: *p_panic
++// gates (REPORT_STATUS_SKIPPED), matching the v1 panic-mode ruling.
++report_status okdiag_report(bool* p_panic,
++                            bool* p_had_error,
++                            const char* p_path,
++                            const char* p_source,
++                            const ok_span* p_span,
++                            bool p_is_eof,
++                            report_severity p_severity,
++                            const ok_string_view p_message,
++                            const ok_note* p_note);
++
++// the (path, line, column) header every diagnostic starts with, exposed for
++// the runtime report's stack trace lines.
++void okdiag_print_header(const char* p_path, uint32_t p_line, uint32_t p_column, const char* p_kind, const char* p_text);
++
++#endif // OK_DIAG_H
+diff --git a/src/oklexer.c b/src/oklexer.c
+index d5caf9e..80ee72a 100644
+--- a/src/oklexer.c
++++ b/src/oklexer.c
+@@ -6,13 +6,15 @@
+ #include "oktoken.h"
+ 
+ void lexer_init(lexer* p_lexer, const char* p_src) {
++  p_lexer->src = p_src;
+   p_lexer->start = p_src;
+   p_lexer->current = p_src;
+   p_lexer->line_info.line = 1;
+-  p_lexer->line_info.offset = 1;
++  p_lexer->line_info.offset = 0;
+ }
+ 
+ void lexer_deinit(lexer* p_lexer) {
++  p_lexer->src = NULL;
+   p_lexer->start = NULL;
+   p_lexer->current = NULL;
+   p_lexer->line_info.line = 0;
+@@ -27,6 +29,11 @@ static token create_token(lexer* p_lexer, token_type p_type) {
+   token token;
+   token.type = p_type;
+   token.line_info = p_lexer->line_info;
++  // the offset is a true file-absolute byte offset, computed from pointers.
++  // the old accumulated counter never reset on '\n' and match() never
++  // counted at all, so "column" was "advance() calls since file start" —
++  // columns are DERIVED from this offset now, never stored.
++  token.line_info.offset = (uint32_t)(p_lexer->start - p_lexer->src);
+   token.length = (uint32_t)(p_lexer->current - p_lexer->start);
+   token.start = p_lexer->start;
+   return token;
+@@ -36,13 +43,17 @@ static token create_error_token(lexer* p_lexer, const char* p_message) {
+   token token;
+   token.type = TOKEN_ERROR;
+   token.line_info = p_lexer->line_info;
++  token.line_info.offset = (uint32_t)(p_lexer->start - p_lexer->src);
++  // .start carries the MESSAGE (the parser reads it there), so any
++  // print-the-line-at-token.start logic would print the message as source.
++  // the renderer takes spans instead and forces error-token length to one
++  // caret on the offending byte — the landmine stays defused.
+   token.length = strlen(p_message);
+   token.start = p_message;
+   return token;
+ }
+ 
+ static char advance(lexer* p_lexer) {
+-  p_lexer->line_info.offset++;
+   return (++p_lexer->current)[-1];
+ }
+ 
+diff --git a/src/oklexer.h b/src/oklexer.h
+index 81a5a95..c48ef6e 100644
+--- a/src/oklexer.h
++++ b/src/oklexer.h
+@@ -7,6 +7,7 @@
+ #include "oktoken.h"
+ 
+ typedef struct {
++  const char* src; // the source begin: token offsets are (start - src), see create_token
+   const char* start;
+   const char* current;
+   ok_line_info line_info;
+diff --git a/src/okparser.c b/src/okparser.c
+index 8e78755..5bbc44d 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -194,10 +194,18 @@ void parse_result_deinit(parse_result* parse_result) {
+ }
+ 
+ void error_at(parser* p_parser, token p_token, const ok_string_view p_message) {
+-  error_at_noted(p_parser, p_token, p_message, ok_create_string_view("", 0, true));
++  // R3: no note at all — the old empty-but-non-NULL note view printed a
++  // phantom `note: ` line under every un-noted parser error.
++  error_at_noted(p_parser, p_token, p_message, ok_create_string_view(NULL, 0, false));
+ }
+ 
+ void error_at_noted(parser* p_parser, token p_token, const ok_string_view p_message, const ok_string_view p_note) {
++  ok_note note;
++  note.text = p_note;
++  note.has_span = false;
++  note.span.line = 0;
++  note.span.offset = 0;
++  note.span.length = 0;
+   report_at_noted(&p_parser->panic,
+                   &p_parser->had_error,
+                   p_token.type == TOKEN_EOF,
+@@ -205,7 +213,7 @@ void error_at_noted(parser* p_parser, token p_token, const ok_string_view p_mess
+                   &p_token,
+                   REPORT_SEVERITY_ERROR,
+                   p_message,
+-                  p_note);
++                  p_note.chars != NULL ? &note : NULL);
+ }
+ 
+ bool advance(parser* p_parser) {
+@@ -216,7 +224,10 @@ bool advance(parser* p_parser) {
+     if (p_parser->current.type != TOKEN_ERROR) {
+       break;
+     }
+-    string message = asprint(alloc, "%*.s", p_parser->current.length, p_parser->current.start);
++    // %.*s (precision), not %*.s: the typo printed an empty message and padded
++    // with spaces — hidden for months because the old renderer printed the
++    // token text (here: the message) as the "source line" anyway.
++    string message = asprint(alloc, "%.*s", p_parser->current.length, p_parser->current.start);
+     error_at(p_parser, p_parser->current, ok_create_string_view_from_string(message));
+     string_deinit(&message, alloc);
+     return false;
+diff --git a/src/okutils.c b/src/okutils.c
+index f69fdb6..7b9312f 100644
+--- a/src/okutils.c
++++ b/src/okutils.c
+@@ -62,10 +62,13 @@ report_status report_at(bool* p_panic,
+                         const token* p_token,
+                         const report_severity p_severity,
+                         const ok_string_view p_message) {
+-  return report_at_noted(
+-      p_panic, p_had_error, p_is_eof, p_source, p_token, p_severity, p_message, ok_create_string_view(NULL, 0, false));
++  return report_at_noted(p_panic, p_had_error, p_is_eof, p_source, p_token, p_severity, p_message, NULL);
+ }
+ 
++// the token-based wrapper the parser and compiler ride. the renderer takes
++// spans (offsets computed from pointers at token creation — never the old
++// accumulated counter) and reads the source text itself, so the printed
++// "line" is the source line, not the token text, and columns line up with it.
+ report_status report_at_noted(bool* p_panic,
+                               bool* p_had_error,
+                               const bool p_is_eof,
+@@ -73,40 +76,16 @@ report_status report_at_noted(bool* p_panic,
+                               const token* p_token,
+                               const report_severity p_severity,
+                               const ok_string_view p_message,
+-                              const ok_string_view p_note) {
++                              const ok_note* p_note) {
+   // TODO: custom loggers
+-  // idk man should we care about printf fail, or at least hide behind macro or not care at all..
+-  // TODO fix formmating, token has only relevant part to it, while error message require full line info (for proper
+-  // offset)
+-  if (*p_panic)
+-    return REPORT_STATUS_SKIPPED;
+-  bool printf_fail = false;
+-  *p_panic = true;
+-  *p_had_error = true;
+-  const char* report = p_severity == REPORT_SEVERITY_WARN ? "warning" : "error";
+-  printf_fail |= fprintf(stderr,
+-                         "%s:%d:%d: %s: %.*s\n",
+-                         p_source->path,
+-                         p_token->line_info.line,
+-                         p_token->line_info.offset,
+-                         report,
+-                         (int)ok_string_view_get_length(&p_message),
+-                         p_message.chars) < 0;
+-  if (p_is_eof) {
+-    printf_fail |= fprintf(stderr, "    | ") < 0;
+-    printf_fail |= fprintf(stderr, "at end (EOF).\n") < 0;
+-  } else {
+-    printf_fail |= fprintf(stderr, "    | ") < 0;
+-    printf_fail |= fprintf(stderr, "%.*s\n", p_token->length, p_token->start) < 0;
+-#if 0
+-    if (p_token->type != TOKEN_ERROR) {
+-      printf_fail |= fprintf(stderr, "    | ") < 0;
+-      printf_fail |= fprintf(stderr, "%*c\n", p_token->line_info.offset - 1, '^') < 0;
+-    }
+-#endif
+-  }
+-  if (p_note.chars != NULL) {
+-    printf_fail |= fprintf(stderr, "    | note: %.*s\n", (int)ok_string_view_get_length(&p_note), p_note.chars) < 0;
+-  }
+-  return printf_fail ? REPORT_STATUS_FAILED : REPORT_STATUS_OK;
++  const ok_span span = ok_span_of_token(p_token);
++  return okdiag_report(p_panic,
++                       p_had_error,
++                       p_source != NULL ? p_source->path : "<unknown>",
++                       p_source != NULL ? p_source->code : NULL,
++                       &span,
++                       p_is_eof,
++                       p_severity,
++                       p_message,
++                       p_note);
+ }
+diff --git a/src/okutils.h b/src/okutils.h
+index 2752111..b57f293 100644
+--- a/src/okutils.h
++++ b/src/okutils.h
+@@ -6,6 +6,7 @@
+ #include <stdint.h>
+ 
+ #include "ok/ok_source.h"
++#include "okdiag.h"
+ #include "okfwd.h"
+ #include "okstring.h"
+ #include "oktoken.h"
+@@ -19,17 +20,6 @@ uint64_t decode_int(const uint8_t* p_bytes, const uint8_t p_bytes_count);
+ 
+ string asprint(allocators* p_alloc, const char* p_fmt, ...);
+ 
+-typedef enum {
+-  REPORT_SEVERITY_WARN,
+-  REPORT_SEVERITY_ERROR,
+-} report_severity;
+-
+-typedef enum {
+-  REPORT_STATUS_OK,
+-  REPORT_STATUS_FAILED,
+-  REPORT_STATUS_SKIPPED,
+-} report_status;
+-
+ report_status report_at(bool* p_panic,
+                         bool* p_had_error,
+                         const bool p_is_eof,
+@@ -44,7 +34,7 @@ report_status report_at_noted(bool* p_panic,
+                               const token* p_token,
+                               const report_severity p_severity,
+                               const ok_string_view p_message,
+-                              const ok_string_view p_note);
++                              const ok_note* p_note);
+ 
+ inline static hash_t fnv1a_hash_str(const ok_string_view p_str, hash_t p_hash) {
+   for (uint64_t i = 0; i < ok_string_view_get_length(&p_str); ++i) {
+diff --git a/tests/e2e/tests/errors/diag_bare_note.ok b/tests/e2e/tests/errors/diag_bare_note.ok
+new file mode 100644
+index 0000000..4cb49e8
+--- /dev/null
++++ b/tests/e2e/tests/errors/diag_bare_note.ok
+@@ -0,0 +1,2 @@
++let x = 1;
++x = 2; // expect error: note: did you forget to declare it 'mut'?
+diff --git a/tests/e2e/tests/errors/diag_eof_span.ok b/tests/e2e/tests/errors/diag_eof_span.ok
+new file mode 100644
+index 0000000..9f4c6cf
+--- /dev/null
++++ b/tests/e2e/tests/errors/diag_eof_span.ok
+@@ -0,0 +1 @@
++let z =  // expect error: expected an expression. (at end of file)
+diff --git a/tests/e2e/tests/errors/diag_snippet_caret.ok b/tests/e2e/tests/errors/diag_snippet_caret.ok
+new file mode 100644
+index 0000000..e712803
+--- /dev/null
++++ b/tests/e2e/tests/errors/diag_snippet_caret.ok
+@@ -0,0 +1,2 @@
++let x = 1;
++x = 2; // expect error: |   ^
+diff --git a/tests/e2e/tests/errors/diag_snippet_line.ok b/tests/e2e/tests/errors/diag_snippet_line.ok
+new file mode 100644
+index 0000000..0c4be89
+--- /dev/null
++++ b/tests/e2e/tests/errors/diag_snippet_line.ok
+@@ -0,0 +1,2 @@
++let x = 1;
++x = 2; // expect error: 2 | x = 2;
+diff --git a/tests/e2e/tests/errors/diag_true_column.ok b/tests/e2e/tests/errors/diag_true_column.ok
+new file mode 100644
+index 0000000..5f6e1ee
+--- /dev/null
++++ b/tests/e2e/tests/errors/diag_true_column.ok
+@@ -0,0 +1,5 @@
++let a = 1;
++let b = 2;
++let c = 3;
++
++c = 4; // expect error: 5:1: error:
+diff --git a/tests/e2e/tests/errors/diag_unterminated.ok b/tests/e2e/tests/errors/diag_unterminated.ok
+new file mode 100644
+index 0000000..eb5c66f
+--- /dev/null
++++ b/tests/e2e/tests/errors/diag_unterminated.ok
+@@ -0,0 +1 @@
++let s = "abc // expect error: unterminated string.

@@ -1,0 +1,810 @@
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index 05d9443..1c7e48a 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -80,8 +80,28 @@ typedef ok_value (*ok_native_fn)(ok* p_ok, uint8_t p_argc, const ok_value* p_arg
+ 
+ bool ok_global_define_native_function(ok* p_ok, ok_string_view p_name, uint8_t p_arity, ok_native_fn p_cb);
+ 
++// the message lane: raises inside the native, crosses into script catch as
++// the map {:kind: "native", :what: <message>} (message sugar — use
++// ok_native_throw to send any value whole).
+ bool ok_native_error(ok* p_ok, ok_string_view p_message);
+ 
++// the value lane: the value crosses into the script's catch binder as
++// itself, exactly like a script `throw v`. only valid inside a native
++// callback (like ok_native_error). a host error that no script catches
++// fails the ok_call/ok_run — read it with ok_last_error.
++bool ok_native_throw(ok* p_ok, ok_value p_value);
++
++// the error from the most recent FAILED ok_run/ok_call on this state: your
++// thrown value as-is, or (for runtime-raised errors) a fresh
++// {:kind: "...", :what: "..."} map — root it (ok_root) if you need it past
++// your next ok allocation. a null value means "no error". a caught error
++// clears it; ok_clear_error clears it explicitly; the next ok_run clears it.
++// note (E7): a failed ok_call prints NOTHING — reporting is your call.
++ok_value ok_last_error(ok* p_ok);
++
++// clears the ok_last_error lane.
++void ok_clear_error(ok* p_ok);
++
+ typedef void (*ok_native_destructor)(void* p_data);
+ 
+ // called during garbage collection while your native value is being traced:
+diff --git a/src/ok.c b/src/ok.c
+index bfcb2e7..4929e79 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -346,6 +346,9 @@ static void stamp_source_ids(object_function* p_function, uint32_t p_source_id)
+ }
+ 
+ ok_result ok_run(ok* p_ok, ok_source p_source) {
++  // a fresh run starts with a clean error lane: ok_last_error reads the
++  // MOST RECENT failed run, and this run hasn't failed yet.
++  vm_clear_error(&p_ok->vm);
+   // register the run's source: the path is interned (ok's copy, so chunks
+   // can name it after the run), the code is borrowed for the call — or
+   // ok's copy when retention is on (ok_retain_source). the borrow expires
+@@ -364,6 +367,14 @@ void ok_retain_source(ok* p_ok, bool p_retain) {
+   p_ok->vm.retain_source = p_retain;
+ }
+ 
++ok_value ok_last_error(ok* p_ok) {
++  return vm_last_error(&p_ok->vm);
++}
++
++void ok_clear_error(ok* p_ok) {
++  vm_clear_error(&p_ok->vm);
++}
++
+ static ok_result ok_run_inner(ok* p_ok, uint32_t p_source_id) {
+   parser parser;
+   parser_specs specs = {.alloc = &p_ok->alloc, .source = &p_ok->source};
+@@ -571,6 +582,10 @@ bool ok_native_error(ok* p_ok, ok_string_view p_message) {
+   return vm_native_error(&p_ok->vm, p_message);
+ }
+ 
++bool ok_native_throw(ok* p_ok, ok_value p_value) {
++  return vm_native_throw(&p_ok->vm, p_value);
++}
++
+ ok_value
+ ok_native_value_new(ok* p_ok, void* p_user_data, ok_native_destructor p_destructor, ok_native_tracer p_tracer) {
+   object_specs s = {.alloc = &p_ok->alloc, .store = &p_ok->objects_store};
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index abab88a..7126b1b 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -2126,20 +2126,32 @@ static bool compile_throw_statement(compiler* p_compiler, ast_throw_statement* p
+   return emit_word2(p_compiler, encode_OPPABCQ(OP_THROW, false, (uint16_t)value.value.index, 0, 0, false), author);
+ }
+ 
+-// `try { B } catch e { H }` compiles to:
++// `try { B } catch e { H } finalize { F }` compiles to:
+ //
+-//   TRY_ENTER catch_target, park = e's register, floor = the try scope's checkpoint
++//   TRY_ENTER fin_target, park, floor      ; record #1 covers B
+ //   B
+ //   TRY_EXIT
++//   LOAD_FALSE flag                        ; normal exit marker
++//   JUMP fin_body
++// fin_target:                              ; the unwinder parks the value at e's
++//   LOAD_TRUE flag                         ; unwind marker
++// fin_body:
++//   TRY_ENTER catch_target, park, floor    ; record #2 covers F itself
++//   F
++//   TRY_EXIT
++//   JUMP_IF truthy flag -> catch_target    ; finalize ran: re-dispatch
+ //   JUMP end
+-// catch_target:            ; the unwinder parks the value at e's register
+-//   H                      ; (e is an ordinary immutable local — zero MOVEs)
++// catch_target:                            ; record #2's target AND the flag's
++//   H                                      ; (no catch clause: OP_THROW park)
+ // end:
+ //
+-// the record's floor is what the unwinder closes upvalues above; the
+-// watermark restores to the handler frame's full window (temps die, locals
+-// stay). entering the handler consumes the record, so a throw inside H finds
+-// only outer handlers — and a bare `throw;` reads e's register directly.
++// the rulings this rides: finalize runs on normal completion AND on unwind,
++// BEFORE the catch (the C++ destructor model — E4). an error raised inside F
++// parks at the same register and lands in catch_target: it REPLACES the
++// in-flight error (every mainstream precedent). the flag re-dispatch is a
++// plain OP_JUMP_IF — no FIN_END opcode exists because none is needed.
++// break/continue/return out of an active region skip F in v1 (the draft
++// ruled the two paths above; the loop-jump lane is 0.9.0-adjacent).
+ static bool compile_try_statement(compiler* p_compiler, ast_try_statement* p_try) {
+   allocators* alloc = p_compiler->alloc;
+   compile_context* ctx = current_context(p_compiler);
+@@ -2170,7 +2182,23 @@ static bool compile_try_statement(compiler* p_compiler, ast_try_statement* p_try
+     return false;
+   }
+ 
+-  uint32_t enter;
++  // the finalize flag: which way fin_body was entered
++  _register flag = {0, REGISTER_FLAG_NONE, REGISTER_OK};
++  const bool has_finalize = p_try->finalize_body != NULL;
++  if (has_finalize) {
++    variable_declaration flag_decl = {
++        .identifier = ok_create_string_view(" fin", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++        .flags = VARIABLE_DECLRATION_FLAGS_NONE};
++    flag = add_local(p_compiler, flag_decl, true, author);
++    if (!IS_REGISTER_VALID(flag)) {
++      end_scope(p_compiler, author);
++      return false;
++    }
++  }
++
++  // record #1: covers B. its target is fin_target (finalize first), or the
++  // catch itself when there is no finalize.
++  uint32_t enter1;
+   {
+     const uint32_t at = current_chunk(p_compiler)->code.count;
+     if (!emit_word2(p_compiler, encode_OPPABCQ(OP_TRY_ENTER, false, 0, (uint16_t)park.index, (uint16_t)floor, false), author)) {
+@@ -2178,7 +2206,7 @@ static bool compile_try_statement(compiler* p_compiler, ast_try_statement* p_try
+       end_scope(p_compiler, author);
+       return false;
+     }
+-    enter = at;
++    enter1 = at;
+   }
+   ctx->active_handlers++;
+ 
+@@ -2192,14 +2220,88 @@ static bool compile_try_statement(compiler* p_compiler, ast_try_statement* p_try
+   ctx->active_handlers--;
+ 
+   uint32_t end_jump;
+-  if (!emit_incomplete_jump(p_compiler, OP_JUMP, &end_jump, author)) {
+-    goto fail_active;
+-  }
++  if (has_finalize) {
++    if (!emit_word(p_compiler, encode_oppA(OP_LOAD_FALSE, false, (uint16_t)flag.index), author)) {
++      goto fail_post_exit;
++    }
++    // the normal path converges at fin_body (a SEPARATE slot from end_jump:
++    // one jump enters the finalize, the other leaves the whole statement)
++    uint32_t fin_body_jump;
++    if (!emit_incomplete_jump(p_compiler, OP_JUMP, &fin_body_jump, author)) {
++      goto fail_post_exit;
++    }
++    // fin_target: patch record #1's offset here
++    if (!patch_jump_if(p_compiler, false, enter1, current_chunk(p_compiler)->code.count, author)) {
++      goto fail_post_exit;
++    }
++    if (!emit_word(p_compiler, encode_oppA(OP_LOAD_TRUE, false, (uint16_t)flag.index), author)) {
++      goto fail_post_exit;
++    }
++    // fin_body: the normal path's jump lands AFTER the true-marker
++    if (!patch_jump(p_compiler, false, fin_body_jump, current_chunk(p_compiler)->code.count, author)) {
++      goto fail_post_exit;
++    }
++    // fin_body: record #2 covers F itself (an error in F replaces the
++    // in-flight one: same park register, catch_target)
++    uint32_t enter2;
++    {
++      const uint32_t at = current_chunk(p_compiler)->code.count;
++      if (!emit_word2(p_compiler,
++                      encode_OPPABCQ(OP_TRY_ENTER, false, 0, (uint16_t)park.index, (uint16_t)floor, false),
++                      author)) {
++        report_oom(p_compiler, author);
++        goto fail_post_exit;
++      }
++      enter2 = at;
++    }
++    ctx->active_handlers++;
+ 
+-  // catch_target: patch the TRY_ENTER's forward offset (patch_jump_if
+-  // rewrites A and preserves B/C — the exact contract TRY_ENTER needs).
+-  if (!patch_jump_if(p_compiler, false, enter, current_chunk(p_compiler)->code.count, author)) {
+-    goto fail_post_jump;
++    if (!compile_statement(p_compiler, p_try->finalize_body)) {
++      goto fail_active;
++    }
++
++    if (!emit_word(p_compiler, encode_oppabprime(OP_TRY_EXIT, false, 0, 0), author)) {
++      goto fail_active;
++    }
++    ctx->active_handlers--;
++
++    // re-dispatch: the flag says whether an error is parked at e's register
++    uint32_t redispatch;
++    if (!emit_incomplete_jump_if(p_compiler, true, flag, &redispatch, author)) {
++      goto fail_post_exit;
++    }
++    uint32_t fin_end_jump;
++    if (!emit_incomplete_jump(p_compiler, OP_JUMP, &fin_end_jump, author)) {
++      goto fail_post_exit;
++    }
++    // catch_target: record #2's target AND the flag's — both patched here
++    if (!patch_jump_if(p_compiler, false, enter2, current_chunk(p_compiler)->code.count, author)) {
++      goto fail_post_exit;
++    }
++    if (!patch_jump_if(p_compiler, false, redispatch, current_chunk(p_compiler)->code.count, author)) {
++      goto fail_post_exit;
++    }
++    if (p_try->catch_body == NULL) {
++      // no catch: the target re-raises the parked value outward
++      if (!emit_word2(p_compiler, encode_OPPABCQ(OP_THROW, false, (uint16_t)park.index, 0, 0, false), author)) {
++        goto fail_post_exit;
++      }
++    }
++    if (!patch_jump(p_compiler, false, fin_end_jump, current_chunk(p_compiler)->code.count, author)) {
++      goto fail_post_exit;
++    }
++    // the statement's exit jump: the finalize layout's way out is the same
++    // slot (patched past the catch body at the bottom, like the plain form)
++    end_jump = fin_end_jump;
++  } else {
++    if (!emit_incomplete_jump(p_compiler, OP_JUMP, &end_jump, author)) {
++      goto fail_post_exit;
++    }
++    // catch_target: patch record #1's offset (patch_jump_if rewrites A and
++    // preserves B/C — the exact contract TRY_ENTER needs)
++    if (!patch_jump_if(p_compiler, false, enter1, current_chunk(p_compiler)->code.count, author)) {
++      goto fail_post_exit;
++    }
+   }
+ 
+   if (p_try->catch_body != NULL) {
+@@ -2225,9 +2327,13 @@ static bool compile_try_statement(compiler* p_compiler, ast_try_statement* p_try
+ 
+ fail_active:
+   ctx->active_handlers--;
++  goto fail_post_exit;
+ fail_post_jump:
+   end_scope(p_compiler, author);
+   return false;
++fail_post_exit:
++  end_scope(p_compiler, author);
++  return false;
+ }
+ 
+ // record this return path's span width against the function's agreed width
+diff --git a/src/okgc.c b/src/okgc.c
+index eae21ec..f6997b8 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -182,10 +182,11 @@ static bool mark_value(gc* p_gc, value p_value) {
+ static bool mark_vm(gc* p_gc) {
+   vm* vm = p_gc->vm;
+   execution_state* exe = vm->current_execution_state;
+-  // a script-thrown value sits in the error lane from raise to park/report —
++  // a script-thrown value sits in the error lane from raise until the host
++  // clears it (ok_last_error keeps it readable past the failed run/call) —
+   // across C boundaries where allocation happens, so it must root like a
+   // register (a thrown object surviving a collection mid-unwind).
+-  if (exe->error_pending && exe->error_is_script) {
++  if (exe->has_error && exe->error_is_script) {
+     if (!mark_value(p_gc, exe->error_value)) {
+       return false;
+     }
+diff --git a/src/okparser.c b/src/okparser.c
+index d8e959e..fee454c 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -2211,17 +2211,23 @@ static ast_try_statement* parse_try_statement(parser* p_parser) {
+     catch_body = (ast_statement*)handler;
+   }
+ 
++  ast_statement* finalize_body = NULL;
+   if (p_parser->current.type == TOKEN_FINALIZE) {
+-    error_at(p_parser,
+-             p_parser->current,
+-             ok_create_string_view("finalize blocks are not implemented yet.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+-    goto fail_all;
++    advance(p_parser); // 'finalize' into previous
++    if (!expect(p_parser, TOKEN_LEFT_BRACE, ok_create_string_view("expected '{' after 'finalize'.", OK_STRING_VIEW_CALCULATE_LENGTH, true))) {
++      goto fail_all;
++    }
++    ast_compound_statement* fin = parse_compound_statement(p_parser);
++    if (fin == NULL) {
++      goto fail_all;
++    }
++    finalize_body = (ast_statement*)fin;
+   }
+ 
+-  if (catch_body == NULL) {
++  if (catch_body == NULL && finalize_body == NULL) {
+     error_at(p_parser,
+              p_parser->current,
+-             ok_create_string_view("expected 'catch' after try block.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++             ok_create_string_view("expected 'catch' or 'finalize' after try block.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+     goto fail_body;
+   }
+ 
+@@ -2237,7 +2243,7 @@ static ast_try_statement* parse_try_statement(parser* p_parser) {
+     try_stmt->body = (ast_statement*)body;
+     try_stmt->catch_binding = catch_binding;
+     try_stmt->catch_body = catch_body;
+-    try_stmt->finalize_body = NULL;
++    try_stmt->finalize_body = finalize_body;
+     return try_stmt;
+   }
+ 
+diff --git a/src/okvm.c b/src/okvm.c
+index eccaa8d..af02de5 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -25,7 +25,7 @@
+ static void runtime_error(vm* p_vm, ok_error_kind p_kind, const char* p_fmt, ...);
+ static void runtime_oom(vm* p_vm, const char* p_fmt, ...);
+ static interpret_result vm_report_error(vm* p_vm) __attribute__((cold));
+-static void vm_finalize_error(vm* p_vm);
++static value materialize_error_value(vm* p_vm);
+ static void reset_error_state(vm* p_vm);
+ 
+ // R10: "expected 1 arguments" is rot. one helper, every arity message rides it.
+@@ -90,8 +90,18 @@ static inline void vm_consume_pending_error(execution_state* p_exe) {
+ // an OP_CALL handler) must check this and fail instead: the error lane is
+ // set, and continuing would run bytecode against a reported-and-reset state.
+ // the outermost C entry point (depth == 0) reports-if-unreported and consumes.
+-static interpret_result vm_error(vm* p_vm) {
+-  vm_finalize_error(p_vm); // no-op inside a native; reports + resets + consumes at depth 0
++static interpret_result vm_error(vm* p_vm, bool p_report) {
++  // no-op inside a native. at depth 0: the ok_run lane reports (the
++  // uncaught-to-top contract), the ok_call lane does NOT — host-caught
++  // errors stop auto-printing (E7): the embedder holds the value through
++  // ok_last_error, printing it is their call.
++  if (p_vm->current_execution_state->native_call_depth == 0) {
++    if (p_report) {
++      vm_report_error(p_vm);
++    }
++    reset_error_state(p_vm);
++    p_vm->current_execution_state->error_pending = false;
++  }
+   interpret_result result = {.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
+   return result;
+ }
+@@ -115,6 +125,7 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->current_execution_state->error_is_script = false;
+   p_vm->current_execution_state->error_value = NULL_AS_VALUE();
+   p_vm->current_execution_state->error_kind = OK_EK_INTERNAL;
++  p_vm->current_execution_state->has_error = false;
+   p_vm->current_execution_state->error_what[0] = '\0';
+   p_vm->current_execution_state->native_call_depth = 0;
+   handler_stack_init(&p_vm->current_execution_state->handlers, p_vm->alloc);
+@@ -216,6 +227,48 @@ const vm_source_entry* vm_source_of(const vm* p_vm, uint32_t p_source_id) {
+   return &p_vm->sources.data[p_source_id];
+ }
+ 
++value vm_last_error(vm* p_vm) {
++  execution_state* exe = p_vm->current_execution_state;
++  if (!exe->has_error) {
++    return NULL_AS_VALUE();
++  }
++  // a script-thrown value is handed back whole; a runtime-raised error
++  // materializes its {:kind:, :what:} map fresh (the lane text is the truth,
++  // the map is a projection — and a host that wants it past the next
++  // allocation roots it, same contract as ok_array_new).
++  return materialize_error_value(p_vm);
++}
++
++void vm_clear_error(vm* p_vm) {
++  execution_state* exe = p_vm->current_execution_state;
++  exe->has_error = false;
++  exe->error_pending = false;
++  exe->error_reported = false;
++  exe->error_is_script = false;
++  exe->error_hard = false;
++  exe->error_value = NULL_AS_VALUE();
++}
++
++bool vm_native_throw(vm* p_vm, ok_value p_value) {
++  execution_state* exe = p_vm->current_execution_state;
++  if (exe->native_call_depth == 0) {
++    return false; // like ok_native_error: only meaningful inside a native
++  }
++  // the value-throwing lane: set the error lane directly. call_native's
++  // error_pending check fails the OP_CALL without touching the lane, and the
++  // dispatch loop's unwind parks THE VALUE at the script's catch binder —
++  // a host throw crosses into script catch as itself, zero extra machinery.
++  exe->error_pending = true;
++  exe->error_reported = false;
++  exe->error_hard = false;
++  exe->error_is_script = true;
++  exe->error_value = p_value;
++  exe->error_what[0] = '\0';
++  exe->error_kind = OK_EK_NATIVE;
++  exe->has_error = true;
++  return true;
++}
++
+ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+   execution_state* exe = p_vm->current_execution_state;
+   register_file* reg = &exe->registers;
+@@ -246,7 +299,7 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+   const uint32_t hidden_start = reg->top;
+   gc_guard_down(p_vm->alloc->gc);
+   if (!call_value(p_vm, p_vm->current_execution_state, reg, 0, 0, 0, 0)) {
+-    return vm_error(p_vm);
++    return vm_error(p_vm, true);
+   }
+   for (uint16_t i = 0; i < p_specs.top_level_values.count; ++i) {
+     reg->array.data[hidden_start + i] = p_specs.top_level_values.data[i];
+@@ -254,8 +307,10 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+   interpret_result interpret_result = run_until(p_vm, 0);
+   if (interpret_result.status != RUNTIME_OK) {
+     // uncaught at the outermost level: FAIL_PATH already printed the report;
+-    // this is the final reset + consume.
+-    vm_finalize_error(p_vm);
++    // this is the final reset + consume (the ok_run lane keeps its print).
++    vm_report_error(p_vm);
++    reset_error_state(p_vm);
++    exe->error_pending = false;
+   }
+   return interpret_result;
+ }
+@@ -277,7 +332,7 @@ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc) {
+   // first ("first of span") instead of tripping the arity check.
+   // single-result callees are byte-for-byte the old behavior.
+   if (!call_value(p_vm, exe, reg, base, 0, p_argc, RETURN_COUNT_DYNAMIC)) {
+-    return vm_error(p_vm);
++    return vm_error(p_vm, false);
+   }
+   if (exe->call_stack.count == call_depth) {
+     interpret_result result = {.status = RUNTIME_OK,
+@@ -290,8 +345,11 @@ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc) {
+     // inside a native) leave the error pending AND THE FRAMES ALIVE so an
+     // outer script level can still catch it (the cross-native lane), and the
+     // enclosing call_native can fail the OP_CALL instead of resuming.
++    // at depth 0 this is the HOST-CAUGHT lane: reset + consume, NO print
++    // (E7 — the embedder reads ok_last_error).
+     if (exe->native_call_depth == 0) {
+-      vm_finalize_error(p_vm);
++      reset_error_state(p_vm);
++      exe->error_pending = false;
+     }
+   }
+   return result;
+@@ -1718,14 +1776,23 @@ static unwind_resume __attribute__((noinline, cold)) attempt_unwind(vm* p_vm, ui
+     resume.frame = fr;
+     resume.ip = fr->ip;
+     resume.caught = true;
+-    // consumed: the catch owns it now
++    // consumed: the catch owns it now (and the run recovered: last_error
++    // reads nothing once a catch took it)
+     exe->error_pending = false;
+     exe->error_reported = false;
++    exe->has_error = false;
+     return resume;
+   }
+   return resume;
+ }
+ 
++static interpret_result error_interpret_result(void) {
++  interpret_result result;
++  result.status = RUNTIME_ERROR;
++  result.top_level_return = NULL_AS_VALUE();
++  return result;
++}
++
+ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+   execution_state* exe = p_vm->current_execution_state;
+   call_frame* frame = &exe->call_stack.data[exe->call_stack.count - 1];
+@@ -1749,13 +1816,19 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+ #define FAIL_PATH()                                                                                                  \
+   do {                                                                                                               \
+     frame->ip = ip;                                                                                                 \
++    if (exe->error_hard) {                                                                                           \
++      /* OOM: uncatchable, prints from the live state with the synced ip */                                          \
++      return vm_report_error(p_vm);                                                                                  \
++    }                                                                                                                \
+     const unwind_resume resume = attempt_unwind(p_vm, p_call_depth);                                                 \
+-    if (resume.caught) {                                                                                            \
++    if (resume.caught) {                                                                                             \
+       frame = resume.frame;                                                                                          \
+       ip = resume.ip;                                                                                                \
+       goto next_instruction;                                                                                         \
+     }                                                                                                                \
+-    return vm_report_error(p_vm);                                                                                   \
++    /* propagation: an outer script level may still catch, and the print belongs */                                  \
++    /* to the outermost C lane (ok_run prints, ok_call does not — E7) */                                             \
++    return error_interpret_result();                                                                                 \
+   } while (0)
+ 
+   for (;;) {
+@@ -2831,6 +2904,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       exe->error_value = REG_AT(A);
+       exe->error_what[0] = '\0';
+       exe->error_kind = OK_EK_INTERNAL;
++      exe->has_error = true;
+       FAIL_PATH();
+       break;
+     }
+@@ -2859,6 +2933,7 @@ void runtime_error(vm* p_vm, ok_error_kind p_kind, const char* p_fmt, ...) {
+   exe->error_hard = false;
+   exe->error_pending = true;
+   exe->error_reported = false;
++  exe->has_error = true;
+ }
+ 
+ // RAISE (hard): the OOM lane. out of memory is not a value and not
+@@ -2875,7 +2950,10 @@ void runtime_oom(vm* p_vm, const char* p_fmt, ...) {
+   exe->error_is_script = false;
+   exe->error_hard = true;
+   exe->error_pending = true;
+-  vm_report_error(p_vm); // prints now (unreported) and resets
++  exe->has_error = true;
++  // no print here: the raising arm's FAIL_PATH prints hard errors itself,
++  // from the live state, with the instruction's SYNCED ip (printing here
++  // would read a stale frame->ip — the arm hasn't synced yet).
+ }
+ 
+ // the report's value half: a script `throw v` prints the value itself, in
+@@ -3023,20 +3101,6 @@ static void reset_error_state(vm* p_vm) {
+   exe->handlers.count = 0;
+ }
+ 
+-// the outermost C boundary (native_call_depth == 0): report the no-frames
+-// lane (an error raised under ok_call with an empty call stack never passes
+-// a FAIL_PATH), reset, consume. inner boundaries leave the error pending so
+-// an outer script level can still catch it (the cross-native lane).
+-static void vm_finalize_error(vm* p_vm) {
+-  execution_state* exe = p_vm->current_execution_state;
+-  if (exe->native_call_depth != 0) {
+-    return;
+-  }
+-  vm_report_error(p_vm);
+-  reset_error_state(p_vm);
+-  exe->error_pending = false;
+-}
+-
+ static inline bool call(vm* p_vm,
+                         execution_state* p_exe,
+                         register_file* p_reg,
+diff --git a/src/okvm.h b/src/okvm.h
+index 6063c11..7bb042f 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -103,6 +103,10 @@ typedef struct {
+   bool error_is_script;
+   bool error_hard;
+   bool error_reported;
++  // the read flag, distinct from error_pending (the propagation flag): a
++  // host-caught error is consumed for propagation but stays readable for
++  // ok_last_error until cleared or the next ok_run.
++  bool has_error;
+ 
+   // set by runtime_error, and checked by call_native (a native returning after an
+   // inner error must fail its OP_CALL) and consumed at the outermost C entry
+@@ -170,6 +174,13 @@ uint32_t vm_begin_source(vm* p_vm, const char* p_code, const char* p_path);
+ void vm_end_source(vm* p_vm, uint32_t p_source_id);
+ const vm_source_entry* vm_source_of(const vm* p_vm, uint32_t p_source_id);
+ 
++// the host-caught lane: the most recent error's value (ok_last_error), the
++// clear (ok_clear_error), and the native's value-throw (ok_native_throw —
++// the sibling of ok_native_error, which stays as message sugar).
++value vm_last_error(vm* p_vm);
++void vm_clear_error(vm* p_vm);
++bool vm_native_throw(vm* p_vm, ok_value p_value);
++
+ typedef enum { TT_STR, TT_NUM, TT_BOOL } temporary_type_tags;
+ 
+ #endif // OK_VM_H
+diff --git a/tests/e2e/tests/errors/finalize_error_replaces.ok b/tests/e2e/tests/errors/finalize_error_replaces.ok
+new file mode 100644
+index 0000000..4de7bdd
+--- /dev/null
++++ b/tests/e2e/tests/errors/finalize_error_replaces.ok
+@@ -0,0 +1,11 @@
++try {
++  try {
++    throw "original";
++  } catch e {
++    print(e); // expect: from-finalize
++  } finalize {
++    throw "from-finalize";
++  }
++} catch outer {
++  print("unreachable");
++}
+diff --git a/tests/e2e/tests/errors/finalize_no_catch.ok b/tests/e2e/tests/errors/finalize_no_catch.ok
+new file mode 100644
+index 0000000..adc773b
+--- /dev/null
++++ b/tests/e2e/tests/errors/finalize_no_catch.ok
+@@ -0,0 +1,6 @@
++try {
++  print("body"); // expect: body
++} finalize {
++  print("fin"); // expect: fin
++}
++print("after"); // expect: after
+diff --git a/tests/e2e/tests/errors/finalize_normal.ok b/tests/e2e/tests/errors/finalize_normal.ok
+new file mode 100644
+index 0000000..abcb527
+--- /dev/null
++++ b/tests/e2e/tests/errors/finalize_normal.ok
+@@ -0,0 +1,9 @@
++let mut log = "";
++try {
++  log = log + "body";
++} catch e {
++  log = log + "catch";
++} finalize {
++  log = log + "|fin";
++}
++print(log); // expect: body|fin
+diff --git a/tests/e2e/tests/errors/finalize_order.ok b/tests/e2e/tests/errors/finalize_order.ok
+new file mode 100644
+index 0000000..350a1df
+--- /dev/null
++++ b/tests/e2e/tests/errors/finalize_order.ok
+@@ -0,0 +1,9 @@
++let mut log = "";
++try {
++  throw "boom";
++} catch e {
++  log = log + e;
++} finalize {
++  log = log + "|fin";
++}
++print(log); // expect: |finboom
+diff --git a/tests/e2e/tests/errors/finalize_rethrow.ok b/tests/e2e/tests/errors/finalize_rethrow.ok
+new file mode 100644
+index 0000000..e7a8a8f
+--- /dev/null
++++ b/tests/e2e/tests/errors/finalize_rethrow.ok
+@@ -0,0 +1,9 @@
++try {
++  try {
++    throw "kept-alive";
++  } finalize {
++    print("fin"); // expect: fin
++  }
++} catch e {
++  print(e); // expect: kept-alive
++}
+diff --git a/tests/e2e/tests/errors/try_requires_catch.ok b/tests/e2e/tests/errors/try_requires_catch.ok
+index dea1151..c95136f 100644
+--- a/tests/e2e/tests/errors/try_requires_catch.ok
++++ b/tests/e2e/tests/errors/try_requires_catch.ok
+@@ -1,3 +1,3 @@
+ try {
+-  print(1); // expect error: expected 'catch' after try block.
++  print(1); // expect error: expected 'catch' or 'finalize' after try block.
+ }
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index 559f786..ca6f367 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -814,14 +814,13 @@ int main() {
+     ok_source sb = {"let b = 1;\n", "b_embed_source.ok"};
+     assert(ok_run(own, sb) == OK);
+ 
+-    ok_value f = ok_value_null();
+-    assert(ok_global_get(own, ok_create_string_view("a_err", 5, true), &f));
+-
+-    // capture stderr: the default (borrowed) lane reports the right path and
+-    // coordinates with NO excerpt — the borrow expired with ok_run.
++    // E7 world: ok_call failures print nothing, so the report lane is
++    // exercised through a second ok_run whose script CALLS the leftover —
++    // an uncaught error, printed by the ok_run lane, naming A's path and
++    // A's line:col (the borrowed lane: no excerpt).
+     std::string report = capture_stderr([&] {
+-      ok_value out = ok_value_null();
+-      assert(!ok_call(own, f, 0, nullptr, &out));
++      ok_source caller = {"a_err();\n", "caller_embed.ok"};
++      assert(ok_run(own, caller) == OK_RUNTIME_ERROR);
+     });
+     assert(report.find("a_embed_source.ok:2:12") != std::string::npos);
+     assert(report.find("    2 |") == std::string::npos); // no snippet: borrowed
+@@ -851,12 +850,9 @@ int main() {
+     ok_source sb = {"let b = 1;\n", "b_retained.ok"};
+     assert(ok_run(own, sb) == OK);
+ 
+-    ok_value f = ok_value_null();
+-    assert(ok_global_get(own, ok_create_string_view("a_err", 5, true), &f));
+-
+     std::string report = capture_stderr([&] {
+-      ok_value out = ok_value_null();
+-      assert(!ok_call(own, f, 0, nullptr, &out));
++      ok_source caller = {"a_err();\n", "caller_retained.ok"};
++      assert(ok_run(own, caller) == OK_RUNTIME_ERROR);
+     });
+     assert(report.find("a_retained.ok:2:12") != std::string::npos);
+     assert(report.find("return 1 + \"x\";") != std::string::npos); // the excerpt is alive
+@@ -932,6 +928,103 @@ int main() {
+     ok_free(err_vm);
+   }
+ 
++  // --- the C boundary (0.4.0): ok_last_error / ok_native_throw / E7 ---
++  // E7's one embedder-visible behavior change: a failed ok_call prints
++  // NOTHING (host-caught lane) — the uncaught-to-top report stays ok_run's.
++  {
++    ok* host = ok_create(ok_specs{});
++
++    // a script-thrown value, read back through ok_last_error
++    const char* thrower_code = R"(
++      glob fu thrower() {
++        throw {"code": 42, "text": "host value"};
++      }
++    )";
++    ok_source tsrc = {thrower_code, "thrower_host.ok"};
++    assert(ok_run(host, tsrc) == OK);
++    ok_value thrower = ok_value_null();
++    assert(ok_global_get(host, ok_create_string_view("thrower", 7, true), &thrower));
++
++    std::string silent = capture_stderr([&] {
++      ok_value out = ok_value_null();
++      assert(!ok_call(host, thrower, 0, nullptr, &out));
++    });
++    assert(silent.empty()); // E7: host-caught errors do not auto-print
++
++    // the documented rooting contract: the returned value is unrooted, so
++    // every allocation happens BEFORE ok_last_error (ok_value_string
++    // allocates — under aggressive GC it would sweep the map mid-use).
++    ok_value key_code = ok_value_string(host, ok_create_string_view("code", 4, true));
++    ok_value err = ok_last_error(host);
++    assert(ok_value_is_map(err));
++    ok_value code = ok_value_null();
++    assert(ok_map_get(err, key_code, &code));
++    assert(ok_value_is_number(code) && ok_value_as_number(code) == 42.0);
++
++    // cleared explicitly
++    ok_clear_error(host);
++    assert(ok_value_is_null(ok_last_error(host)));
++
++    // a runtime-raised error materializes the {:kind:, :what:} map
++    const char* binop_code = R"(
++      glob fu bad() {
++        return 1 + "x";
++      }
++    )";
++    ok_source bsrc = {binop_code, "binop_host.ok"};
++    assert(ok_run(host, bsrc) == OK);
++    ok_value bad = ok_value_null();
++    assert(ok_global_get(host, ok_create_string_view("bad", 3, true), &bad));
++    ok_value out2 = ok_value_null();
++    assert(!ok_call(host, bad, 0, nullptr, &out2));
++    // the rooting lane: ok_last_error's map is unrooted, and THIS time an
++    // allocation must happen after it — so the map goes under ok_root first
++    // (the documented contract, demonstrated instead of avoided).
++    ok_value rerr = ok_last_error(host);
++    assert(ok_value_is_map(rerr));
++    const uint32_t rerr_root = ok_root(host, rerr);
++    assert(rerr_root != OK_ROOT_INVALID);
++    ok_value key_kind = ok_value_string(host, ok_create_string_view("kind", 4, true));
++    ok_value kind = ok_value_null();
++    assert(ok_map_get(rerr, key_kind, &kind));
++    assert(ok_value_is_string(kind));
++    assert(std::string(ok_value_as_string(kind).chars) == "type");
++    assert(ok_unroot(host, rerr_root));
++
++    ok_clear_error(host);
++
++    // ok_native_throw: the host's value crosses into the script's catch as itself
++    auto native_thrower = [](ok* p_ok, uint8_t argc, const ok_value* argv) -> ok_value {
++      (void)argc;
++      (void)argv;
++      assert(ok_native_throw(p_ok, ok_value_number(7.0)));
++      return ok_value_null();
++    };
++    assert(ok_global_define_native_function(
++        host, ok_create_string_view("host_throw", OK_STRING_VIEW_CALCULATE_LENGTH, true), 0, native_thrower));
++    const char* catcher_code = R"(
++      glob let mut got = 0;
++      try {
++        host_throw();
++      } catch e {
++        got = e;
++      }
++    )";
++    ok_source csrc = {catcher_code, "catcher_host.ok"};
++    assert(ok_run(host, csrc) == OK);
++    ok_value got = ok_value_null();
++    assert(ok_global_get(host, ok_create_string_view("got", 3, true), &got));
++    assert(ok_value_is_number(got) && ok_value_as_number(got) == 7.0);
++
++    // and the ok_run lane still prints its uncaught report
++    const char* uncaught_code = "throw \"to the top\";\n";
++    ok_source usrc = {uncaught_code, "uncaught_host.ok"};
++    std::string loud = capture_stderr([&] { assert(ok_run(host, usrc) == OK_RUNTIME_ERROR); });
++    assert(loud.find("uncaught_host.ok:1:1: error: uncaught error: to the top") != std::string::npos);
++
++    ok_free(host);
++  }
++
+   assert(g_destructor_calls == 1);
+   assert(bag_destructor_calls == 1);
+ 

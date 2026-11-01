@@ -1,0 +1,1305 @@
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 009cb94..f9dcd18 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -111,6 +111,7 @@ static void register_allocator_reset_locals(register_allocator* p_regalloc, uint
+ static void scope_init(scope* p_scope, uint32_t p_checkpoint, allocators* p_alloc) {
+   scope_registers_init(&p_scope->registers_map, p_alloc);
+   uint16_array_init(&p_scope->registers, p_alloc);
++  declarations_init(&p_scope->declarations, p_alloc);
+   p_scope->registers_checkpoint = p_checkpoint;
+   p_scope->captures_any = false;
+ }
+@@ -118,6 +119,7 @@ static void scope_init(scope* p_scope, uint32_t p_checkpoint, allocators* p_allo
+ static void scope_deinit(scope* p_scope, allocators* p_alloc) {
+   scope_registers_deinit(&p_scope->registers_map);
+   uint16_array_deinit(&p_scope->registers, p_alloc);
++  declarations_deinit(&p_scope->declarations, p_alloc);
+   p_scope->registers_checkpoint = 0;
+ }
+ 
+@@ -148,6 +150,7 @@ static void compile_context_init(compile_context* p_context,
+                                  allocators* p_alloc) {
+   register_allocator_init(&p_context->register_allocator, p_alloc);
+   upvalues_init(&p_context->upvalues, p_alloc);
++  declarations_init(&p_context->upvalue_declarations, p_alloc);
+   scopes_init(&p_context->scopes, p_alloc);
+   loop_stack_init(&p_context->loop_stack, p_alloc);
+   p_context->function.function = p_obj_function;
+@@ -159,6 +162,7 @@ static void compile_context_init(compile_context* p_context,
+ static void compile_context_deinit(compile_context* p_context, allocators* p_alloc) {
+   loop_stack_deinit(&p_context->loop_stack, p_alloc);
+   scopes_deinit(&p_context->scopes, p_alloc);
++  declarations_deinit(&p_context->upvalue_declarations, p_alloc);
+   upvalues_deinit(&p_context->upvalues, p_alloc);
+   register_allocator_deinit(&p_context->register_allocator);
+   p_context->function.function = NULL;
+@@ -167,11 +171,26 @@ static void compile_context_deinit(compile_context* p_context, allocators* p_all
+ 
+ ARRAY_DEFINE_DEFAULT(registers, _register, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(upvalues, upvalue, ARRAY_DEFAULT_TYPE_DEINIT)
++ARRAY_DEFINE_DEFAULT(declarations, scope_declaration, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(scopes, scope, scope_deinit)
+ ARRAY_DEFINE_DEFAULT(compile_contexts, compile_context, compile_context_deinit)
+ ARRAY_DEFINE_DEFAULT(uint16_array, uint16_t, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(loop_stack, loop_context, loop_context_deinit)
+ 
++static void error_at_noted_located(compiler* p_compiler,
++                                  const ast_node* p_author,
++                                  const ok_string_view p_message,
++                                  const ok_note* p_note) {
++  report_at_noted(&p_compiler->panic,
++                  &p_compiler->had_error,
++                  p_author->node_type == AST_EOF_STATEMENT,
++                  p_compiler->source,
++                  &p_author->token,
++                  REPORT_SEVERITY_ERROR,
++                  p_message,
++                  p_note);
++}
++
+ static void error_at_noted(compiler* p_compiler,
+                            const ast_node* p_author,
+                            const ok_string_view p_message,
+@@ -182,14 +201,7 @@ static void error_at_noted(compiler* p_compiler,
+   note.span.line = 0;
+   note.span.offset = 0;
+   note.span.length = 0;
+-  report_at_noted(&p_compiler->panic,
+-                  &p_compiler->had_error,
+-                  p_author->node_type == AST_EOF_STATEMENT,
+-                  p_compiler->source,
+-                  &p_author->token,
+-                  REPORT_SEVERITY_ERROR,
+-                  p_message,
+-                  p_note.chars != NULL ? &note : NULL);
++  error_at_noted_located(p_compiler, p_author, p_message, p_note.chars != NULL ? &note : NULL);
+ }
+ 
+ static void error_at(compiler* p_compiler, const ast_node* p_author, const ok_string_view p_message) {
+@@ -323,6 +335,30 @@ static inline void end_context(compiler* p_compiler) {
+   ASSERT(compile_contexts_pop(&p_compiler->contexts));
+ }
+ 
++// the latest receipt for a register in one scope (latest first: the span
++// bindings path can re-emit a register inside the same scope).
++static token* scope_declaration_at(scope* p_scope, uint16_t p_register) {
++  for (uint32_t i = p_scope->declarations.count; i-- > 0;) {
++    if (p_scope->declarations.data[i].register_index == p_register) {
++      return &p_scope->declarations.data[i].declared;
++    }
++  }
++  return NULL;
++}
++
++// the receipt for a live local, innermost scope first. register indices are
++// unique across live scopes (allocation is monotonic from a shared top, dead
++// scopes pop with their receipts), so the first hit is the declaration.
++static token* context_declaration_at(compile_context* p_ctx, uint16_t p_register) {
++  for (uint32_t i = p_ctx->scopes.count; i-- > 0;) {
++    token* declared = scope_declaration_at(&p_ctx->scopes.data[i], p_register);
++    if (declared != NULL) {
++      return declared;
++    }
++  }
++  return NULL;
++}
++
+ static _register
+ add_local(compiler* p_compiler, const variable_declaration p_declration, bool p_initialized, ast_node* p_author) {
+   // full flag set must be computed before any allocation: the metadata array copies the
+@@ -370,11 +406,27 @@ add_local(compiler* p_compiler, const variable_declaration p_declration, bool p_
+       register_allocator_rollback_local(&ctx->register_allocator);
+       return reg;
+     }
++    // the binder receipt: what the redefinition and immutability notes read.
++    // allocation failure is not fatal here — the notes just degrade to text.
++    scope_declaration receipt = {reg.index, p_author->token};
++    declarations_append(&scp->declarations, receipt);
+     return reg;
+   }
+   string name = create_string_from_string_view(p_declration.identifier, alloc);
+   string message = asprint(alloc, "redefining local: '%s' in the same scope.", name.chars);
+-  error_at(p_compiler, p_author, ok_create_string_view_from_string(message));
++  string note = asprint(alloc, "previous declaration of '%s' is here.", name.chars);
++  ok_note located;
++  located.text = ok_create_string_view_from_string(note);
++  token* declared = scope_declaration_at(scp, *resolved);
++  if (declared != NULL) {
++    located.has_span = true;
++    located.span = ok_span_of_token(declared);
++  } else {
++    located.has_span = false;
++  }
++  error_at_noted_located(
++      p_compiler, p_author, ok_create_string_view_from_string(message), declared != NULL ? &located : NULL);
++  string_deinit(&note, alloc);
+   string_deinit(&message, alloc);
+   string_deinit(&name, alloc);
+   reg.errors = REGISTER_REDEFINED_LOCAL;
+@@ -1178,17 +1230,32 @@ store_local(compiler* p_compiler, location p_local_location, expression_result p
+   allocators* alloc = p_compiler->alloc;
+   _register local = current_context(p_compiler)->register_allocator.registers.data[p_local_location.index];
+   if ((local.flags & REGISTER_FLAG_MUTABLE) == 0) {
+-    error_at_noted(p_compiler,
+-                   p_author,
+-                   ok_create_string_view(
+-                       "attempting to mutate an immutable local variable.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                   ok_create_string_view("did you forget to declare it 'mut'?", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ok_note note;
++    note.text = ok_create_string_view("declared here without 'mut'.", OK_STRING_VIEW_CALCULATE_LENGTH, true);
++    token* declared = context_declaration_at(current_context(p_compiler), local.index);
++    if (declared != NULL) {
++      note.has_span = true;
++      note.span = ok_span_of_token(declared);
++      error_at_noted_located(p_compiler,
++                                 p_author,
++                                 ok_create_string_view("attempting to mutate an immutable local variable.",
++                                                       OK_STRING_VIEW_CALCULATE_LENGTH,
++                                                       true),
++                                 &note);
++    } else {
++      error_at_noted(p_compiler,
++                     p_author,
++                     ok_create_string_view(
++                         "attempting to mutate an immutable local variable.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                     ok_create_string_view("did you forget to declare it 'mut'?", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    }
+     return false;
+   }
+   return write_local(p_compiler, local, p_value, p_author);
+ }
+ 
+-static upvalue add_upvalue(compiler* p_compiler, compile_context* p_ctx, upvalue p_upvalue, ast_node* p_author) {
++static upvalue
++add_upvalue(compiler* p_compiler, compile_context* p_ctx, upvalue p_upvalue, const token* p_root, ast_node* p_author) {
+   allocators* alloc = p_compiler->alloc;
+   // the array stores semantic indices (captured local's slot, or parent's upvalue position),
+   // but the returned index must be the position in this context's upvalues array, because
+@@ -1217,6 +1284,12 @@ static upvalue add_upvalue(compiler* p_compiler, compile_context* p_ctx, upvalue
+     report_oom(p_compiler, p_author);
+     return p_upvalue;
+   }
++  // binder receipt for the new entry, in lockstep (first capture wins: an
++  // existing entry keeps its receipt, found on the dedup path above). a
++  // missing root (hidden state) parks a zeroed token — has_span is judged
++  // by the note builder, not here.
++  scope_declaration receipt = {p_upvalue.index, p_root != NULL ? *p_root : (token){0}};
++  declarations_append(&p_ctx->upvalue_declarations, receipt);
+   p_upvalue.index = (ok_index)(p_ctx->upvalues.count - 1);
+   p_upvalue.errors = UPVALUE_OK;
+   return p_upvalue;
+@@ -1244,12 +1317,19 @@ resolve_upvalue(compiler* p_compiler, uint32_t p_context_index, ok_string_view p
+     if ((local_reg->flags & REGISTER_FLAG_MUTABLE) != 0) {
+       u.flags |= UPVALUE_FLAG_MUTABLE;
+     }
+-    return add_upvalue(p_compiler, current, u, p_author);
++    return add_upvalue(p_compiler, current, u, scope_declaration_at(scp, local_reg->index), p_author);
+   }
+   u = resolve_upvalue(p_compiler, p_context_index + 1, p_identifier, p_author);
+   if (u.error != UPVALUE_UNDEFINED) {
+     u.flags = (u.flags & UPVALUE_FLAG_MUTABLE) != 0 ? UPVALUE_FLAG_MUTABLE | UPVALUE_FLAG_UP : UPVALUE_FLAG_UP;
+-    return add_upvalue(p_compiler, current, u, p_author);
++    // an UP upvalue's root receipt lives in the parent context's parallel
++    // array, by the semantic index the recursive call returned.
++    const token* root = NULL;
++    if (u.index < up->upvalue_declarations.count &&
++        up->upvalue_declarations.data[u.index].declared.line_info.line > 0) {
++      root = &up->upvalue_declarations.data[u.index].declared;
++    }
++    return add_upvalue(p_compiler, current, u, root, p_author);
+   }
+   return u;
+ }
+@@ -1257,11 +1337,27 @@ resolve_upvalue(compiler* p_compiler, uint32_t p_context_index, ok_string_view p
+ static bool store_upvalue(compiler* p_compiler, location p_upvalue, expression_result p_value, ast_node* p_author) {
+   upvalue up = current_context(p_compiler)->upvalues.data[p_upvalue.index];
+   if ((up.flags & UPVALUE_FLAG_MUTABLE) == 0) {
+-    error_at_noted(p_compiler,
+-                   p_author,
+-                   ok_create_string_view(
+-                       "attempting to mutate an immutable upvalue variable.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                   ok_create_string_view("did you forget to declare it 'mut'?", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    compile_context* ctx = current_context(p_compiler);
++    ok_note note;
++    note.text = ok_create_string_view("declared here without 'mut'.", OK_STRING_VIEW_CALCULATE_LENGTH, true);
++    const bool rooted = p_upvalue.index < ctx->upvalue_declarations.count &&
++                        ctx->upvalue_declarations.data[p_upvalue.index].declared.line_info.line > 0;
++    if (rooted) {
++      note.has_span = true;
++      note.span = ok_span_of_token(&ctx->upvalue_declarations.data[p_upvalue.index].declared);
++      error_at_noted_located(p_compiler,
++                             p_author,
++                             ok_create_string_view(
++                                 "attempting to mutate an immutable upvalue variable.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                             &note);
++    } else {
++      error_at_noted(p_compiler,
++                     p_author,
++                     ok_create_string_view(
++                         "attempting to mutate an immutable upvalue variable.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                     ok_create_string_view(
++                         "did you forget to declare it 'mut'?", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    }
+     return false;
+   }
+   // the operand must be the position in this function's upvalue array (the location index),
+@@ -1990,8 +2086,9 @@ static bool record_return_span(compiler* p_compiler, ast_return_statement* p_ret
+   if (ctx->return_span != p_count) {
+     allocators* alloc = p_compiler->alloc;
+     string message = asprint(alloc,
+-                             "return span mismatch: this path returns %u values, the return at line %u returns %u.",
++                             "return span mismatch: this path returns %u value%s, the return at line %u returns %u.",
+                              p_count,
++                             p_count == 1 ? "" : "s",
+                              ctx->first_return_author != NULL ? ctx->first_return_author->token.line_info.line : 0,
+                              ctx->return_span);
+     error_at_noted(p_compiler,
+@@ -2971,12 +3068,25 @@ static bool compile_compound_assign_expression(compiler* p_compiler,
+   if (lv.kind == LVALUE_VARIABLE && lv.variable.kind == LOCATION_KIND_REGISTER) {
+     const _register local = current_context(p_compiler)->register_allocator.registers.data[lv.variable.index];
+     if ((local.flags & REGISTER_FLAG_MUTABLE) == 0) {
+-      error_at_noted(
+-          p_compiler,
+-          author,
+-          ok_create_string_view(
+-              "attempting to mutate an immutable local variable.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-          ok_create_string_view("did you forget to declare it 'mut'?", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      ok_note note;
++      note.text = ok_create_string_view("declared here without 'mut'.", OK_STRING_VIEW_CALCULATE_LENGTH, true);
++      token* declared = context_declaration_at(current_context(p_compiler), local.index);
++      if (declared != NULL) {
++        note.has_span = true;
++        note.span = ok_span_of_token(declared);
++        error_at_noted_located(p_compiler,
++                               author,
++                               ok_create_string_view(
++                                   "attempting to mutate an immutable local variable.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                               &note);
++      } else {
++        error_at_noted(p_compiler,
++                       author,
++                       ok_create_string_view(
++                           "attempting to mutate an immutable local variable.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                       ok_create_string_view(
++                           "did you forget to declare it 'mut'?", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      }
+       return false;
+     }
+     cur = (_register){lv.variable.index, REGISTER_FLAG_NONE, REGISTER_OK};
+diff --git a/src/okcompiler.h b/src/okcompiler.h
+index 7e0eb77..7c916a7 100644
+--- a/src/okcompiler.h
++++ b/src/okcompiler.h
+@@ -119,9 +119,21 @@ MAP_DECLARE(scope_registers, string, uint16_t /* index to the scope's registers
+ ARRAY_DECLARE_DEFAULT(registers, _register)
+ ARRAY_DECLARE_DEFAULT(upvalues, upvalue)
+ 
++// a binder's receipt: where a local was declared. the scope map stores only
++// the register index, so these ride in a parallel array — the "note:
++// previously declared here" lane reads them at error time (the token's
++// .start points into the source, alive for the whole compile pass).
++typedef struct {
++  uint16_t register_index;
++  token declared;
++} scope_declaration;
++
++ARRAY_DECLARE_DEFAULT(declarations, scope_declaration)
++
+ typedef struct {
+   scope_registers registers_map; // indices into the scope's registers
+   uint16_array registers;        // indices into the function's registers
++  declarations declarations;     // binder receipts, parallel to the map's values
+   uint32_t registers_checkpoint;
+   bool captures_any;
+ } scope;
+@@ -161,6 +173,10 @@ typedef struct {
+ typedef struct {
+   scopes scopes;
+   upvalues upvalues;
++  // binder receipts for upvalues, by position in `upvalues` (the captured
++  // local's declaration token, when the root was resolvable). the
++  // immutable-upvalue-mutation note reads it.
++  declarations upvalue_declarations;
+   loop_stack loop_stack;
+   compile_function function;
+   register_allocator register_allocator;
+diff --git a/src/okvm.c b/src/okvm.c
+index 9e5ef64..3e38883 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -17,11 +17,18 @@
+ #include "okgc.h"
+ #include "okglobals_store.h"
+ #include "okobject.h"
++#include "okdiag.h"
+ #include "okutils.h"
+ 
+ #define STACK_SIZE 256
+ 
+ static void runtime_error(vm* p_vm, const char* p_fmt, ...);
++static interpret_result vm_report_error(vm* p_vm) __attribute__((cold));
++
++// R10: "expected 1 arguments" is rot. one helper, every arity message rides it.
++static const char* s_if_plural(uint32_t p_n) {
++  return p_n == 1 ? "" : "s";
++}
+ static bool call_spread(vm* p_vm,
+                         execution_state* p_exe,
+                         register_file* p_reg,
+@@ -55,11 +62,17 @@ static inline void vm_consume_pending_error(execution_state* p_exe) {
+ 
+ // a runtime error fired somewhere under the current C entry point. callers
+ // that resume interpretation after the error point (call_native returning to
+-// an OP_CALL handler) must check this and fail instead: runtime_error already
+-// reset the call stack + watermark, and continuing would run bytecode against
+-// a wild frame pointer.
+-static interpret_result vm_error(execution_state* p_exe) {
+-  vm_consume_pending_error(p_exe);
++// an OP_CALL handler) must check this and fail instead: the error lane is
++// set, and continuing would run bytecode against a reported-and-reset state.
++// the outermost C entry point (depth == 0) reports-if-unreported and consumes.
++static interpret_result vm_error(vm* p_vm) {
++  execution_state* exe = p_vm->current_execution_state;
++  if (exe->native_call_depth == 0) {
++    // the no-frames lane: an error raised under ok_call with an empty call
++    // stack never passes a FAIL_PATH, so this is its one report.
++    vm_report_error(p_vm);
++    vm_consume_pending_error(exe);
++  }
+   interpret_result result = {.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
+   return result;
+ }
+@@ -77,6 +90,8 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->current_execution_state->open_upvalues = NULL;
+   p_vm->current_execution_state->native_has_error = false;
+   p_vm->current_execution_state->error_pending = false;
++  p_vm->current_execution_state->error_reported = false;
++  p_vm->current_execution_state->error_what[0] = '\0';
+   p_vm->current_execution_state->native_call_depth = 0;
+   string_init(&p_vm->current_execution_state->native_error_message, NULL, 0, false, p_vm->alloc);
+   register_file_init_warm(&p_vm->current_execution_state->registers, STACK_SIZE, p_specs.alloc);
+@@ -95,6 +110,7 @@ void vm_deinit(vm* p_vm) {
+   p_vm->current_execution_state->native_call_depth = 0;
+   p_vm->current_execution_state->native_has_error = false;
+   p_vm->current_execution_state->error_pending = false;
++  p_vm->current_execution_state->error_reported = false;
+   string_deinit(&p_vm->current_execution_state->native_error_message, p_vm->alloc);
+   p_vm->alloc->release(p_vm->alloc, p_vm->current_execution_state);
+ }
+@@ -140,7 +156,7 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+   const uint32_t hidden_start = reg->top;
+   gc_guard_down(p_vm->alloc->gc);
+   if (!call_value(p_vm, p_vm->current_execution_state, reg, 0, 0, 0, 0)) {
+-    return vm_error(p_vm->current_execution_state);
++    return vm_error(p_vm);
+   }
+   for (uint16_t i = 0; i < p_specs.top_level_values.count; ++i) {
+     reg->array.data[hidden_start + i] = p_specs.top_level_values.data[i];
+@@ -169,7 +185,7 @@ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc) {
+   // first ("first of span") instead of tripping the arity check.
+   // single-result callees are byte-for-byte the old behavior.
+   if (!call_value(p_vm, exe, reg, base, 0, p_argc, RETURN_COUNT_DYNAMIC)) {
+-    return vm_error(exe);
++    return vm_error(p_vm);
+   }
+   if (exe->call_stack.count == call_depth) {
+     interpret_result result = {.status = RUNTIME_OK,
+@@ -1187,11 +1203,11 @@ static inline bool object_as_num(vm* p_vm, object* p_obj, value* p_result) {
+     char* endptr;
+     const double value = strtod(buff, &endptr);
+     if (endptr == buff) {
+-      runtime_error(p_vm, "failed to convert string to number");
++      runtime_error(p_vm, "failed to convert string to number.");
+       return false;
+     }
+     if (*endptr != '\0') {
+-      runtime_error(p_vm, "failed to convert string to number");
++      runtime_error(p_vm, "failed to convert string to number.");
+       return false;
+     }
+     if (errno == ERANGE) {
+@@ -1202,24 +1218,24 @@ static inline bool object_as_num(vm* p_vm, object* p_obj, value* p_result) {
+     return true;
+   }
+   case OBJ_ARRAY: {
+-    runtime_error(p_vm, "array is not convertable to number.");
++    runtime_error(p_vm, "array is not convertible to number.");
+     return false;
+   }
+   case OBJ_MAP: {
+-    runtime_error(p_vm, "map is not convertable to number.");
++    runtime_error(p_vm, "map is not convertible to number.");
+     return false;
+   }
+   case OBJ_CLOSURE: {
+-    runtime_error(p_vm, "function is not convertable to number.");
++    runtime_error(p_vm, "function is not convertible to number.");
+     return false;
+   }
+   case OBJ_NATIVE_FUNCTION: {
+-    runtime_error(p_vm, "native function is not convertable to number.");
++    runtime_error(p_vm, "native function is not convertible to number.");
+     return false;
+   }
+   case OBJ_NATIVE_VALUE: {
+     // scrr idk if we should allow this!?
+-    runtime_error(p_vm, "native value is not convertable to number.");
++    runtime_error(p_vm, "native value is not convertible to number.");
+     return false;
+   }
+   }
+@@ -1239,12 +1255,12 @@ static ok_value as_num(vm* p_vm, ok_value p_value, value* p_result) {
+     *p_result = NUMBER_AS_VALUE(VALUE_AS_INT(p_value));
+   }
+   case TAG_NULL_MASK: {
+-    runtime_error(p_vm, "null is not convertable to number.");
++    runtime_error(p_vm, "null is not convertible to number.");
+     return false;
+   }
+   case TAG_TRUE_MASK:
+   case TAG_FALSE_MASK: {
+-    runtime_error(p_vm, "boolean is not convertable to number.");
++    runtime_error(p_vm, "boolean is not convertible to number.");
+     return false;
+   }
+   case TAG_OBJECT_MASK: {
+@@ -1495,14 +1511,6 @@ static bool map_write(vm* p_vm, value p_map_value, value p_key, value p_value) {
+   return true;
+ }
+ 
+-// the error return every opcode handler uses after runtime_error reported
+-static interpret_result interpret_result_error(void) {
+-  interpret_result result;
+-  result.status = RUNTIME_ERROR;
+-  result.top_level_return = NULL_AS_VALUE();
+-  return result;
+-}
+-
+ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+   execution_state* exe = p_vm->current_execution_state;
+   call_frame* frame = &exe->call_stack.data[exe->call_stack.count - 1];
+@@ -1511,6 +1519,20 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+   register word* ip = frame->ip;
+ #define READ_WORD() (*ip++)
+ #define JOIN_WORD(instruction) (((word2)READ_WORD() << 32u) | (word2)(instruction))
++  // R4: the error exit. the loop owns the live ip — runtime_error only STASHES
++  // the message (no print, no reset), so this is the one place where the live
++  // ip and the call stack still exist together: sync the frame, print the
++  // report from the live stack, reset, fail. before this, frame->ip was only
++  // synced in the four CALL arms, so every BIN_OP/INDEX/... error read the
++  // frame's ENTRY pointer, the wrapped index missed the line table, and the
++  // report printed with no location at all. (lua's lvm.c keeps the same
++  // invariant via savestate/Protect; a per-instruction store was measured at
++  // +10-18% on numeric_for_sum and declined.)
++#define FAIL_PATH()                                                                                                  \
++  do {                                                                                                               \
++    frame->ip = ip;                                                                                                 \
++    return vm_report_error(p_vm);                                                                                   \
++  } while (0)
+ 
+   for (;;) {
+ #if defined(OK_TRACE_EXECUTION)
+@@ -1716,10 +1738,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                       a,
+                       p ? reg->top - (frame->registers_base + a + 1) : b,
+                       c == 0 ? RETURN_COUNT_DYNAMIC : c - 1)) {
+-        interpret_result result;
+-        result.status = RUNTIME_ERROR;
+-        result.top_level_return = NULL_AS_VALUE();
+-        return result;
++        FAIL_PATH();
+       }
+       // not sure if exe is gonna be modified here or not (resume??) but we set it anyways
+       exe = p_vm->current_execution_state;
+@@ -1742,10 +1761,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                       A,
+                       p ? reg->top - (frame->registers_base + A + 1) : B,
+                       C == 0 ? RETURN_COUNT_DYNAMIC : C - 1)) {
+-        interpret_result result;
+-        result.status = RUNTIME_ERROR;
+-        result.top_level_return = NULL_AS_VALUE();
+-        return result;
++        FAIL_PATH();
+       }
+       // not sure if exe is gonna be modified here or not (resume??) but we set it anyways
+       exe = p_vm->current_execution_state;
+@@ -1793,7 +1809,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t bp = bprime_of(instruction);
+       interpret_result result = create_closure(p_vm, exe, reg, frame, ap, bp);
+       if (result.status != RUNTIME_OK) {
+-        return result;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1803,7 +1819,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       interpret_result result = create_closure(p_vm, exe, reg, frame, A, B);
+       if (result.status != RUNTIME_OK) {
+-        return result;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1813,7 +1829,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t bp = bprime_of(instruction);
+       interpret_result res = perform_not(p_vm, reg, frame, ap, resolve_operand(frame, reg, bp, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1824,7 +1840,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       interpret_result res = perform_not(p_vm, reg, frame, A, resolve_operand(frame, reg, B, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1834,7 +1850,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t bp = bprime_of(instruction);
+       interpret_result res = perform_negate(p_vm, reg, frame, ap, resolve_operand(frame, reg, bp, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1845,7 +1861,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t B = B_of(words);
+       interpret_result res = perform_negate(p_vm, reg, frame, A, resolve_operand(frame, reg, B, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1856,7 +1872,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_add(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1870,7 +1886,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res =
+           perform_add(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1881,7 +1897,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_subtract(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1895,7 +1911,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res =
+           perform_subtract(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1906,7 +1922,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_multiply(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1920,7 +1936,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res =
+           perform_multiply(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1931,7 +1947,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_divide(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1945,7 +1961,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res =
+           perform_divide(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1956,7 +1972,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_modulo(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1970,7 +1986,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res =
+           perform_modulo(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1981,7 +1997,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_equal(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -1995,7 +2011,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res =
+           perform_equal(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2006,7 +2022,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_not_equal(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2020,7 +2036,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res =
+           perform_not_equal(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2031,7 +2047,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_greater(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2045,7 +2061,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res =
+           perform_greater(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2056,7 +2072,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_less(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2070,7 +2086,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res =
+           perform_less(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2081,7 +2097,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_greater_equal(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2095,7 +2111,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res = perform_greater_equal(
+           p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2106,7 +2122,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_less_equal(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2120,7 +2136,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res =
+           perform_less_equal(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2131,7 +2147,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       interpret_result res = perform_as(p_vm, reg, frame, a, REG_AT(b), resolve_goperand(p_vm, frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2145,7 +2161,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       interpret_result res =
+           perform_as(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_goperand(p_vm, frame, reg, C, p));
+       if (res.status != RUNTIME_OK) {
+-        return res;
++        FAIL_PATH();
+       }
+       break;
+     }
+@@ -2174,10 +2190,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       break;
+     oom_new:
+       runtime_error(p_vm, "out of memory: failed to allocate array.");
+-      interpret_result result;
+-      result.status = RUNTIME_ERROR;
+-      result.top_level_return = NULL_AS_VALUE();
+-      return result;
++      FAIL_PATH();
+     }
+     case OP_ARRAY_NEW_LONG: {
+       const word2 words = JOIN_WORD(instruction);
+@@ -2199,10 +2212,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       break;
+     oom_new_long:
+       runtime_error(p_vm, "out of memory: failed to allocate array.");
+-      interpret_result result;
+-      result.status = RUNTIME_ERROR;
+-      result.top_level_return = NULL_AS_VALUE();
+-      return result;
++      FAIL_PATH();
+     }
+     case OP_MAP_NEW: {
+       const uint8_t a = a_of(instruction);
+@@ -2225,13 +2235,13 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       }
+       gc_guard_down(p_vm->alloc->gc);
+       if (!filled) {
+-        return interpret_result_error(); // map_write already reported
++        FAIL_PATH(); // map_write already reported
+       }
+       REG_AT(a) = OBJECT_AS_VALUE(map);
+       break;
+     oom_map_new:
+       runtime_error(p_vm, "out of memory: failed to allocate map.");
+-      return interpret_result_error();
++      FAIL_PATH();
+     }
+     case OP_MAP_NEW_LONG: {
+       const word2 words = JOIN_WORD(instruction);
+@@ -2250,13 +2260,13 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       }
+       gc_guard_down(p_vm->alloc->gc);
+       if (!filled) {
+-        return interpret_result_error(); // map_write already reported
++        FAIL_PATH(); // map_write already reported
+       }
+       REG_AT(A) = OBJECT_AS_VALUE(map);
+       break;
+     oom_map_new_long:
+       runtime_error(p_vm, "out of memory: failed to allocate map.");
+-      return interpret_result_error();
++      FAIL_PATH();
+     }
+     case OP_INDEX_GET: {
+       const bool p = p_of(instruction);
+@@ -2268,7 +2278,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (value_is_object_type(base, OBJ_MAP)) {
+         value read;
+         if (!map_read(p_vm, base, key, &read)) {
+-          return interpret_result_error();
++          FAIL_PATH();
+         }
+         REG_AT(a) = read;
+         break;
+@@ -2276,7 +2286,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+       if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
+-        return interpret_result_error();
++        FAIL_PATH();
+       }
+       REG_AT(a) = arr->values.data[index];
+       break;
+@@ -2292,7 +2302,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (value_is_object_type(base, OBJ_MAP)) {
+         value read;
+         if (!map_read(p_vm, base, key, &read)) {
+-          return interpret_result_error();
++          FAIL_PATH();
+         }
+         REG_AT(A) = read;
+         break;
+@@ -2300,7 +2310,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+       if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
+-        return interpret_result_error();
++        FAIL_PATH();
+       }
+       REG_AT(A) = arr->values.data[index];
+       break;
+@@ -2316,14 +2326,14 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         // narrow SET has no room for a value-const flag (p is spent on the key):
+         // the compiler materializes constant values, c is always a register here.
+         if (!map_write(p_vm, base, key, REG_AT(c))) {
+-          return interpret_result_error();
++          FAIL_PATH();
+         }
+         break;
+       }
+       const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+       if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
+-        return interpret_result_error();
++        FAIL_PATH();
+       }
+       ((object_array*)arr)->values.data[index] = REG_AT(c);
+       break;
+@@ -2339,14 +2349,14 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const value key = resolve_operand(frame, reg, B, p);
+       if (value_is_object_type(base, OBJ_MAP)) {
+         if (!map_write(p_vm, base, key, resolve_operand(frame, reg, C, q))) {
+-          return interpret_result_error();
++          FAIL_PATH();
+         }
+         break;
+       }
+       const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+       if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
+-        return interpret_result_error();
++        FAIL_PATH();
+       }
+       ((object_array*)arr)->values.data[index] = resolve_operand(frame, reg, C, q);
+       break;
+@@ -2368,17 +2378,11 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (!for_operand_as_number(p_vm, REG_AT(B), "numeric for start", &start) ||
+           !for_operand_as_number(p_vm, REG_AT(B + 1), "numeric for limit", &limit) ||
+           !for_operand_as_number(p_vm, REG_AT(B + 2), "numeric for step", &step)) {
+-        interpret_result result;
+-        result.status = RUNTIME_ERROR;
+-        result.top_level_return = NULL_AS_VALUE();
+-        return result;
++        FAIL_PATH();
+       }
+       if (step == 0.0) {
+         runtime_error(p_vm, "numeric for step is zero.");
+-        interpret_result result;
+-        result.status = RUNTIME_ERROR;
+-        result.top_level_return = NULL_AS_VALUE();
+-        return result;
++        FAIL_PATH();
+       }
+ 
+       REG_AT(B) = NUMBER_AS_VALUE(start);
+@@ -2399,7 +2403,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         counter = VALUE_AS_NUMBER(REG_AT(B));
+       } else if (!for_operand_as_number(p_vm, REG_AT(B), "numeric for counter", &counter)) {
+         // mut counter: the body may reseat it to any value, keep the gate.
+-        return interpret_result_error();
++        FAIL_PATH();
+       }
+       // only the counter is reachable by name
+       const double limit = VALUE_AS_NUMBER(REG_AT(B + 1));
+@@ -2421,7 +2425,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (value_is_object_type(iterable, OBJ_ARRAY)) {
+         if (p) {
+           runtime_error(p_vm, "array iteration binds one loop variable.");
+-          return interpret_result_error();
++          FAIL_PATH();
+         }
+         // cursor/end are written here and by ITER_LOOP only, always as plain
+         // numbers: the back edge reads them raw with no tag gate.
+@@ -2449,7 +2453,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         break;
+       }
+       runtime_error(p_vm, "can only iterate over arrays and maps.");
+-      return interpret_result_error();
++      FAIL_PATH();
+     }
+     case OP_ITER_GET: {
+       const bool p = p_of(instruction); // p == 1: also write the value register
+@@ -2493,7 +2497,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       object_map* map = VALUE_AS_MAP(iterable);
+       if ((double)map->version != VALUE_AS_NUMBER(REG_AT(B + 2))) {
+         runtime_error(p_vm, "map changed size during iteration.");
+-        return interpret_result_error();
++        FAIL_PATH();
+       }
+       uint32_t slot = (uint32_t)VALUE_AS_NUMBER(REG_AT(B + 1));
+       for (++slot; slot < map->entries.capacity && IS_VALUE_STRICTLY_NULL(map->entries.keys[slot]); ++slot) {
+@@ -2518,14 +2522,14 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       object_array* arr = create_object_array(&s);
+       if (arr == NULL) {
+         runtime_error(p_vm, "out of memory: failed to allocate the varargs array.");
+-        return interpret_result_error();
++        FAIL_PATH();
+       }
+       gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(arr));
+       const bool appended = count == 0 || value_array_append_n(&arr->values, &REG_AT(bp), count);
+       gc_guard_down(p_vm->alloc->gc);
+       if (!appended) {
+         runtime_error(p_vm, "out of memory: failed to allocate the varargs array.");
+-        return interpret_result_error();
++        FAIL_PATH();
+       }
+       REG_AT(ap) = OBJECT_AS_VALUE(arr);
+       break;
+@@ -2536,7 +2540,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t c = c_of(instruction);
+       frame->ip = ip;
+       if (!call_spread(p_vm, exe, reg, frame->registers_base, a, b, c == 0 ? RETURN_COUNT_DYNAMIC : (uint32_t)c - 1u)) {
+-        return interpret_result_error();
++        FAIL_PATH();
+       }
+       exe = p_vm->current_execution_state;
+       reg = &exe->registers;
+@@ -2551,7 +2555,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint16_t C = C_of(words);
+       frame->ip = ip;
+       if (!call_spread(p_vm, exe, reg, frame->registers_base, A, B, C == 0 ? RETURN_COUNT_DYNAMIC : (uint32_t)C - 1u)) {
+-        return interpret_result_error();
++        FAIL_PATH();
+       }
+       exe = p_vm->current_execution_state;
+       reg = &exe->registers;
+@@ -2577,62 +2581,98 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+ #undef BIN_OP
+ }
+ 
++// RAISE: stash the message into the error lane. no printing, no reset —
++// those happen where the live ip and the call stack still exist together
++// (FAIL_PATH in the dispatch loop, vm_error at the outermost C boundary).
++// keeping the raise allocation-free and side-effect-free is what lets the
++// report read the raising instruction's synced ip and the full stack trace.
+ void runtime_error(vm* p_vm, const char* p_fmt, ...) {
+   execution_state* exe = p_vm->current_execution_state;
+   va_list ap;
+-
+-  if (exe->call_stack.count > 0) {
+-    call_frame* frame = &exe->call_stack.data[exe->call_stack.count - 1];
+-
+-    size_t instruction = frame->ip - frame->closure->function->chunk.code.data - 1;
+-
+-    ok_line_info_repeated* info = chunk_find_line_info(&frame->closure->function->chunk, instruction);
+-
+-    if (info != NULL && p_vm->source != NULL) {
+-      fprintf(stderr, "\n%s:%d:%d ", p_vm->source->path, info->line_info.line, info->line_info.offset);
+-    }
+-  }
+-
+   va_start(ap, p_fmt);
+-  vfprintf(stderr, p_fmt, ap);
++  vsnprintf(exe->error_what, sizeof(exe->error_what), p_fmt, ap);
+   va_end(ap);
+-  // the message must always be newline terminated: with an empty call stack
+-  // (ok_call from C) no stack trace follows and the next terminal line would
+-  // glue onto the error. %
+-  fputc('\n', stderr);
+-
+-  if (exe->call_stack.count > 0) {
+-    fputs("stack trace (most recent call last):\n", stderr);
++  exe->error_pending = true;
++  exe->error_reported = false;
++}
+ 
+-    for (uint32_t i = 0; i < exe->call_stack.count; ++i) {
+-      call_frame* frame = &exe->call_stack.data[i];
++// REPORT: the single point a runtime error prints and resets. idempotent
++// via error_reported — an error that crossed a native ok_call hop reports
++// once (at the innermost FAIL_PATH that still sees the frames) and the
++// outer levels propagate silently. resetting closes every open upvalue
++// first: an error-path frame's captured locals must not stay open pointing
++// into a register file the next run reuses (stale-open-upvalue bug, found
++// while building this lane).
++static interpret_result __attribute__((cold)) vm_report_error(vm* p_vm) {
++  execution_state* exe = p_vm->current_execution_state;
++  interpret_result result = {.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++  if (!exe->error_pending || exe->error_reported) {
++    if (exe->error_pending) {
++      // reported by an inner level (crossed a C boundary): still reset.
++      goto reset;
++    }
++    return result;
++  }
++  exe->error_reported = true;
+ 
+-      uint32_t instruction = frame->ip - frame->closure->function->chunk.code.data - 1;
++  {
++    bool panic = false;
++    bool had_error = false;
++    const ok_string_view message = ok_create_string_view(exe->error_what, OK_STRING_VIEW_CALCULATE_LENGTH, true);
+ 
++    if (exe->call_stack.count > 0) {
++      call_frame* frame = &exe->call_stack.data[exe->call_stack.count - 1];
++      size_t instruction = frame->ip - frame->closure->function->chunk.code.data - 1;
+       ok_line_info_repeated* info = chunk_find_line_info(&frame->closure->function->chunk, instruction);
+-
+       if (info != NULL && p_vm->source != NULL) {
+-        fprintf(stderr,
+-                "%s:%d:%d in %s.\n",
+-                p_vm->source->path,
+-                info->line_info.line,
+-                info->line_info.offset,
+-                frame->closure->function->name->string.chars);
++        // the span is the token that authored the raising instruction: one
++        // caret on it. the snippet comes from the source text the renderer
++        // reads — the old code printed the token text as the line.
++        const ok_span span = {.line = info->line_info.line, .offset = info->line_info.offset, .length = 1};
++        okdiag_report(&panic,
++                      &had_error,
++                      p_vm->source->path,
++                      p_vm->source->code,
++                      &span,
++                      false,
++                      REPORT_SEVERITY_ERROR,
++                      message,
++                      NULL);
+       } else {
+-        fprintf(stderr,
+-                "%s in %s.\n",
+-                p_vm->source != NULL ? p_vm->source->path : "<host>",
+-                frame->closure->function->name->string.chars);
++        okdiag_report(&panic, &had_error, "", NULL, NULL, false, REPORT_SEVERITY_ERROR, message, NULL);
++      }
++    } else {
++      okdiag_report(&panic, &had_error, "", NULL, NULL, false, REPORT_SEVERITY_ERROR, message, NULL);
++    }
++
++    if (exe->call_stack.count > 0) {
++      fputs("\nstack trace (most recent call last):\n", stderr);
++      for (uint32_t i = 0; i < exe->call_stack.count; ++i) {
++        call_frame* frame = &exe->call_stack.data[i];
++        uint32_t instruction = frame->ip - frame->closure->function->chunk.code.data - 1;
++        ok_line_info_repeated* info = chunk_find_line_info(&frame->closure->function->chunk, instruction);
++        if (info != NULL && p_vm->source != NULL) {
++          fprintf(stderr,
++                  "%s:%u:%u in %s\n",
++                  p_vm->source->path,
++                  info->line_info.line,
++                  okdiag_column_of(p_vm->source->code, info->line_info.offset),
++                  frame->closure->function->name->string.chars);
++        } else {
++          fprintf(stderr,
++                  "%s in %s\n",
++                  p_vm->source != NULL ? p_vm->source->path : "<host>",
++                  frame->closure->function->name->string.chars);
++        }
+       }
+     }
+   }
+ 
++reset:
++  close_upvalues(exe, 0);
+   exe->registers.top = 0;
+   exe->call_stack.count = 0;
+-  // mark the error as pending: interpretation must not resume after this
+-  // point without propagating the failure (call_native checks this when a
+-  // native returns. vm_call/vm_interpret consume it at the outermost C boundary).
+-  exe->error_pending = true;
++  return result;
+ }
+ 
+ static inline bool call(vm* p_vm,
+@@ -2651,27 +2691,34 @@ static inline bool call(vm* p_vm,
+     const uint32_t floor = (uint32_t)(fu->arity - fu->ndefaults) - 1u;
+     if (p_argc < floor) {
+       runtime_error(p_vm,
+-                    "invalid call to '%s': expected at least %u arguments, got: %d.",
++                    "invalid call to '%s': expected at least %u argument%s, got %u.",
+                     fu->name->string.chars,
+                     floor,
++                    s_if_plural(floor),
+                     p_argc);
+       return false;
+     }
+   } else if (p_argc < (uint32_t)(fu->arity - fu->ndefaults) || p_argc > fu->arity) {
+     if (fu->ndefaults == 0) {
+-      runtime_error(
+-          p_vm, "invalid call to '%s': expected %d arguments, got: %d.", fu->name->string.chars, fu->arity, p_argc);
++      runtime_error(p_vm,
++                    "invalid call to '%s': expected %u argument%s, got %u.",
++                    fu->name->string.chars,
++                    fu->arity,
++                    s_if_plural(fu->arity),
++                    p_argc);
+     } else if (p_argc < fu->arity - fu->ndefaults) {
+       runtime_error(p_vm,
+-                    "invalid call to '%s': expected at least %d arguments, got: %d.",
++                    "invalid call to '%s': expected at least %u argument%s, got %u.",
+                     fu->name->string.chars,
+                     fu->arity - fu->ndefaults,
++                    s_if_plural(fu->arity - fu->ndefaults),
+                     p_argc);
+     } else {
+       runtime_error(p_vm,
+-                    "invalid call to '%s': expected at most %d arguments, got: %d.",
++                    "invalid call to '%s': expected at most %u argument%s, got %u.",
+                     fu->name->string.chars,
+                     fu->arity,
++                    s_if_plural(fu->arity),
+                     p_argc);
+     }
+     return false;
+@@ -2684,9 +2731,10 @@ static inline bool call(vm* p_vm,
+   // no check, the results are dropped. the dynamic lane (ok_call) takes all.
+   if (p_retc != RETURN_COUNT_DYNAMIC && p_retc >= 1 && p_retc != (uint32_t)fu->results) {
+     runtime_error(p_vm,
+-                  "invalid call to '%s': it returns %u values, %u were requested here.",
++                  "invalid call to '%s': it returns %u value%s, %u were requested here.",
+                   fu->name->string.chars,
+                   fu->results,
++                  s_if_plural(fu->results),
+                   p_retc);
+     return false;
+   }
+@@ -2761,9 +2809,10 @@ static inline bool call_native(vm* p_vm,
+                                uint32_t p_retc) {
+   if (p_native->arity != OK_NATIVE_ARITY_ANY && p_argc != p_native->arity) {
+     runtime_error(p_vm,
+-                  "invalid call to native '%s': expected %d arguments, got: %d.",
++                  "invalid call to native '%s': expected %u argument%s, got %u.",
+                   p_native->name.chars,
+                   p_native->arity,
++                  s_if_plural(p_native->arity),
+                   p_argc);
+     return false;
+   }
+@@ -2899,7 +2948,7 @@ static bool call_value(vm* p_vm,
+     }
+   }
+ invalid_call:
+-  runtime_error(p_vm, "invalid call: value is not callable");
++  runtime_error(p_vm, "invalid call: value is not callable.");
+   return false;
+ }
+ 
+diff --git a/src/okvm.h b/src/okvm.h
+index 58b8160..ed5e8ec 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -36,6 +36,14 @@ typedef struct {
+   string native_error_message;
+   bool native_has_error;
+ 
++  // the error lane. runtime_error RAISES into it (message text + pending
++  // flag, no printing, no reset); the dispatch loop's error exit (FAIL_PATH)
++  // or the outermost C boundary REPORTS it — the only places where the live
++  // ip and the call stack still exist together. error_reported keeps the
++  // cross-native hops single-printed.
++  char error_what[512];
++  bool error_reported;
++
+   // set by runtime_error, and checked by call_native (a native returning after an
+   // inner error must fail its OP_CALL) and consumed at the outermost C entry
+   // point (vm_call/vm_interpret with native_call_depth == 0).
+diff --git a/tests/e2e/tests/errors/diag_note_located.ok b/tests/e2e/tests/errors/diag_note_located.ok
+new file mode 100644
+index 0000000..16f96eb
+--- /dev/null
++++ b/tests/e2e/tests/errors/diag_note_located.ok
+@@ -0,0 +1,2 @@
++let x = 1;
++x = 2; // expect error: 1:1: note: declared here without 'mut'.
+diff --git a/tests/e2e/tests/errors/diag_redef_note.ok b/tests/e2e/tests/errors/diag_redef_note.ok
+new file mode 100644
+index 0000000..1844bfe
+--- /dev/null
++++ b/tests/e2e/tests/errors/diag_redef_note.ok
+@@ -0,0 +1,2 @@
++let x = 1;
++let x = 2; // expect error: previous declaration of 'x' is here.
+diff --git a/tests/e2e/tests/errors/diag_runtime_location.ok b/tests/e2e/tests/errors/diag_runtime_location.ok
+new file mode 100644
+index 0000000..b5caacb
+--- /dev/null
++++ b/tests/e2e/tests/errors/diag_runtime_location.ok
+@@ -0,0 +1 @@
++let a = 1 + "x"; // expect error: 1:11: error:
+diff --git a/tests/e2e/tests/errors/diag_trace_frame.ok b/tests/e2e/tests/errors/diag_trace_frame.ok
+new file mode 100644
+index 0000000..38d1bae
+--- /dev/null
++++ b/tests/e2e/tests/errors/diag_trace_frame.ok
+@@ -0,0 +1,4 @@
++fu g() {
++  return 1 + "x";
++}
++g(); // expect error: in g
+diff --git a/tests/e2e/tests/errors/diag_trace_location.ok b/tests/e2e/tests/errors/diag_trace_location.ok
+new file mode 100644
+index 0000000..9e10625
+--- /dev/null
++++ b/tests/e2e/tests/errors/diag_trace_location.ok
+@@ -0,0 +1,4 @@
++fu g() {
++  return 1 + "x";
++}
++g(); // expect error: 2:12: error:
+diff --git a/tests/e2e/tests/operators/as/errors.ok b/tests/e2e/tests/operators/as/errors.ok
+index a98c48d..bb2e705 100644
+--- a/tests/e2e/tests/operators/as/errors.ok
++++ b/tests/e2e/tests/operators/as/errors.ok
+@@ -1,3 +1,3 @@
+ // explicit over shady: containers do not silently convert to their length.
+ let arr = [1, 2, 3];
+-print arr as num; // expect error: array is not convertable to number.
++print arr as num; // expect error: array is not convertible to number.
+diff --git a/tests/e2e/tests/spans/errors/arity_too_many.ok b/tests/e2e/tests/spans/errors/arity_too_many.ok
+index 6981674..42f4eb7 100644
+--- a/tests/e2e/tests/spans/errors/arity_too_many.ok
++++ b/tests/e2e/tests/spans/errors/arity_too_many.ok
+@@ -4,4 +4,4 @@ fu one() {
+ }
+ 
+ let (a, b) = one();
+-print a; // expect error: it returns 1 values, 2 were requested
++print a; // expect error: it returns 1 value, 2 were requested here.

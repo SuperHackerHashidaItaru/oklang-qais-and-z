@@ -806,3 +806,125 @@ Stage Summary:
   model). bench reading above wants a line in bench/README.md when Q
   reviews (lua 5.4 is the CI truth now, 5.2 numbers are dead).
 - 0.3.0 tag still pending Q's codename.
+
+## session 24 — errors implemented: patches 23-27 (E1-E8 ruled, all five shipped)
+
+Task: Q ruled E1-E8 ("your draft is already perfect, hope it reflects on
+code — i know you can!") with three amendments: E2's fields are `kind` +
+`what` (not message — "backbone of the std.exception class"), E3 caught him
+rightfully mocking my `catch (e)` parens ("we don't use () anywhere" — no
+ambiguity exists, shipped `catch e {}`), E8 came with his catch: source
+holding must be OPT-IN ("we don't want to force every embedder into source
+code, some might not have at all (future okc)"). E4: ship finalize if the
+budget holds (it held). E6: my call (deleted). implementation session, the
+usual rhythm.
+
+Work Log:
+- synced oklang master 0193e08 + collab master (bench auto-run only).
+- baseline gates on clean master: e2e 305x4, unit/embed x3, plus receipts
+  re-captured (t1-t8: the R1 absolute-offset columns, R2 token-text-as-line,
+  R3 phantom note, R4 no-location runtime errors, R5 EOF-nothing, R6 message
+  pointer, R10 rot — all live on master).
+- patch 23 (diag core): okdiag.c/h (gcc-parseable headers + rustc snippets,
+  notes-with-spans), spans-from-pointers (lexer stores src begin; offset =
+  start - src, computed per token — the accumulated counter and its
+  never-reset-on-newline, never-counted-in-match bugs die by construction),
+  error tokens = 1 caret on the offending byte, EOF renders the last line
+  + "(at end of file)", RLE assert (sum(reps) == code.count). found on the
+  way: parser asprint("%*.s") — width/precision typo, empty messages since
+  ever, hidden because the old renderer printed the token text as the line.
+- patch 24 (runtime locations + notes): R4 root-caused to run_until's local
+  ip vs frame->ip (only the 4 CALL arms synced). first fix (store at loop
+  top) measured +10-18% numeric_for_sum — declined. the shipped shape:
+  runtime_error STASHES (no print/reset/alloc — the raise can't be observed
+  before a catch might consume it), FAIL_PATH (the failing arm) reports from
+  the live state. this pulled the error lane into 24. binder receipts in
+  scopes (declarations array parallel to the map values; upvalue receipts
+  chained per-context) → "previous declaration of 'x' is here." and
+  "declared here without 'mut'." with real secondary snippets — the upvalue
+  one points into the DECLARING function's source. R10 sweep (~75 sites:
+  pluralize via s_if_plural, "got:" → "got", trailing periods, convertable
+  → convertible, `in <main>.` → `in <main>`).
+- patch 25 (source ownership, E8-as-ruled): vm-owned per-run source table
+  {path (always ok's copy), code (borrowed for the call | ok's copy when
+  retained), owns_code}; chunk.source_id stamped over the compiled tree
+  (constants hold nested protos); reports resolve per-FRAME (R8 dead: A-
+  compiled leftovers during run B report A's path + A's line:col; excerpt
+  only while the text is alive). ok_retain_source(ok*, bool) — default off;
+  REPL opts in, CLI borrows. ok_line_info gained a stored column (lexer
+  tracks line_start; true line:col headers even with expired borrows —
+  deviation from the draft's "columns are derived, never stored", the
+  degraded-never-wrong case forced it). from/OK_FROM_* deleted (E6). ok.h
+  rewritten to tell the truth (R7). embed: A/B borrowed (right path, NO
+  snippet — asserted via stderr capture) + retained (snippet asserted) +
+  stack-buffer reuse.
+- patch 26 (throw/catch): THREE opcodes — TRY_ENTER (A=fwd offset, B=park
+  reg, C=upvalue floor; patched via patch_jump_if which preserves B/C),
+  TRY_EXIT, THROW (2w, A=value reg). NO CATCH_BIND: the record's park
+  register IS the binder's register, the unwinder writes it directly (zero
+  MOVEs). records: ONE vm-wide frame-tagged stack (try-free scripts pay
+  zero), frame pops drop their records (cleanup_frame), break/continue emit
+  TRY_EXITs for crossed regions (compile_context.active_handlers vs
+  loop_context.handlers_at_entry — the stale-record-hijack correctness
+  trap). attempt_unwind: pop frames above (close upvalues), close above the
+  floor, restore the watermark, materialize + park, resume via goto
+  next_instruction. the lane: error_pending + is_script/value (throw v
+  whole, GC-rooted via mark_vm while pending) | kind + what[512]
+  (materialize {:kind:,:what:} ONLY on consumption) | error_hard (OOM:
+  runtime_oom, prints from the live state with the synced ip, uncatchable).
+  kind sweep across all raise sites (type/arity/index/key/value/conversion/
+  native/internal). bare `throw;` = OP_THROW on the catch context's park reg
+  (compile_context.in_catch). TWO perf bugs measured + fixed: (a) &frame/&ip
+  out-params made the loop's hottest locals address-taken (+15% numeric_for)
+  → by-value unwind_resume struct; (b) same for the removed `register`
+  qualifier on ip. 11 e2e (any-value, nested, loop-with-break/continue,
+  runtime-kind/what, bare catch, rethrow, across-call, binder immutability,
+  uncaught report, rethrow-outside-catch, catch-mut, try-requires-clause) +
+  embed cross-native section (throw through ok_call into a native that
+  IGNORES the failure — call_native's pending check fails the OP_CALL, the
+  outer script catch takes the value; number AND string values, kind/what).
+- patch 27 (finalize + C API): finalize with NO new opcode — LOAD_TRUE/
+  FALSE stage the entry path (flag = hidden local), a plain OP_JUMP_IF
+  re-dispatches after F, the record covering F reuses the park register so
+  an error raised in F REPLACES the in-flight one by construction; no-catch
+  try/finalize re-raises outward (the stub is OP_THROW park). bookkeeping
+  bugs found by testing: the normal-path jump needed its own patch slot
+  (first cut aliased it with end_jump — normal finalize silently skipped),
+  and enter2's slot got clobbered by the re-dispatch jump (separate
+  `redispatch` slot). C API (E7): ok_last_error (script value as-is |
+  fresh {:kind:,:what:} map — unrooted, root-or-allocate-first contract),
+  ok_clear_error, ok_native_throw (host value crosses into script catch as
+  itself; call_native's pending check propagates it with zero new
+  machinery), ok_native_error = message sugar (kind "native"). host-caught
+  ok_call failures print NOTHING (E7; the print decision lives at the
+  outermost lane: ok_run prints, ok_call doesn't — an early cut printed at
+  every level and the embed test caught it printing "uncaught" for errors
+  that were caught). has_error (read flag) split from error_pending
+  (propagation flag). ok_run clears the lane at entry.
+- found + fixed on the way: (a) stale-open-upvalue across runs (error-path
+  frames never closed their upvalues; the final reset now closes all);
+  (b) MY OWN embed test violated ok_last_error's rooting contract under
+  aggressive GC (ok_value_string between fetch and map_get swept the map) —
+  rewritten to demonstrate the contract with ok_root, which is the part
+  worth review.
+- gates: e2e 333x4 (305 → +28), unit x3, embed x3, spans corpus --dump
+  identical (diffed). bench trio measured back-to-back against master in
+  the same machine window (the box drifted 85→102ms on numeric_for within
+  the session): errors at-or-better than master on all three; the two real
+  regressions introduced along the way were measured, caught, and removed.
+- delivery: patches 23-27 in patches/ + download/, ERRORS.md §9 (rulings)
+  + §11 (honest deltas: 3 opcodes not 4, lane pulled into 24, stored
+  column, opt-in ownership, FAIL_PATH print semantics), ROADMAP 0.4.0
+  marked ruled+implemented, this entry.
+
+Stage Summary:
+- the errors phase is CODE, five patches deep, gates green, awaiting Q's
+  hand-application + the 0.4.0 tag once he's read them.
+- honest flags for his review, all in §11: the stored column (draft said
+  derived), the OP_CATCH_BIND drop, finalize's jump-slot bookkeeping (three
+  bugs found by test, all fixed), the rooting contract demo in the embed
+  test, and the v1 limitations (break/continue/return skip finalize —
+  ruled-out paths, but he should see them in writing).
+- next: Q applies + reviews; 0.3.0 codename still pending (spans tag);
+  bench README wants the lua 5.4 line; 0.5.0 classes inherits the
+  {:kind:,:what:} shape for std.exception.

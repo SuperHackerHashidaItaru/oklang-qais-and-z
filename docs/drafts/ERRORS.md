@@ -1,6 +1,6 @@
-# ERRORS — 0.4.0 candidate, feature draft, rulings OPEN
+# ERRORS — 0.4.0, ruled and shipped (patches 23-27 awaiting hand-application)
 
-status: DRAFT for Q. carries D7 (DECISIONS.md — lua-model values + bytecode
+status: RULED (E1-E8, session 24) + IMPLEMENTED. carries D7 (DECISIONS.md — lua-model values + bytecode
 handler frames, NO setjmp/longjmp) forward against the code as it stands
 after spans (master 0193e08), and adds what D7 didn't have to decide: the
 diagnostics half (Q's ask this session: pull `error_at*` into this round —
@@ -388,31 +388,122 @@ identically throughout.
   is `finalize` and stays `finalize`).
 - utf8: byte=char everywhere in diag, ONE function to revisit (§4).
 
-## 9. rulings — OPEN (for Q)
+## 9. rulings — RULED (Q, session 24) and SHIPPED (patches 23-27)
 
-- **E1 surface**: try/catch/finalize as §1 (keywords already reserved).
-  confirm, or amend the shape.
-- **E2 caught value for runtime-raised errors**: map `{:kind:, :message:}`
-  (Z's lean — branchable, classes-ready) vs bare string v1 (cheaper,
-  less committal).
-- **E3 catch binding**: `catch (e)`, immutable, block-scoped; bare
-  `catch { }` (no binder) also legal? Z's lean: yes, both.
-- **E4 finalize**: ship in 0.4.0 (patch 27) vs keep reserved with
-  semantics ruled (runs on normal + unwind, before catch; an error
-  raised during finalize replaces the in-flight one). Z's lean: rule
-  now, ship if the patch budget holds.
-- **E5 columns**: byte-based v1, tab = 1 column, caret aligns to raw
-  text; codepoint-based at 0.8.0 in exactly one function. confirm.
-- **E6 `ok_source.from`**: DELETE the field + enum (Z's lean — it is
-  write-only) vs rename to a meaningful kind with a consumer.
-- **E7 C boundary**: `ok_last_error` + `ok_native_throw` + host-caught
-  errors stop auto-printing (uncaught still prints). confirm the API
-  shape and the behavior change.
-- **E8 multi-source split**: own-the-copy + chunk identity now, full
-  source registry at 0.7.0 modules (ROADMAP-v1 updated accordingly).
-  confirm the split.
+- **E1 surface**: RULED yes — `try` / `catch` / `finalize`, keywords as
+  reserved. shipped in patches 26/27.
+- **E2 caught value for runtime-raised errors**: RULED map, Q's field names —
+  `{:kind: "...", :what: "..."}` (not `message`: "they are backbone of the
+  std.exception class, or wherever it is gonna be"). the closed kind set:
+  type / arity / index / key / value / conversion / native / internal
+  (consumer-driven, §8 stands). shipped: the map materializes only when a
+  catch (or ok_last_error) actually consumes it.
+- **E3 catch binding**: RULED yes — and Q called the draft out: `catch (e)`
+  was "out of place since we don't use () anywhere". he was right, there is
+  no ambiguity (`catch` is a keyword; after it an identifier is always the
+  binder). shipped as `catch e { }` and bare `catch { }`. `catch mut e`
+  errors with its own message ("the catch binder is immutable.").
+- **E4 finalize**: RULED ship-if-budget — the budget held. shipped in
+  patch 27 exactly as ruled: runs on normal completion AND on unwind, BEFORE
+  the catch (the C++ destructor model); an error raised inside finalize
+  replaces the in-flight one; `try {} finalize {}` without catch re-raises
+  outward.
+- **E5 columns**: RULED byte-based, tab = 1 column, caret aligns to raw
+  text. shipped — plus one deviation from the draft's letter: the column is
+  now STORED in `ok_line_info` (computed by the lexer from a tracked line
+  start, still pointer arithmetic) rather than derived at render time, so
+  runtime reports keep true `path:line:col` headers even after the source
+  text itself is gone (expired borrow). the utf8 pass still touches one
+  computation — it just lives in the lexer now.
+- **E6 `ok_source.from`**: RULED Z's call → DELETED (write-only since
+  birth). the 0.9.0 REPL pass may reintroduce a kind WITH a consumer.
+- **E7 C boundary**: RULED yes — `ok_last_error` + `ok_clear_error` +
+  `ok_native_throw` shipped; host-caught errors (failed ok_call) print
+  NOTHING; the uncaught-to-top report stays ok_run's. ok_native_error stays
+  as message sugar (it throws {:kind: "native", :what: <message>}).
+- **E8 multi-source split**: RULED yes WITH Q's catch — source holding is
+  OPT-IN. shipped as `ok_retain_source(ok*, bool)` (default OFF): the path
+  is always interned (right path forever), the code is borrowed for the
+  ok_run call only; with retention on, every run's source is ok's copy until
+  ok_free. the REPL opts in (its reused stack buffer demands it), the CLI
+  borrows, future okc pays nothing. "last-source-wins" is gone entirely —
+  chunks carry source ids into a per-run table, so A-compiled leftovers
+  called during run B report A's path with A's line:col, excerpt only while
+  A's text is alive. (the 0.7.0 registry stays: keyed, deduped, module-era.)
 
 ## 10. what spans/maps already bought us (reuse inventory)
+
+- **patch 23** shipped as drafted: okdiag.c/h, spans-from-pointers, R1/R2/R3/
+  R5/R6 dead, RLE assert, snippet-contract tests. one bonus fix found on the
+  way: the parser's error-token message extraction was `asprint("%*.s")` —
+  a width/precision typo that printed an empty message padded with spaces,
+  hidden for months because the old renderer printed the token text (the
+  message) as the "line" anyway.
+- **patch 24** deviated in one load-bearing way: the draft said "sync
+  frame->ip on the loop's error exits". measured: a per-instruction store at
+  the loop top costs +10-18% on numeric_for_sum — declined. the working
+  shape is lua's savestate/Protect model turned inside out: runtime_error
+  only STASHES (no print, no reset, no allocation), and the failing arm's
+  FAIL_PATH is the one place the live ip and the call stack still exist
+  together. that pulled patch 26's error lane forward into 24 — 26 then
+  became purely the model. also shipped: binder receipts in the scopes
+  (located notes for locals AND upvalues — the upvalue note points into the
+  declaring function's source, the draft only promised scope machinery), and
+  the R10 sweep (pluralization, "got:" colons, trailing periods, one
+  "convertable" spelling, gcc-parseable trace headers).
+- **patch 25** shipped per E8's revised shape (opt-in, above) rather than
+  the draft's unconditional own-the-copy. the source table lives on the vm
+  (chunks reference it by id; ok_run stamps the compiled tree, nested protos
+  included). `ok_line_info` gained the stored column (E5's deviation).
+- **patch 26** shipped with THREE opcodes, not four: OP_TRY_ENTER /
+  OP_TRY_EXIT / OP_THROW. OP_CATCH_BIND is dead — the handler record carries
+  the park register, and the unwinder writes the value straight into the
+  binder's own register (the spans window discipline, zero MOVEs). the
+  records live on ONE vm-wide frame-tagged stack, not per-frame arrays:
+  scripts without try pay nothing (the stack stays empty). OOM got its own
+  hard lane (runtime_oom: not a value, not catchable, prints from the live
+  state). two bugs found and fixed while building it, both worth Q's eyes:
+  - the unwinder's out-params (&frame/&ip in the FAIL_PATH macro) made the
+    dispatch loop's hottest locals address-taken — +15% on numeric_for_sum.
+    fixed with a by-value resume struct.
+  - an early cut printed the report at EVERY C level, so an error that
+    crossed a native and got caught still printed "uncaught" on the way
+    through. fixed: FAIL_PATH propagates silently; only the outermost lane
+    decides (ok_run prints, ok_call does not — which IS E7).
+- **patch 27** shipped finalize with NO new opcode: the flag re-dispatch is
+  a plain OP_JUMP_IF (LOAD_TRUE/LOAD_FALSE stage the paths, the record
+  covering F reuses the same park register — an error in F replaces the
+  in-flight one by construction). plus the C API per E7.
+- **found on the way, fixed**: error-path frames left open upvalues
+  pointing into a register file the next run reuses (stale-open-upvalue
+  across REPL lines) — the final reset now closes everything. the embed
+  tests also caught the author of these very tests violating ok_last_error's
+  rooting contract under aggressive GC (the map is unrooted; root it or
+  allocate before you fetch it) — the test now demonstrates the contract
+  with ok_root instead of avoiding it.
+- **v1 limitations, deliberate** (0.9.0 / classes lanes): break/continue/
+  return out of an active try region skip finalize (the draft ruled normal +
+  unwind only; the loop-jump patching lane is recovery-work adjacent). the
+  REPL numbers each line as its own source (every input is `stdin:1` —
+  input numbering is the 0.9.0 REPL pass, exactly the consumer the deleted
+  `from` field was waiting for). a bare `throw;` inside finalize is illegal
+  (only catch blocks). uncaught rethrows report the try statement's span
+  (the rethrow stub's author), not the original throw site.
+- **verification**: e2e 333x4 (was 305x4 at master; +28 new tests: snippet
+  contracts, located notes, throw/catch/finalize battery, uncaught reports),
+  unit x3, embed x3 (new sections: A/B cross-source borrowed + retained,
+  stack-buffer reuse, cross-native throw with a swallowing native,
+  ok_last_error/ok_clear_error/ok_native_throw, the E7 silent lane). the
+  spans corpus disassembles IDENTICALLY (verified: multi_return + for_in
+  --dump diffs empty). perf, measured honestly on the same machine
+  back-to-back: master measured 85/253/199 (numeric_for/arithmetic/branch)
+  early in the session and 102/270/195 later — the machine drifts; the
+  errors branch measured 93/262/185 in the LATE window, i.e. at-or-better
+  than master in all three under like-for-like conditions. the address-taken
+  and per-instruction-store regressions that did show up along the way were
+  measured, caught, and removed (the two patch-26 bullets above).
+
+## 11. what shipped vs the draft (patches 23-27, the honest deltas)
 
 - maps: the caught-value map (E2), and the module-era source registry
   (0.7.0) is another interned-path table — the maps core's second

@@ -138,3 +138,86 @@ varargs param). 19 e2e (sum_all shapes, empty, defaults, capture, spread of
 empty/computed/mixed, gc-churn torture, arity/type/position errors) + embed
 varargs section + bench trio (mr_call, varargs_pack). spread in array/map
 literals and non-last call positions: precise compile errors.
+
+## 23-27 — the errors series (ERRORS.md, ruled E1-E8): diagnostics + throw/catch/finalize + source ownership + the C boundary
+
+vs master `0193e08` (spans). five patches, apply in order. the phase in one
+line: patch 23-25 rebuild what you SEE when something fails (okdiag
+renderer, true locations, source ownership), 26-27 are the model (errors as
+values, handler frames, finalize, the host API). rulings E1-E8 folded in
+`docs/drafts/ERRORS.md` §9, the honest deltas from the draft in §11 —
+read §11 before reviewing, three deviations are load-bearing.
+
+**23 — diag core.** `src/okdiag.c/h`: the one renderer (gcc-parseable
+`path:line:col:` headers + rustc-style snippets, notes with their own
+spans), spans-from-pointers at token creation (`ok_line_info.offset` is now
+a true file-absolute byte offset; the accumulated counter is dead — R1),
+error tokens render one caret on the offending byte instead of printing the
+message as the "line" (R2/R6), the phantom empty note is gone (R3), EOF
+errors render the last line + `(at end of file)` (R5), the RLE line table
+gets a debug assert. bonus fix: the parser's `asprint("%*.s")` typo (empty
+error messages, hidden for months). 6 snippet-contract e2e.
+
+**24 — runtime locations + notes.** R4: the dispatch loop owns the live ip
+— `runtime_error` now only stashes (no print/reset/alloc) and the failing
+arm's `FAIL_PATH` reports from the live state, so BIN_OP/INDEX errors carry
+locations for the first time ever. measured first: a per-instruction store
+cost +10-18% on numeric_for_sum and was declined — this is lua's
+savestate/Protect shape, and it pulled the error lane (planned for 26)
+into this patch. binder receipts in the scopes: redefinition and
+immutability notes get real secondary snippets (`note: previous declaration
+of 'x' is here.`, `note: declared here without 'mut'.`), locals AND
+upvalues (the upvalue note points into the declaring function). R10 sweep
+(pluralization, `got:` colons, trailing periods, "convertable", trace
+headers). 5 e2e.
+
+**25 — source ownership (E8 as ruled: opt-in).** the vm owns a per-run
+source table; chunks carry source ids (stamped over the compiled tree,
+nested protos included); reports read per-frame — an A-compiled function
+called during run B reports A's path with A's line:col, excerpt only while
+A's text is alive (borrow expired → header-only: degraded, never wrong —
+R8 dead). `ok_retain_source(ok*, bool)` opts into ok-owned copies until
+ok_free (the REPL rides it; the CLI borrows; future okc pays nothing).
+`ok_source.from` + `OK_FROM_*` DELETED (E6: write-only since birth).
+`ok_line_info` gained a stored `column` (lexer-computed: true line:col even
+without source text). ok.h's ownership comment tells the truth now (R7).
+embed: A/B borrowed + retained (stderr captured, asserted), stack-buffer
+reuse.
+
+**26 — throw/catch.** THREE opcodes: TRY_ENTER (2w: catch offset, park
+register, upvalue floor) / TRY_EXIT / THROW. no CATCH_BIND — the record
+parks the value straight into the binder's register (zero MOVEs, the spans
+window trick). handler records on ONE vm-wide frame-tagged stack (try-free
+scripts pay nothing); frame pops drop their records; break/continue emit
+TRY_EXITs for the regions they cross (a stale record hijacking a later
+error was the correctness trap). the unwind is a loop (D7): pop frames
+above the handler (close their upvalues), close above the floor, restore
+the watermark, materialize + park, resume. the lane: script `throw v`
+carries the value whole (GC-rooted while pending); runtime errors carry
+kind + text and materialize `{:kind:, :what:}` only when consumed (E2, your
+field names); OOM is a hard lane (runtime_oom: not a value, not catchable).
+kinds swept across all ~75 raise sites (type/arity/index/key/value/
+conversion/native/internal). two perf bugs found + fixed on the way (see
+§11). 11 e2e + the cross-native embed section (throw through ok_call into
+a native that ignores the failure — the catch still takes it).
+
+**27 — finalize + C API.** finalize with NO new opcode: LOAD_TRUE/FALSE
+stage the entry path, a plain JUMP_IF re-dispatches after F, and the record
+covering F reuses the park register — an error in F replaces the in-flight
+error by construction (E4 as ruled: runs on normal + unwind, before catch).
+`try {} finalize {}` (no catch) re-raises outward. the C boundary (E7):
+`ok_last_error` (your thrown value as-is, or a fresh {:kind:,:what:} map —
+unrooted, root it or allocate before fetching), `ok_clear_error`,
+`ok_native_throw` (the host's value crosses into script catch as itself;
+ok_native_error stays as message sugar). host-caught ok_call failures print
+NOTHING — the uncaught-to-top report stays ok_run's. 6 finalize e2e + embed
+sections (rooting contract demonstrated with ok_root, the E7 silent lane,
+native_throw, the ok_run report).
+
+gates: e2e 333x4 (305 at master, +28), unit x3, embed x3, spans corpus
+disassembles identically (verified by diff). v1 limitations deliberate and
+listed in §11 (break/continue/return skip finalize; REPL per-line
+numbering; rethrow's report span). honest note: my first cut of the
+ok_last_error embed test violated the API's own rooting contract under
+aggressive GC — the test now demonstrates the contract instead of dodging
+it, which is the review-worthy part.
