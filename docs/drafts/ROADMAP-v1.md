@@ -53,16 +53,25 @@ syntax ruling: destructuring shape (R4).
 
 ### 0.4.0 — ERRORS (the user-facing model)
 
-D7 sketch stands: errors as values, bytecode handler frames, **NO setjmp /
-no longjmp** (Q's explicit ruling — don't inherit lua's bad parts; also
-wasm-safe), lazy tracebacks. OPEN, settled at the coro session: pcall-shape
-vs **try/catch from the start** (Q's current lean — only if it doesn't mess
-functionality; the known interaction is coro propagation, which is why the
-coro session owns the call). lands BEFORE classes because class methods,
-stdlib API shape, and every native's error path (dorg3's three
-missing-return bugs were this class) hang off the philosophy. the
-coro⟷error interplay is SETTLED ON PAPER here, even though coros ship
-later. touches ok_call — the surgical phase.
+draft: `docs/drafts/ERRORS.md` (E1–E8 open). D7 sketch stands: errors as
+values, bytecode handler frames, **NO setjmp / no longjmp** (Q's explicit
+ruling — don't inherit lua's bad parts; also wasm-safe), lazy tracebacks.
+try/catch-vs-pcall is answered ON PAPER in the draft (both, split by
+boundary: try/catch for oklang code, status-shaped ok_call +
+ok_last_error for C) so the coro session inherits it closed. Q's
+session-23 additions, riding THIS phase: the `error_at*` overhaul
+(source-line excerpts + carets — the "message quality" half pulled
+forward from 0.9.0; recovery/multi-error stays 0.9.0), gcc-style notes
+with secondary locations ("previously declared here"), and **source
+ownership v1**: ok_run copies code+path, chunks carry a source identity,
+the write-only `ok_source.from` dies — this kills the dangling-pointer
+class the VM's single borrowed source created (REPL stack buffers,
+embedder-freed heaps). the FULL multi-source registry (many
+simultaneously-live sources) stays 0.7.0 — see below. lands BEFORE
+classes because class methods, stdlib API shape, and every native's
+error path (dorg3's three missing-return bugs were this class) hang off
+the philosophy. the coro⟷error interplay is SETTLED ON PAPER here, even
+though coros ship later. touches ok_call — the surgical phase.
 
 ### 0.5.0 — CLASSES + THE TYPE SYSTEM (the 1.0 centerpiece)
 
@@ -94,8 +103,13 @@ propagation (partially solved — the 0.4.0 paper finishes it).
 D8/D9 stand: pipeline isolation + compile-time imports (`import x`,
 `import x as z`, `from x import y`), run-once top-level, module registry
 keyed by interned path (a 0.2.0-table customer), exports as slot arrays.
-EXPORT SEMANTICS OPEN (Q's first instinct: implicit exports — flagged, no
-ruling yet). the 13.2 lesson rides explicitly: every import adds a
+**the source registry lands here (carried from the 0.4.0 errors session):**
+replaces last-source-wins with many simultaneously-live sources — the ok
+state owns a source set keyed by interned path, chunks reference source
+ids, runtime reports resolve id→source for excerpts. 0.4.0's ownership v1
+(own-the-copy + chunk identity) is the bridge that makes the swap
+mechanical. EXPORT SEMANTICS OPEN (Q's first instinct: implicit exports —
+flagged, no ruling yet). the 13.2 lesson rides explicitly: every import adds a
 compile→load→run handoff window — the rooting discipline from patches
 10/12 is the vaccine, and the aggressive-gc lane is the proof. **native
 modules via shared libs (dlopen) are POST-1.0** (Q agreed after the
@@ -141,10 +155,12 @@ modules' first customer).
 
 - parser: fuzz harness (clean-parse-or-clean-error, never crash — the
   12.95 flag), error recovery (multiple errors per compile, sync to
-  statement boundary), message quality pass. arena/AST decisions if classes
-  or utf8 didn't already force them. (observed in session 19's stress test:
-  diagnostic columns appear to be absolute file offsets, not line columns —
-  a QoI bug to fold into this phase's message-quality pass.)
+  statement boundary — the parser's sync_state leak gets formalized
+  here), message-quality residue (author-token choices, pluralization
+  sweep — the format itself, true columns, excerpts and notes landed in
+  0.4.0; the session-19 "columns are file offsets" observation was
+  root-caused in ERRORS.md §3-R1 and fixed by patch 23). arena/AST
+  decisions if classes or utf8 didn't already force them.
 - **sandboxing** (Q's session-19 addition, pairs with 0.7.0 modules):
   capability model for what an embedded oklang VM may touch — which
   natives/modules a host exposes, load/IO gating, fuel limits (already
@@ -263,8 +279,9 @@ CI once the account-move happens (see §7); benches workflow re-enabled then.
 - R1 missing map key: null (lean) vs error — argued in MAPS.md
 - R2 -0.0 / 0.0 as map keys: normalize (lean) — MAPS.md
 - R3 map iteration order: unspecified v1, documented — MAPS.md
-- R4 MR destructuring syntax: `let a, b = f()` vs `let (a, b) = f()`
-- R5 errors-as-values surface shape; try/catch sugar timing
+- R4 MR destructuring syntax: `let (a, b) = f()` — CLOSED (spans R1, nov 1)
+- R5 errors-as-values surface shape; try/catch sugar timing — drafted
+  (ERRORS.md E1–E8), Q ruling pending
 - R6 coro: stackful vs stackless; wasm switch story
 - R7 tailcall guarantee: yes/no (rule early, implement 0.9.0)
 - R8 utf8 len/index semantics: rule early (0.2/0.3 era), implement 0.8.0

@@ -712,3 +712,97 @@ Stage Summary:
 - next: the errors (0.4.0) conversation — he forgot it was next; ROADMAP-v1
   has the shape (try/catch-vs-pcall still open until the coro session,
   no-longjmp ruled). i can draft ERRORS.md whenever he says go.
+
+## session 23 — ERRORS.md drafted (E1-E8 open); the diagnostics receipts
+
+Task: Q applied/reviewed/edited + pushed spans to oklang master (0193e08,
+TT_MAP deliberately moved, not dropped — his words). "errors now you may
+draft them", with three session asks folded in: (1) error_at* overhaul in
+THIS round (broken since written — they pretty-print the token text as the
+line; we have full source at parse/compile so use it), (2) gcc-style notes
+("previously declared here"), (3) the vm single-source/filename-pointer
+bug recorded (his "huge problem for embedded" — fix now or later, store it
+either in the draft or the roadmap's proper section). plus: rename/delete
+OK_FROM_FILE/OK_FROM_REPL, byte=char until the utf8 pass, look at the old
+oklangcpp error model at 62b429f ("the code is dogshit... maybe you may
+look maybe not"), and the CI benches ran against new master (his local was
+lua 5.2, CI is 5.4 — "they are much faster in almost all cases, but thats
+fine!!"). no tag yet — he's thinking of the 0.3.0 codename while i draft.
+
+Work Log:
+- synced oklang master 0193e08 (spans+varargs hand-applied, 24 spans e2e
+  files present) and collab master (bench auto-run 301f4fb against 0193e08).
+- recon, with receipts captured on build-release/ok (t1-t8):
+  R1 columns are ABSOLUTE FILE OFFSETS — lexer never resets offset on '\n'
+  (oklexer.c:380) and match() doesn't count (oklexer.c:49); session-19
+  suspicion CONFIRMED (`x = 2 + ;` reports 3:22). R2 the printed "line" is
+  the TOKEN TEXT (okutils.c:100, caret #if 0'd at 101). R3 every parser
+  error prints a phantom EMPTY note (parser passes ""-but-non-NULL,
+  okparser.c:197 vs compiler's NULL). R4 runtime errors from the dispatch
+  loop have NO location — run_until caches ip locally (okvm.c:1511),
+  frame->ip synced ONLY in the four CALL handlers, so frame->ip-1 wraps
+  and chunk_find_line_info misses; only call()-raised errors (arity) carry
+  a location, which is why it looked random. R5 EOF errors render nothing.
+  R6 create_error_token points token.start at the MESSAGE (oklexer.c:35).
+  R7 ok.h's "takes ownership" comment is fiction (CLI frees, REPL passes
+  a REUSED STACK buffer). R8 vm_interpret's own TODO (okvm.c:115): one
+  borrowed source per vm — REPL stack dangles on return, A-compiled
+  functions report B's path after a second ok_run. R9 ok_source.from is
+  WRITE-ONLY (set by cli + embedders, read by nobody). R10 message rot
+  ("expected 1 arguments", trailing periods, redefinition has no note —
+  scope map stores only the register index, okcompiler.c:333).
+- the R4 root cause was the session's dig: BIN_OP/INDEX errors print no
+  location, arity errors do — ip sync points, verified against the
+  disassembly (line tables ARE complete; the index into them was stale).
+- oklangcpp 62b429f error model examined: error{code,line,offset,
+  line_content,message} + collect+show(), panic mode, no caret. stole two
+  ideas into the draft (snap the line content = excerpts; greppable ids),
+  declined the code enum (nothing consumed the codes — un-consumed
+  taxonomies rot; the modern equivalent is E2's kind FIELD, consumer-
+  driven). dogshit status reconfirmed, stays buried.
+- drafted docs/drafts/ERRORS.md (~430 lines, SPANS.md format): surface
+  (throw expr / try-catch(e) / bare rethrow / finalize-ruled-may-trail /
+  OOM the one uncatchable hard lane); D7 handler-records-per-frame
+  mechanism (OP_TRY_ENTER/EXIT/CATCH_BIND/THROW, lazy traces, catch
+  binder = ordinary local); caught-value E2 (script throws keep the value
+  whole; runtime errors synthesize a {:kind:,:message:} map); okdiag.c
+  renderer (gcc-parseable path:line:col headers + rustc-style snippets,
+  notes-with-spans = "previously declared here", spans-from-pointers kill
+  R1 by construction, ONE column function for the 0.8.0 utf8 pass,
+  byte=char + tab=1col documented, no colors v1); source ownership v1
+  (ok copies code+path, chunk source identity → right paths always,
+  excerpts only on identity match, last-source-wins becomes a DOCUMENTED
+  limitation); C boundary (ok_last_error/ok_native_throw, host-caught
+  stops auto-printing — E7, the phase's one embedder-visible change);
+  coro paper restated closed (handler records live in frames, coros own
+  their stacks, unwinding coro-local by construction); patches 23-27
+  (diag core → runtime locations+notes → ownership → throw/catch →
+  finalize+C API), gates 306×4→~330×4, bytecode discipline stated.
+- E1-E8 open for Q: surface confirm; caught value map-vs-string; catch
+  binder + bare catch; finalize ship-or-reserve; byte columns; from-field
+  DELETE (my lean — it's write-only) vs rename; C API shape + auto-print
+  removal; multi-source split (v1 ownership now, registry 0.7.0).
+- ROADMAP-v1.md updated: 0.4.0 section carries the draft pointer + the
+  session-23 scope (error_at* pulled forward from 0.9.0's message-quality
+  pass, ownership v1); 0.7.0 gains the source-registry entry (carried
+  from this session so it's not forgotten — his ask); 0.9.0 slimmed to
+  recovery+residue with the R1 root-cause note; register R4 marked CLOSED
+  (spans R1), R5 points at ERRORS.md E1-E8.
+- CI benches vs new master (run 301f4fb, lua 5.4.8, python 3.14.4):
+  oklang WINS the iteration family — map_for_in_sum 1.93x faster than
+  lua, array_for_in_sum 2.00x, varargs_pack 1.14x (the maps/ITER/spans
+  work paying off exactly where it aimed). lua 5.4 wins the dispatch-
+  heavy rest: branch_toggle 2.14x, numeric_for_sum 2.27x, arithmetic_sum
+  1.58x, mr_call 1.66x, recursion_fib 1.83x, array_index_sum 2.14x.
+  the split is clean and expected: iteration kernels are ours, the
+  dispatch loop is the computed-goto lane's (roadmap standing perf lane).
+  Q's "much faster in almost all cases" = the 5.2→5.4 swing, confirmed.
+
+Stage Summary:
+- ERRORS.md drafted and pushed, E1-E8 awaiting Q's rulings; ROADMAP-v1
+  updated (0.4.0 scope, 0.7.0 registry, 0.9.0 slimmed, register hygiene).
+- next: Q rules E1-E8 → patches 23-27 in the usual rhythm (23-25 are
+  pure infrastructure, no surface change beyond output; 26-27 are the
+  model). bench reading above wants a line in bench/README.md when Q
+  reviews (lua 5.4 is the CI truth now, 5.2 numbers are dead).
+- 0.3.0 tag still pending Q's codename.
