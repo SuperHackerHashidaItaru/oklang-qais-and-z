@@ -276,3 +276,57 @@ from your `errors` branch (defer_basic / deferr_only_on_error /
 try_catch_nested) parse with zero ERROR nodes. apply: `git apply` from the
 tree-sitter repo root, or read the grammar.js + corpus hunks and type them
 (the generated files you regenerate yourself either way).
+
+## 30 — classes: core + construction + statics (Citadel, round 1)
+
+vs oklang master `0666651` (v0.4.0 Eyrie). the first code round of the
+classes design, implementing the C1-C18 rulings: `class Name : Parent`
+(the `inherits` token is dead, `pub` and `static` are the new keywords);
+OBJ_CLASS/OBJ_INSTANCE/OBJ_BOUND_METHOD in the 24-bit info field (no new
+NaN-box tags); fields as `let`/`let mut` with initializer thunks run
+root-first at construction; `fu init` + `super(...)` with the definition-
+time forgot-super check (the compile-time half is a calls-super flag on
+the proto, the chain check fires at OP_DEFINE_METHOD - the one place the
+chain is knowable); construction is the static `operator ()` (no `new`,
+C4): `ClassName(args)` calls a user override or defaults to allocate +
+field inits + nearest init; statics (`static fu`/`static let`, pub
+composes) in their own table with chain-shared storage (never copied);
+privacy per C5/C6 - fields and statics are hierarchy-internal, pub
+survives overrides, the signature contract governs virtual methods but
+NOT init (a constructor may widen its parameters); sealed tables frozen
+at OP_CLASS_END with the in-place name-to-slot freeze pass; INVOKE /
+GET_MEMBER / SUPER_INVOKE with per-site monomorphic caches (keyed on the
+receiver's class for instances, the class value itself for class
+receivers, the lane bit keeps them apart); bound methods (`let m =
+obj.method`, C18's question - the ruling is in the round-1 guide);
+`this` immutable at r0, capturable in lambdas (bare field names inside
+lambdas take the guarded member lane); classes are values (stored,
+passed, `==` identity); Object + Class singletons, seeded as immutable
+top-level bindings; the disassembler learned every new op (the mid-work
+had them missing from OPCODE_NAMES entirely - out of bounds reads in
+--dump). 22 new e2e tests in tests/e2e/tests/classes/. gates: e2e 364
+x4 (plain/asan/asan-aggr/aggressive), unit x3, embed x3. note: hand-
+formatted to the codebase style - no clang-format in this sandbox, run
+yours if you want the canonical pass. apply: `git apply` from the oklang
+root, or the usual hand-typing. the full walkthrough is
+docs/drafts/CITADEL-R1.md.
+
+## 31 — performs: numbers-first + tag switch (C14)
+
+vs the same master, applies after 30. the micro-optimization you asked
+for in C14: every binary perform_* (add subtract multiply divide modulo
+equal not_equal greater less greater_equal less_equal) rewritten from
+the if-chain to your perform_as shape - one numeric check first
+(`value_is_numeric`, the strict-int doctrine: raw doubles alias the int
+tag, the tag check alone is not a discriminator - the first cut of this
+patch shipped that bug and the modulo e2e caught it), int/int stays int,
+any float widens through `value_as_f64`, then a `switch (VALUE_TAG(lhs))`
+for the object lanes (string concat for +, content compare for ==/!=,
+identity fallback for mixed equality preserved exactly). the dead
+`IS_VALUE_OBJECT(rhs)` TODO arms are gone - C14 answered them (strictly
+lhs, invalid). the four ordered comparisons share one macro. micro-
+bench baseline post-rewrite, release build, this sandbox: 5M-iteration
+float/int add loops at ~124ms each - the hyperfine A/B against the
+0.4.0 binary is one run-benchmarks.sh away whenever you want the table.
+gates: same 364 x4 + unit + embed (run after this patch, everything
+green together with 30).

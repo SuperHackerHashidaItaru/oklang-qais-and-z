@@ -1,0 +1,843 @@
+From 59d396d6c8a45a1bffb956d162b0d36f513cf0d9 Mon Sep 17 00:00:00 2001
+From: z <z@localhost>
+Date: Mon, 2 Nov 2026 06:15:02 +0000
+Subject: [PATCH 2/2] performs: numbers-first + tag switch rewrite (C14)
+
+---
+ src/okvm.c | 744 ++++++++++++-----------------------------------------
+ 1 file changed, 160 insertions(+), 584 deletions(-)
+
+diff --git a/src/okvm.c b/src/okvm.c
+index 459f12e..612faae 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -475,257 +475,130 @@ perform_negate(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_d
+   return res;
+ }
+ 
++// the numeric union: doubles and the int48 lane, one comparison point. the
++// int48 payload converts to double exactly (2^48 < 2^53), so mixed compares
++// through f64 lose nothing.
++static inline bool value_is_numeric(value p_v) {
++  return IS_VALUE_NUMBER(p_v) || IS_VALUE_STRICTLY_INT(p_v);
++}
++
++// strictly-int first: raw doubles can alias the int tag (the _STRICT
++// doctrine - the tag check alone is not a discriminator), and a double that
++// aliases must take the VALUE_AS_NUMBER read.
++static inline double value_as_f64(value p_v) {
++  return IS_VALUE_STRICTLY_INT(p_v) ? (double)VALUE_AS_INT(p_v) : VALUE_AS_NUMBER(p_v);
++}
++
+ static interpret_result
+ perform_add(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+-  value rhs = p_rhs;
+-  if (IS_VALUE_NUMBER(lhs)) {
+-    if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_NUMBER(lhs) + VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_INT(rhs)) {
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_NUMBER(lhs) + VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      goto invalid;
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
++  // the number lane first: the common case, and nothing below it can ever
++  // intercept it (the builtin classes are sealed).
++  if (value_is_numeric(lhs) && value_is_numeric(p_rhs)) {
++    if (IS_VALUE_STRICTLY_INT(lhs) && IS_VALUE_STRICTLY_INT(p_rhs)) {
++      lhs = INT_AS_VALUE(VALUE_AS_INT(lhs) + VALUE_AS_INT(p_rhs));
+     } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_INT(lhs)) {
+-    if (IS_VALUE_INT(rhs)) {
+-      lhs = INT_AS_VALUE(VALUE_AS_INT(lhs) + VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_INT(lhs) + VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      goto invalid;
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_OBJECT(lhs)) {
+-    if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(rhs)) {
+-      // string concatenation: both operands must be strings, no implicit
+-      // coercion ("a" + 1 = error)
+-      // build the combined bytes over a raw scratch buffer first:
+-      // it is plain memory, invisible to the gc, so allocations inside the
+-      // object creation can collect freely. create_object_string copies the
+-      // view into its own dynamic buffer and the result is published into the
+-      // destination register with no allocation in between. the
+-      // post-store-append window that killed array NEW does not exist here (no
+-      // append_n phase, nothing allocates between creation and publication).
+-      const object_string* left = VALUE_AS_STRING(p_lhs);
+-      const object_string* right = VALUE_AS_STRING(p_rhs);
+-      const uint64_t left_length = string_get_length(&left->string);
+-      const uint64_t right_length = string_get_length(&right->string);
+-      char* scratch = (char*)p_vm->alloc->allocate(p_vm->alloc, left_length + right_length);
+-      if (scratch == NULL) {
+-        runtime_oom(p_vm, "out of memory: failed to concatenate strings.");
+-        interpret_result res;
+-        res.status = RUNTIME_ERROR;
+-        res.top_level_return = NULL_AS_VALUE();
+-        return res;
+-      }
+-      memcpy(scratch, left->string.chars, left_length);
+-      memcpy(scratch + left_length, right->string.chars, right_length);
+-      object_specs specs = {p_vm->alloc, p_vm->objects_store};
+-      object_string* concatenated =
+-          create_object_string(ok_create_string_view(scratch, left_length + right_length, false), &specs);
+-      p_vm->alloc->release(p_vm->alloc, scratch);
+-      if (concatenated == NULL) {
+-        runtime_oom(p_vm, "out of memory: failed to concatenate strings.");
+-        interpret_result res;
+-        res.status = RUNTIME_ERROR;
+-        res.top_level_return = NULL_AS_VALUE();
+-        return res;
+-      }
+-      lhs = OBJECT_AS_VALUE(concatenated);
+-    } else {
+-      goto invalid;
++      lhs = NUMBER_AS_VALUE(value_as_f64(lhs) + value_as_f64(p_rhs));
+     }
+-  } else {
+-  invalid: {
+-    runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '+'.");
+-    interpret_result res;
+-    res.status = RUNTIME_ERROR;
+-    res.top_level_return = NULL_AS_VALUE();
+-    return res;
++    p_reg->array.data[base + p_dest] = lhs;
++    return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
+   }
++  switch (VALUE_TAG(lhs)) {
++  case TAG_OBJECT_MASK: {
++    // string concatenation: both operands must be strings, no implicit
++    // coercion ("a" + 1 = error). build the combined bytes over a raw scratch
++    // buffer first: it is plain memory, invisible to the gc, so allocations
++    // inside the object creation can collect freely.
++    if (!IS_VALUE_STRING(lhs) || !IS_VALUE_STRING(p_rhs)) {
++      break;
++    }
++    const object_string* left = VALUE_AS_STRING(lhs);
++    const object_string* right = VALUE_AS_STRING(p_rhs);
++    const uint64_t left_length = string_get_length(&left->string);
++    const uint64_t right_length = string_get_length(&right->string);
++    char* scratch = (char*)p_vm->alloc->allocate(p_vm->alloc, left_length + right_length);
++    if (scratch == NULL) {
++      runtime_oom(p_vm, "out of memory: failed to concatenate strings.");
++      return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++    }
++    memcpy(scratch, left->string.chars, left_length);
++    memcpy(scratch + left_length, right->string.chars, right_length);
++    object_specs specs = {p_vm->alloc, p_vm->objects_store};
++    object_string* concatenated =
++        create_object_string(ok_create_string_view(scratch, left_length + right_length, false), &specs);
++    p_vm->alloc->release(p_vm->alloc, scratch);
++    if (concatenated == NULL) {
++      runtime_oom(p_vm, "out of memory: failed to concatenate strings.");
++      return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++    }
++    p_reg->array.data[base + p_dest] = OBJECT_AS_VALUE(concatenated);
++    return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
++  }
++  default:
++    break;
+   }
+-  p_reg->array.data[base + p_dest] = lhs;
+-  interpret_result res;
+-  res.status = RUNTIME_OK;
+-  return res;
++  runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '+'.");
++  return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
+ }
+ 
+ static interpret_result
+ perform_subtract(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+-  value rhs = p_rhs;
+-  if (IS_VALUE_NUMBER(lhs)) {
+-    if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_NUMBER(lhs) - VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_INT(rhs)) {
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_NUMBER(lhs) - VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      goto invalid;
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
++  if (value_is_numeric(lhs) && value_is_numeric(p_rhs)) {
++    if (IS_VALUE_STRICTLY_INT(lhs) && IS_VALUE_STRICTLY_INT(p_rhs)) {
++      lhs = INT_AS_VALUE(VALUE_AS_INT(lhs) - VALUE_AS_INT(p_rhs));
+     } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_INT(lhs)) {
+-    if (IS_VALUE_INT(rhs)) {
+-      lhs = INT_AS_VALUE(VALUE_AS_INT(lhs) - VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_INT(lhs) - VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      goto invalid;
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
++      lhs = NUMBER_AS_VALUE(value_as_f64(lhs) - value_as_f64(p_rhs));
+     }
+-  } else if (IS_VALUE_OBJECT(lhs)) {
+-    goto invalid;
+-    // TODO
+-  } else {
+-  invalid: {
+-    runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '-'.");
+-    interpret_result res;
+-    res.status = RUNTIME_ERROR;
+-    res.top_level_return = NULL_AS_VALUE();
+-    return res;
+-  }
++    p_reg->array.data[base + p_dest] = lhs;
++    return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
+   }
+-  p_reg->array.data[base + p_dest] = lhs;
+-  interpret_result res;
+-  res.status = RUNTIME_OK;
+-  return res;
++  runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '-'.");
++  return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
+ }
+ 
+ static interpret_result
+ perform_multiply(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+-  value rhs = p_rhs;
+-  if (IS_VALUE_NUMBER(lhs)) {
+-    if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_NUMBER(lhs) * VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_INT(rhs)) {
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_NUMBER(lhs) * VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      goto invalid;
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_INT(lhs)) {
+-    if (IS_VALUE_INT(rhs)) {
+-      lhs = INT_AS_VALUE(VALUE_AS_INT(lhs) * VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_INT(lhs) * VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      goto invalid;
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
++  if (value_is_numeric(lhs) && value_is_numeric(p_rhs)) {
++    if (IS_VALUE_STRICTLY_INT(lhs) && IS_VALUE_STRICTLY_INT(p_rhs)) {
++      lhs = INT_AS_VALUE(VALUE_AS_INT(lhs) * VALUE_AS_INT(p_rhs));
+     } else {
+-      goto invalid;
++      lhs = NUMBER_AS_VALUE(value_as_f64(lhs) * value_as_f64(p_rhs));
+     }
+-  } else if (IS_VALUE_OBJECT(lhs)) {
+-    goto invalid;
+-    // TODO
+-  } else {
+-  invalid: {
+-    runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '*'.");
+-    interpret_result res;
+-    res.status = RUNTIME_ERROR;
+-    res.top_level_return = NULL_AS_VALUE();
+-    return res;
+-  }
++    p_reg->array.data[base + p_dest] = lhs;
++    return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
+   }
+-  p_reg->array.data[base + p_dest] = lhs;
+-  interpret_result res;
+-  res.status = RUNTIME_OK;
+-  return res;
++  runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '*'.");
++  return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
+ }
+ 
+ static interpret_result
+ perform_divide(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+-  value rhs = p_rhs;
+-  if (IS_VALUE_NUMBER(lhs)) {
+-    if (IS_VALUE_NUMBER(rhs)) {
+-      if (VALUE_AS_NUMBER(rhs) == 0.0f) {
+-        goto division_by_zero;
+-      }
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_NUMBER(lhs) / VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_INT(rhs)) {
+-      if (VALUE_AS_INT(rhs) == 0) {
+-        goto division_by_zero;
+-      }
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_NUMBER(lhs) / VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      goto invalid;
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_INT(lhs)) {
+-    if (IS_VALUE_INT(rhs)) {
+-      if (VALUE_AS_INT(rhs) == 0) {
+-        goto division_by_zero;
+-      }
+-      lhs = INT_AS_VALUE(VALUE_AS_INT(lhs) / VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_NUMBER(rhs)) {
+-      if (VALUE_AS_NUMBER(rhs) == 0.0f) {
+-        goto division_by_zero;
+-      }
+-      lhs = NUMBER_AS_VALUE(VALUE_AS_INT(lhs) / VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      goto invalid;
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
++  if (value_is_numeric(lhs) && value_is_numeric(p_rhs)) {
++    if (IS_VALUE_STRICTLY_INT(lhs) && IS_VALUE_STRICTLY_INT(p_rhs)) {
++      if (VALUE_AS_INT(p_rhs) == 0) {
++        runtime_error(p_vm, OK_EK_VALUE, "division by zero.");
++        return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++      }
++      lhs = INT_AS_VALUE(VALUE_AS_INT(lhs) / VALUE_AS_INT(p_rhs));
+     } else {
+-      goto invalid;
++      if (value_as_f64(p_rhs) == 0.0) {
++        runtime_error(p_vm, OK_EK_VALUE, "division by zero.");
++        return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++      }
++      lhs = NUMBER_AS_VALUE(value_as_f64(lhs) / value_as_f64(p_rhs));
+     }
+-  } else if (IS_VALUE_OBJECT(lhs)) {
+-    // TODO
+-  } else {
+-  invalid: {
+-    runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '/'.");
+-    interpret_result res;
+-    res.status = RUNTIME_ERROR;
+-    res.top_level_return = NULL_AS_VALUE();
+-    return res;
+-  }
+-  }
+-  {
+     p_reg->array.data[base + p_dest] = lhs;
+-    interpret_result res;
+-    res.status = RUNTIME_OK;
+-    return res;
++    return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
+   }
+-division_by_zero: {
+-  runtime_error(p_vm, OK_EK_VALUE, "division by zero.");
+-  interpret_result res;
+-  res.status = RUNTIME_ERROR;
+-  res.top_level_return = NULL_AS_VALUE();
+-  return res;
+-}
++  runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '/'.");
++  return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
+ }
+ 
+ static double floor_mod(double p_lhs, double p_rhs) {
+@@ -740,408 +613,111 @@ static interpret_result
+ perform_modulo(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+-  value rhs = p_rhs;
+-  if (IS_VALUE_NUMBER(lhs)) {
+-    if (IS_VALUE_NUMBER(rhs)) {
+-      if (VALUE_AS_NUMBER(rhs) == 0.0f) {
+-        goto modulo_by_zero;
+-      }
+-      lhs = NUMBER_AS_VALUE(floor_mod(VALUE_AS_NUMBER(lhs), VALUE_AS_NUMBER(rhs)));
+-    } else if (IS_VALUE_INT(rhs)) {
+-      if (VALUE_AS_INT(rhs) == 0) {
+-        goto modulo_by_zero;
+-      }
+-      lhs = NUMBER_AS_VALUE(floor_mod(VALUE_AS_NUMBER(lhs), (double)VALUE_AS_INT(rhs)));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      goto invalid;
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_INT(lhs)) {
+-    if (IS_VALUE_INT(rhs)) {
+-      if (VALUE_AS_INT(rhs) == 0) {
+-        goto modulo_by_zero;
++  if (value_is_numeric(lhs) && value_is_numeric(p_rhs)) {
++    if (IS_VALUE_STRICTLY_INT(lhs) && IS_VALUE_STRICTLY_INT(p_rhs)) {
++      if (VALUE_AS_INT(p_rhs) == 0) {
++        runtime_error(p_vm, OK_EK_VALUE, "modulo by zero.");
++        return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
+       }
+-      int64_t remainder = VALUE_AS_INT(lhs) % VALUE_AS_INT(rhs);
+-      if (remainder != 0 && ((remainder < 0) != (VALUE_AS_INT(rhs) < 0))) {
+-        remainder += VALUE_AS_INT(rhs); // |remainder| < |rhs|: cannot leave the int48 domain
++      int64_t remainder = VALUE_AS_INT(lhs) % VALUE_AS_INT(p_rhs);
++      if (remainder != 0 && ((remainder < 0) != (VALUE_AS_INT(p_rhs) < 0))) {
++        remainder += VALUE_AS_INT(p_rhs); // |remainder| < |rhs|: cannot leave the int48 domain
+       }
+       lhs = INT_AS_VALUE(remainder);
+-    } else if (IS_VALUE_NUMBER(rhs)) {
+-      if (VALUE_AS_NUMBER(rhs) == 0.0f) {
+-        goto modulo_by_zero;
+-      }
+-      lhs = NUMBER_AS_VALUE(floor_mod((double)VALUE_AS_INT(lhs), VALUE_AS_NUMBER(rhs)));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      goto invalid;
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+     } else {
+-      goto invalid;
++      if (value_as_f64(p_rhs) == 0.0) {
++        runtime_error(p_vm, OK_EK_VALUE, "modulo by zero.");
++        return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++      }
++      lhs = NUMBER_AS_VALUE(floor_mod(value_as_f64(lhs), value_as_f64(p_rhs)));
+     }
+-  } else if (IS_VALUE_OBJECT(lhs)) {
+-    goto invalid;
+-    // TODO
+-  } else {
+-  invalid: {
+-    runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '%%'.");
+-    interpret_result res;
+-    res.status = RUNTIME_ERROR;
+-    res.top_level_return = NULL_AS_VALUE();
+-    return res;
+-  }
+-  }
+-  {
+     p_reg->array.data[base + p_dest] = lhs;
+-    interpret_result res;
+-    res.status = RUNTIME_OK;
+-    return res;
++    return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
+   }
+-modulo_by_zero: {
+-  runtime_error(p_vm, OK_EK_VALUE, "modulo by zero.");
+-  interpret_result res;
+-  res.status = RUNTIME_ERROR;
+-  res.top_level_return = NULL_AS_VALUE();
+-  return res;
+-}
++  runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '%%'.");
++  return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
+ }
+ 
+ static interpret_result
+ perform_equal(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+-  value rhs = p_rhs;
+-  if (IS_VALUE_NUMBER(lhs)) {
+-    if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) == VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) == VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_INT(lhs)) {
+-    if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) == VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) == VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_OBJECT(lhs)) {
+-    if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(rhs)) {
+-      // value equality: equal content, not common prefix. strncmp with only
+-      // the lhs length made "ab" == "abc" true.
+-      const object_string* left = VALUE_AS_STRING(p_lhs);
++  if (value_is_numeric(lhs) && value_is_numeric(p_rhs)) {
++    p_reg->array.data[base + p_dest] = BOOL_AS_VALUE(value_as_f64(lhs) == value_as_f64(p_rhs));
++    return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
++  }
++  switch (VALUE_TAG(lhs)) {
++  case TAG_OBJECT_MASK: {
++    // value equality for strings: equal content, not common prefix.
++    if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(p_rhs)) {
++      const object_string* left = VALUE_AS_STRING(lhs);
+       const object_string* right = VALUE_AS_STRING(p_rhs);
+       const uint64_t left_length = string_get_length(&left->string);
+-      lhs = BOOL_AS_VALUE(left_length == string_get_length(&right->string) &&
+-                          memcmp(left->string.chars, right->string.chars, left_length) == 0);
+-    } else {
+-      goto invalid;
+-      // TODO others
++      p_reg->array.data[base + p_dest] =
++          BOOL_AS_VALUE(left_length == string_get_length(&right->string) &&
++                        memcmp(left->string.chars, right->string.chars, left_length) == 0);
++      return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
+     }
+-  } else {
+-  invalid:
+-    // mixed type equality intentionally falls back to a raw identity check
+-    // (null/bool vs anything): turning this into a type error is a semantic
+-    // decision deferred to when we design the error model.
+-    lhs = BOOL_AS_VALUE(lhs == rhs);
++    break;
+   }
+-  {
+-    p_reg->array.data[base + p_dest] = lhs;
+-    interpret_result res;
+-    res.status = RUNTIME_OK;
+-    return res;
++  default:
++    break;
+   }
++  // mixed type equality intentionally falls back to a raw identity check
++  // (null/bool vs anything): turning this into a type error is a semantic
++  // decision deferred to when we design the error model.
++  p_reg->array.data[base + p_dest] = BOOL_AS_VALUE(lhs == p_rhs);
++  return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
+ }
+ 
+ static interpret_result
+ perform_not_equal(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+   value lhs = p_lhs;
+-  value rhs = p_rhs;
+-  if (IS_VALUE_NUMBER(lhs)) {
+-    if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) != VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) != VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_INT(lhs)) {
+-    if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) != VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) != VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_OBJECT(lhs)) {
+-    if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(rhs)) {
+-      // value equality, same length+memcmp shape as perform_equal
+-      const object_string* left = VALUE_AS_STRING(p_lhs);
++  if (value_is_numeric(lhs) && value_is_numeric(p_rhs)) {
++    p_reg->array.data[base + p_dest] = BOOL_AS_VALUE(value_as_f64(lhs) != value_as_f64(p_rhs));
++    return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
++  }
++  switch (VALUE_TAG(lhs)) {
++  case TAG_OBJECT_MASK: {
++    // value equality for strings, negated - same length+memcmp shape.
++    if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(p_rhs)) {
++      const object_string* left = VALUE_AS_STRING(lhs);
+       const object_string* right = VALUE_AS_STRING(p_rhs);
+       const uint64_t left_length = string_get_length(&left->string);
+-      lhs = BOOL_AS_VALUE(!(left_length == string_get_length(&right->string) &&
+-                            memcmp(left->string.chars, right->string.chars, left_length) == 0));
+-    } else {
+-      goto invalid;
+-      // TODO others
+-    }
+-  } else {
+-  invalid:
+-    // mixed type equality intentionally falls back to a raw identity check
+-    // (null/bool vs anything): turning this into a type error is a semantic
+-    // decision deferred to when we design the error model.
+-    lhs = BOOL_AS_VALUE(lhs != rhs);
+-  }
+-  {
+-    p_reg->array.data[base + p_dest] = lhs;
+-    interpret_result res;
+-    res.status = RUNTIME_OK;
+-    return res;
+-  }
+-}
+-
+-static interpret_result
+-perform_greater(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+-  const uint32_t base = p_frame->registers_base;
+-  value lhs = p_lhs;
+-  value rhs = p_rhs;
+-  if (IS_VALUE_NUMBER(lhs)) {
+-    if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) > VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) > VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_INT(lhs)) {
+-    if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) > VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) > VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_OBJECT(lhs)) {
+-    if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(rhs)) {
+-      lhs = BOOL_AS_VALUE(strncmp(VALUE_AS_STRING(p_lhs)->string.chars,
+-                                  VALUE_AS_STRING(p_rhs)->string.chars,
+-                                  string_get_length(&VALUE_AS_STRING(p_lhs)->string)) > 0);
+-    } else {
+-      goto invalid;
+-      // TODO others
+-    }
+-  } else {
+-  invalid: {
+-    runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '>'.");
+-    interpret_result res;
+-    res.status = RUNTIME_ERROR;
+-    res.top_level_return = NULL_AS_VALUE();
+-    return res;
+-  }
+-  }
+-  {
+-    p_reg->array.data[base + p_dest] = lhs;
+-    interpret_result res;
+-    res.status = RUNTIME_OK;
+-    return res;
+-  }
+-}
+-
+-static interpret_result
+-perform_less(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+-  const uint32_t base = p_frame->registers_base;
+-  value lhs = p_lhs;
+-  value rhs = p_rhs;
+-  if (IS_VALUE_NUMBER(lhs)) {
+-    if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) < VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) < VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_INT(lhs)) {
+-    if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) < VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) < VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
++      p_reg->array.data[base + p_dest] =
++          BOOL_AS_VALUE(!(left_length == string_get_length(&right->string) &&
++                          memcmp(left->string.chars, right->string.chars, left_length) == 0));
++      return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
+     }
+-  } else if (IS_VALUE_OBJECT(lhs)) {
+-    if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(rhs)) {
+-      lhs = BOOL_AS_VALUE(strncmp(VALUE_AS_STRING(p_lhs)->string.chars,
+-                                  VALUE_AS_STRING(p_rhs)->string.chars,
+-                                  string_get_length(&VALUE_AS_STRING(p_lhs)->string)) < 0);
+-    } else {
+-      goto invalid;
+-      // TODO others
+-    }
+-  } else {
+-  invalid: {
+-    runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '<'.");
+-    interpret_result res;
+-    res.status = RUNTIME_ERROR;
+-    res.top_level_return = NULL_AS_VALUE();
+-    return res;
+-  }
++    break;
+   }
+-  {
+-    p_reg->array.data[base + p_dest] = lhs;
+-    interpret_result res;
+-    res.status = RUNTIME_OK;
+-    return res;
++  default:
++    break;
+   }
++  // mixed type: the identity fallback, negated (see perform_equal).
++  p_reg->array.data[base + p_dest] = BOOL_AS_VALUE(lhs != p_rhs);
++  return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
+ }
+ 
+-static interpret_result
+-perform_greater_equal(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+-  const uint32_t base = p_frame->registers_base;
+-  value lhs = p_lhs;
+-  value rhs = p_rhs;
+-  if (IS_VALUE_NUMBER(lhs)) {
+-    if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) >= VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) >= VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_INT(lhs)) {
+-    if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) >= VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) >= VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_OBJECT(lhs)) {
+-    if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(rhs)) {
+-      lhs = BOOL_AS_VALUE(strncmp(VALUE_AS_STRING(p_lhs)->string.chars,
+-                                  VALUE_AS_STRING(p_rhs)->string.chars,
+-                                  string_get_length(&VALUE_AS_STRING(p_lhs)->string)) >= 0);
+-    } else {
+-      goto invalid;
+-      // TODO others
+-    }
+-  } else {
+-  invalid: {
+-    runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '>='.");
+-    interpret_result res;
+-    res.status = RUNTIME_ERROR;
+-    res.top_level_return = NULL_AS_VALUE();
+-    return res;
+-  }
++// the four comparisons share one shape: numbers compare through the numeric
++// union, everything else is a type error (no coercion, no cross-type order).
++#define PERFORM_ORDERED(name, op, spelling)                                                                             \
++  static interpret_result perform_##name(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest,          \
++                                          value p_lhs, value p_rhs) {                                                   \
++    const uint32_t base = p_frame->registers_base;                                                                      \
++    if (value_is_numeric(p_lhs) && value_is_numeric(p_rhs)) {                                                           \
++      p_reg->array.data[base + p_dest] = BOOL_AS_VALUE(value_as_f64(p_lhs) op value_as_f64(p_rhs));                     \
++      return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};                             \
++    }                                                                                                                   \
++    runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '" spelling "'.");                                     \
++    return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};                            \
+   }
+-  {
+-    p_reg->array.data[base + p_dest] = lhs;
+-    interpret_result res;
+-    res.status = RUNTIME_OK;
+-    return res;
+-  }
+-}
+ 
+-static interpret_result
+-perform_less_equal(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+-  const uint32_t base = p_frame->registers_base;
+-  value lhs = p_lhs;
+-  value rhs = p_rhs;
+-  if (IS_VALUE_NUMBER(lhs)) {
+-    if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) <= VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_NUMBER(lhs) <= VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_INT(lhs)) {
+-    if (IS_VALUE_INT(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) <= VALUE_AS_INT(rhs));
+-    } else if (IS_VALUE_NUMBER(rhs)) {
+-      lhs = BOOL_AS_VALUE(VALUE_AS_INT(lhs) <= VALUE_AS_NUMBER(rhs));
+-    } else if (IS_VALUE_OBJECT(rhs)) {
+-      // TODO
+-      // not sure if we should allow this for objects or they have to be strictly lhs.
+-      // TBD after we add classes.
+-    } else {
+-      goto invalid;
+-    }
+-  } else if (IS_VALUE_OBJECT(lhs)) {
+-    if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(rhs)) {
+-      lhs = BOOL_AS_VALUE(strncmp(VALUE_AS_STRING(p_lhs)->string.chars,
+-                                  VALUE_AS_STRING(p_rhs)->string.chars,
+-                                  string_get_length(&VALUE_AS_STRING(p_lhs)->string)) <= 0);
+-    } else {
+-      goto invalid;
+-      // TODO others
+-    }
+-  } else {
+-  invalid: {
+-    runtime_error(p_vm, OK_EK_TYPE, "invalid operands for binary '<='.");
+-    interpret_result res;
+-    res.status = RUNTIME_ERROR;
+-    res.top_level_return = NULL_AS_VALUE();
+-    return res;
+-  }
+-  }
+-  {
+-    p_reg->array.data[base + p_dest] = lhs;
+-    interpret_result res;
+-    res.status = RUNTIME_OK;
+-    return res;
+-  }
+-}
++PERFORM_ORDERED(greater, >, ">")
++PERFORM_ORDERED(less, <, "<")
++PERFORM_ORDERED(greater_equal, >=, ">=")
++PERFORM_ORDERED(less_equal, <=, "<=")
+ 
+ static inline bool as_str_rest(vm* p_vm, ok_string_view p_str, value* p_result) {
+   object_specs specs = {p_vm->alloc, p_vm->objects_store};
+-- 
+2.47.3
+

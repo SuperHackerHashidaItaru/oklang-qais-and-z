@@ -1095,3 +1095,89 @@ Stage Summary:
   call); then patches 30-34 in the usual rhythm. the errors branch is
   his to merge + tag (Eyrie). oklangcpp postmortem section awaits
   pasted files if he wants it grounded in the real wreckage.
+
+## session 27 — Citadel round 1: classes implemented (patches 30+31, C1-C18 closed)
+
+Task ID: session-27
+
+Context: Q ruled C1-C18 on the classes draft and said implement or
+whiteboard 1.1. The rulings were sufficient with four open halves
+closed in the round-1 guide's ledger (C7 partially enforceable — the
+forgot-super check shipped as a compile flag + definition-time chain
+check; C10 formalized for patch 33; C12 `is` ruled yes riding 33 as a
+dedicated op, not a desugar; C18 re-ruled IN with the honest reasoning
+— it was sequencing, not a design flaw, and the recovered work had
+already built it). No whiteboard needed. Naming: Citadel confirmed,
+triptych banked.
+
+Work Log:
+- recovered ~2500 lines of uncommitted mid-work from the cut-off
+  session (the context died mid-edit: one double-pasted block in
+  okast.c was the only compile break). audited it file by file against
+  the draft, then finished: statics end-to-end (TOKEN_STATIC, the
+  statics tables with chain-shared never-copied storage, FUNCTION_
+  STATIC with this=the class, bare-static name lane with the class
+  operand resolved through the class-name variable), construction via
+  the static call operator per C4 (call_value's OBJ_CLASS arm → user
+  `operator ()` override or the default allocate + root-first field
+  thunks + nearest init, driven through the defer machinery's
+  nested-run_until lane), the C7 teeth (calls_super_init flag stamped
+  by the compiler incl. nested closures, checked at DEFINE_METHOD
+  against the completed chain), and the disassembler catch-up (the new
+  ops were missing from OPCODE_NAMES entirely — OOB reads in --dump).
+- the bugs the gates caught, seven real ones, all in the guide's §4
+  with the reasoning: two AST double-frees; `return <bare-field>`
+  encoding RETURNED_NULL (the location-kind switch shape — its sibling
+  in compound-assign too); the freeze pass never having worked on
+  2-word ops (missing word counts for LOAD_NULL/CLOSURE_LONG, the
+  join-words order inverted vs JOIN_WORD, and the STORE_FIELD_G bake
+  rewriting only the second word); OP_CLASS_END's dual-width encoding
+  (now two ops, one width each, opcode_word_count the single
+  authority); the MIC never tracing its cached classes (aggressive GC
+  swept them — mark now walks the mic array and every class table
+  key); upvalues closing after the return value overwrote r0 (a lambda
+  capturing this captured the method's return value — the close now
+  precedes the result write in all three return paths); and the
+  singleton startup ordering (created after gc_watch_vm now, in-flight
+  pieces on the guard stack, plus three unguarded create-then-constant
+  sites in the compiler fixed the same way).
+- sub-rulings forced by the implementation, R1-R8, all OPEN for Q in
+  the guide §1: no bare method calls (receivers required); init exempt
+  from the override signature contract; mutability as a
+  post-construction contract (init + thunks assign non-mut; lambdas
+  inside init do not); statics never shadowed chain-wide; this in
+  statics is the class; bound-method privacy is bind-time (capability
+  semantics — the one C18 behavior to actually review); the class name
+  visible inside its own body; construction with no chain init runs
+  defaults only.
+- patch 31 = the C14 performs rewrite: all twelve binary performs to
+  the numbers-first + tag-switch shape (Q's perform_as pattern), the
+  four ordered comparisons sharing one macro, the dead rhs-OBJECT TODO
+  arms deleted (strictly lhs, answered). the first cut shipped the
+  _STRICT landmine (raw doubles alias the int tag — `7 % -3` reported
+  modulo-by-zero; the modulo e2e caught it in one run) — the strict
+  forms are the discriminator now, second monument to the doctrine.
+  post-rewrite baseline recorded: 5M-iter add loops ~124ms, release,
+  this sandbox.
+- 22 e2e tests in tests/e2e/tests/classes/ (behavior + every error
+  path above). gates on the final state: e2e 364x4 (342 + 22), unit
+  x3, embed x3 — the 364 is the new floor. fresh-apply of 30+31 on
+  clean v0.4.0 master verified sequentially clean.
+- delivered: patches/30-classes-core.patch (5139 lines) +
+  31-performs-numbers-first.patch (843) + README entries, download/
+  mirrors, docs/drafts/CITADEL-R1.md (the round-1 guide: rulings
+  ledger, surface by example, the receipts, the renumbered 32-34
+  plan), worklog (this entry), pushed to collab master. formatting
+  note for Q: no clang-format in this sandbox — hand-matched to the
+  codebase style, run yours for the canonical pass.
+
+Stage Summary:
+- classes round 1 done: the C1-C18 core is real, gates-green code —
+  declaration, fields, init, super with the enforceable teeth,
+  statics, construction via the call operator, privacy, sealed frozen
+  tables, monomorphic caches, bound methods, this-capture. what
+  remains of 0.5.0 is the layer on top: operators (32), conversions +
+  ===/==/isinstance/classof/is + the TAG_AS/TT_ teardown (33),
+  natives-as-classes (34) — the guide's §6 has the plan.
+- next: Q reviews R1-R8 + the C18 capability semantics and the
+  upvalue fix, rules the vetoes, then patch 32 in the usual rhythm.
