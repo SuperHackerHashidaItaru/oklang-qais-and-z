@@ -1,0 +1,11 @@
+class Node {
+  pub fu bump(x) { return x + 1; }
+}
+let n = Node();
+let mut i = 0;
+let mut r = 0;
+while i < 5000000 {
+  r = n.bump(r);
+  i = i + 1;
+}
+print r;

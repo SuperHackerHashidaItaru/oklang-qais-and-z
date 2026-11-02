@@ -1,0 +1,15 @@
+class Hot {
+  let mut a = 0;
+  let mut b = 0;
+  let mut c = 0;
+  let mut d = 0;
+  pub fu run(n) {
+    let mut i = 0;
+    while i < n {
+      a = a + 1; b = b + 2; c = c + 3; d = d + 4;
+      i = i + 1;
+    }
+    return a + b + c + d;
+  }
+}
+print Hot().run(5000000);

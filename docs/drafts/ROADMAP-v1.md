@@ -171,10 +171,11 @@ modules' first customer).
   candidates, runner UX (failure buckets, timeouts), REPL itch-decided.
   docs tool: **okdocy** (Q's name, adopted).
 - cheap compiler passes: constant folding + propagation on statically
-  resolved operands, compare+jump fusion (kills boolean materialization in
-  condition position — this IS Q's "branch no materialize"; hard, optional,
-  measured before kept), DCE-lite, jump threading. tailcall implementation
-  (semantics ruled early — R7).
+  resolved operands, compare+jump fusion (the general boolean
+  materialization kill — its condition-lane half moved up to the perf lane's
+  pass 1 per the session-30 split; hard, optional, measured before kept),
+  DCE-lite, jump threading. tailcall implementation (semantics ruled
+  early — R7).
 - bench expansion; everything measured against the workflow baselines.
 
 ### 1.0.0 — THE FREEZE (Celestial)
@@ -185,18 +186,39 @@ era opens with the web framework as the first big consumer.
 
 ## 3. standing lanes (ride any minor)
 
-**PERF** — measured, gated, zero contract change:
-- computed gotos behind the OK_PURE-style compile-time gate (Q's main
-  course; hidden behind a feature macro exactly because it's non-standard —
-  it doesn't break binaries like vectorization might). measure on
-  branch_toggle, our worst-case bench.
-- dispatch tag-switch micro-opt (Q's perform_as observation: tag-check then
-  switch vs the if-chains in the other perform_XX). may be free (compiler
-  sees it) or real (it can't know our tag semantics) — measure, don't
-  assume. hot-path candidate.
-- string interning: separate from hashing-on-construct (which lands with
-  maps). interning changes key equality to pointer-eq — a post-classes
-  option, not a dependency.
+**PERF** — measured, gated, zero contract change. **Ruled (Q, session 30): the
+optimization work splits into two passes.** a lightweight pass lands right
+after the classes theme closes; the heavy compiler passes stay later.
+
+*pass 1 — the lightweight round (post-0.5.0, before the next theme):*
+- string interning: separate from hashing-on-construct (which landed with
+  maps). interning changes key equality to pointer-eq — now scheduled here.
+- inline polymorphic cache: the per-site mic grows a 2-3 entry class probe
+  chain, so `class_poly_dispatch` (two classes alternating at one site)
+  stops thrashing. the class-resident operator cache (patch 32) already
+  covers the operator lanes.
+- conditional materialization: conditions stop materializing booleans into
+  registers — the compare+jump fusion's first half (this is Q's "branch no
+  materialize", sized down to the condition lane; the full fusion stays in
+  pass 2). targets the branch_toggle gap.
+- threaded dispatch loop behind a compile-time switch: computed gotos
+  (labels-as-values), the classic register-VM dispatch win.
+- pure mode + compiler auto-detection in cmake: the OK_PURE-style build mode
+  and cmake detecting GNU extensions (gcc/clang) to enable them — the switch
+  the threaded dispatch rides on, and the portability gate that keeps the
+  non-GNU builds honest.
+- sequencing rule: the classes benchmarks (incl. the wren column) run BEFORE
+  this pass lands and again after — the before/after numbers are the pass's
+  report card.
+
+*pass 2 — the heavy compiler passes (0.9.0 as planned, standing lane):*
+- constant folding + propagation on statically resolved operands.
+- full compare+jump fusion (the general boolean-materialization kill, beyond
+  the condition lane), DCE-lite, jump threading.
+- tailcall implementation (semantics ruled early — R7).
+- already landed, for the record: the dispatch tag-switch micro-opt (the
+  performs rewrite, patch 31) and the class-resident operator caches
+  (patch 32).
 - **wasm32 alias-window spike** (survivor of the site postponement — now a
   language-level portability item since wasm is an embedding target):
   re-run the nan-boxing alias tests under emscripten. dorg3 running fine is

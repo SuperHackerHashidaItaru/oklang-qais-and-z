@@ -1,6 +1,6 @@
-# Oklang / Lua / Python benchmark suite (v3)
+# Oklang / Lua / Python / Wren benchmark suite (v4)
 
-This suite compares the register-based Oklang VM to Lua and Python, and optionally compares the older stack VM on the legacy subset. Version 3 adds the variable-index and global-container array-assignment pairs plus a Lua numeric-index-loop comparator for `for-in`. It uses the Oklang language features established by the existing tests: numeric `for`, arrays, indexed reads/writes, `for-in`, `push`, and compound assignment. It does not use game-specific C API functions.
+This suite compares the register-based Oklang VM to Lua, Python, and (optionally) Wren, and optionally compares the older stack VM on the legacy subset. Version 4 adds the Wren column and the classes family. It uses the Oklang language features established by the existing tests: numeric `for`, arrays, indexed reads/writes, `for-in`, `push`, compound assignment, and (for the classes family) classes. It does not use game-specific C API functions.
 
 ## What is included
 
@@ -52,6 +52,29 @@ The old stack VM is deliberately skipped for these because it does not implement
 | `mr_call` | Multi-result calls: two-value return destructured per trip (`let (x, y) = pair(...)`), vs Lua multi-return and Python tuple-return + unpacking. | 1,000,000 | `1000000` |
 | `varargs_pack` | Varargs packing: `sum_all(i, i+1, i+2)` per trip (one pack allocation per call), vs Lua `...` (also packs a table) and Python `*args`. | 200,000 | `60000300000` |
 
+## The Wren column
+
+Wren is included per benchmark when a `.wren` port exists and the `WREN` environment variable points at a `wren_cli` executable; otherwise the column is simply absent. Wren ports cover every benchmark whose shape Wren can express: no compound assignment (the `*_compound` benches and Lua use plain assignment there), no multiple returns (`mr_call`), no varargs (`varargs_pack`). `function_calls` uses a static method (Wren's free function), `recursion_fib` recurses inside a static method, and `map_for_in_sum` iterates `m.keys` then subscripts (Wren's map iteration yields `"key:value"` strings, not keys).
+
+The CI workflow builds `wren_cli` 0.4.x from the wren-cli repository (release config) and sets `WREN` automatically; a failed Wren build drops the column without failing the run.
+
+## The classes family
+
+Six benchmarks exercise the 0.5.0 class surface in all four languages (Lua via metatables, Python via classes, Wren via classes):
+
+| Benchmark | Workload | Iterations | Expected output |
+|---|---|---:|---:|
+| `class_field_loop` | four field mutations inside a hot method | 5,000,000 | `50000000` |
+| `class_method_call` | monomorphic instance-method dispatch, empty-ish body | 5,000,000 calls | `5000000` |
+| `class_dispatch_chain` | method inherited two levels up (Base -> Mid -> Leaf), resolved per call | 5,000,000 calls | `35000000` |
+| `class_operator_add` | `Vec2` operator `+` constructing the result | 1,000,000 | `2000003` |
+| `class_instantiate` | construct + init + one method call per trip | 2,000,000 | `3999998000000` |
+| `class_poly_dispatch` | two classes alternating at one call site (inline-cache pressure) | 5,000,000 calls | `7500000` |
+
+The runner probes the register binary once with a one-line class script (see `classes-benches.txt`); until the benched Oklang build speaks classes, these six are skipped with a printed reason, so pre-classes masters keep the automated run green.
+
+Sandbox preview at -O2 (single machine, indicative only): Oklang is at parity or ahead on the core loops, branches, and map workloads; Wren leads roughly 1.2-2.1x on the class paths (dispatch, construction). That gap is the optimization round's target - record the non-optimized numbers before it lands.
+
 ## Run it
 
 Requirements: `hyperfine`, `lua`, and `python3`. Run from the directory containing your Oklang `ok` executable. Extract this `oklang-bench-suite` directory somewhere under or next to your build directory.
@@ -65,6 +88,12 @@ If you also retain the old stack VM binary, the legacy benchmarks can compare it
 
 ```bash
 OK_REGISTER="$PWD/ok" OK_STACK="$PWD/ok-stack" RUNS=10 WARMUP=2 ../oklang-bench-suite/run-benchmarks.sh
+```
+
+To add the Wren column (build `wren_cli` from the wren-cli repository first):
+
+```bash
+OK_REGISTER="$PWD/ok" WREN="/path/to/wren_cli" RUNS=10 WARMUP=2 ../oklang-bench-suite/run-benchmarks.sh
 ```
 
 If the suite directory is inside the current build directory, use `./oklang-bench-suite/run-benchmarks.sh` instead. The runner stores each Hyperfine JSON and Markdown report in `results/`.

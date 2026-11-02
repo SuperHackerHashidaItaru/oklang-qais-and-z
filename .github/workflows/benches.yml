@@ -61,11 +61,27 @@ jobs:
           cmake --build /tmp/oklang/build --parallel
           /tmp/oklang/build/ok --version 2>/dev/null || true
 
+      - name: build wren (optional column)
+        run: |
+          # best effort: a failed build just drops the wren column, it must
+          # never fail the run
+          git clone --depth 1 https://github.com/wren-lang/wren-cli.git /tmp/wren-cli
+          if make -C /tmp/wren-cli/projects/make config=release_64bit -j2 >/tmp/wren-build.log 2>&1; then
+            if [[ -x /tmp/wren-cli/bin/wren_cli ]]; then
+              /tmp/wren-cli/bin/wren_cli --version
+              echo "WREN_BIN=/tmp/wren-cli/bin/wren_cli" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "wren build failed; running without the wren column"
+            tail -20 /tmp/wren-build.log || true
+          fi
+
       - name: run benchmarks
         working-directory: bench
         env:
           OK_REGISTER: /tmp/oklang/build/ok
           OK_STACK: ""
+          WREN: ${{ env.WREN_BIN }}
           RUNS: "15"
           WARMUP: "5"
         run: ./run-benchmarks.sh benchmarks results/_staging
@@ -91,11 +107,14 @@ jobs:
             echo "runner: github ubuntu-latest ($(uname -m))"
             echo "lua: $(lua -v 2>&1)"
             echo "python: $(python3 --version 2>&1)"
+            echo "wren: $([[ -n "${WREN_BIN:-}" ]] && "${WREN_BIN}" --version 2>&1 || echo "not built (column absent)")"
             echo "hyperfine: $(hyperfine --version)"
             echo "protocol: warmup=${WARMUP} runs=${RUNS}"
             echo "benchmark_count: $(find results/_staging -maxdepth 1 -name '*.json' | wc -l)"
             echo "note: ok-register was built from source at the ref above."
             echo "note: ok-stack is included only for benchmarks listed in stack-compatible.txt when OK_STACK is configured."
+            echo "note: wren is included only for benchmarks with a .wren port when the wren build succeeded."
+            echo "note: classes-only benchmarks are skipped until the benched oklang speaks classes."
           } > results/_staging/run-info.txt
 
       - name: publish results and prune archive

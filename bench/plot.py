@@ -18,6 +18,7 @@ IMPLEMENTATION_COLORS = {
     "ok-stack": "#7c3aed",
     "lua": "#16a34a",
     "python3": "#d97706",
+    "wren": "#dc2626",
 }
 
 

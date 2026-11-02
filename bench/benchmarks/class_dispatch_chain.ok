@@ -1,0 +1,11 @@
+class Base { pub fu tag() { return 7; } }
+class Mid : Base {}
+class Leaf : Mid {}
+let leaf = Leaf();
+let mut i = 0;
+let mut sum = 0;
+while i < 5000000 {
+  sum = sum + leaf.tag();
+  i = i + 1;
+}
+print sum;

@@ -1327,3 +1327,122 @@ Stage Summary:
   profiling); tree-sitter catch-up (is/=== tokens, classes grammar)
   flagged so it does not get lost. 0.5.0's classes plan is code-
   complete pending those.
+
+## session 30 — citadel round 4, patch 35: the door (classes code-complete)
+
+Task ID: session-30
+
+Context: Q's R13-R16 pass on round 3 — four confirmations. R15 (str's
+empty 0.5.0 surface) deferred to the stdlib era as ruled; R16 green-lit
+patch 35 with "when applicable, i.e. local classes twice". Q also
+re-split the optimization plan (a lightweight pass first: string
+interning, the inline polymorphic cache, conditional materialization,
+threaded dispatch behind a compile-time switch, pure mode + cmake GNU
+auto-detect; the heavy compiler passes stay later), asked for wren in
+the bench matrix (it advertises class speed — a real benchmark), and
+ruled the sequencing: optimizations LAST, so non-optimized-with-classes
+gets benchmarked first. this round was the small one; the optimization
+round is the big one that follows. the unpushed session-29 collab
+commit was still sitting local (remote had moved; rebased + pushed
+first thing).
+
+Work Log:
+- patch 35 (copy-on-redefine, okvm.c + tests + embed section): a
+  re-entered local class definition takes a deep copy of the compiled
+  body and freezes that. THE GATE: the copy is valid only when the
+  parent matches — the bake encodes the flattened layout, and a
+  varying-base factory (`class Inner : p`) would need a different bake
+  from pre-freeze code the in-place rewrite destroyed. same parent (both
+  chains frozen/sealed) = identical layout = inherited bake valid;
+  different parent = honest refusal with its own message. Q's "when
+  applicable" made precise; pristine-rebake mapped as the future step.
+- the copy: one object_function per proto in the tree (code, line
+  table, identifiers re-owned, upvalue descriptors as-is — they
+  reference the same enclosing chunk, scalars); constants shared except
+  nested non-member protos (copied, recursively) and member protos of
+  inner classes (shared — their own OP_CLASS_END owns them). mic slots
+  copy as fresh empties: each generation's sites start cold. entry point
+  became freeze_patch_closure (takes the CLOSURE — the rebind target is
+  closure->function; the upvalue array was sized from the identical
+  descriptor count at creation, so no resize can be needed).
+- the rooting discipline (the aggressive-gc receipt): children are
+  created, appended to a safe parent's constants, THEN filled — so a
+  node is safe the moment it lands in a safe parent's constants, and
+  the guard stack never exceeds root + one child in flight, regardless
+  of lambda nesting. create_object_function allocates exactly once (its
+  collect runs before the object exists) and object_store_append is an
+  intrusive alloc-free prepend, so the creation-to-guard window is
+  empty by construction. failed copies leave unreachable garbage the
+  collector reclaims.
+- the embed lane: the factory test calls make_inner twice through
+  ok_call — the C-api redefine path. first cut tripped over TWO things
+  worth recording: top-level `fu` is a local (needs `glob fu` for
+  ok_global_get), and ok_call failures print nothing by design (E7) —
+  the repro went through the CLI to see the error.
+- the receipt of the round, PRE-EXISTING (verified on the unpatched
+  session-29 state): a bare name in call position inside a method
+  resolves through the compiler's ladder locals -> upvalues -> statics
+  -> fields -> globals, and the std-zero builtins live in a hidden
+  enclosing scope — so a method named `get` is shadowed for BARE calls
+  by the map builtin (the upvalue rung beats the field/method rung;
+  the freeze bake's own ladder is correct, the compiler just captures
+  the builtin directly). pinned as bare_builtin_shadow.ok with both
+  lanes; open as R17 (keep-and-document vs resolve() surgery). i lean
+  keep for 0.5.0.
+- wren joined the bench matrix: 33 .wren ports (everything wren can
+  express — no compound-assign/mr/varargs columns; function_calls via
+  static method; map_for_in_sum via m.keys because wren's map iteration
+  yields "key:value" STRINGS), all 33 cross-checked for identical
+  output against ok/lua/python (numeric-aware compare; oklang's %g
+  prints 6 sig figs). wren 0.4.0 built in the sandbox from wren-cli
+  (the CLI moved out of the main repo; it vendors libuv + the vm).
+  the classes family landed with it: six benchmarks x four languages
+  (field loop, method call, dispatch chain, operator +, instantiate,
+  poly dispatch), lua via metatables. runner: WREN env (optional,
+  per-benchmark on .wren presence) + classes-benches.txt + a one-script
+  probe of the register binary so the six class benches are SKIPPED
+  with a printed reason until the benched build speaks classes (today's
+  master keeps the auto-run green — verified both ways with a stubbed
+  hyperfine, 42 discovered on the classes build / 36 + 6 skipped on
+  master). the CI workflow builds wren-cli itself, best-effort (a
+  failed wren build drops the column, never the run). plot.py got a
+  fixed wren color; combine.py needed nothing (it reads command names
+  dynamically).
+- the honest baseline, sandbox -O2 best-of-3 (the CI matrix is the
+  record): oklang at parity or ahead on the core — loop_counter even,
+  branch_toggle slightly ahead, numeric_for_step ~3x, map_for_in_sum
+  ~4.6x. wren ahead on the class paths: ~1.2x field, ~1.3x method/poly,
+  ~1.4x chain, ~2x operator, ~2.1x instantiate. exactly the gap the
+  lightweight optimization round targets; the classes benches exist so
+  the before/after is measurable, per Q's sequencing rule.
+- the optimization split recorded in ROADMAP-v1's PERF lane: pass 1
+  (lightweight, post-0.5.0) = string interning, inline polymorphic
+  cache, conditional materialization (condition-lane half of the
+  fusion), threaded dispatch behind the compile-time switch, pure mode
+  + cmake GNU auto-detect, with the before/after sequencing rule;
+  pass 2 (0.9.0 as planned) = constant folding/propagation, the general
+  fusion, DCE-lite, jump threading, tailcalls. the performs tag-switch
+  (31) and class-resident operator caches (32) recorded as landed.
+- patches/README caught up: entries for 32/33/34 (sessions 28/29
+  delivered the patches but never the README lines — an omission fixed
+  this round) plus 35.
+- gates on the final state: e2e 399 x4 (394 + 6 new - the flipped
+  error test), unit x3, embed x3. one process stumble worth confessing:
+  a mid-round stash/rebuild test left the plain binary stale, and the
+  four-lane output interleaving made it look green for a beat — the
+  per-lane capture now goes to separate files before the verdict.
+- delivered: patches/35-copy-on-redefine.patch + download/ mirror,
+  docs/drafts/CITADEL-R4.md (rulings applied, the parent gate, the
+  rooting receipt, R17-R18 open), the bench suite (33 wren ports + 6
+  class benches x4 + runner + workflow + classes-benches.txt + README
+  v4), the roadmap split, patches/README 32-35, worklog (this entry),
+  pushed to collab master.
+
+Stage Summary:
+- 0.5.0 Citadel is code-complete: 30 through 35 written, gated,
+  delivered. what remains is Q's side — apply, push master, tag. then
+  the big one: the lightweight optimization round, with the classes
+  baseline already in the matrix and delta blue to join it there.
+- open for veto: R17 (the prelude shadowing), R18 (fresh mic slots on
+  copies + the parent-identity gate). tree-sitter catch-up still
+  flagged (is/=== tokens, classes grammar).

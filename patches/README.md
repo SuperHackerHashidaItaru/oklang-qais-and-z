@@ -330,3 +330,84 @@ float/int add loops at ~124ms each - the hyperfine A/B against the
 0.4.0 binary is one run-benchmarks.sh away whenever you want the table.
 gates: same 364 x4 + unit + embed (run after this patch, everything
 green together with 30).
+
+## 32 — operators + the bare-name ladder (Citadel, round 2)
+
+vs the 30+31 state, applies after 31. R1 as ruled: methods ride bare-name
+resolution - the freeze bakes field -> GET_METHOD (binds this) -> global
+for unresolved names in member bodies, stores bake the not-assignable
+trap for method names; statics mirror the ladder at runtime in the
+GET/STORE_STATIC_NAME miss path (which also fixed bare sibling static
+calls and bare glob access from static contexts). the operator surface:
++ - * / % == != < <= > >= unary- [] []= and the instance operator (),
+left-dispatch only (C14), != desugars to == plus negation, the ordered
+four return the method's raw value. canonical spellings from ONE shared
+parser helper ("operator +", whitespace normalized both sites);
+non-dispatchable spellings refused with reasons; `operator` reserved as
+a field name. one name one owner within a body (the unary/binary minus
+split rides the signature contract). the cache is class-resident -
+op_cache[CLASS_OP_COUNT] per (class, operator), sound forever under the
+C15 seal, zero instruction words. two shipped-bug fixes found by probing:
+a class in a method hard-errored at the enclosing freeze (protos now
+carry is_class_member; the walk stops at member boundaries), and the
+statics-lane miss path had no global fallback. gates: e2e 379 x4 + unit
++ embed. the full walkthrough is docs/drafts/CITADEL-R2.md.
+
+## 33 — conversions + identity (Citadel, round 3, first half)
+
+vs the 32 state, applies after 32. === as word identity (1 === 1.0 is
+true - there is no public int box; 0.0 === -0.0 false is the visible
+edge); `is` as the exact-class probe (classof+identity fused; the chain
+walk is isinstance's job); isinstance/classof as plain natives; operator
+<Target> rides the as lane (inherited, private = hierarchy-internal,
+result checked); the seven builtin singletons under Object through ONE
+seeding table; TAG_AS + TT_ + the hidden " str" globals dead, tag id 6
+reserved, the unit test pins the numbering. the round's receipt: the
+guard-stack overflow at startup (capacity 16, the sequence was at 17
+pre-p33 and hit 24 with the builtins - the str singleton's name was
+swept mid-startup and its memory reused by the num name, so `x as str`
+probed "operator num"; flaky across suite-vs-solo). fix: per-object
+balanced guards, every push checked. also: the asprint leak in every
+object_as_str arm, as_num's missing int return + copy-paste message, and
+a confessed test bug (operators_subscript.ok mixed expect lanes, hiding
+a wrong 40 vs 45). gates: e2e 390 x4 + unit + embed. the full walkthrough
+is docs/drafts/CITADEL-R3.md.
+
+## 34 — natives as classes (Citadel, round 3, second half)
+
+vs the 33 state, applies after 33. run_native (the shared flight; closes
+a pre-existing 256+-arg truncation+overrun on ANY-arity natives) +
+call_native_method (receiver rides argv[0]; the INVOKE / bound-method /
+operator-dispatch windows were already the same shape). all seven
+'native methods arrive with the native-class patch' traps are real lanes,
+including a C-defined init. builtin receivers dispatch on their singleton
+through classof, mic-cached. surfaces per the no-new-stdlib ruling: array
+len/push/pop/remove, map len/remove/get - the SAME receiver-first entries
+mounted twice, so len(a) and a.len() are one function. C API:
+ok_class_new / ok_class_define_native_method / ok_class_freeze /
+ok_value_is_class, with the script lane's definition rules enforced
+C-side. the embed test grows a Math class. gates: e2e 394 x4 + unit +
+embed. the full walkthrough is docs/drafts/CITADEL-R3.md.
+
+## 35 — copy-on-redefine (Citadel, round 4, R16)
+
+vs the 34 state, applies after 34. a re-entered local class definition
+hands out a fresh class with its own copy of the body: freeze_patch_closure
+sees a proto already patched by another class, checks the parent, deep-
+copies the proto tree (code, line table, identifiers, upvalue
+descriptors, scalars; constants shared except nested non-member protos,
+which copy; member protos of inner classes stay shared), rebinds the
+closure, and freezes the copy. same parent = identical flattened layout =
+the inherited bake is valid; a different parent keeps an honest refusal
+(the bake would need pre-freeze code the proto no longer carries). the
+rooting discipline: children are created, appended to a safe parent's
+constants, THEN filled - the guard stack never holds more than the root
+plus one child, regardless of lambda nesting; a failed copy's partial
+tree is unreachable garbage the collector reclaims. mic slots copy fresh
+(each generation's sites start cold). the R2 error test flips positive;
+five new pins including the different-parent refusal and the embed
+factory called twice through ok_call. also in the round (not this patch):
+bare_builtin_shadow.ok pins a pre-existing finding - a bare call inside
+a method reaches the std-zero builtin before the class's own method of
+the same name (R17 in CITADEL-R4). gates: e2e 399 x4 + unit + embed.
+the full walkthrough is docs/drafts/CITADEL-R4.md.

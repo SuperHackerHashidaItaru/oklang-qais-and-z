@@ -1,0 +1,15 @@
+class Vec2 {
+  let x = 0;
+  let y = 0;
+  fu init(x, y) { this.x = x; this.y = y; }
+  pub fu operator +(o) { return Vec2(x + o.x, y + o.y); }
+  pub fu total() { return x + y; }
+}
+let mut a = Vec2(1, 2);
+let d = Vec2(1, 1);
+let mut i = 0;
+while i < 1000000 {
+  a = a + d;
+  i = i + 1;
+}
+print a.total();

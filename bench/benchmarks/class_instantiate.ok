@@ -1,0 +1,14 @@
+class Point {
+  let x = 0;
+  let y = 0;
+  fu init(x, y) { this.x = x; this.y = y; }
+  pub fu sum() { return x + y; }
+}
+let mut i = 0;
+let mut s = 0;
+while i < 2000000 {
+  let p = Point(i, i);
+  s = s + p.sum();
+  i = i + 1;
+}
+print s;

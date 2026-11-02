@@ -1,0 +1,9 @@
+# benchmarks that require the classes build (class syntax). the runner probes
+# the register binary once and skips these when it does not speak classes,
+# so pre-classes masters keep the auto-run green.
+class_field_loop
+class_method_call
+class_dispatch_chain
+class_operator_add
+class_instantiate
+class_poly_dispatch

@@ -10,9 +10,11 @@ OUT_DIR="${2:-$ROOT/results}"
 
 OK_REGISTER="${OK_REGISTER:-$PWD/ok}"
 OK_STACK="${OK_STACK:-}"
+WREN="${WREN:-}"
 RUNS="${RUNS:-10}"
 WARMUP="${WARMUP:-2}"
 STACK_COMPAT_FILE="${STACK_COMPAT_FILE:-$ROOT/stack-compatible.txt}"
+CLASSES_BENCH_FILE="${CLASSES_BENCH_FILE:-$ROOT/classes-benches.txt}"
 
 # Dependencies
 for dependency in hyperfine lua python3; do
@@ -29,6 +31,11 @@ fi
 
 if [[ -n "$OK_STACK" && ! -x "$OK_STACK" ]]; then
   echo "error: stack-VM executable is not executable: $OK_STACK" >&2
+  exit 1
+fi
+
+if [[ -n "$WREN" && ! -x "$WREN" ]]; then
+  echo "error: wren executable is not executable: $WREN" >&2
   exit 1
 fi
 
@@ -60,6 +67,28 @@ if [[ -f "$STACK_COMPAT_FILE" ]]; then
     [[ -n "$line" ]] && STACK_COMPAT["$line"]=1
   done < "$STACK_COMPAT_FILE"
 fi
+
+# Load classes-only benchmark names.
+declare -A CLASSES_BENCH=()
+
+if [[ -f "$CLASSES_BENCH_FILE" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line//[[:space:]]/}"
+
+    [[ -n "$line" ]] && CLASSES_BENCH["$line"]=1
+  done < "$CLASSES_BENCH_FILE"
+fi
+
+# Probe the register binary for class syntax once: the classes benches are
+# skipped until the benched build speaks classes.
+CLASSES_OK=0
+PROBE="$(mktemp "${TMPDIR:-/tmp}/ok-classes-probe.XXXXXX.ok")"
+printf 'class Probe { pub fu p() { return 1; } }\nprint(Probe().p());\n' > "$PROBE"
+if "$OK_REGISTER" "$PROBE" >/dev/null 2>&1; then
+  CLASSES_OK=1
+fi
+rm -f "$PROBE"
 
 run_one() {
   local name="$1"
@@ -103,6 +132,13 @@ run_one() {
   commands+=("$command")
   names+=("python3")
 
+  # Wren (optional, per benchmark: only when a .wren port exists).
+  if [[ -n "$WREN" && -f "$source.wren" ]]; then
+    printf -v command '%q %q' "$WREN" "$source.wren"
+    commands+=("$command")
+    names+=("wren")
+  fi
+
   local i
 
   for ((i=0; i<${#commands[@]}; i++)); do
@@ -130,6 +166,11 @@ skipped=()
 
 for ok_file in "${ok_files[@]}"; do
   name="$(basename "$ok_file" .ok)"
+
+  if [[ -n "${CLASSES_BENCH[$name]:-}" ]] && (( CLASSES_OK == 0 )); then
+    skipped+=("$name (needs the classes build)")
+    continue
+  fi
 
   if [[ -f "$RUN_DIR/$name.lua" && -f "$RUN_DIR/$name.py" ]]; then
     discovered+=("$name")
@@ -167,4 +208,6 @@ done
 echo
 echo "Done. Reports are in: $OUT_DIR"
 echo "Note: stack VM is only included for compatible benchmarks when OK_STACK is set."
+echo "Note: wren is included for benchmarks with a .wren port when WREN is set."
+echo "Note: classes-only benchmarks are skipped when the register build does not speak classes."
 

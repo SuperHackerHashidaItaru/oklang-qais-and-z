@@ -1,0 +1,414 @@
+From 49835affd53a6a1f694522b01c28c2049a424810 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Mon, 2 Nov 2026 23:37:00 +0000
+Subject: [PATCH] classes: copy-on-redefine - local classes earn per-definition
+ bodies (citadel r4, patch 35)
+
+---
+ src/okvm.c                                    | 142 +++++++++++++++++-
+ .../e2e/tests/classes/bare_builtin_shadow.ok  |  14 ++
+ .../tests/classes/local_class_parent_error.ok |  10 ++
+ .../classes/local_class_redefine_closures.ok  |  22 +++
+ .../classes/local_class_redefine_in_method.ok |  17 +++
+ .../classes/local_class_redefine_inherit.ok   |  20 +++
+ tests/e2e/tests/classes/local_class_twice.ok  |  17 +++
+ .../tests/classes/local_class_twice_error.ok  |   6 -
+ tests/integration/embedding/src/main.cpp      |  49 ++++++
+ 9 files changed, 283 insertions(+), 14 deletions(-)
+ create mode 100644 tests/e2e/tests/classes/bare_builtin_shadow.ok
+ create mode 100644 tests/e2e/tests/classes/local_class_parent_error.ok
+ create mode 100644 tests/e2e/tests/classes/local_class_redefine_closures.ok
+ create mode 100644 tests/e2e/tests/classes/local_class_redefine_in_method.ok
+ create mode 100644 tests/e2e/tests/classes/local_class_redefine_inherit.ok
+ create mode 100644 tests/e2e/tests/classes/local_class_twice.ok
+ delete mode 100644 tests/e2e/tests/classes/local_class_twice_error.ok
+
+diff --git a/src/okvm.c b/src/okvm.c
+index a7b8e1b..7646daf 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -2373,24 +2373,150 @@ static bool patch_chunk_fields(vm* p_vm, object_class* p_class, chunk* p_chunk,
+ 
+ static bool freeze_walk_chunk(vm* p_vm, object_class* p_class, chunk* p_chunk, bool p_construction);
+ 
+-// patch one proto (once): the patched_by marker is the single-definition
+-// guard - a body frozen for one class cannot be re-frozen for another (the
+-// in-place rewrite is already done; per-definition copies are the ladder step
+-// when local classes earn them).
++// fill a fresh proto from its source: code, line table, identifiers, upvalue
++// descriptors, mic slots (empty), and the constants. constant indices are
++// load-bearing (the code addresses them), so order and count are preserved
++// exactly. values are shared; nested non-member protos are copied so the new
++// definition owns its own bake. protos of a class declared inside this body
++// are shared - their own definition owns them.
++//
++// p_dest must already be rooted (guard stack or a reachable parent's
++// constants) before this runs: every allocation below can collect. children
++// are created, appended, THEN filled - a node is safe the moment it lands in
++// a safe parent's constants, so the guard stack never holds more than the
++// tree root plus the child being appended.
++static bool copy_proto_fill(vm* p_vm, object_function* p_dest, object_function* p_src, object_specs* p_specs) {
++  chunk* dest = &p_dest->chunk;
++  chunk* src = &p_src->chunk;
++  if (!code_append_n(&dest->code, src->code.data, src->code.count) ||
++      !source_info_append_n(&dest->source_info, src->source_info.data, src->source_info.count)) {
++    return false;
++  }
++  for (uint32_t i = 0; i < src->identifiers.count; ++i) {
++    const string* id = &src->identifiers.data[i];
++    string copy;
++    if (!string_init(&copy, id->chars, string_get_length(id), string_is_dynamic(id), p_specs->alloc) ||
++        !identifiers_append(&dest->identifiers, copy)) {
++      return false;
++    }
++  }
++  if (!upvalue_descriptor_array_append_n(&p_dest->upvalues, p_src->upvalues.data, p_src->upvalues.count)) {
++    return false;
++  }
++  const mic_entry empty_mic = {NULL_AS_VALUE(), NULL, 0, 0};
++  for (uint32_t i = 0; i < src->mic.count; ++i) {
++    if (!mic_entries_append(&dest->mic, empty_mic)) {
++      return false;
++    }
++  }
++  p_dest->ndefaults = p_src->ndefaults;
++  p_dest->registers = p_src->registers;
++  p_dest->results = p_src->results;
++  p_dest->has_varargs = p_src->has_varargs;
++  p_dest->is_class_member = p_src->is_class_member;
++  p_dest->calls_super_init = p_src->calls_super_init;
++  dest->source_id = src->source_id;
++  for (uint32_t i = 0; i < src->constants.count; ++i) {
++    const value v = src->constants.data[i];
++    if (IS_VALUE_FUNCTION(v) && !VALUE_AS_FUNCTION(v)->is_class_member) {
++      object_function* nested_src = VALUE_AS_FUNCTION(v);
++      object_function* nested = create_object_function(nested_src->name, nested_src->arity, p_specs);
++      if (nested == NULL) {
++        return false;
++      }
++      // the guard covers exactly the window between creation and the append
++      // that roots the child (the append itself can collect).
++      if (!gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(nested))) {
++        return false;
++      }
++      const bool appended = value_array_append(&dest->constants, OBJECT_AS_VALUE(nested));
++      gc_guard_down(p_vm->alloc->gc);
++      if (!appended) {
++        return false;
++      }
++      if (!copy_proto_fill(p_vm, nested, nested_src, p_specs)) {
++        return false;
++      }
++    } else {
++      if (!value_array_append(&dest->constants, v)) {
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
++// deep-copy a compiled body (every nested non-member proto included) so a
++// second definition can own its own bake. the source's code is already
++// freeze-patched for its class; the copy starts from that state, which the
++// caller guarantees to be valid (same parent, identical flattened layout).
++// a failed copy leaves the partial tree unreachable - the collector reclaims
++// it.
++static object_function* copy_proto_tree(vm* p_vm, object_function* p_src) {
++  object_specs specs = {p_vm->alloc, p_vm->objects_store};
++  object_function* top = create_object_function(p_src->name, p_src->arity, &specs);
++  if (top == NULL) {
++    return NULL;
++  }
++  // create_object_function makes one allocation (its collect runs before the
++  // object exists) and object_store_append does not allocate, so nothing can
++  // collect between creation and this guard.
++  if (!gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(top))) {
++    return NULL;
++  }
++  const bool filled = copy_proto_fill(p_vm, top, p_src, &specs);
++  gc_guard_down(p_vm->alloc->gc);
++  return filled ? top : NULL;
++}
++
++// patch one proto (once): the patched_by marker is the single-walk guard.
++// redefinitions are handled one level up, at the closures that own member
++// protos - every proto reaching this function is fresh or already this
++// class's, so a foreign marker here is an internal error.
+ static bool freeze_patch_proto(vm* p_vm, object_class* p_class, object_function* p_proto, bool p_construction) {
+   if (p_proto->patched_by == p_class) {
+     return true;
+   }
+   if (p_proto->patched_by != NULL) {
+     runtime_error(p_vm,
+-                  OK_EK_TYPE,
+-                  "this class body is already defined: a local class can only be defined once.");
++                  OK_EK_INTERNAL,
++                  "a class body reached the freeze walk without a per-definition copy.");
+     return false;
+   }
+   p_proto->patched_by = p_class;
+   return freeze_walk_chunk(p_vm, p_class, &p_proto->chunk, p_construction);
+ }
+ 
++// freeze one member closure for p_class. a proto already patched for another
++// class is a redefinition: the same parent bakes to the identical layout, so
++// the new definition takes a copy of the body and freezes that. a different
++// parent would need a different bake from pre-freeze code the proto no
++// longer carries, so it is refused.
++static bool freeze_patch_closure(vm* p_vm, object_class* p_class, object_closure* p_closure, bool p_construction) {
++  object_function* proto = p_closure->function;
++  if (proto->patched_by == p_class) {
++    return true;
++  }
++  if (proto->patched_by != NULL) {
++    if (proto->patched_by->parent != p_class->parent) {
++      runtime_error(p_vm,
++                    OK_EK_TYPE,
++                    "this class body is already defined with a different base: "
++                    "a local class can only be redefined with the same parent.");
++      return false;
++    }
++    object_function* copy = copy_proto_tree(p_vm, proto);
++    if (copy == NULL) {
++      runtime_oom(p_vm, "out of memory: failed to copy a redefined class body.");
++      return false;
++    }
++    p_closure->function = copy;
++    proto = copy;
++  }
++  proto->patched_by = p_class;
++  return freeze_walk_chunk(p_vm, p_class, &proto->chunk, p_construction);
++}
++
+ static bool freeze_walk_chunk(vm* p_vm, object_class* p_class, chunk* p_chunk, bool p_construction) {
+   if (!patch_chunk_fields(p_vm, p_class, p_chunk, p_construction)) {
+     return false;
+@@ -2436,14 +2562,14 @@ static bool class_freeze(vm* p_vm, object_class* p_class) {
+     if (p_class->methods.keys[i] != NULL && p_class->methods.values[i].closure != NULL) {
+       const object_string* mname = p_class->methods.keys[i];
+       const bool is_init = string_get_length(&mname->string) == 4 && memcmp(mname->string.chars, "init", 4) == 0;
+-      if (!freeze_patch_proto(p_vm, p_class, p_class->methods.values[i].closure->function, is_init)) {
++      if (!freeze_patch_closure(p_vm, p_class, p_class->methods.values[i].closure, is_init)) {
+         return false;
+       }
+     }
+   }
+   for (uint32_t i = 0; i < p_class->own_inits.count; ++i) {
+     if (p_class->own_inits.data[i] != NULL) {
+-      if (!freeze_patch_proto(p_vm, p_class, p_class->own_inits.data[i]->function, true)) {
++      if (!freeze_patch_closure(p_vm, p_class, p_class->own_inits.data[i], true)) {
+         return false;
+       }
+     }
+diff --git a/tests/e2e/tests/classes/bare_builtin_shadow.ok b/tests/e2e/tests/classes/bare_builtin_shadow.ok
+new file mode 100644
+index 0000000..9870bd8
+--- /dev/null
++++ b/tests/e2e/tests/classes/bare_builtin_shadow.ok
+@@ -0,0 +1,14 @@
++// pinned shadowing, awaiting a ruling: the std-zero builtins ride a hidden
++// enclosing scope, and a captured enclosing name beats the field/method
++// ladder. so a bare call inside a method reaches the builtin, while the
++// explicit member call reaches the method of the same name.
++let m = {"a": 10, "b": 20};
++class Inner {
++  let t = 5;
++  pub fu get() { return t; }
++  pub fu via_bare() { return get(m, "b"); }
++  pub fu via_this() { return this.get(); }
++}
++let v = Inner();
++print(v.via_this()); // expect: 5
++print(v.via_bare()); // expect: 20
+diff --git a/tests/e2e/tests/classes/local_class_parent_error.ok b/tests/e2e/tests/classes/local_class_parent_error.ok
+new file mode 100644
+index 0000000..3ed47a2
+--- /dev/null
++++ b/tests/e2e/tests/classes/local_class_parent_error.ok
+@@ -0,0 +1,10 @@
++// the one shape a redefinition cannot express: a different base would need a
++// different bake from pre-freeze code the body no longer carries
++class Base1 { let a = 1; }
++class Base2 { let b = 2; }
++fu make_class(p) {
++  class Inner : p { let t = 1; pub fu get() { return t; } }
++  return Inner;
++}
++let C1 = make_class(Base1);
++let C2 = make_class(Base2); // expect error: different base
+diff --git a/tests/e2e/tests/classes/local_class_redefine_closures.ok b/tests/e2e/tests/classes/local_class_redefine_closures.ok
+new file mode 100644
+index 0000000..c62300b
+--- /dev/null
++++ b/tests/e2e/tests/classes/local_class_redefine_closures.ok
+@@ -0,0 +1,22 @@
++// lambdas inside a redefined method: the copies follow the body, and each
++// generation closes over its own fields
++fu make_box_class() {
++  class Box {
++    let mut n = 0;
++    pub fu bump() {
++      n = n + 1;
++      let report = fu() { return n; };
++      return report();
++    }
++  }
++  return Box;
++}
++let B1 = make_box_class();
++let B2 = make_box_class();
++let x = B1();
++let y = B2();
++print(x.bump()); // expect: 1
++print(x.bump()); // expect: 2
++print(y.bump()); // expect: 1
++print(x.bump()); // expect: 3
++print(y.bump()); // expect: 2
+diff --git a/tests/e2e/tests/classes/local_class_redefine_in_method.ok b/tests/e2e/tests/classes/local_class_redefine_in_method.ok
+new file mode 100644
+index 0000000..f163c2a
+--- /dev/null
++++ b/tests/e2e/tests/classes/local_class_redefine_in_method.ok
+@@ -0,0 +1,17 @@
++// a class declared inside a method, re-entered: the member protos are shared
++// constants of the method's chunk, and each definition copies its own
++class Outer {
++  pub fu make_inner() {
++    class Inner {
++      let t = 1;
++      pub fu get() { return t; }
++    }
++    return Inner;
++  }
++}
++let o = Outer();
++let I1 = o.make_inner();
++let I2 = o.make_inner();
++print(I1().get()); // expect: 1
++print(I2().get()); // expect: 1
++print(I1 is I2); // expect: false
+diff --git a/tests/e2e/tests/classes/local_class_redefine_inherit.ok b/tests/e2e/tests/classes/local_class_redefine_inherit.ok
+new file mode 100644
+index 0000000..38b443a
+--- /dev/null
++++ b/tests/e2e/tests/classes/local_class_redefine_inherit.ok
+@@ -0,0 +1,20 @@
++// redefinition with a named base: the inherited field bake rides the copied
++// body, and the layout is identical for every generation
++class Base { let a = 1; }
++fu make_class() {
++  class Inner : Base {
++    let mut t = 2;
++    pub fu both() { return a + t; }
++    pub fu set(v) { t = v; return t; }
++  }
++  return Inner;
++}
++let C1 = make_class();
++let C2 = make_class();
++let x = C1();
++let y = C2();
++print(x.both()); // expect: 3
++print(y.both()); // expect: 3
++print(x.set(10)); // expect: 10
++print(y.both()); // expect: 3
++print(x.both()); // expect: 11
+diff --git a/tests/e2e/tests/classes/local_class_twice.ok b/tests/e2e/tests/classes/local_class_twice.ok
+new file mode 100644
+index 0000000..623ca7e
+--- /dev/null
++++ b/tests/e2e/tests/classes/local_class_twice.ok
+@@ -0,0 +1,17 @@
++// a local class re-entered: each definition owns its body (copy-on-redefine)
++fu make_class() {
++  class Inner { let t = 1; pub fu get() { return t; } }
++  return Inner;
++}
++let C1 = make_class();
++let C2 = make_class();
++print(C1().get()); // expect: 1
++print(C2().get()); // expect: 1
++print(C1 is C2); // expect: false
++let a = C1();
++let b = C2();
++print(a is C1); // expect: true
++print(a is C2); // expect: false
++print(b is C2); // expect: true
++// one line, alternating receivers: each generation's method cache is its own
++print(a.get() + b.get() + a.get()); // expect: 3
+diff --git a/tests/e2e/tests/classes/local_class_twice_error.ok b/tests/e2e/tests/classes/local_class_twice_error.ok
+deleted file mode 100644
+index 4652f77..0000000
+--- a/tests/e2e/tests/classes/local_class_twice_error.ok
++++ /dev/null
+@@ -1,6 +0,0 @@
+-fu make_class() {
+-  class Inner { let t = 1; pub fu get() { return t; } }
+-  return Inner;
+-}
+-let C1 = make_class();
+-let C2 = make_class(); // expect error: only be defined once
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index 55a9e73..d474909 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -513,6 +513,55 @@ int main() {
+ 
+   assert(result == OK_RUNTIME_ERROR);
+ 
++  // a script factory re-called through the C API: the second call redefines
++  // the local class (copy-on-redefine, same parent). both generations work,
++  // each with its own captured seed.
++  const char* factory_code = R"(
++    glob fu make_inner(seed) {
++      class Inner {
++        let t;
++        fu init() { this.t = seed; }
++        pub fu read() { return t; }
++        pub fu twice() { return read() * 2; }
++      }
++      let v = Inner();
++      return v.twice();
++    }
++  )";
++
++  ok_source factory_source = {
++      .code = factory_code,
++      .path = "embed",
++  };
++
++  result = ok_run(vm, factory_source);
++
++  assert(result == OK);
++
++  ok_value factory = ok_value_null();
++
++  assert(ok_global_get(vm, ok_create_string_view("make_inner", OK_STRING_VIEW_CALCULATE_LENGTH, true), &factory));
++
++  ok_value gen1_args[] = {
++      ok_value_number(21),
++  };
++
++  ok_value gen1 = ok_value_null();
++
++  assert(ok_call(vm, factory, 1, gen1_args, &gen1));
++
++  assert(ok_value_as_number(gen1) == 42);
++
++  ok_value gen2_args[] = {
++      ok_value_number(50),
++  };
++
++  ok_value gen2 = ok_value_null();
++
++  assert(ok_call(vm, factory, 1, gen2_args, &gen2));
++
++  assert(ok_value_as_number(gen2) == 100);
++
+   const char* error_code = "host_fail();\n";
+ 
+   ok_source error_source = {
+-- 
+2.47.3
+
