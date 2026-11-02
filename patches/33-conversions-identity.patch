@@ -1,0 +1,1495 @@
+From 97e983fdd2f600a2d4bbb81e18535ee6b3ac38ee Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Mon, 2 Nov 2026 22:30:00 +0000
+Subject: [PATCH] classes: conversions + identity + the builtin singletons
+ (citadel r3, patch 33)
+
+- === : word identity (C11), total, never dispatchable. 1 === 1.0 is true -
+  both are the double 1.0, there is no public int box; the visible edge is
+  0.0 === -0.0 (false) while 0.0 == -0.0 stays true
+- is (C12): classof + identity fused, the exact-class probe; isinstance/
+  classof as plain native builtins for the chain walk and the class value
+- operator <Target> rides the as lane (C13): user conversions dispatch like
+  operator methods (receiver staged, result type-checked - a subclass of the
+  target is legal), inherited down the chain, private ones hierarchy-internal
+- the seven builtin class singletons (C10): str/num/bool/array/map/function/
+  nil under Object, frozen at birth, bound as top-level values through ONE
+  seed table (the old two hand-built arrays were position-paired by
+  discipline); classof(null) === nil, classof(Class) === Class
+- TAG_AS + TT_ + the hidden ' str' globals die; tag id 6 stays reserved
+- three bugs fixed: the guard-stack overflow in vm_init_singletons
+  (OK_GC_GUARD_CAPACITY 16, silently exceeded - the str singleton's name was
+  swept mid-startup and reused by the num name; discipline is per-object
+  balanced and checked now), the asprint leak in the as_str object arms
+  (lsan, first exposed by instance-as-str), and as_num's missing int return
+  + copy-paste message + missing instance/class/method arms
+- operators_subscript.ok split: its error-lane directive made the whole file
+  skip output comparison, hiding a wrong expect (40 vs the correct 45)
+
+gates: e2e 391x4 + unit x3 + embed x3
+---
+ src/ok.c                                      | 145 ++++---
+ src/okchunk.h                                 |   9 +
+ src/okcompiler.c                              |  26 ++
+ src/okdebug.c                                 |  16 +-
+ src/okgc.c                                    |   8 +
+ src/oklexer.c                                 |   6 +-
+ src/okobject.c                                |  18 +
+ src/okobject.h                                |  20 +
+ src/okoperator.c                              |   4 +
+ src/okoperator.h                              |   4 +
+ src/okparser.c                                |   2 +
+ src/oktoken.h                                 |   4 +
+ src/okvalue.h                                 |  11 +-
+ src/okvm.c                                    | 359 ++++++++++++++++--
+ src/okvm.h                                    |  15 +-
+ tests/e2e/tests/classes/as_error.ok           |   2 +
+ tests/e2e/tests/classes/as_not_type_error.ok  |   2 +
+ tests/e2e/tests/classes/builtin_classes.ok    |  25 ++
+ tests/e2e/tests/classes/classof_isinstance.ok |  28 ++
+ .../classes/conversion_bad_return_error.ok    |   4 +
+ .../tests/classes/conversion_private_error.ok |   3 +
+ tests/e2e/tests/classes/conversions.ok        |  56 +++
+ tests/e2e/tests/classes/identity.ok           |  32 ++
+ .../tests/classes/instance_as_num_error.ok    |   3 +
+ tests/e2e/tests/classes/is_error.ok           |   2 +
+ tests/e2e/tests/classes/is_operator.ok        |  37 ++
+ .../e2e/tests/classes/operators_subscript.ok  |   6 +-
+ .../classes/operators_subscript_error.ok      |   4 +
+ tests/unit/src/oktest_nan.c                   |   5 +-
+ 29 files changed, 749 insertions(+), 107 deletions(-)
+ create mode 100644 tests/e2e/tests/classes/as_error.ok
+ create mode 100644 tests/e2e/tests/classes/as_not_type_error.ok
+ create mode 100644 tests/e2e/tests/classes/builtin_classes.ok
+ create mode 100644 tests/e2e/tests/classes/classof_isinstance.ok
+ create mode 100644 tests/e2e/tests/classes/conversion_bad_return_error.ok
+ create mode 100644 tests/e2e/tests/classes/conversion_private_error.ok
+ create mode 100644 tests/e2e/tests/classes/conversions.ok
+ create mode 100644 tests/e2e/tests/classes/identity.ok
+ create mode 100644 tests/e2e/tests/classes/instance_as_num_error.ok
+ create mode 100644 tests/e2e/tests/classes/is_error.ok
+ create mode 100644 tests/e2e/tests/classes/is_operator.ok
+ create mode 100644 tests/e2e/tests/classes/operators_subscript_error.ok
+
+diff --git a/src/ok.c b/src/ok.c
+index c7db448..e422814 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -46,6 +46,28 @@ static ok_value native_len(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
+   return NULL_AS_VALUE();
+ }
+ 
++// classof(v) (C12): the one class every value is an instance of. never
++// fails - the answer is total over the value space.
++static ok_value native_classof(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  return OBJECT_AS_VALUE(vm_classof(&p_ok->vm, p_argv[0]));
++}
++
++// isinstance(v, C) (C12): the chain walk - true when C is classof(v) or one
++// of its ancestors (Object at the root matches everything, including null
++// through nil). the exact-class check is `classof(v) == C` or the `is`
++// operator; this is the family question.
++static ok_value native_isinstance(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  if (!IS_VALUE_CLASS(p_argv[1])) {
++    ok_native_error(p_ok,
++                    ok_create_string_view(
++                        "invalid argument: 'isinstance' expects a class.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  return BOOL_AS_VALUE(vm_is_instance(&p_ok->vm, p_argv[0], VALUE_AS_CLASS(p_argv[1])));
++}
++
+ // get(m, k) / get(m, k, default)
+ // absent yields null (or the given default), where [] hard-errors.
+ // the key rules are the map's: null and unhashable keys error, only absence is lax.
+@@ -235,70 +257,101 @@ static bool ok_define_core_natives(ok* p_ok) {
+                                              native_remove);
+   status &= ok_global_define_native_function(
+       p_ok, ok_create_string_view(" get", OK_STRING_VIEW_CALCULATE_LENGTH, true), OK_NATIVE_ARITY_ANY, native_get);
++  // the class-surface builtins (C12): classof/isinstance are plain native
++  // functions like the rest, rebindable like the rest. the `is` operator and
++  // `===` are the primitive lanes that never consult bindings.
++  status &= ok_global_define_native_function(
++      p_ok, ok_create_string_view(" classof", OK_STRING_VIEW_CALCULATE_LENGTH, true), 1, native_classof);
++  status &= ok_global_define_native_function(
++      p_ok, ok_create_string_view(" isinstance", OK_STRING_VIEW_CALCULATE_LENGTH, true), 2, native_isinstance);
+   return status;
+ }
+ 
+-static bool ok_define_temporary_types(ok* p_ok) {
+-  bool status = true;
+-  status &= ok_global_define(
+-      p_ok, ok_create_string_view(" str", OK_STRING_VIEW_CALCULATE_LENGTH, true), AS_TAG_AS_VALUE(TT_STR), false);
+-  status &= ok_global_define(
+-      p_ok, ok_create_string_view(" num", OK_STRING_VIEW_CALCULATE_LENGTH, true), AS_TAG_AS_VALUE(TT_NUM), false);
+-  status &= ok_global_define(
+-      p_ok, ok_create_string_view(" bool", OK_STRING_VIEW_CALCULATE_LENGTH, true), AS_TAG_AS_VALUE(TT_BOOL), false);
+-  return status;
+-}
++// the seeding table: ONE list both sides walk, so the visible-name array and
++// the value array can never drift apart (the old two hand-built arrays were
++// position-paired by discipline alone). natives pull their hidden " name"
++// global (the space prefix is what hides them); builtin classes pull the vm
++// singletons; Object and Class ride the same walk.
++typedef enum {
++  SEED_NATIVE,       // the value is hidden-global " <name>" (a native fn)
++  SEED_BUILTIN_CLASS, // the value is vm->builtin_classes[class_id]
++  SEED_OBJECT,       // the root singleton
++  SEED_CLASS,        // the metaclass singleton
++} seed_kind;
++
++typedef struct {
++  const char* name;   // the visible top-level binding
++  seed_kind kind;
++  builtin_class_id class_id; // SEED_BUILTIN_CLASS only, else OK_BUILTIN_COUNT
++} seed_entry;
++
++static const seed_entry top_level_seeds[] = {
++    {"len", SEED_NATIVE, OK_BUILTIN_COUNT},
++    {"push", SEED_NATIVE, OK_BUILTIN_COUNT},
++    {"pop", SEED_NATIVE, OK_BUILTIN_COUNT},
++    {"remove", SEED_NATIVE, OK_BUILTIN_COUNT},
++    {"get", SEED_NATIVE, OK_BUILTIN_COUNT},
++    {"isinstance", SEED_NATIVE, OK_BUILTIN_COUNT},
++    {"classof", SEED_NATIVE, OK_BUILTIN_COUNT},
++    {"str", SEED_BUILTIN_CLASS, OK_BUILTIN_STR},
++    {"num", SEED_BUILTIN_CLASS, OK_BUILTIN_NUM},
++    {"bool", SEED_BUILTIN_CLASS, OK_BUILTIN_BOOL},
++    {"array", SEED_BUILTIN_CLASS, OK_BUILTIN_ARRAY},
++    {"map", SEED_BUILTIN_CLASS, OK_BUILTIN_MAP},
++    {"function", SEED_BUILTIN_CLASS, OK_BUILTIN_FUNCTION},
++    {"nil", SEED_BUILTIN_CLASS, OK_BUILTIN_NIL},
++    {"Object", SEED_OBJECT, OK_BUILTIN_COUNT},
++    {"Class", SEED_CLASS, OK_BUILTIN_COUNT},
++};
+ 
+ static top_level_declarations ok_get_top_level_declarations(ok* p_ok, bool* p_error) {
+   top_level_declarations decls;
+   top_level_declarations_init(&decls, &p_ok->alloc);
+-  variable_declaration raw_decls[] = {{ok_create_string_view("len", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+-                                      {ok_create_string_view("push", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+-                                      {ok_create_string_view("pop", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+-                                      {ok_create_string_view("remove", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+-                                      {ok_create_string_view("get", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+-                                      {ok_create_string_view("str", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+-                                      {ok_create_string_view("num", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+-                                      {ok_create_string_view("bool", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+-                                      {ok_create_string_view("Object", OK_STRING_VIEW_CALCULATE_LENGTH, true)},
+-                                      {ok_create_string_view("Class", OK_STRING_VIEW_CALCULATE_LENGTH, true)}};
+-
+-  *p_error = !top_level_declarations_append_n(&decls, raw_decls, sizeof(raw_decls) / sizeof(variable_declaration));
++  for (uint32_t i = 0; i < sizeof(top_level_seeds) / sizeof(top_level_seeds[0]); ++i) {
++    variable_declaration decl = {
++        ok_create_string_view(top_level_seeds[i].name, OK_STRING_VIEW_CALCULATE_LENGTH, true)};
++    if (!top_level_declarations_append(&decls, decl)) {
++      *p_error = true;
++      break;
++    }
++  }
+   return decls;
+ }
+ 
+ static value_array ok_get_top_level_values(ok* p_ok, bool* p_error) {
+-  ok_string_view raw_idents[] = {ok_create_string_view(" len", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                 ok_create_string_view(" push", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                 ok_create_string_view(" pop", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                 ok_create_string_view(" remove", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                 ok_create_string_view(" get", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                 ok_create_string_view(" str", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                 ok_create_string_view(" num", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                                 ok_create_string_view(" bool", OK_STRING_VIEW_CALCULATE_LENGTH, true)};
+-
+   value_array vals;
+   value_array_init(&vals, &p_ok->alloc);
+ 
+-  for (uint32_t i = 0; i < sizeof(raw_idents) / sizeof(ok_string_view); ++i) {
++  for (uint32_t i = 0; i < sizeof(top_level_seeds) / sizeof(top_level_seeds[0]) && !*p_error; ++i) {
++    const seed_entry* seed = &top_level_seeds[i];
+     value temp;
+-    if (!ok_global_get(p_ok, raw_idents[i], &temp)) {
+-      *p_error = true;
++    switch (seed->kind) {
++    case SEED_NATIVE: {
++      // the hidden global is " " + the visible name; the names are short
++      // static strings, so a bounded stack buffer is the whole story
++      char hidden[32];
++      const int written = snprintf(hidden, sizeof(hidden), " %s", seed->name);
++      if (written <= 0 || (size_t)written >= sizeof(hidden) ||
++          !ok_global_get(p_ok, ok_create_string_view(hidden, (uint32_t)written, true), &temp)) {
++        *p_error = true;
++      }
+       break;
+     }
+-    if (!value_array_append(&vals, temp)) {
+-      *p_error = true;
++    case SEED_BUILTIN_CLASS:
++      temp = OBJECT_AS_VALUE(p_ok->vm.builtin_classes[seed->class_id]);
++      break;
++    case SEED_OBJECT:
++      // Object and Class have no global storage; the vm singletons are
++      // the values (seeded fresh every run, rooted by mark_vm in between)
++      temp = OBJECT_AS_VALUE(p_ok->vm.object_singleton);
++      break;
++    case SEED_CLASS:
++      temp = OBJECT_AS_VALUE(p_ok->vm.class_singleton);
+       break;
+     }
+-  }
+-  // the hierarchy singletons ride the same seeding: position-paired with
+-  // their declarations above (Object, Class), pulled straight from the vm
+-  // since no global storage exists for them.
+-  if (!*p_error) {
+-    if (p_ok->vm.object_singleton == NULL || p_ok->vm.class_singleton == NULL ||
+-        !value_array_append(&vals, OBJECT_AS_VALUE(p_ok->vm.object_singleton)) ||
+-        !value_array_append(&vals, OBJECT_AS_VALUE(p_ok->vm.class_singleton))) {
++    if (*p_error || !value_array_append(&vals, temp)) {
+       *p_error = true;
++      break;
+     }
+   }
+   return vals;
+@@ -339,10 +392,6 @@ ok* ok_create(ok_specs p_specs) {
+     ok_free(okay);
+     return NULL;
+   }
+-  if (!ok_define_temporary_types(okay)) {
+-    ok_free(okay);
+-    return NULL;
+-  }
+   return okay;
+ }
+ 
+diff --git a/src/okchunk.h b/src/okchunk.h
+index d0623bd..a1e03dc 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -371,6 +371,13 @@ typedef enum {
+                          //                          written by the freeze pass in place of a this-relative
+                          //                          store it proved to target a method.
+   OP_METHOD_NOT_ASSIGNABLE_LONG, // 2w: (A)         -> same, wide; ip += w
++  OP_STRICT_EQUAL,       // w:    (p, a, b, c)    -> r[a] = r[b] === (p then k[c] otherwise r[c]) - raw word
++                         //                          identity, total over every value, never dispatchable
++  OP_STRICT_EQUAL_LONG,  // 2w:   (p, A, B, C, q) -> r[A] = (q then k[B] otherwise r[B]) === (p then k[C] otherwise r[C]); ip += w
++  OP_IS,                 // w:    (p, a, b, c)    -> r[a] = classof(r[b]) === (p then k[c] otherwise r[c]) - the
++                         //                          exact-class probe, classof+identity fused, no global involved.
++                         //                          the operand must be a class value
++  OP_IS_LONG,            // 2w:   (p, A, B, C, q) -> r[A] = classof(q then k[B] otherwise r[B]) === (p then k[C] otherwise r[C]); ip += w
+ } opcode;
+ 
+ // clang-format on
+@@ -632,6 +639,8 @@ static inline uint32_t opcode_word_count(opcode p_op) {
+   case OP_STORE_STATIC_NAME:
+   case OP_GET_METHOD_LONG:
+   case OP_METHOD_NOT_ASSIGNABLE_LONG:
++  case OP_STRICT_EQUAL_LONG:
++  case OP_IS_LONG:
+     return 2;
+   case OP_GET_MEMBER:
+   case OP_INVOKE:
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 1b36a0d..98c2e09 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -3678,6 +3678,32 @@ static bool compile_binary_value_operator(compiler* p_compiler,
+ 
+     break;
+   }
++  case OPERATOR_BIN_STRICT_EQUALS: {
++    result = emit_binop(p_compiler,
++                        OP_STRICT_EQUAL,
++                        OP_STRICT_EQUAL_LONG,
++                        p_dest,
++                        lhs.value,
++                        rhs.value,
++                        is_lhs_p,
++                        is_rhs_p,
++                        (ast_node*)p_binexpr);
++
++    break;
++  }
++  case OPERATOR_BIN_IS: {
++    result = emit_binop(p_compiler,
++                        OP_IS,
++                        OP_IS_LONG,
++                        p_dest,
++                        lhs.value,
++                        rhs.value,
++                        is_lhs_p,
++                        is_rhs_p,
++                        (ast_node*)p_binexpr);
++
++    break;
++  }
+   case OPERATOR_BIN_BANG_EQUAL: {
+     result = emit_binop(p_compiler,
+                         OP_NOT_EQUAL,
+diff --git a/src/okdebug.c b/src/okdebug.c
+index b66bb8a..db7d518 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -117,10 +117,12 @@ static const char* const OPCODE_NAMES[] = {
+     "GET_METHOD_LONG",
+     "METHOD_NOT_ASSIGNABLE",
+     "METHOD_NOT_ASSIGNABLE_LONG",
++    "STRICT_EQUAL",
++    "STRICT_EQUAL_LONG",
++    "IS",
++    "IS_LONG",
+ };
+-typedef char opcode_names_in_sync[(sizeof(OPCODE_NAMES) / sizeof(OPCODE_NAMES[0]) == (size_t)OP_METHOD_NOT_ASSIGNABLE_LONG + 1)
+-                                      ? 1
+-                                      : -1];
++typedef char opcode_names_in_sync[(sizeof(OPCODE_NAMES) / sizeof(OPCODE_NAMES[0]) == (size_t)OP_IS_LONG + 1) ? 1 : -1];
+ 
+ static const char* binop_symbol(const opcode p_op) {
+   switch (p_op) {
+@@ -142,6 +144,12 @@ static const char* binop_symbol(const opcode p_op) {
+   case OP_EQUALS:
+   case OP_EQUALS_LONG:
+     return "==";
++  case OP_STRICT_EQUAL:
++  case OP_STRICT_EQUAL_LONG:
++    return "===";
++  case OP_IS:
++  case OP_IS_LONG:
++    return "is";
+   case OP_NOT_EQUAL:
+   case OP_NOT_EQUAL_LONG:
+     return "!=";
+@@ -207,6 +215,8 @@ static bool op_is_two_words(opcode p_op) {
+   case OP_DIVIDE_LONG:
+   case OP_MODULUS_LONG:
+   case OP_EQUALS_LONG:
++  case OP_STRICT_EQUAL_LONG:
++  case OP_IS_LONG:
+   case OP_NOT_EQUAL_LONG:
+   case OP_GREATER_LONG:
+   case OP_LESS_LONG:
+diff --git a/src/okgc.c b/src/okgc.c
+index 66702c8..0365012 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -200,6 +200,14 @@ static bool mark_vm(gc* p_gc) {
+       return false;
+     }
+   }
++  // the seven builtin singletons root here exactly like Object and Class:
++  // nothing else references them at startup, and every classof() answer
++  // funnels through one of them.
++  for (uint32_t i = 0; i < OK_BUILTIN_COUNT; ++i) {
++    if (!mark_object(p_gc, (object*)vm->builtin_classes[i])) {
++      return false;
++    }
++  }
+   // a script-thrown value sits in the error lane from raise until the host
+   // clears it (ok_last_error keeps it readable past the failed run/call).
+   // across C boundaries where allocation happens, so it must root like a
+diff --git a/src/oklexer.c b/src/oklexer.c
+index a22708f..987bf51 100644
+--- a/src/oklexer.c
++++ b/src/oklexer.c
+@@ -219,6 +219,8 @@ static token_type lookup_identifier(lexer* p_lexer) {
+         return check_keyword(p_lexer, 2, 4, "port", TOKEN_IMPORT);
+       case 'f':
+         return check_keyword(p_lexer, 2, 0, "", TOKEN_IF);
++      case 's':
++        return check_keyword(p_lexer, 2, 0, "", TOKEN_IS);
+       }
+     }
+     break;
+@@ -362,7 +364,9 @@ start:
+   case '!':
+     return create_token(p_lexer, match(p_lexer, '=') ? TOKEN_BANG_EQUAL : TOKEN_BANG);
+   case '=':
+-    return create_token(p_lexer, match(p_lexer, '=') ? TOKEN_EQUAL : TOKEN_ASSIGN);
++    // longest match first: === (identity) before == before =
++    return create_token(p_lexer,
++                        match(p_lexer, '=') ? match(p_lexer, '=') ? TOKEN_TRIPLE_EQUAL : TOKEN_EQUAL : TOKEN_ASSIGN);
+   case '<':
+     return create_token(p_lexer,
+                         match(p_lexer, '=')   ? TOKEN_LESS_EQUAL
+diff --git a/src/okobject.c b/src/okobject.c
+index cf93510..9f9570c 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -643,6 +643,24 @@ const char* class_operator_spelling(class_operator p_op) {
+   return class_operator_spellings[p_op];
+ }
+ 
++// the builtin singleton names, index-parallel to builtin_class_id. these are
++// the user-visible global names, the `as` target spellings, and the suffixes
++// of `operator str`-style conversion names - one table keeps the three
++// agreeing by construction.
++static const char* const builtin_class_names[OK_BUILTIN_COUNT] = {
++    "str",
++    "num",
++    "bool",
++    "array",
++    "map",
++    "function",
++    "nil",
++};
++
++const char* builtin_class_name(builtin_class_id p_id) {
++  return builtin_class_names[p_id];
++}
++
+ const method_entry* object_class_find_operator(object_class* p_class, class_operator p_op, const object_string* p_name) {
+   if (p_class->op_cache[p_op] != NULL) {
+     return p_class->op_cache[p_op];
+diff --git a/src/okobject.h b/src/okobject.h
+index af6e97b..f3ffb61 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -267,6 +267,26 @@ typedef enum {
+ // the canonical method-table spelling of an operator ("operator +" etc.).
+ const char* class_operator_spelling(class_operator p_op);
+ 
++// the seven builtin classes (C10): one per existing value lane, all under
++// Object, all created at startup and frozen empty (their method tables fill
++// with native entries in the natives-as-classes patch). int and float share
++// `num` (the box detail is not a class difference); `nil` is null's class
++// and null is its sole instance.
++typedef enum {
++  OK_BUILTIN_STR = 0,
++  OK_BUILTIN_NUM,
++  OK_BUILTIN_BOOL,
++  OK_BUILTIN_ARRAY,
++  OK_BUILTIN_MAP,
++  OK_BUILTIN_FUNCTION,
++  OK_BUILTIN_NIL,
++  OK_BUILTIN_COUNT,
++} builtin_class_id;
++
++// the singleton's name ("str", "num", ...), also the `as` target spelling
++// and the mangled-name suffix of an `operator str`-style conversion.
++const char* builtin_class_name(builtin_class_id p_id);
++
+ // one flat-layout field: its absolute slot in the instance array + mutability.
+ typedef struct {
+   uint16_t slot;
+diff --git a/src/okoperator.c b/src/okoperator.c
+index e46f8d5..38b4cdb 100644
+--- a/src/okoperator.c
++++ b/src/okoperator.c
+@@ -18,6 +18,10 @@ operator_type operator_type_from_token_type(const token_type p_token_type, bool
+     return OPERATOR_PRE_BANG;
+   case TOKEN_EQUAL:
+     return OPERATOR_BIN_EQUALS;
++  case TOKEN_TRIPLE_EQUAL:
++    return OPERATOR_BIN_STRICT_EQUALS;
++  case TOKEN_IS:
++    return OPERATOR_BIN_IS;
+   case TOKEN_BANG_EQUAL:
+     return OPERATOR_BIN_BANG_EQUAL;
+   case TOKEN_GREATER:
+diff --git a/src/okoperator.h b/src/okoperator.h
+index 7c32396..6bc1726 100644
+--- a/src/okoperator.h
++++ b/src/okoperator.h
+@@ -15,6 +15,8 @@
+   X(OPERATOR_BIN_CARET, "^")                                                                                           \
+   X(OPERATOR_PRE_BANG, "!")                                                                                            \
+   X(OPERATOR_BIN_EQUALS, "==")                                                                                         \
++  X(OPERATOR_BIN_STRICT_EQUALS, "===")                                                                                 \
++  X(OPERATOR_BIN_IS, "is")                                                                                             \
+   X(OPERATOR_BIN_BANG_EQUAL, "!=")                                                                                     \
+   X(OPERATOR_BIN_GREATER, ">")                                                                                         \
+   X(OPERATOR_BIN_GREATER_EQUAL, ">=")                                                                                  \
+@@ -62,6 +64,8 @@ typedef enum {
+   OPERATOR_BIN_BAR,
+   OPERATOR_BIN_TILED,
+   OPERATOR_BIN_EQUALS,
++  OPERATOR_BIN_STRICT_EQUALS,
++  OPERATOR_BIN_IS,
+   OPERATOR_BIN_BANG_EQUAL,
+   OPERATOR_BIN_GREATER,
+   OPERATOR_BIN_GREATER_EQUAL,
+diff --git a/src/okparser.c b/src/okparser.c
+index 8c86957..ff7d182 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -128,6 +128,8 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_BANG] = {parse_unary_prefix, NULL, PREC_PREFIX},
+     [TOKEN_BANG_EQUAL] = {NULL, parse_binary_infix, PREC_EQUALITY},
+     [TOKEN_EQUAL] = {NULL, parse_binary_infix, PREC_EQUALITY},
++    [TOKEN_TRIPLE_EQUAL] = {NULL, parse_binary_infix, PREC_EQUALITY},
++    [TOKEN_IS] = {NULL, parse_binary_infix, PREC_EQUALITY},
+     [TOKEN_LESS_EQUAL] = {NULL, parse_binary_infix, PREC_COMPARISION},
+     [TOKEN_GREATER_EQUAL] = {NULL, parse_binary_infix, PREC_COMPARISION},
+     [TOKEN_LESS] = {NULL, parse_binary_infix, PREC_COMPARISION},
+diff --git a/src/oktoken.h b/src/oktoken.h
+index 655becb..616187d 100644
+--- a/src/oktoken.h
++++ b/src/oktoken.h
+@@ -41,6 +41,7 @@
+   X(TOKEN_BANG, "!")                                                                                                   \
+   X(TOKEN_BANG_EQUAL, "!=")                                                                                            \
+   X(TOKEN_EQUAL, "==")                                                                                                 \
++  X(TOKEN_TRIPLE_EQUAL, "===")                                                                                                 \
+   X(TOKEN_LESS_EQUAL, "<=")                                                                                            \
+   X(TOKEN_GREATER_EQUAL, ">=")                                                                                         \
+   X(TOKEN_LESS, "<")                                                                                                   \
+@@ -57,6 +58,7 @@
+   X(TOKEN_PRINT, "print")                                                                                              \
+   X(TOKEN_IMPORT, "import")                                                                                            \
+   X(TOKEN_AS, "as")                                                                                                    \
++  X(TOKEN_IS, "is")                                                                                                    \
+   X(TOKEN_FU, "fu")                                                                                                    \
+   X(TOKEN_LET, "let")                                                                                                  \
+   X(TOKEN_WHILE, "while")                                                                                              \
+@@ -124,6 +126,7 @@ typedef enum {
+   TOKEN_BANG,
+   TOKEN_BANG_EQUAL,
+   TOKEN_EQUAL,
++  TOKEN_TRIPLE_EQUAL,
+   TOKEN_LESS_EQUAL,
+   TOKEN_GREATER_EQUAL,
+   TOKEN_LESS,
+@@ -142,6 +145,7 @@ typedef enum {
+   TOKEN_PRINT,
+   TOKEN_IMPORT,
+   TOKEN_AS,
++  TOKEN_IS,
+   TOKEN_FU,
+   TOKEN_LET,
+   TOKEN_WHILE,
+diff --git a/src/okvalue.h b/src/okvalue.h
+index f0508ce..8176842 100644
+--- a/src/okvalue.h
++++ b/src/okvalue.h
+@@ -39,7 +39,10 @@
+ #define TAG_OBJECT 3
+ #define TAG_INT 4
+ #define TAG_USER 5  // pointer or whatever as long as it is 48bits
+-#define TAG_AS 6    // the `as` conversion type carrier (TT_STR/TT_NUM/TT_BOOL)
++#define TAG_AS 6    // RETIRED (0.5.0): was the `as` conversion type carrier.
++                   // the lane went through real class values with the builtin
++                   // singletons; the tag id stays reserved so the survivors keep
++                   // their numbers.
+ #define TAG_DEFER 7 // a pending defer: the payload is an object_closure*
+ 
+ #define TAG_NULL_MASK UINT64_C(0x0000000000000000)
+@@ -48,7 +51,7 @@
+ #define TAG_OBJECT_MASK UINT64_C(0x0003000000000000)
+ #define TAG_INT_MASK UINT64_C(0x8000000000000000)
+ #define TAG_USER_MASK UINT64_C(0x8001000000000000)
+-#define TAG_AS_MASK UINT64_C(0x8002000000000000)
++// TAG_AS_MASK retired with TAG_AS (see above).
+ #define TAG_DEFER_MASK UINT64_C(0x8003000000000000)
+ 
+ #define VALUE_TAG(v) ((v) & TAG_MASK)
+@@ -62,7 +65,6 @@
+ #define IS_VALUE_OBJECT(v) (VALUE_TAG(v) == TAG_OBJECT_MASK)
+ #define IS_VALUE_INT(v) (VALUE_TAG(v) == TAG_INT_MASK)
+ #define IS_VALUE_USER(v) (VALUE_TAG(v) == TAG_USER_MASK)
+-#define IS_VALUE_AS(v) (VALUE_TAG(v) == TAG_AS_MASK)
+ #define IS_VALUE_DEFER(v) (VALUE_TAG(v) == TAG_DEFER_MASK)
+ 
+ #define IS_VALUE_STRICTLY_NULL(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_NULL(v))
+@@ -70,7 +72,6 @@
+ #define IS_VALUE_STRICTLY_OBJECT(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_OBJECT(v))
+ #define IS_VALUE_STRICTLY_INT(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_INT(v))
+ #define IS_VALUE_STRICTLY_USER(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_USER(v))
+-#define IS_VALUE_STRICTLY_AS(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_AS(v))
+ #define IS_VALUE_STRICTLY_DEFER(v) (!IS_VALUE_NUMBER(v) && IS_VALUE_DEFER(v))
+ 
+ #define NUMBER_AS_VALUE(n) number_to_value(n)
+@@ -80,7 +81,6 @@
+ #define INT_AS_VALUE(i) TAGGED_VALUE(TAG_INT_MASK, int_to_payload(i))
+ #define USER_AS_VALUE(u) TAGGED_VALUE(TAG_USER_MASK, (uint64_t)u)
+ #define USER_PTR_AS_VALUE(u) TAGGED_VALUE(TAG_USER_MASK, (uint64_t)(uintptr_t)(u))
+-#define AS_TAG_AS_VALUE(t) TAGGED_VALUE(TAG_AS_MASK, (uint64_t)(t))
+ #define DEFER_AS_VALUE(c) TAGGED_VALUE(TAG_DEFER_MASK, (uint64_t)(uintptr_t)(c))
+ 
+ #define VALUE_AS_NUMBER(v) value_to_number(v)
+@@ -90,7 +90,6 @@
+ #define VALUE_AS_INT(v) (payload_to_int(VALUE_PAYLOAD(v)))
+ #define VALUE_AS_USER(v) VALUE_PAYLOAD(v)
+ #define VALUE_AS_USER_PTR(v) ((void*)(uintptr_t)VALUE_PAYLOAD(v))
+-#define VALUE_AS_AS_TAG(v) ((uint64_t)VALUE_PAYLOAD(v))
+ 
+ typedef uint64_t value;
+ 
+diff --git a/src/okvm.c b/src/okvm.c
+index 9329e9c..dd7951e 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -117,6 +117,9 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->print_ctx = NULL;
+   p_vm->object_singleton = NULL;
+   p_vm->class_singleton = NULL;
++  for (uint32_t i = 0; i < OK_BUILTIN_COUNT; ++i) {
++    p_vm->builtin_classes[i] = NULL;
++  }
+   p_vm->static_call_name = NULL;
+   p_vm->init_method_name = NULL;
+   for (uint32_t i = 0; i < CLASS_OP_COUNT; ++i) {
+@@ -177,6 +180,18 @@ void vm_deinit(vm* p_vm) {
+ // allocations that could collect mid-sequence: aggressive mode collects on
+ // every allocation, and an unrooted, unassigned object is exactly what a
+ // collect would sweep.
++//
++// the guard discipline here is PER-OBJECT BALANCED: a name rides the stack
++// only across the class creation that adopts it, and drops the moment the
++// class assignment roots the pair (mark_vm marks the singleton, its trace
++// marks the name). the original shape held every name on the stack at once,
++// which silently overflowed OK_GC_GUARD_CAPACITY (16) once the builtin
++// singletons joined the sequence - gc_guard_up fails quietly past capacity,
++// the str singleton's name was swept mid-startup, its memory got reused by
++// the num name, and `x as str` probed "operator num". found under
++// OK_AGGRESSIVE_GC by conversion_private_error.ok; guard pushes are checked
++// now, and the cached names below need no guard at all (their assignment is
++// the rooting - nothing allocates between the two).
+ bool vm_init_singletons(vm* p_vm) {
+   object_specs specs = {p_vm->alloc, p_vm->objects_store};
+   gc* gc = p_vm->alloc->gc;
+@@ -185,10 +200,12 @@ bool vm_init_singletons(vm* p_vm) {
+   if (object_name == NULL) {
+     return false;
+   }
+-  gc_guard_up(gc, OBJECT_AS_VALUE(object_name));
++  if (!gc_guard_up(gc, OBJECT_AS_VALUE(object_name))) {
++    return false;
++  }
+   p_vm->object_singleton = create_object_class(object_name, NULL, &specs);
++  gc_guard_down(gc); // the assignment above rooted class + name for good
+   if (p_vm->object_singleton == NULL) {
+-    gc_guard_down(gc);
+     return false;
+   }
+   // the root is born complete: no fields, no methods, frozen empty.
+@@ -196,34 +213,24 @@ bool vm_init_singletons(vm* p_vm) {
+   object_string* class_name =
+       create_object_string(ok_create_string_view("Class", OK_STRING_VIEW_CALCULATE_LENGTH, true), &specs);
+   if (class_name == NULL) {
+-    gc_guard_down(gc);
+     return false;
+   }
+-  gc_guard_up(gc, OBJECT_AS_VALUE(class_name));
++  if (!gc_guard_up(gc, OBJECT_AS_VALUE(class_name))) {
++    return false;
++  }
+   p_vm->class_singleton = create_object_class(class_name, p_vm->object_singleton, &specs);
++  gc_guard_down(gc); // same rooting as above
+   if (p_vm->class_singleton == NULL) {
+-    gc_guard_down(gc);
+-    gc_guard_down(gc);
+     return false;
+   }
+   object_class_freeze(p_vm->class_singleton);
+-  // every name created below is rooted by mark_vm the moment it is assigned,
+-  // but the NEXT allocation in this sequence can collect (aggressive mode
+-  // collects on every allocation), so each rides the guard stack until the
+-  // sequence completes. guards counts the pushes so the drops always balance.
+-  uint32_t guards = 2; // object_name + class_name, still held from above
++  // the cached lookup names: no guard window exists for any of them - the
++  // assignment into the vm IS the rooting (mark_vm scans these slots, and
++  // nothing allocates between assignment and the next possible collect).
+   p_vm->static_call_name =
+       create_object_string(ok_create_string_view("operator ()", OK_STRING_VIEW_CALCULATE_LENGTH, true), &specs);
+-  if (p_vm->static_call_name != NULL) {
+-    gc_guard_up(gc, OBJECT_AS_VALUE(p_vm->static_call_name));
+-    guards++;
+-  }
+   p_vm->init_method_name =
+       create_object_string(ok_create_string_view("init", OK_STRING_VIEW_CALCULATE_LENGTH, true), &specs);
+-  if (p_vm->init_method_name != NULL) {
+-    gc_guard_up(gc, OBJECT_AS_VALUE(p_vm->init_method_name));
+-    guards++;
+-  }
+   // the operator probe names: one per class_operator, from the canonical
+   // spelling table. [CALL] aliases static_call_name (same spelling), so it is
+   // skipped here and patched in after the loop.
+@@ -239,20 +246,40 @@ bool vm_init_singletons(vm* p_vm) {
+                                                    OK_STRING_VIEW_CALCULATE_LENGTH,
+                                                    true),
+                              &specs);
+-    if (p_vm->op_names[i] != NULL) {
+-      gc_guard_up(gc, OBJECT_AS_VALUE(p_vm->op_names[i]));
+-      guards++;
+-    }
+-  }
+-  for (uint32_t i = 0; i < guards; ++i) {
+-    gc_guard_down(gc);
+   }
+   p_vm->op_names[CLASS_OP_CALL] = p_vm->static_call_name;
++  // the seven builtin singletons (C10): under Object, frozen empty at birth
++  // (their method tables are a later patch's business). the name rides the
++  // guard stack only across the class creation that adopts it.
++  for (uint32_t i = 0; i < OK_BUILTIN_COUNT; ++i) {
++    object_string* builtin_name =
++        create_object_string(ok_create_string_view(builtin_class_name((builtin_class_id)i),
++                                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                                   true),
++                             &specs);
++    if (builtin_name == NULL) {
++      break;
++    }
++    if (!gc_guard_up(gc, OBJECT_AS_VALUE(builtin_name))) {
++      break;
++    }
++    p_vm->builtin_classes[i] = create_object_class(builtin_name, p_vm->object_singleton, &specs);
++    gc_guard_down(gc); // the class assignment roots the pair
++    if (p_vm->builtin_classes[i] == NULL) {
++      break;
++    }
++    object_class_freeze(p_vm->builtin_classes[i]);
++  }
+   for (uint32_t i = 0; i < CLASS_OP_COUNT; ++i) {
+     if (p_vm->op_names[i] == NULL) {
+       return false;
+     }
+   }
++  for (uint32_t i = 0; i < OK_BUILTIN_COUNT; ++i) {
++    if (p_vm->builtin_classes[i] == NULL) {
++      return false;
++    }
++  }
+   return p_vm->static_call_name != NULL && p_vm->init_method_name != NULL;
+ }
+ 
+@@ -894,6 +921,20 @@ static inline bool as_str_rest(vm* p_vm, ok_string_view p_str, value* p_result)
+   return true;
+ }
+ 
++// asprint + as_str_rest + the release of the printed intermediate. the bare
++// pattern leaked the middle buffer on every call (lsan found it the day
++// `instance as str` first ran in the e2e corpus - the object arms had simply
++// never been reached before). the result value is written before the deinit
++// and the deinit never collects, so no rooting window opens.
++static inline bool as_str_printed(vm* p_vm, string p_printed, value* p_result) {
++  if (p_printed.chars == NULL) {
++    return false; // the caller reported its own failure flavor already
++  }
++  const bool ok = as_str_rest(p_vm, ok_create_string_view_from_string(p_printed), p_result);
++  string_deinit(&p_printed, p_vm->alloc);
++  return ok;
++}
++
+ static inline bool num_as_str(vm* p_vm, double p_value, value* p_result) {
+   char buff[64];
+   if (snprintf(buff, 64, "%g", p_value) < 0) {
+@@ -1043,7 +1084,7 @@ static inline bool closure_as_str(vm* p_vm, object* p_closure, value* p_result)
+     runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert function to string.");
+     return false;
+   }
+-  return as_str_rest(p_vm, ok_create_string_view_from_string(str), p_result);
++  return as_str_printed(p_vm, str, p_result);
+ }
+ 
+ static inline bool native_function_as_str(vm* p_vm, object* p_native_function, value* p_result) {
+@@ -1059,7 +1100,7 @@ static inline bool native_function_as_str(vm* p_vm, object* p_native_function, v
+     runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert native function to string.");
+     return false;
+   }
+-  return as_str_rest(p_vm, ok_create_string_view_from_string(str), p_result);
++  return as_str_printed(p_vm, str, p_result);
+ }
+ 
+ static inline bool native_value_as_str(vm* p_vm, object* p_native_value, value* p_result) {
+@@ -1069,7 +1110,7 @@ static inline bool native_value_as_str(vm* p_vm, object* p_native_value, value*
+     runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert native value to string.");
+     return false;
+   }
+-  return as_str_rest(p_vm, ok_create_string_view_from_string(str), p_result);
++  return as_str_printed(p_vm, str, p_result);
+ }
+ 
+ static inline bool object_as_str(vm* p_vm, object* p_obj, value* p_result) {
+@@ -1100,7 +1141,7 @@ static inline bool object_as_str(vm* p_vm, object* p_obj, value* p_result) {
+       runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert class to string.");
+       return false;
+     }
+-    return as_str_rest(p_vm, ok_create_string_view_from_string(str), p_result);
++    return as_str_printed(p_vm, str, p_result);
+   }
+   case OBJ_INSTANCE: {
+     object_instance* inst = (object_instance*)p_obj;
+@@ -1109,7 +1150,7 @@ static inline bool object_as_str(vm* p_vm, object* p_obj, value* p_result) {
+       runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert instance to string.");
+       return false;
+     }
+-    return as_str_rest(p_vm, ok_create_string_view_from_string(str), p_result);
++    return as_str_printed(p_vm, str, p_result);
+   }
+   case OBJ_BOUND_METHOD: {
+     object_bound_method* bound = (object_bound_method*)p_obj;
+@@ -1118,7 +1159,7 @@ static inline bool object_as_str(vm* p_vm, object* p_obj, value* p_result) {
+       runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert method to string.");
+       return false;
+     }
+-    return as_str_rest(p_vm, ok_create_string_view_from_string(str), p_result);
++    return as_str_printed(p_vm, str, p_result);
+   }
+   }
+   runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert unknown object to string.");
+@@ -1205,8 +1246,22 @@ static inline bool object_as_num(vm* p_vm, object* p_obj, value* p_result) {
+     runtime_error(p_vm, OK_EK_CONVERSION, "native value is not convertible to number.");
+     return false;
+   }
++  case OBJ_CLASS: {
++    runtime_error(p_vm, OK_EK_CONVERSION, "class is not convertible to number.");
++    return false;
+   }
+-  runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert unknown object to string.");
++  case OBJ_INSTANCE: {
++    // the operator lane already had its chance in perform_as; an instance
++    // with no `operator num` has no numeric form, full stop
++    runtime_error(p_vm, OK_EK_CONVERSION, "instance is not convertible to number.");
++    return false;
++  }
++  case OBJ_BOUND_METHOD: {
++    runtime_error(p_vm, OK_EK_CONVERSION, "method is not convertible to number.");
++    return false;
++  }
++  }
++  runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert unknown object to number.");
+   return false;
+ }
+ 
+@@ -1220,6 +1275,7 @@ static ok_value as_num(vm* p_vm, ok_value p_value, value* p_result) {
+   switch (tag) {
+   case TAG_INT_MASK: {
+     *p_result = NUMBER_AS_VALUE(VALUE_AS_INT(p_value));
++    return true;
+   }
+   case TAG_NULL_MASK: {
+     runtime_error(p_vm, OK_EK_CONVERSION, "null is not convertible to number.");
+@@ -1249,6 +1305,119 @@ static ok_value as_bool(vm* p_vm, value p_value, value* p_result) {
+   return true;
+ }
+ 
++// classof (C10): every value is an instance of exactly one class. instances
++// carry theirs, class values are all Class, every other object maps to its
++// lane's builtin singleton. native values (opaque embedder payloads) sit
++// directly under Object, and bound methods count as function - both are
++// recorded in the classes draft as the two judgment calls.
++object_class* vm_classof(vm* p_vm, ok_value p_value) {
++  if (IS_VALUE_NUMBER(p_value) || IS_VALUE_INT(p_value)) {
++    return p_vm->builtin_classes[OK_BUILTIN_NUM];
++  }
++  switch (VALUE_TAG(p_value)) {
++  case TAG_INT_MASK:
++    return p_vm->builtin_classes[OK_BUILTIN_NUM];
++  case TAG_NULL_MASK:
++    return p_vm->builtin_classes[OK_BUILTIN_NIL];
++  case TAG_TRUE_MASK:
++  case TAG_FALSE_MASK:
++    return p_vm->builtin_classes[OK_BUILTIN_BOOL];
++  case TAG_OBJECT_MASK:
++    break;
++  default:
++    return p_vm->object_singleton;
++  }
++  if (IS_VALUE_INSTANCE(p_value)) {
++    return VALUE_AS_INSTANCE(p_value)->klass;
++  }
++  if (IS_VALUE_CLASS(p_value)) {
++    return p_vm->class_singleton;
++  }
++  switch (OBJECT_TYPE(p_value)) {
++  case OBJ_STRING:
++    return p_vm->builtin_classes[OK_BUILTIN_STR];
++  case OBJ_ARRAY:
++    return p_vm->builtin_classes[OK_BUILTIN_ARRAY];
++  case OBJ_MAP:
++    return p_vm->builtin_classes[OK_BUILTIN_MAP];
++  case OBJ_CLOSURE:
++  case OBJ_NATIVE_FUNCTION:
++  case OBJ_BOUND_METHOD:
++    return p_vm->builtin_classes[OK_BUILTIN_FUNCTION];
++  default:
++    // native values are opaque payloads: Object directly. raw protos and
++    // upvalues never surface as values; if one ever does, Object is the
++    // honest total answer.
++    return p_vm->object_singleton;
++  }
++}
++
++bool vm_is_instance(vm* p_vm, ok_value p_value, const object_class* p_target) {
++  return object_class_is_a(vm_classof(p_vm, p_value), p_target);
++}
++
++// the mangled conversion name "operator <Target>": the same string the
++// parser synthesizes at the declaration site, rebuilt here because the
++// target is a runtime value. the raw buffer dies inside (create_object_string
++// copies the bytes), so the probe owns its own storage.
++static object_string* make_conversion_name(vm* p_vm, const object_class* p_target) {
++  enum { PREFIX_LEN = 9 }; // "operator " - keyword, one space, per the canonical spelling
++  const uint32_t target_len = string_get_length(&p_target->name->string);
++  char* buffer = p_vm->alloc->allocate(p_vm->alloc, PREFIX_LEN + target_len + 1u);
++  if (buffer == NULL) {
++    return NULL;
++  }
++  memcpy(buffer, "operator ", PREFIX_LEN);
++  memcpy(buffer + PREFIX_LEN, p_target->name->string.chars, target_len);
++  buffer[PREFIX_LEN + target_len] = '\0';
++  object_specs specs = {p_vm->alloc, p_vm->objects_store};
++  object_string* probe =
++      create_object_string(ok_create_string_view(buffer, PREFIX_LEN + target_len, true), &specs);
++  p_vm->alloc->release(p_vm->alloc, buffer);
++  return probe;
++}
++
++// the conversion contract (C13): an `operator <Target>` must deliver a value
++// of the target. the builtin targets check their lane, a class target
++// accepts the target or any descendant (an operator Vec2 returning a Vec3 : Vec2
++// is a legal narrowing source, not a lie).
++static bool conversion_result_matches(vm* p_vm, const object_class* p_target, value p_result) {
++  if (p_target == p_vm->builtin_classes[OK_BUILTIN_STR]) {
++    return IS_VALUE_STRING(p_result);
++  }
++  if (p_target == p_vm->builtin_classes[OK_BUILTIN_NUM]) {
++    return value_is_numeric(p_result);
++  }
++  if (p_target == p_vm->builtin_classes[OK_BUILTIN_BOOL]) {
++    return IS_VALUE_STRICTLY_BOOL(p_result);
++  }
++  return IS_VALUE_INSTANCE(p_result) && object_class_is_a(VALUE_AS_INSTANCE(p_result)->klass, p_target);
++}
++
++static interpret_result
++perform_strict_equal(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++  (void)p_vm;
++  // raw word identity (C11): total over every value, never dispatchable.
++  // same bits for immediates (1 === 1.0 is false - different boxes), same
++  // allocation for heap values. bit-identical NaNs compare equal here; that
++  // is the box's truth and the operator promises nothing else.
++  p_reg->array.data[p_frame->registers_base + p_dest] = BOOL_AS_VALUE(p_lhs == p_rhs);
++  return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
++}
++
++static interpret_result
++perform_is(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
++  if (!IS_VALUE_CLASS(p_rhs)) {
++    runtime_error(p_vm, OK_EK_TYPE, "invalid type: 'is' requires a class on the right.");
++    return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++  }
++  // classof + identity, fused (C12's ruling): the exact-class probe. the
++  // chain-walk lives in isinstance; `is` answers "what box", not "what family".
++  p_reg->array.data[p_frame->registers_base + p_dest] =
++      BOOL_AS_VALUE(vm_classof(p_vm, p_lhs) == VALUE_AS_CLASS(p_rhs));
++  return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
++}
++
+ static interpret_result
+ perform_as(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, value p_lhs, value p_rhs) {
+   const uint32_t base = p_frame->registers_base;
+@@ -1256,32 +1425,81 @@ perform_as(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_dest,
+   res.status = RUNTIME_ERROR;
+   res.top_level_return = NULL_AS_VALUE();
+ 
+-  if (!IS_VALUE_STRICTLY_AS(p_rhs)) {
++  if (!IS_VALUE_CLASS(p_rhs)) {
+     runtime_error(p_vm, OK_EK_CONVERSION, "invalid type: expected a type in 'as' conversion.");
+     return res;
+   }
++  object_class* target = VALUE_AS_CLASS(p_rhs);
+   value* dest = &p_reg->array.data[base + p_dest];
+ 
+-  switch (VALUE_AS_AS_TAG(p_rhs)) {
+-  case TT_STR: {
++  // the user lane (C13): an instance's chain may carry `operator <Target>`.
++  // builtin classes are sealed and empty, so no other receiver shape can
++  // define one - the probe is skipped entirely for numbers, strings, arrays,
++  // maps, functions and null, keeping the builtin lanes below allocation-free.
++  if (IS_VALUE_INSTANCE(p_lhs)) {
++    object_class* klass = VALUE_AS_INSTANCE(p_lhs)->klass;
++    object_string* probe = make_conversion_name(p_vm, target);
++    if (probe == NULL) {
++      runtime_oom(p_vm, "out of memory: failed to allocate conversion name.");
++      return res;
++    }
++    gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(probe));
++    const method_entry* entry = object_class_find_method(klass, probe);
++    if (entry != NULL) {
++      if (!entry_visible_from(entry, p_frame)) {
++        gc_guard_down(p_vm->alloc->gc);
++        runtime_error(p_vm,
++                      OK_EK_TYPE,
++                      "operator '%s' of class '%s' is private.",
++                      probe->string.chars,
++                      entry->owner->name->string.chars);
++        return res;
++      }
++      interpret_result out =
++          dispatch_operator_method(p_vm, p_reg, p_frame, p_dest, entry, probe, p_lhs, NULL, 0);
++      gc_guard_down(p_vm->alloc->gc);
++      if (out.status != RUNTIME_OK) {
++        return out;
++      }
++      if (!conversion_result_matches(p_vm, target, p_reg->array.data[base + p_dest])) {
++        runtime_error(p_vm,
++                      OK_EK_INTERNAL,
++                      "operator '%s' of class '%s' returned the wrong type.",
++                      probe->string.chars,
++                      klass->name->string.chars);
++        return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++      }
++      return out;
++    }
++    gc_guard_down(p_vm->alloc->gc);
++  }
++
++  // the builtin lanes: same targets as always, now reached through the
++  // class values instead of the retired hidden tag globals.
++  if (target == p_vm->builtin_classes[OK_BUILTIN_STR]) {
+     if (as_str(p_vm, p_lhs, dest)) {
+       res.status = RUNTIME_OK;
+     }
+-    break;
++    return res;
+   }
+-  case TT_NUM: {
++  if (target == p_vm->builtin_classes[OK_BUILTIN_NUM]) {
+     if (as_num(p_vm, p_lhs, dest)) {
+       res.status = RUNTIME_OK;
+     }
+-    break;
++    return res;
+   }
+-  case TT_BOOL: {
++  if (target == p_vm->builtin_classes[OK_BUILTIN_BOOL]) {
+     if (as_bool(p_vm, p_lhs, dest)) {
+       res.status = RUNTIME_OK;
+     }
+-    break;
+-  }
++    return res;
+   }
++
++  runtime_error(p_vm,
++                OK_EK_CONVERSION,
++                "no conversion from '%s' to '%s'.",
++                vm_classof(p_vm, p_lhs)->name->string.chars,
++                target->name->string.chars);
+   return res;
+ }
+ 
+@@ -2830,6 +3048,59 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       REFRESH_AFTER_NESTED();
+       break;
+     }
++    case OP_STRICT_EQUAL: {
++      const bool p = p_of(instruction);
++      const uint8_t a = a_of(instruction);
++      const uint8_t b = b_of(instruction);
++      const uint8_t c = c_of(instruction);
++      // never nests: raw word compare, no dispatch, no allocation
++      interpret_result res =
++          perform_strict_equal(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++      if (res.status != RUNTIME_OK) {
++        FAIL_PATH();
++      }
++      break;
++    }
++    case OP_STRICT_EQUAL_LONG: {
++      const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      const uint16_t C = C_of(words);
++      interpret_result res =
++          perform_strict_equal(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++      if (res.status != RUNTIME_OK) {
++        FAIL_PATH();
++      }
++      break;
++    }
++    case OP_IS: {
++      const bool p = p_of(instruction);
++      const uint8_t a = a_of(instruction);
++      const uint8_t b = b_of(instruction);
++      const uint8_t c = c_of(instruction);
++      // never nests: classof + pointer compare
++      interpret_result res = perform_is(p_vm, reg, frame, a, REG_AT(b), resolve_operand(frame, reg, c, p));
++      if (res.status != RUNTIME_OK) {
++        FAIL_PATH();
++      }
++      break;
++    }
++    case OP_IS_LONG: {
++      const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const bool q = Q_of(words);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      const uint16_t C = C_of(words);
++      interpret_result res =
++          perform_is(p_vm, reg, frame, A, resolve_operand(frame, reg, B, q), resolve_operand(frame, reg, C, p));
++      if (res.status != RUNTIME_OK) {
++        FAIL_PATH();
++      }
++      break;
++    }
+     case OP_NOT_EQUAL_LONG: {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+@@ -2958,10 +3229,13 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
++      // an `operator <Target>` conversion runs script from inside the
++      // perform: the register file and call stack may realloc under us
+       interpret_result res = perform_as(p_vm, reg, frame, a, REG_AT(b), resolve_goperand(p_vm, frame, reg, c, p));
+       if (res.status != RUNTIME_OK) {
+         FAIL_PATH();
+       }
++      REFRESH_AFTER_NESTED();
+       break;
+     }
+     case OP_AS_LONG: {
+@@ -2976,6 +3250,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (res.status != RUNTIME_OK) {
+         FAIL_PATH();
+       }
++      REFRESH_AFTER_NESTED();
+       break;
+     }
+ 
+diff --git a/src/okvm.h b/src/okvm.h
+index d16d43c..d145771 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -132,6 +132,11 @@ struct vm {
+   // exactly one metaclass, no tower). created at vm_init, traced via mark_vm.
+   struct object_class* object_singleton;
+   struct object_class* class_singleton;
++  // the seven builtin class singletons (C10), index-parallel to
++  // builtin_class_id: str/num/bool/array/map/function/nil, all under Object,
++  // all frozen at birth. every value's classof() lands on one of these (or on
++  // Class, or on a user class). traced via mark_vm like the two above.
++  struct object_class* builtin_classes[OK_BUILTIN_COUNT];
+   // the cached spelling of the static call operator, so constructing through
+   // a class value never allocates its lookup name. rooted like the singletons.
+   object_string* static_call_name;
+@@ -204,6 +209,14 @@ value vm_last_error(vm* p_vm);
+ void vm_clear_error(vm* p_vm);
+ bool vm_native_throw(vm* p_vm, ok_value p_value);
+ 
+-typedef enum { TT_STR, TT_NUM, TT_BOOL } temporary_type_tags;
++// classof (C10): the one class value every value is an instance of.
++// instances -> their class, class values -> Class, everything else -> its
++// lane's builtin singleton (native values -> Object, bound methods ->
++// function; both noted in the classes record). total: never NULL.
++object_class* vm_classof(vm* p_vm, ok_value p_value);
++
++// the chain-walk half of the family (C12): is p_value an instance of
++// p_target or one of its descendants (Object at the root matches everything).
++bool vm_is_instance(vm* p_vm, ok_value p_value, const object_class* p_target);
+ 
+ #endif // OK_VM_H
+diff --git a/tests/e2e/tests/classes/as_error.ok b/tests/e2e/tests/classes/as_error.ok
+new file mode 100644
+index 0000000..bb5e4d1
+--- /dev/null
++++ b/tests/e2e/tests/classes/as_error.ok
+@@ -0,0 +1,2 @@
++// no operator, no builtin lane: nothing converts a num to an array
++print(1 as array); // expect error: no conversion from 'num' to 'array'
+diff --git a/tests/e2e/tests/classes/as_not_type_error.ok b/tests/e2e/tests/classes/as_not_type_error.ok
+new file mode 100644
+index 0000000..b576a82
+--- /dev/null
++++ b/tests/e2e/tests/classes/as_not_type_error.ok
+@@ -0,0 +1,2 @@
++// the target of `as` must be a class value
++print(1 as 5); // expect error: expected a type in 'as' conversion
+diff --git a/tests/e2e/tests/classes/builtin_classes.ok b/tests/e2e/tests/classes/builtin_classes.ok
+new file mode 100644
+index 0000000..bdf37e1
+--- /dev/null
++++ b/tests/e2e/tests/classes/builtin_classes.ok
+@@ -0,0 +1,25 @@
++// the builtin class singletons as global values (C10): one per lane under
++// Object, one metaclass for all of them. they are ordinary values - store
++// them, pass them, compare them by identity.
++print(num is Class); // expect: true
++print(str is Class); // expect: true
++print(bool is Class); // expect: true
++print(array is Class); // expect: true
++print(map is Class); // expect: true
++print(function is Class); // expect: true
++print(nil is Class); // expect: true
++print(Object is Class); // expect: true
++print(classof(str) === Class); // expect: true
++// under the root
++print(isinstance(str, Object)); // expect: true
++print(isinstance(nil, Object)); // expect: true
++print(isinstance(Object, Object)); // expect: true
++// identity comparison, the right semantics for class values
++print(str == str); // expect: true
++print(str == num); // expect: false
++let saved = num;
++print(saved === num); // expect: true
++// passable like any value
++fu same(a, b) { return a === b; }
++print(same(str, str)); // expect: true
++print(same(str, num)); // expect: false
+diff --git a/tests/e2e/tests/classes/classof_isinstance.ok b/tests/e2e/tests/classes/classof_isinstance.ok
+new file mode 100644
+index 0000000..7732688
+--- /dev/null
++++ b/tests/e2e/tests/classes/classof_isinstance.ok
+@@ -0,0 +1,28 @@
++// classof + isinstance (C12): plain builtin functions, rebindable like the
++// rest. classof(null) === nil, classof(Class) === Class - the one self-loop.
++print(classof(1) == num); // expect: true
++print(classof(1.5) == num); // expect: true
++print(classof("x") == str); // expect: true
++print(classof(true) == bool); // expect: true
++print(classof([1]) == array); // expect: true
++print(classof({:}) == map); // expect: true
++print(classof(len) == function); // expect: true
++print(classof(null) === nil); // expect: true
++print(classof(Class) === Class); // expect: true
++print(classof(num) === Class); // expect: true
++class Animal : Object {}
++class Dog : Animal {}
++let d = Dog();
++print(classof(d) == Dog); // expect: true
++print(classof(d) == Animal); // expect: false
++// isinstance walks the chain; the root matches everything
++print(isinstance(d, Dog)); // expect: true
++print(isinstance(d, Animal)); // expect: true
++print(isinstance(d, Object)); // expect: true
++print(isinstance(null, Object)); // expect: true
++print(isinstance(null, nil)); // expect: true
++print(isinstance(1, Object)); // expect: true
++print(isinstance(Class, Class)); // expect: true
++print(isinstance(num, Object)); // expect: true
++print(isinstance(d, str)); // expect: false
++print(isinstance(1, num)); // expect: true
+diff --git a/tests/e2e/tests/classes/conversion_bad_return_error.ok b/tests/e2e/tests/classes/conversion_bad_return_error.ok
+new file mode 100644
+index 0000000..e4c6e1a
+--- /dev/null
++++ b/tests/e2e/tests/classes/conversion_bad_return_error.ok
+@@ -0,0 +1,4 @@
++// the conversion contract (C13): operator Vec2 must deliver a Vec2
++class Vec2 { let x = 0; fu init(x) { this.x = x; } }
++class Liar { pub fu operator Vec2() { return 42; } }
++print(Liar() as Vec2); // expect error: returned the wrong type
+diff --git a/tests/e2e/tests/classes/conversion_private_error.ok b/tests/e2e/tests/classes/conversion_private_error.ok
+new file mode 100644
+index 0000000..102d7e3
+--- /dev/null
++++ b/tests/e2e/tests/classes/conversion_private_error.ok
+@@ -0,0 +1,3 @@
++// conversions are methods: private ones are hierarchy-internal
++class Secret { fu operator str() { return "s"; } }
++print(Secret() as str); // expect error: is private
+diff --git a/tests/e2e/tests/classes/conversions.ok b/tests/e2e/tests/classes/conversions.ok
+new file mode 100644
+index 0000000..618f766
+--- /dev/null
++++ b/tests/e2e/tests/classes/conversions.ok
+@@ -0,0 +1,56 @@
++// the conversion surface (C13): `operator <Target>` rides the `as` lane.
++// the builtin targets (str/num/bool) override the default lanes for
++// instances; class targets are user-defined end to end.
++class Vec2 {
++  let x = 0;
++  let y = 0;
++  fu init(x, y) { this.x = x; this.y = y; }
++  pub fu operator ==(o) { return x == o.x and y == o.y; }
++}
++class Vec {
++  let a = 0;
++  let b = 0;
++  fu init(a, b) { this.a = a; this.b = b; }
++  pub fu operator Vec2() { return Vec2(a, b); }
++  pub fu operator str() { return "Vec(" + (a as str) + ", " + (b as str) + ")"; }
++  pub fu operator num() { return a + b; }
++  pub fu operator bool() { return a != 0; }
++}
++let v = Vec(3, 4);
++print(v as Vec2 == Vec2(3, 4)); // expect: true
++print(v as str); // expect: Vec(3, 4)
++print(v as num); // expect: 7
++print(v as bool); // expect: true
++print(Vec(0, 1) as bool); // expect: false
++// the conversion is found on the chain: a subclass inherits it
++class Vec3 : Vec {
++  fu init(a, b) { super(a, b); }
++}
++let w = Vec3(5, 6);
++print(w as Vec2 == Vec2(5, 6)); // expect: true
++print(w as num); // expect: 11
++// a conversion may return the target or any descendant of it
++class Vec2x : Vec2 {}
++class Box {
++  pub fu operator Vec2() { return Vec2x(1, 1); }
++}
++print((Box() as Vec2) is Vec2x); // expect: true
++print((Box() as Vec2) == Vec2(1, 1)); // expect: true
++// the builtin lanes for non-instances, unchanged
++print(12 as str); // expect: 12
++print("34" as num); // expect: 34
++print(0 as bool); // expect: true
++print(null as bool); // expect: false
++// instances without operator str keep the default rendering
++class Plain { let x = 1; }
++print(Plain() as str); // expect: <instance Plain>
++// conversions inside methods resolve the target through the same ladder
++class Meter {
++  let m = 0;
++  fu init(m) { this.m = m; }
++  pub fu feet() { return (m as num) * 3.281; }
++  pub fu tag() { return (m as str) + "m"; }
++}
++let m = Meter(2);
++print(m.feet()); // expect: 6.562
++print(m.tag()); // expect: 2m
+diff --git a/tests/e2e/tests/classes/identity.ok b/tests/e2e/tests/classes/identity.ok
+new file mode 100644
+index 0000000..8913244
+--- /dev/null
++++ b/tests/e2e/tests/classes/identity.ok
+@@ -0,0 +1,32 @@
++// === : word identity (C11). total, primitive, never dispatchable.
++// numbers are f64 at the surface - there is no public int box - so
++// 1 === 1.0 compares the double 1.0 against itself: true. the visible
++// word-identity edge is the signed zero.
++print(1 === 1); // expect: true
++print(1 === 1.0); // expect: true
++print(1 == 1.0); // expect: true
++print(0.0 === -0.0); // expect: false
++print(0.0 == -0.0); // expect: true
++print(null === null); // expect: true
++print(true === true); // expect: true
++print(true === 1); // expect: false
++print(null === false); // expect: false
++// strings: same allocation, not same content
++print("a" === "a"); // expect: false
++let s = "a";
++print(s === s); // expect: true
++// heap values: the allocation is the identity
++let arr = [1];
++print(arr === arr); // expect: true
++print([] === []); // expect: false
++class P {}
++let a = P();
++let b = P();
++print(a === b); // expect: false
++print(a === a); // expect: true
++// the result is an ordinary bool
++print((1 === 2) === false); // expect: true
++print(1 === 2); // expect: false
++// and it composes with the logical operators
++print(1 === 1 and 2 === 2); // expect: true
++print(1 === 1 or 2 === 3); // expect: true
+diff --git a/tests/e2e/tests/classes/instance_as_num_error.ok b/tests/e2e/tests/classes/instance_as_num_error.ok
+new file mode 100644
+index 0000000..b9339a8
+--- /dev/null
++++ b/tests/e2e/tests/classes/instance_as_num_error.ok
+@@ -0,0 +1,3 @@
++// an instance with no `operator num` has no numeric form
++class Plain { let x = 1; }
++print(Plain() as num); // expect error: instance is not convertible to number
+diff --git a/tests/e2e/tests/classes/is_error.ok b/tests/e2e/tests/classes/is_error.ok
+new file mode 100644
+index 0000000..cd1606f
+--- /dev/null
++++ b/tests/e2e/tests/classes/is_error.ok
+@@ -0,0 +1,2 @@
++// `is` demands a class on the right
++print(1 is 5); // expect error: 'is' requires a class
+diff --git a/tests/e2e/tests/classes/is_operator.ok b/tests/e2e/tests/classes/is_operator.ok
+new file mode 100644
+index 0000000..030e37f
+--- /dev/null
++++ b/tests/e2e/tests/classes/is_operator.ok
+@@ -0,0 +1,37 @@
++// the `is` operator (C12's yes): classof + identity, fused. the exact-class
++// probe - `x is C` is true when classof(x) === C, no chain walk. the family
++// question is isinstance. builtin lanes match by construction: every number's
++// class is num, every string's is str.
++print(1 is num); // expect: true
++print(1.5 is num); // expect: true
++print("x" is str); // expect: true
++print(true is bool); // expect: true
++print(false is bool); // expect: true
++print([1] is array); // expect: true
++print({:} is map); // expect: true
++print(null is nil); // expect: true
++print(len is function); // expect: true
++class Animal : Object {}
++class Dog : Animal {}
++let d = Dog();
++print(d is Dog); // expect: true
++// the exact-class ruling, pinned: `is` answers "what box", not "what family"
++print(d is Animal); // expect: false
++print(d is Object); // expect: false
++print(isinstance(d, Animal)); // expect: true
++print(isinstance(d, Object)); // expect: true
++// every class value is an instance of the one metaclass
++print(Dog is Class); // expect: true
++print(Object is Class); // expect: true
++print(Class is Class); // expect: true
++print(d is Class); // expect: false
++print(d is num); // expect: false
++// where it reads right: the guard
++fu check(v) {
++  if v is num { return "number"; } else { return "other"; }
++}
++print(check(3)); // expect: number
++print(check("3")); // expect: other
++// the right side is any expression that evaluates to a class
++let cls = num;
++print(1 is cls); // expect: true
+diff --git a/tests/e2e/tests/classes/operators_subscript.ok b/tests/e2e/tests/classes/operators_subscript.ok
+index d40249c..35920f7 100644
+--- a/tests/e2e/tests/classes/operators_subscript.ok
++++ b/tests/e2e/tests/classes/operators_subscript.ok
+@@ -14,7 +14,7 @@ b[1] += 5; // compound: [] then + then []=
+ print(b[1]); // expect: 25
+ b[0] = b[0] * 2;
+ print(b[0]); // expect: 20
+-print(b.total()); // expect: 40
++print(b.total()); // expect: 45
+ // arrays and maps keep their builtin lanes; instances only dispatch when
+ // the class carries the operator
+ let arr = [1, 2, 3];
+@@ -23,7 +23,3 @@ print(arr[0]); // expect: 9
+ let mp = {:};
+ mp["k"] = "v";
+ print(mp["k"]); // expect: v
+-// a class without operator [] is not subscriptable
+-class Plain { let v = 1; }
+-let p = Plain();
+-print(p[0]); // expect error: expected an array
+diff --git a/tests/e2e/tests/classes/operators_subscript_error.ok b/tests/e2e/tests/classes/operators_subscript_error.ok
+new file mode 100644
+index 0000000..66a08ff
+--- /dev/null
++++ b/tests/e2e/tests/classes/operators_subscript_error.ok
+@@ -0,0 +1,4 @@
++// a class without operator [] is not subscriptable
++class Plain { let v = 1; }
++let p = Plain();
++print(p[0]); // expect error: expected an array
+diff --git a/tests/unit/src/oktest_nan.c b/tests/unit/src/oktest_nan.c
+index 68c639d..2c7bc41 100644
+--- a/tests/unit/src/oktest_nan.c
++++ b/tests/unit/src/oktest_nan.c
+@@ -20,7 +20,10 @@ void test_tag_logical_vs_physical() {
+   TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_OBJECT), TAG_OBJECT_MASK);
+   TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_INT), TAG_INT_MASK);
+   TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_USER), TAG_USER_MASK);
+-  TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_AS), TAG_AS_MASK);
++  // TAG_AS is retired (0.5.0: the `as` lane rides real class values now) but
++  // its logical id stays reserved so the survivors keep their numbers - the
++  // physical mask for id 6 is still the retired 0x8002 tag bits.
++  TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_AS), UINT64_C(0x8002000000000000));
+   TEST_ASSERT_EQUAL(TAG_X_MASK(TAG_DEFER), TAG_DEFER_MASK);
+ }
+ 
+-- 
+2.47.3
+

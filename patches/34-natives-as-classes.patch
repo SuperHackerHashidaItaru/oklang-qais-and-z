@@ -1,0 +1,933 @@
+From 405db45275a879d16a84ca1898f349c19953133c Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Mon, 2 Nov 2026 22:44:12 +0000
+Subject: [PATCH] classes: natives as classes - the embedder's door (citadel
+ r3, patch 34)
+
+- native method entries fly: run_native (one shared flight, arity-bounds
+  checked against ok_native_fn's 8-bit argc - the old call_native would
+  truncate then overrun its stash on a 256+ argument ANY-arity call) and
+  call_native_method (receiver rides argv[0], the INVOKE/bound-method/
+  operator-dispatch window shape). all seven 'native methods arrive with
+  the native-class patch' traps are now the real lanes: INVOKE,
+  SUPER_INVOKE, bound methods, the instance and static call operators,
+  the operator dispatch, and a C-defined init
+- the builtin receivers dispatch on their class singletons: a.len() maps
+  through classof, mic-cached like any site (sealed tables, C15). the
+  error message for a missing method on a native names the class now
+- the surfaces (no new stdlib, per the ruling): array len/push/pop/
+  remove, map len/remove/get - the SAME C entries the free-function
+  spellings use, mounted twice. str/function/num/bool/nil stay empty in
+  v0.5.0: nothing existed to mirror
+- the embedder's C API: ok_class_new (unfrozen, parent or null=Object),
+  ok_class_define_native_method (arity counts the receiver, pub flag,
+  one-name-one-owner + pub-survives + dispatch-arity contract enforced
+  across the native/closure kind boundary), ok_class_freeze (the seal),
+  ok_value_is_class. guard discipline per call for unrooted C state
+- the embed test grows a Math class: construct, call, bind, isinstance,
+  a mic-warmed loop, a native operator + entry, privacy, redeclaration
+  and post-freeze refusals
+
+gates: e2e 394x4 + unit x3 + embed x3
+---
+ include/ok/ok.h                               |  31 +++
+ src/ok.c                                      | 129 ++++++++++-
+ src/okobject.c                                |  69 ++++++
+ src/okobject.h                                |  23 +-
+ src/okvm.c                                    | 211 ++++++++++++++----
+ src/okvm.h                                    |   3 +-
+ .../classes/native_method_arity_error.ok      |   3 +
+ .../e2e/tests/classes/native_method_error.ok  |   3 +
+ tests/e2e/tests/classes/native_methods.ok     |  40 ++++
+ tests/e2e/tests/classes/operator_errors.ok    |   2 +-
+ tests/integration/embedding/src/main.cpp      | 104 +++++++++
+ 11 files changed, 565 insertions(+), 53 deletions(-)
+ create mode 100644 tests/e2e/tests/classes/native_method_arity_error.ok
+ create mode 100644 tests/e2e/tests/classes/native_method_error.ok
+ create mode 100644 tests/e2e/tests/classes/native_methods.ok
+
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index 703ce4b..07a679b 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -160,6 +160,37 @@ bool ok_map_set(ok* p_ok, ok_value p_map, ok_value p_key, ok_value p_value);
+ // (no store happens either way). never allocates.
+ bool ok_map_remove(ok_value p_map, ok_value p_key);
+ 
++/* classes (embedder side) */
++
++bool ok_value_is_class(ok_value p_value);
++
++// a C-defined class: created unfrozen (define its native methods, then
++// ok_class_freeze). p_parent is a class value, or a null value for Object.
++// returns a null value on failure. the result is not rooted: the define and
++// freeze calls below guard it across their own allocations, but anything
++// else you allocate in between (or keeping it past the sequence) is your
++// rooting job - ok_root it, same contract as an ok_array_new result.
++// script sees the frozen class like any other: store it in a global and
++// construct instances with C(args).
++ok_value ok_class_new(ok* p_ok, ok_string_view p_name, ok_value p_parent);
++
++// define one native method on an unfrozen class. the receiver rides argv[0]
++// and the arity COUNTS it (`fu m(x)` on the script side is arity 2 here);
++// OK_NATIVE_ARITY_ANY defers the check to the callback. false = p_class is
++// not a class value, the class is sealed, a same-name redeclaration, a
++// private override of a pub ancestor, an arity disagreement with an
++// ancestor's dispatch, or OOM.
++bool ok_class_define_native_method(ok* p_ok,
++                                    ok_value p_class,
++                                    ok_string_view p_name,
++                                    uint16_t p_arity_including_receiver,
++                                    ok_native_fn p_cb,
++                                    bool p_pub);
++
++// seal the class (C15): builds the flat field map and freezes the tables.
++// after this, definitions are refused forever.
++bool ok_class_freeze(ok* p_ok, ok_value p_class);
++
+ /* output */
+ 
+ // print statements route through p_cb when set. the default (NULL) keeps the
+diff --git a/src/ok.c b/src/ok.c
+index e422814..6956371 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -27,8 +27,10 @@ struct ok {
+   bool dump_skip_run;
+ };
+ 
+-// when classes + methods are implemented, push/pop/remove become methods and these globals
+-// either retire or stay as free functions (len likely stays, go style).
++// the core builtins are receiver-first native functions: `len(a)` and
++// `a.len()` are one C entry, mounted twice (free function + method on the
++// array/map class singletons). str carries no methods in v0.5.0 - nothing
++// existed as a str function builtin to mirror, and the ruling is no new stdlib.
+ // errors go through the supported path ok_native_error -> vm_native_error.
+ 
+ static ok_value native_len(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
+@@ -267,6 +269,48 @@ static bool ok_define_core_natives(ok* p_ok) {
+   return status;
+ }
+ 
++// the natives-as-classes step: mount the method surfaces on the builtin
++// singletons, then seal them. the C handlers are the SAME functions the
++// free-function spellings use - they were receiver-first all along
++// (`len(x)` always took its receiver as argv[0]) - so `len(a)` and `a.len()`
++// are one entry, and the "no new stdlib" ruling holds by construction:
++// only what already existed as a function builtin gets a method spelling
++// (array: len/push/pop/remove; map: len/remove/get; str/function/num/bool/
++// nil carry nothing in v0.5.0). the sealing happens here, after the tables
++// fill - which is why vm_init_singletons leaves the builtins unfrozen.
++static bool ok_define_builtin_surfaces(ok* p_ok) {
++  object_specs specs = {&p_ok->alloc, &p_ok->objects_store};
++  struct {
++    builtin_class_id klass;
++    const char* name;
++    uint16_t arity; // counts the receiver
++    ok_native_fn fn;
++  } const methods[] = {
++      {OK_BUILTIN_ARRAY, "len", 1, native_len},
++      {OK_BUILTIN_ARRAY, "push", 2, native_push},
++      {OK_BUILTIN_ARRAY, "pop", 1, native_pop},
++      {OK_BUILTIN_ARRAY, "remove", OK_NATIVE_ARITY_ANY, native_remove},
++      {OK_BUILTIN_MAP, "len", 1, native_len},
++      {OK_BUILTIN_MAP, "remove", OK_NATIVE_ARITY_ANY, native_remove},
++      {OK_BUILTIN_MAP, "get", OK_NATIVE_ARITY_ANY, native_get},
++  };
++  bool status = true;
++  for (uint32_t i = 0; i < sizeof(methods) / sizeof(methods[0]); ++i) {
++    status &= object_class_define_native_method(p_ok->vm.builtin_classes[methods[i].klass],
++                                                ok_create_string_view(methods[i].name, OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                                                methods[i].arity,
++                                                methods[i].fn,
++                                                /*p_pub*/ true,
++                                                &specs);
++  }
++  for (uint32_t i = 0; i < OK_BUILTIN_COUNT; ++i) {
++    // the seal (C15): from here the builtin tables are frozen like every
++    // script class's, which is what the fast lanes depend on.
++    status &= object_class_freeze(p_ok->vm.builtin_classes[i]);
++  }
++  return status;
++}
++
+ // the seeding table: ONE list both sides walk, so the visible-name array and
+ // the value array can never drift apart (the old two hand-built arrays were
+ // position-paired by discipline alone). natives pull their hidden " name"
+@@ -392,6 +436,10 @@ ok* ok_create(ok_specs p_specs) {
+     ok_free(okay);
+     return NULL;
+   }
++  if (!ok_define_builtin_surfaces(okay)) { // mount the method tables, then seal
++    ok_free(okay);
++    return NULL;
++  }
+   return okay;
+ }
+ 
+@@ -429,6 +477,83 @@ void ok_retain_source(ok* p_ok, bool p_retain) {
+   p_ok->vm.retain_source = p_retain;
+ }
+ 
++/* classes (embedder side) */
++
++bool ok_value_is_class(ok_value p_value) {
++  return IS_VALUE_CLASS(p_value);
++}
++
++// a C-defined class: created unfrozen (define its native methods, then
++// ok_class_freeze). p_parent is a class value, or a null value for Object.
++// returns a null value on failure. the returned class is NOT rooted - the
++// definition-sequence calls below guard it across their own allocations,
++// but if you allocate anything else in between (or keep it past the
++// sequence), root it with ok_root first, exactly like an ok_array_new result.
++ok_value ok_class_new(ok* p_ok, ok_string_view p_name, ok_value p_parent) {
++  object_specs specs = {&p_ok->alloc, &p_ok->objects_store};
++  object_class* parent = p_ok->vm.object_singleton;
++  if (!IS_VALUE_STRICTLY_NULL(p_parent)) {
++    if (!IS_VALUE_CLASS(p_parent)) {
++      return NULL_AS_VALUE();
++    }
++    parent = VALUE_AS_CLASS(p_parent);
++  }
++  object_string* name = create_object_string(p_name, &specs);
++  if (name == NULL) {
++    return NULL_AS_VALUE();
++  }
++  if (!gc_guard_up(p_ok->alloc.gc, OBJECT_AS_VALUE(name))) {
++    return NULL_AS_VALUE();
++  }
++  object_class* klass = create_object_class(name, parent, &specs);
++  gc_guard_down(p_ok->alloc.gc); // the class (and its trace) owns the name
++  if (klass == NULL) {
++    return NULL_AS_VALUE();
++  }
++  return OBJECT_AS_VALUE(klass);
++}
++
++// define one native method on an unfrozen class. the arity COUNTS the
++// receiver (`fu m(x)` on the script side is arity 2 here). OK_NATIVE_ARITY_ANY
++// defers the check to the callback. false = p_class is not a class value, the
++// class is sealed, a same-name redeclaration, a private override of a pub
++// ancestor, an arity disagreement with an ancestor, or OOM.
++bool ok_class_define_native_method(ok* p_ok,
++                                    ok_value p_class,
++                                    ok_string_view p_name,
++                                    uint16_t p_arity_including_receiver,
++                                    ok_native_fn p_cb,
++                                    bool p_pub) {
++  if (!IS_VALUE_CLASS(p_class)) {
++    return false;
++  }
++  // the class may be unrooted C state: guard it across the name allocation
++  // and the map insert (both can collect under aggressive gc).
++  if (!gc_guard_up(p_ok->alloc.gc, p_class)) {
++    return false;
++  }
++  object_specs specs = {&p_ok->alloc, &p_ok->objects_store};
++  const bool defined = object_class_define_native_method(
++      VALUE_AS_CLASS(p_class), p_name, p_arity_including_receiver, p_cb, p_pub, &specs);
++  gc_guard_down(p_ok->alloc.gc);
++  return defined;
++}
++
++// seal the class (C15): builds the flat field map and freezes both tables.
++// after this, ok_class_define_native_method is refused. script sees the class
++// like any other: store it in a global and construct with C(args).
++bool ok_class_freeze(ok* p_ok, ok_value p_class) {
++  if (!IS_VALUE_CLASS(p_class)) {
++    return false;
++  }
++  if (!gc_guard_up(p_ok->alloc.gc, p_class)) {
++    return false;
++  }
++  const bool frozen = object_class_freeze(VALUE_AS_CLASS(p_class));
++  gc_guard_down(p_ok->alloc.gc);
++  return frozen;
++}
++
+ ok_value ok_last_error(ok* p_ok) {
+   return vm_last_error(&p_ok->vm);
+ }
+diff --git a/src/okobject.c b/src/okobject.c
+index 9f9570c..5992572 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -1,6 +1,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++#include "okgc.h"
+ #include "okobject.h"
+ #include "okobject_store.h"
+ #include "okutils.h"
+@@ -703,6 +704,74 @@ object_bound_method* create_object_bound_method(value p_receiver, const method_e
+   return bound;
+ }
+ 
++// the dispatch argc an entry settles at: a closure counts parameters (the
++// receiver rides the window separately), a native counts the receiver in its
++// declared arity. virtual dispatch only stays honest when the two agree.
++static uint32_t method_entry_dispatch_argc(const method_entry* p_entry) {
++  return p_entry->is_native ? (uint32_t)p_entry->arity - 1u : (uint32_t)p_entry->closure->function->arity;
++}
++
++bool object_class_define_native_method(object_class* p_class,
++                                       ok_string_view p_name,
++                                       uint16_t p_arity,
++                                       ok_native_fn p_fn,
++                                       bool p_pub,
++                                       object_specs* p_specs) {
++  if (p_class->frozen) {
++    return false; // sealed (C15); the caller reports its own flavor
++  }
++  if (p_fn == NULL || p_name.chars == NULL) {
++    return false;
++  }
++  // the name object rides the guard stack across the map insert that adopts
++  // it (the map set allocates; an unrooted, unassigned string is exactly
++  // what an aggressive collect would sweep).
++  object_string* name = create_object_string(p_name, p_specs);
++  if (name == NULL) {
++    return false;
++  }
++  if (!gc_guard_up(p_specs->alloc->gc, OBJECT_AS_VALUE(name))) {
++    return false;
++  }
++  bool pub = p_pub;
++  const method_entry* inherited = NULL;
++  for (const object_class* c = p_class->parent; c != NULL; c = c->parent) {
++    inherited = method_map_get(&c->methods, name);
++    if (inherited != NULL) {
++      break;
++    }
++  }
++  if (inherited != NULL) {
++    if (inherited->pub && !p_pub) {
++      gc_guard_down(p_specs->alloc->gc);
++      return false; // no quiet narrowing of a pub ancestor
++    }
++    if (inherited->pub) {
++      pub = true; // pub survives overrides
++    }
++    if (method_entry_dispatch_argc(inherited) != (uint32_t)p_arity - 1u) {
++      gc_guard_down(p_specs->alloc->gc);
++      return false; // the signature contract
++    }
++  }
++  // one name, one owner - the same doctrine the script lane enforces.
++  if (method_map_get(&p_class->methods, name) != NULL) {
++    gc_guard_down(p_specs->alloc->gc);
++    return false;
++  }
++  method_entry entry;
++  entry.closure = NULL;
++  entry.native = p_fn;
++  entry.name = name;
++  entry.arity = p_arity;
++  entry.owner = p_class;
++  entry.is_native = 1;
++  entry.pub = pub;
++  const bool set = method_map_set(&p_class->methods, name, entry);
++  gc_guard_down(p_specs->alloc->gc); // the map (and the class's trace) owns the name now
++  return set;
++}
++
+ void object_dispatch_deinit(object* p_object, object_specs* p_specs) {
+   switch (object_get_type(p_object)) {
+   case OBJ_STRING:
+diff --git a/src/okobject.h b/src/okobject.h
+index f3ffb61..8111858 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -268,8 +268,10 @@ typedef enum {
+ const char* class_operator_spelling(class_operator p_op);
+ 
+ // the seven builtin classes (C10): one per existing value lane, all under
+-// Object, all created at startup and frozen empty (their method tables fill
+-// with native entries in the natives-as-classes patch). int and float share
++// Object, all created at startup and sealed by ok_define_builtin_surfaces
++// once their native method tables are mounted (str/function/num/bool/nil
++// carry no methods in v0.5.0 - nothing existed as a function builtin to
++// mirror, and the ruling is no new stdlib). int and float share
+ // `num` (the box detail is not a class difference); `nil` is null's class
+ // and null is its sole instance.
+ typedef enum {
+@@ -330,6 +332,23 @@ struct object_class {
+ 
+ object_class* create_object_class(object_string* p_name, object_class* p_parent, object_specs* p_specs);
+ 
++// definition-time (C side): append one native method entry. the arity COUNTS
++// the receiver (`a.len()` is arity 1) - the builtin handlers were already
++// receiver-first functions, which is what makes one C entry serve the
++// function and method spellings. OK_NATIVE_ARITY_ANY validates inside the
++// callback. false = OOM, the class is frozen (sealed, C15), a same-name
++// redeclaration in the body, a private override of a pub ancestor method,
++// or an override whose dispatch arity disagrees with the ancestor's (a
++// native's declared arity and a closure's parameter count both express "the
++// argc this entry dispatches at" - native counts the receiver, closure
++// does not - and the two must agree for virtual dispatch to be honest).
++bool object_class_define_native_method(object_class* p_class,
++                                       ok_string_view p_name,
++                                       uint16_t p_arity,
++                                       ok_native_fn p_fn,
++                                       bool p_pub,
++                                       object_specs* p_specs);
++
+ // definition-time: append one own field. false = OOM or a redeclaration
+ // (p_previous_owner names the ancestor that already declared it).
+ bool object_class_add_field(object_class* p_class,
+diff --git a/src/okvm.c b/src/okvm.c
+index dd7951e..a7b8e1b 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -248,9 +248,11 @@ bool vm_init_singletons(vm* p_vm) {
+                              &specs);
+   }
+   p_vm->op_names[CLASS_OP_CALL] = p_vm->static_call_name;
+-  // the seven builtin singletons (C10): under Object, frozen empty at birth
+-  // (their method tables are a later patch's business). the name rides the
+-  // guard stack only across the class creation that adopts it.
++  // the seven builtin singletons (C10): under Object, created UNFROZEN here -
++  // the native method surface is mounted by ok_define_builtin_surfaces (the
++  // C-side step that owns their freeze, so the tables fill before the seal).
++  // the name rides the guard stack only across the class creation that
++  // adopts it.
+   for (uint32_t i = 0; i < OK_BUILTIN_COUNT; ++i) {
+     object_string* builtin_name =
+         create_object_string(ok_create_string_view(builtin_class_name((builtin_class_id)i),
+@@ -268,7 +270,6 @@ bool vm_init_singletons(vm* p_vm) {
+     if (p_vm->builtin_classes[i] == NULL) {
+       break;
+     }
+-    object_class_freeze(p_vm->builtin_classes[i]);
+   }
+   for (uint32_t i = 0; i < CLASS_OP_COUNT; ++i) {
+     if (p_vm->op_names[i] == NULL) {
+@@ -493,6 +494,96 @@ resolve_goperand(vm* p_vm, call_frame* p_frame, register_file* p_reg, uint16_t p
+   return p_reg->array.data[p_frame->registers_base + p_index];
+ }
+ 
++// ============================== native methods ==============================
++// (the natives-as-classes patch: one flight, two staging shapes)
++
++// the shared native flight: run one C entry point with a staged argv and
++// hand its result back through p_result. error lanes (ok_native_error,
++// ok_native_throw, a failed ok_call inside) are reported here exactly like
++// call_native always did. the caller owns where the result lands and the
++// register watermark. p_argc is bounds-checked against the 8-bit argc of
++// ok_native_fn itself - the old call_native would truncate and then overrun
++// its stash on an ANY-arity native called with 256+ arguments (a landmine
++// the method path would have inherited; now it is everyone's guard).
++static inline bool
++run_native(vm* p_vm, execution_state* p_exe, ok_native_fn p_fn, uint16_t p_argc, const value* p_argv, value* p_result) {
++  if (p_argc > UINT8_MAX) {
++    runtime_error(p_vm, OK_EK_ARITY, "too many arguments to a native call.");
++    return false;
++  }
++  p_exe->native_call_depth++;
++  value result = p_fn(p_vm->ok, (uint8_t)p_argc, p_argv);
++  p_exe->native_call_depth--;
++  if (p_exe->native_has_error) {
++    runtime_error(p_vm, OK_EK_NATIVE, "%s", p_exe->native_error_message.chars);
++    p_exe->native_has_error = false;
++    string_deinit(&p_exe->native_error_message, p_vm->alloc);
++    return false;
++  }
++  if (p_exe->error_pending) {
++    // a runtime error fired inside the native (e.g. its ok_call on a script
++    // closure failed). runtime_error already reset the state and printed the
++    // report; resuming would reload frame state that no longer exists.
++    return false;
++  }
++  p_exe->native_has_error = false;
++  string_deinit(&p_exe->native_error_message, p_vm->alloc);
++  *p_result = result;
++  return true;
++}
++
++// a native METHOD entry: the receiver rides argv[0]. p_window is the call
++// window base - the receiver's own register, arguments above it (the INVOKE
++// shape, the bound-method shape, and the operator-dispatch staging all share
++// it, which is the whole reason the door was pre-built this way). the
++// declared arity COUNTS the receiver: the existing builtin handlers were
++// already receiver-first functions (`len(x)` always took its receiver as
++// argv[0]), so one C entry serves both spellings - `len(a)` and `a.len()`.
++// no frame is pushed; the result lands at the window base like OP_CALL's
++// r[a] = r[a](...) and the watermark returns to the caller's frame top.
++static inline bool call_native_method(vm* p_vm,
++                                      execution_state* p_exe,
++                                      register_file* p_reg,
++                                      const method_entry* p_entry,
++                                      uint32_t p_window,
++                                      uint16_t p_argc) {
++  const uint32_t total = (uint32_t)p_argc + 1u;
++  if (p_entry->arity != OK_NATIVE_ARITY_ANY && total != (uint32_t)p_entry->arity) {
++    runtime_error(p_vm,
++                  OK_EK_ARITY,
++                  "invalid call to method '%s' of class '%s': expected %u argument%s, got %u.",
++                  p_entry->name->string.chars,
++                  p_entry->owner->name->string.chars,
++                  (unsigned)p_entry->arity - 1u,
++                  p_entry->arity - 1u == 1 ? "" : "s",
++                  p_argc);
++    return false;
++  }
++  if (total > UINT8_MAX) {
++    runtime_error(p_vm, OK_EK_ARITY, "too many arguments to method '%s'.", p_entry->name->string.chars);
++    return false;
++  }
++  // stage a copy: the native may re-enter the vm and grow (realloc) the
++  // register file out from under a window pointer - call_native's discipline.
++  value stash[UINT8_MAX];
++  memcpy(stash, p_reg->array.data + p_window, total * sizeof(value));
++  value result;
++  if (!run_native(p_vm, p_exe, p_entry->native, (uint16_t)total, stash, &result)) {
++    return false;
++  }
++  gc_guard_up(p_vm->alloc->gc, result);
++  register_file* reg = &p_exe->registers;
++  if (p_exe->call_stack.count > 0) {
++    call_frame* caller = &p_exe->call_stack.data[p_exe->call_stack.count - 1];
++    reg->top = caller->registers_base + caller->closure->function->registers;
++  } else {
++    reg->top = p_window;
++  }
++  reg->array.data[p_window] = result;
++  gc_guard_down(p_vm->alloc->gc);
++  return true;
++}
++
+ // forward declarations for the operator dispatch lane (definitions sit after
+ // entry_visible_from, which they share with the member/invoke paths).
+ static bool entry_visible_from(const method_entry* p_entry, const call_frame* p_frame);
+@@ -2062,11 +2153,9 @@ static interpret_result dispatch_operator_method(vm* p_vm,
+   // pre-check is the ERROR MESSAGE lane only - call() re-asserts the real
+   // contract (defaults ladder included), so it stays deliberately simple:
+   // exact match, the defaulted window, or varargs deferred to call() itself.
+-  if (p_entry->is_native) {
+-    runtime_error(p_vm, OK_EK_INTERNAL, "native methods arrive with the native-class patch.");
+-    return error_interpret_result();
+-  }
+-  if (!p_entry->closure->function->has_varargs &&
++  // native entries check their own arity inside call_native_method (theirs
++  // counts the receiver).
++  if (!p_entry->is_native && !p_entry->closure->function->has_varargs &&
+       p_argc > p_entry->closure->function->arity) {
+     runtime_error(p_vm,
+                   OK_EK_ARITY,
+@@ -2079,7 +2168,7 @@ static interpret_result dispatch_operator_method(vm* p_vm,
+   }
+   const uint32_t depth = exe->call_stack.count;
+   const uint32_t saved_top = p_reg->top;
+-  const uint32_t need = 1u + p_argc + p_entry->closure->function->registers;
++  const uint32_t need = 1u + p_argc + (p_entry->is_native ? 0u : p_entry->closure->function->registers);
+   if (saved_top + need > UINT16_MAX + 1u) {
+     runtime_error(p_vm, OK_EK_INTERNAL, "operator dispatch: register file exhausted.");
+     return error_interpret_result();
+@@ -2103,6 +2192,18 @@ static interpret_result dispatch_operator_method(vm* p_vm,
+     p_reg->array.data[staged + 1u + i] = p_args[i];
+   }
+   p_reg->top = staged + need;
++  if (p_entry->is_native) {
++    // the native flight reads the staged window (receiver at [staged], the
++    // arguments above), lands its result back at [staged]. no frame, no
++    // nested run_until - but the register file may still have grown above.
++    const bool called = call_native_method(p_vm, exe, p_reg, p_entry, staged, (uint16_t)p_argc);
++    p_reg->top = saved_top;
++    if (!called) {
++      return error_interpret_result();
++    }
++    p_reg->array.data[p_frame->registers_base + p_dest] = p_reg->array.data[staged];
++    return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
++  }
+   gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(p_entry->closure));
+   const bool called = call(p_vm, exe, p_reg, p_entry->closure, staged, (uint16_t)p_argc, 1u);
+   gc_guard_down(p_vm->alloc->gc);
+@@ -2461,8 +2562,16 @@ static bool construct_instance(vm* p_vm, object_class* p_class, uint32_t p_windo
+         p_vm->init_method_name != NULL ? object_class_find_method(p_class, p_vm->init_method_name) : NULL;
+     if (init != NULL) {
+       if (init->is_native) {
+-        runtime_error(p_vm, OK_EK_INTERNAL, "native methods arrive with the native-class patch.");
+-        ok = false;
++        // a C-defined initializer: the receiver-first flight over the stashed
++        // arguments, the result discarded - the construction's value is the
++        // instance, same as the closure lane.
++        value init_stash[UINT8_MAX];
++        init_stash[0] = instance_value;
++        if (p_argc > 0) {
++          memcpy(init_stash + 1, args_stash, p_argc * sizeof(value));
++        }
++        value discarded;
++        ok = run_native(p_vm, exe, init->native, (uint16_t)(p_argc + 1u), init_stash, &discarded);
+       } else if (!run_method_to_completion(p_vm, init->closure, instance_value, p_argc, args_stash, NULL)) {
+         ok = false;
+       }
+@@ -4561,9 +4670,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       } else if (recv_is_class) {
+         klass = VALUE_AS_CLASS(recv);
+       } else {
+-        runtime_error(p_vm, OK_EK_TYPE, "only instances and classes have members.");
+-        FAIL_PATH();
+-        break;
++        // the native lane (§11): a builtin receiver dispatches on its class
++        // singleton - `a.len()` finds the native entry on the array class
++        klass = vm_classof(p_vm, recv);
+       }
+       chunk* chunk = &frame->closure->function->chunk;
+       if (mic_at >= chunk->mic.count) {
+@@ -4740,9 +4849,11 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         // value as its receiver, and Foo(args) rides OP_CALL's class arm.
+         klass = VALUE_AS_CLASS(recv);
+       } else {
+-        runtime_error(p_vm, OK_EK_TYPE, "only instances and classes have methods.");
+-        FAIL_PATH();
+-        break;
++        // the native lane (§11): a builtin receiver dispatches on its class
++        // singleton. the builtin tables are sealed (C15), so the mic below
++        // stays sound; a value whose class carries no such method gets the
++        // ordinary "has no method" error, naming the class.
++        klass = vm_classof(p_vm, recv);
+       }
+       chunk* chunk = &frame->closure->function->chunk;
+       if (mic_at >= chunk->mic.count) {
+@@ -4896,8 +5007,19 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         }
+       }
+       if (entry->is_native) {
+-        runtime_error(p_vm, OK_EK_INTERNAL, "native methods arrive with the native-class patch.");
+-        FAIL_PATH();
++        // the native method flight: the window already holds the receiver at
++        // r[A] with the arguments above - exactly the argv shape. no frame is
++        // pushed, but the native may re-enter the vm and realloc the call
++        // stack and register file, so the cached locals refresh after.
++        frame->ip = ip;
++        if (!call_native_method(p_vm, exe, reg, entry, frame->registers_base + A, B)) {
++          FAIL_PATH();
++          break;
++        }
++        exe = p_vm->current_execution_state;
++        reg = &exe->registers;
++        frame = &exe->call_stack.data[exe->call_stack.count - 1];
++        ip = frame->ip;
+         break;
+       }
+       frame->ip = ip;
+@@ -4946,8 +5068,18 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         break;
+       }
+       if (entry->is_native) {
+-        runtime_error(p_vm, OK_EK_INTERNAL, "native methods arrive with the native-class patch.");
+-        FAIL_PATH();
++        // same window shape as the closure lane: receiver (register 0)
++        // staged at the call window base, arguments above it.
++        REG_AT(A) = REG_AT(0);
++        frame->ip = ip;
++        if (!call_native_method(p_vm, exe, reg, entry, frame->registers_base + A, B)) {
++          FAIL_PATH();
++          break;
++        }
++        exe = p_vm->current_execution_state;
++        reg = &exe->registers;
++        frame = &exe->call_stack.data[exe->call_stack.count - 1];
++        ip = frame->ip;
+         break;
+       }
+       // stage the receiver (register 0) as the call window base, then the
+@@ -5302,6 +5434,7 @@ static inline bool call_native(vm* p_vm,
+                                uint32_t p_callee,
+                                uint16_t p_argc,
+                                uint32_t p_retc) {
++  (void)p_retc; // natives yield exactly one result; the caller's retc only trims closures
+   if (p_native->arity != OK_NATIVE_ARITY_ANY && p_argc != p_native->arity) {
+     runtime_error(p_vm,
+                   OK_EK_ARITY,
+@@ -5312,7 +5445,6 @@ static inline bool call_native(vm* p_vm,
+                   p_argc);
+     return false;
+   }
+-  p_exe->native_call_depth++;
+   // the native receives a pointer into the register file. if it calls back
+   // into the vm and the callee's frame needs more registers than the current capacity, call() grows the
+   // file with realloc and that pointer would dangle for the rest of the
+@@ -5322,26 +5454,11 @@ static inline bool call_native(vm* p_vm,
+   if (p_argc > 0) {
+     memcpy(args_stash, p_reg->array.data + p_callee + 1, p_argc * sizeof(value));
+   }
+-  // TODO: allow multiple
+-  value result = p_native->function(p_vm->ok, p_argc, args_stash);
+-  p_exe->native_call_depth--;
+-  if (p_exe->native_has_error) {
+-    runtime_error(p_vm, OK_EK_NATIVE, "%s", p_exe->native_error_message.chars);
+-    p_exe->native_has_error = false;
+-    string_deinit(&p_exe->native_error_message, p_vm->alloc);
+-    return false;
+-  }
+-  if (p_exe->error_pending) {
+-    // a runtime error fired inside the native (e.g. its ok_call on a script
+-    // closure failed). runtime_error already reset the state and printed the
+-    // report. returning true here would make the OP_CALL handler reload
+-    // frame from an empty call stack (data[count - 1] with count == 0) and segfault.
+-    // so we fail the call so the error propagates up to the C entry point instead.
++  value result;
++  if (!run_native(p_vm, p_exe, p_native->function, p_argc, args_stash, &result)) {
+     return false;
+   }
+   gc_guard_up(p_vm->alloc->gc, result);
+-  p_exe->native_has_error = false;
+-  string_deinit(&p_exe->native_error_message, p_vm->alloc);
+   // natives do not push a call frame: when invoked via ok_call the call stack is
+   // empty (data[count - 1] would be a wild pointer), and when invoked from
+   // bytecode the caller frame's return_base is not where this call's result
+@@ -5444,11 +5561,10 @@ static bool call_value(vm* p_vm,
+       // the receiver takes the bound value's place at the window base (the
+       // OP_CALL shape holds), then the entry calls through the ordinary lane
+       object_bound_method* bound = (object_bound_method*)obj;
++      p_reg->array.data[p_base + p_callee] = bound->receiver;
+       if (bound->entry->is_native) {
+-        runtime_error(p_vm, OK_EK_INTERNAL, "native methods arrive with the native-class patch.");
+-        return false;
++        return call_native_method(p_vm, p_exe, p_reg, bound->entry, p_base + p_callee, p_argc);
+       }
+-      p_reg->array.data[p_base + p_callee] = bound->receiver;
+       return call(p_vm, p_exe, p_reg, bound->entry->closure, p_base + p_callee, p_argc, p_retc);
+     }
+     case OBJ_INSTANCE: {
+@@ -5477,8 +5593,9 @@ static bool call_value(vm* p_vm,
+         return false;
+       }
+       if (entry->is_native) {
+-        runtime_error(p_vm, OK_EK_INTERNAL, "native methods arrive with the native-class patch.");
+-        return false;
++        // the instance already sits at the window base: the receiver-first
++        // argv shape, ready to fly
++        return call_native_method(p_vm, p_exe, p_reg, entry, p_base + p_callee, p_argc);
+       }
+       return call(p_vm, p_exe, p_reg, entry->closure, p_base + p_callee, p_argc, p_retc);
+     }
+@@ -5501,8 +5618,8 @@ static bool call_value(vm* p_vm,
+           return false;
+         }
+         if (entry->is_native) {
+-          runtime_error(p_vm, OK_EK_INTERNAL, "native methods arrive with the native-class patch.");
+-          return false;
++          // the class value is the receiver and already sits at the callee slot
++          return call_native_method(p_vm, p_exe, p_reg, entry, p_base + p_callee, p_argc);
+         }
+         return call(p_vm, p_exe, p_reg, entry->closure, p_base + p_callee, p_argc, p_retc);
+       }
+diff --git a/src/okvm.h b/src/okvm.h
+index d145771..560ec35 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -134,7 +134,8 @@ struct vm {
+   struct object_class* class_singleton;
+   // the seven builtin class singletons (C10), index-parallel to
+   // builtin_class_id: str/num/bool/array/map/function/nil, all under Object,
+-  // all frozen at birth. every value's classof() lands on one of these (or on
++  // sealed by ok_define_builtin_surfaces after their native method tables
++  // are mounted. every value's classof() lands on one of these (or on
+   // Class, or on a user class). traced via mark_vm like the two above.
+   struct object_class* builtin_classes[OK_BUILTIN_COUNT];
+   // the cached spelling of the static call operator, so constructing through
+diff --git a/tests/e2e/tests/classes/native_method_arity_error.ok b/tests/e2e/tests/classes/native_method_arity_error.ok
+new file mode 100644
+index 0000000..54df82a
+--- /dev/null
++++ b/tests/e2e/tests/classes/native_method_arity_error.ok
+@@ -0,0 +1,3 @@
++// the declared arity counts the receiver: push takes exactly one argument
++let a = [1];
++a.push(1, 2); // expect error: expected 1 argument
+diff --git a/tests/e2e/tests/classes/native_method_error.ok b/tests/e2e/tests/classes/native_method_error.ok
+new file mode 100644
+index 0000000..09162a2
+--- /dev/null
++++ b/tests/e2e/tests/classes/native_method_error.ok
+@@ -0,0 +1,3 @@
++// str carries no methods in v0.5.0 (nothing existed as a str function
++// builtin to mirror, and the ruling is no new stdlib)
++print("abc".len()); // expect error: class 'str' has no method 'len'
+diff --git a/tests/e2e/tests/classes/native_methods.ok b/tests/e2e/tests/classes/native_methods.ok
+new file mode 100644
+index 0000000..067382f
+--- /dev/null
++++ b/tests/e2e/tests/classes/native_methods.ok
+@@ -0,0 +1,40 @@
++// the native method surface (§11): the builtin functions, re-mounted as
++// methods on their class singletons. one C entry serves both spellings -
++// `len(a)` and `a.len()` were always the same receiver-first function.
++let a = [1, 2, 3];
++print(a.len()); // expect: 3
++a.push(4);
++print(a.len()); // expect: 4
++print(a.pop()); // expect: 4
++a.remove(0, 2);
++print(a.len()); // expect: 1
++print(a[0]); // expect: 3
++let m = {:};
++m["k1"] = 1;
++m["k2"] = 2;
++print(m.len()); // expect: 2
++print(m.get("k1")); // expect: 1
++print(m.get("nope", 99)); // expect: 99
++m.remove("k1");
++print(m.len()); // expect: 1
++// the free-function spelling still works: same entry, mounted twice
++print(len(a)); // expect: 1
++print(len(m)); // expect: 1
++// a method as a value: the bound native method carries its receiver
++let pusher = a.push;
++pusher(7);
++print(a.len()); // expect: 2
++// a warm site: the mic caches (builtin class -> native entry) like any other
++for let i = 0 : 500 {
++  a.push(i);
++}
++print(a.len()); // expect: 502
++// the methods are visible through the class singletons too
++print(a is array); // expect: true
++print(classof(a) == array); // expect: true
++// instances of user classes still resolve their own methods first
++class Box {
++  let items = [1];
++  pub fu count() { return items.len(); }
++}
++print(Box().count()); // expect: 1
+diff --git a/tests/e2e/tests/classes/operator_errors.ok b/tests/e2e/tests/classes/operator_errors.ok
+index 7b59a0c..f128d37 100644
+--- a/tests/e2e/tests/classes/operator_errors.ok
++++ b/tests/e2e/tests/classes/operator_errors.ok
+@@ -8,6 +8,6 @@ class Vec2 {
+ }
+ let a = Vec2(1);
+ print((a + Vec2(2)).get()); // expect: 3
+-print(a + 2); // expect error: only instances and classes have members
++print(a + 2); // expect error: class 'num' has no field or method 'x'
+ print(a * 2); // expect error: is private
+ print(a.operator +(Vec2(1), Vec2(2)).get()); // expect error: expects at most 1 argument
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index 3d8e80b..55a9e73 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -98,6 +98,51 @@ static void native_destructor(void* ptr) {
+   g_destructor_calls++;
+ }
+ 
++// natives as classes: the receiver rides argv[0] (an instance of the
++// host-defined class), the declared arity counts it.
++static ok_value native_square(ok* p_ok, uint8_t argc, const ok_value* argv) {
++  (void)p_ok;
++
++  assert(argc == 2); // receiver + x
++  assert(ok_value_is_object(argv[0]));
++  assert(ok_value_is_number(argv[1]));
++
++  const double x = ok_value_as_number(argv[1]);
++
++  return ok_value_number(x * x);
++}
++
++static ok_value native_method_add(ok* p_ok, uint8_t argc, const ok_value* argv) {
++  (void)p_ok;
++
++  assert(argc == 3); // receiver + a + b
++  assert(ok_value_is_object(argv[0]));
++  assert(ok_value_is_number(argv[1]));
++  assert(ok_value_is_number(argv[2]));
++
++  return ok_value_number(ok_value_as_number(argv[1]) + ok_value_as_number(argv[2]));
++}
++
++static ok_value native_hidden(ok* p_ok, uint8_t argc, const ok_value* argv) {
++  (void)p_ok;
++  (void)argc;
++  (void)argv;
++
++  return ok_value_number(0);
++}
++
++// a native operator entry: dispatched through the perform ladders exactly
++// like a script `operator +`, receiver on the left (C14).
++static ok_value native_operator_add(ok* p_ok, uint8_t argc, const ok_value* argv) {
++  (void)p_ok;
++
++  assert(argc == 2);
++  assert(ok_value_is_object(argv[0]));
++  assert(ok_value_is_number(argv[1]));
++
++  return ok_value_number(100 + ok_value_as_number(argv[1]));
++}
++
+ struct string_bag {
+   std::vector<ok_value> items;
+   int* destructor_calls;
+@@ -409,6 +454,65 @@ int main() {
+   assert(ok_value_is_number(echo_result));
+   assert(ok_value_as_number(echo_result) == 123);
+ 
++  // natives as classes: a host-defined class with native methods, consumed
++  // from script like any other - construct, call, bind, instanceof, privacy.
++  ok_value math = ok_class_new(vm, ok_create_string_view("Math", OK_STRING_VIEW_CALCULATE_LENGTH, true), ok_value_null());
++
++  assert(ok_value_is_class(math));
++  assert(!ok_value_is_number(math));
++
++  assert(ok_class_define_native_method(
++      vm, math, ok_create_string_view("square", OK_STRING_VIEW_CALCULATE_LENGTH, true), 2, native_square, true));
++  assert(ok_class_define_native_method(
++      vm, math, ok_create_string_view("add", OK_STRING_VIEW_CALCULATE_LENGTH, true), 3, native_method_add, true));
++  // a private one: script outside the (empty) hierarchy ring cannot call it
++  assert(ok_class_define_native_method(
++      vm, math, ok_create_string_view("hidden", OK_STRING_VIEW_CALCULATE_LENGTH, true), 1, native_hidden, false));
++  // a native operator: the perform ladders find it by the canonical spelling
++  assert(ok_class_define_native_method(
++      vm, math, ok_create_string_view("operator +", OK_STRING_VIEW_CALCULATE_LENGTH, true), 2, native_operator_add, true));
++  // one name, one owner - the same doctrine the script lane enforces
++  assert(!ok_class_define_native_method(
++      vm, math, ok_create_string_view("square", OK_STRING_VIEW_CALCULATE_LENGTH, true), 2, native_square, true));
++
++  assert(ok_class_freeze(vm, math));
++  // sealed (C15): definitions are refused forever
++  assert(!ok_class_define_native_method(
++      vm, math, ok_create_string_view("late", OK_STRING_VIEW_CALCULATE_LENGTH, true), 1, native_hidden, true));
++
++  assert(ok_global_define(vm, ok_create_string_view("Math", OK_STRING_VIEW_CALCULATE_LENGTH, true), math, false));
++
++  const char* class_code = R"(
++    let m = Math();
++    if m.square(7) != 49 { print "bad: square"; }
++    if m.add(1, 2) != 3 { print "bad: add"; }
++    if not (m is Math) { print "bad: is"; }
++    if not isinstance(m, Object) { print "bad: root"; }
++    // the bound native method carries its receiver
++    let sq = m.square;
++    if sq(6) != 36 { print "bad: bound"; }
++    // a warm site: the mic caches (builtin class -> native entry) like any other
++    let mut total = 0;
++    for let i = 0 : 100 {
++      total = total + m.square(i);
++    }
++    if total != 328350 { print "bad: warm site"; }
++    // the native operator entry, dispatched through the binary + ladder
++    if m + 5 != 105 { print "bad: native operator"; }
++    m.hidden();
++  )";
++
++  ok_source class_source = {
++      .code = class_code,
++      .path = "embed",
++  };
++
++  // the last line calls a private native method: a runtime error, exactly
++  // like a private script method would be
++  result = ok_run(vm, class_source);
++
++  assert(result == OK_RUNTIME_ERROR);
++
+   const char* error_code = "host_fail();\n";
+ 
+   ok_source error_source = {
+-- 
+2.47.3
+

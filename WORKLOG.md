@@ -1260,3 +1260,70 @@ Stage Summary:
   noted: a small optimization round lands after classes close, before
   the next 0.x theme; the classes benchmarks (delta blue, the wren
   matrix entry) fold into THAT round where the profiling lives.
+
+## session 29 — citadel round 3, patches 33+34: the wall closes
+
+- Q's R9-R12 pass on round 2: all four confirmations, nothing moved.
+  R10's bounce-back ("enforce the unary special name now?") answered no
+  on the record: the signature contract holds the line, the refinement
+  is one hunk whenever a real hierarchy wants both -nesses, paying now
+  buys a maybe.
+- patch 33 (conversions + identity, 749 insertions / 29 files): === as
+  word identity (one honest clarification: 1 === 1.0 is TRUE - there is
+  no public int box; the visible edge is 0.0 === -0.0 false vs ==
+  true); `is` as the exact-class probe (classof+identity fused, d is
+  Animal is false - isinstance owns the chain walk); isinstance/classof
+  as plain natives; `operator <Target>` into the as lane (inherited,
+  private = hierarchy-internal, result checked, subclass-of-target
+  legal); the seven builtin singletons under Object seeded through ONE
+  table; TAG_AS + TT_ + the hidden ' str' globals dead, tag id 6
+  reserved, unit test pins the numbering.
+- the receipt of the round, found under aggressive gc by
+  conversion_private_error.ok: vm_init_singletons held every startup
+  name on the guard stack at once, OK_GC_GUARD_CAPACITY is 16, the
+  sequence was already silently overflowing at 17 pre-p33 and hit 24
+  with the builtins - the str singleton's NAME was swept mid-startup
+  and its memory reused by the num name, so `x as str` probed 'operator
+  num'. flaky across suite-vs-solo for extra sport. fix: per-object
+  balanced guards (a name rides only across the class creation that
+  adopts it), every push checked, the cached names need no guard (the
+  assignment IS the rooting).
+- two more: the asprint leak in every object_as_str arm (lsan, first
+  exposed by instance-as-str; map/array were the template) and as_num's
+  tail (missing int return - publicly dead but a landmine - copy-paste
+  message, no instance/class/method arms). plus a confessed test bug:
+  operators_subscript.ok mixed expect lanes so the full runner skipped
+  its output compare, hiding a wrong expect (40 vs 45). split + fixed.
+- patch 34 (natives as classes, 565 insertions / 11 files): run_native
+  (shared flight; closes a pre-existing 256+-arg truncation+overrun on
+  ANY-arity natives) + call_native_method (receiver rides argv[0]; the
+  INVOKE / bound-method / operator-dispatch windows were already the
+  same shape). all seven 'native methods arrive with the native-class
+  patch' traps are real lanes now, including a C-defined init. builtin
+  receivers dispatch on their singleton through classof, mic-cached.
+  surfaces per the no-new-stdlib ruling: array len/push/pop/remove,
+  map len/remove/get - the SAME receiver-first C entries mounted twice,
+  so len(a) and a.len() are one function. str/function/num/bool/nil
+  stay empty (nothing existed to mirror). C API: ok_class_new /
+  ok_class_define_native_method / ok_class_freeze / ok_value_is_class,
+  with the script lane's definition rules enforced C-side (one name one
+  owner, pub survives, no private narrowing, dispatch-arity agreement
+  across the native/closure kind boundary). embed test grows a Math
+  class: construct, call, bind, isinstance, mic-warmed loop, native
+  operator + entry, privacy, redeclaration + post-freeze refusals.
+- gates: e2e 394x4 (379 + the subscript split + 11 p33 tests + 3 p34
+  tests), unit x3, embed x3.
+- delivered: patches/33-conversions-identity.patch +
+  patches/34-natives-as-classes.patch, download/ mirror,
+  docs/drafts/CITADEL-R3.md (the round guide: rulings applied, the
+  guard-stack receipt, both patch records, R13-R16 open for veto),
+  worklog (this entry).
+- open for veto (R13-R16): the === box clarification (1===1.0 true),
+  `is` exact-class vs chain walk, the empty str surface in 0.5.0,
+  patch 35 (copy-on-redefine - now cheaper than at R2, the conversions
+  ride runtime probes not freeze bakes).
+- next: patch 35 if green-lit; then the small-optimization round Q
+  re-scheduled (delta blue, wren in the matrix, next to the
+  profiling); tree-sitter catch-up (is/=== tokens, classes grammar)
+  flagged so it does not get lost. 0.5.0's classes plan is code-
+  complete pending those.
