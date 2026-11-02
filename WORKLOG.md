@@ -1181,3 +1181,82 @@ Stage Summary:
   natives-as-classes (34) — the guide's §6 has the plan.
 - next: Q reviews R1-R8 + the C18 capability semantics and the
   upvalue fix, rules the vetoes, then patch 32 in the usual rhythm.
+
+## session 28 — citadel round 2, patch 32: operators + the bare-name ladder
+
+- resumed from the cutoff with the p32 groundwork intact (7 files, ~350
+  lines of AST/parser/object/chunk scaffolding survived the webui kill).
+  this entry lands the rest.
+- R1 RESOLVED (Q's ruling, no veto needed): methods participate in
+  bare-name resolution, implicitly bound to this, explicit this keeps
+  the fused fast lane. the honest impl shape dissolved the original
+  objection: the freeze pass ALREADY swallows unresolved names as
+  maybe-fields, so the method ladder rides the same NAME op —
+  field -> method -> global, baked at freeze (GET_FIELD / GET_METHOD /
+  LOAD_GLOBAL; stores bake the not-assignable trap for method names).
+  statics mirror the ladder at runtime (static field -> static method
+  -> global) in GET/STORE_STATIC_NAME's miss path.
+- operators shipped: + - * / % == != < <= > >= unary- [] []= and the
+  instance operator () (OP_CALL's OBJ_INSTANCE arm; the instance is
+  already the call window's receiver — zero staging). privacy rides
+  the calling frame; != desugars to == + truthiness-negation; the
+  ordered four return the method's raw value (truthiness at the
+  consumer, like ==).
+- the cache design replaced "per-site MIC": class-resident
+  op_cache[CLASS_OP_COUNT], one entry pointer per (class, operator),
+  filled on first dispatch, sound forever under the C15 seal (frozen
+  tables never move entries; the parent chain roots every owner).
+  zero instruction words spent; one cache serves every site.
+- canonical spellings: ONE shared parser helper builds "operator <sp>"
+  names; whitespace normalized both at definition and member sites.
+  `fu operator+(o)` and `a.operator  +(b)` agree. non-dispatchable
+  spellings refused with reasons ('!' is the truthiness substrate,
+  '!=' desugars, compound forms desugar, bitwise unimplemented).
+  'operator' reserved as a field name (a field so named would be
+  unreachable - .operator always fuses).
+- one name one owner, within a body: OP_DEFINE_METHOD refuses same-name
+  redefinition. load-bearing for "operator -": binary and unary share
+  the spelling, the signature contract keeps hierarchies coherent
+  (a subclass cannot flip the arity of an inherited operator).
+- dispatch_operator_method: the nested run_until lane (construction/
+  defer machinery) staging above every live register — a binop's
+  (dest, lhs, rhs) shape carries no call-window guarantee. the dispatch
+  cases REFRESH_AFTER_NESTED (exe/reg/frame + ip sync) after every
+  dispatchable perform: the nested call can realloc both arrays.
+- two real pre-existing bugs found by probing, both fixed + pinned:
+  1. a class declared inside a method HARD-ERRORED at the enclosing
+     class's freeze — the walk descended into the inner class's member
+     protos (constants of the method's chunk) and baked the wrong
+     layout into them. protos now carry is_class_member; the freeze
+     walk stops at member boundaries (class_in_method.ok).
+  2. bare sibling static calls + bare glob access from static contexts
+     were unreachable (statics lane swallowed the name with no
+     fallback). now: static field -> static method -> global
+     (bare_static_method.ok).
+- the shadow shape pinned (bare_method_call.ok): reads are field-first
+  (data wins), call sites fuse to INVOKE and are method-first
+  (invoking wins), a bare name in call position is a read-then-call.
+  field x + method x on one class is legal and coherent under those
+  rules.
+- asan caught one bug in the new parser code before any gate did:
+  read-after-free of the error token in the operator-field reservation
+  (captured before the free now). the gates earn their keep again.
+- gates: e2e 379x4 (364 + 15 new tests), unit x3, embed x3. the 379 is
+  the new floor. run_e2e_full.sh (scripts/) now checks the error lane
+  too — the old quick runner misreported expect-error tests as fails.
+- delivered: patches/32-operator-dispatch.patch (2278 lines, 16 files),
+  download/ mirror, docs/drafts/CITADEL-R2.md (this round's guide:
+  the p32 record + the copy-on-redefine analysis Q asked for + the
+  ruling responses), worklog (this entry), pushed to collab master.
+- rulings carried: C11 (== default identity, operator == dispatch),
+  C14 (left-operand only), C13's parse surface, R1 accepted as ruled.
+  open for veto: the unary/binary minus split (one name one owner +
+  signature contract => a hierarchy picks one -ness), the field-first
+  read / method-first invoke shadow order, the class-resident cache
+  superseding per-site MIC.
+- next: patch 33 (===, is, isinstance/classof, the as-lane through
+  operator Target, TAG_AS/TT_ death, builtin class singletons + nil
+  binding), then 34 (natives as classes + the C API). Q's re-schedule
+  noted: a small optimization round lands after classes close, before
+  the next 0.x theme; the classes benchmarks (delta blue, the wren
+  matrix entry) fold into THAT round where the profiling lives.
