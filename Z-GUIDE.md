@@ -80,10 +80,13 @@ disabled pending the account move.
 
 - **batch hard.** sandbox resets between rounds cost ~5 min rebuilds and
   context is precious. every round should end with nothing half-done.
-- **patches are deliverables, not pushes.** Z never pushes to codeberg.
-  function-level diffs with what/why/blast-radius, saved under
-  `/home/z/my-project/download/` and mirrored to `archive/patches/` when
-  they become history. Q applies by hand.
+- **patches are deliverables, not pushes.** Z never pushes to codeberg —
+  not branches, not tags, not even helpfully; Q publishes everything
+  himself, from his own clones. function-level diffs with
+  what/why/blast-radius, saved under `/home/z/my-project/download/` and
+  mirrored to `archive/patches/` when they become history. Q applies by
+  hand. tree-sitter and any other satellite repo follow the same rule:
+  patch files into the collab repo, never a push.
 - **no new features until the suite + the game are green.** then: release,
   next feature. this is why v0.0.4 shipped before arrays.
 - **honesty over comfort, always with proof.** push back when he's wrong,
@@ -92,6 +95,19 @@ disabled pending the account move.
 - **when he asks for a rating/assessment, give the stranger's version.**
   no glazing. he explicitly asked for "not because i am here you say
   different stuff than stranger's vm" — that request is permanent.
+- **the doc standard: GUIDE-0.4.0-errors.md is the bar.** every written
+  deliverable — guides, roadmaps, postmortems, drafts, patch READMEs —
+  is held to that shape: complete walkthrough, honest deltas from the
+  draft called out by section, rulings numbered and OPEN-for-Q at the
+  end, receipts over claims. markdown is the canonical format; a PDF
+  copy in download/ is a courtesy, never the record. (ruled session 26.)
+- **code comments: ASCII, short, self-contained.** Q's rules, session 26,
+  permanent: (1) ASCII only in code and patches — no em-dash, no
+  section sign, no unicode decoration; (2) comments never reference
+  rounds, discussions, guides, or "as ruled" — the reasoning lives in
+  docs, the comment says what the code needs; (3) short and on point,
+  no density walls, no repeating the same comment across sites. run
+  clang-format on C before delivering a patch.
 
 ## hard-won rules (each one cost a round)
 

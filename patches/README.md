@@ -255,3 +255,24 @@ same-frame ones that lexically enclose a NORMAL-exit defer (the ruled
 exception: the catch whose region was unwinding never sees one); a defer
 failing during the uncaught sweep is dropped after the report (nothing
 left to consume it).
+
+## 29 — tree-sitter: defer/deferr in, finalize out (the errors catch-up)
+
+vs tree-sitter-oklang master `72b061f` (your v0.2.0). the grammar had
+try/catch/throw but still carried `finalize` and knew nothing of defer —
+this is the patch the guide's §10 claimed shipped last session and didn't
+(owned in the worklog). the delta: `defer_stmt` / `deferr_stmt` rules
+(`'defer' expr ';'`, same for deferr) + both added to `_stmt`; `finalize`
+deleted from `try_stmt`; `finalize` deleted from the highlights query,
+`defer`/`deferr` added to @exception; the `[($.try_stmt)]` conflict entry
+removed (tree-sitter flags it unnecessary post-change); corpus: the "try:
+binding + finalize" test rewritten finalize-free, two new tests (defer
+schedules a call for scope exit, deferr error-path-only). parser.c /
+grammar.json / node-types.json regenerated with tree-sitter-cli 0.27.1 —
+note parser.c churns wholesale across CLI versions, the semantic delta is
+the grammar + queries + corpus (~60 lines). verification: corpus 132/132
+(was 130 + the rewritten pair), zero warnings, and the real e2e sources
+from your `errors` branch (defer_basic / deferr_only_on_error /
+try_catch_nested) parse with zero ERROR nodes. apply: `git apply` from the
+tree-sitter repo root, or read the grammar.js + corpus hunks and type them
+(the generated files you regenerate yourself either way).

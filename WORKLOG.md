@@ -928,3 +928,170 @@ Stage Summary:
 - next: Q applies + reviews; 0.3.0 codename still pending (spans tag);
   bench README wants the lua 5.4 line; 0.5.0 classes inherits the
   {:kind:,:what:} shape for std.exception.
+
+## session 25 — finalize killed, defer shipped (RETRO — reconstructed from the repo record)
+
+Task: [this entry was never written — the round ended in context loss after
+the commits landed but before the worklog append. reconstructed below from
+what the repo carries: commits 42be65d + 502cbb8, patches 27v2 + 28, and
+ERRORS.md §12 / GUIDE-0.4.0-errors.md. if it isn't in the record, it isn't
+claimed.]
+
+Task (as the record tells it): Q killed finalize before it ever shipped —
+"kill finally, embrace defer. why have 2 ways if one do trick?!" — with a
+half-asleep design sketch to validate (per-scope zig style, LIFO, snapshot
+args at the defer site, runs before locals die and before upvalues close,
+deferr as the errdefer sibling, one NaN-box tag, CLOSE_UPVALUES
+repurposing). patch 27 regenerated as the C-boundary-only v2 (finalize
+gutted out of it), patch 28 written as the replacement.
+
+Work Log:
+- patch 27 v2: C API only — ok_last_error / ok_clear_error /
+  ok_native_throw (ok_native_error stays as sugar), E7 host-caught
+  no-print lane, the dead vm_consume_pending_error removed (0 call sites
+  after the restructure).
+- patch 28 (defer + deferr): the whole design is recorded in
+  GUIDE-0.4.0-errors.md §6 + ERRORS.md §12 — snapshot locals + parser-
+  built thunk through the ordinary lambda path, TAG_DEFER as the box's
+  last tag, compile-time-visible normal exits (DEFER_RUN LIFO +
+  LOAD_NULL kills for deferr), the unwinder's register-range scan for
+  unwind exits, cascade + replace semantics, three aggressive-GC bugs
+  found and fixed (epilogue dead code, staging resurrection, scan range
+  above the watermark). gates 342x4 + unit/embed x3 + fresh-apply.
+- the reading guide (GUIDE-0.4.0-errors.md) written: patches 23-28
+  walkthrough, the defer design record, the NaN-box storage verdict
+  (the box is full; the scattered 3 bits are the budget, not a cost).
+- FAILURES this round, owned: the tree-sitter update claimed in the
+  guide §10 ("corpus expectations included in the patch's tree-sitter
+  delta") never existed in patch 28 — the work sat uncommitted in the
+  sandbox clone and the round died before it landed. same for this
+  worklog entry and the collab-repo push (two commits sat local).
+  session 26 repaired all three.
+
+Stage Summary:
+- the errors phase complete on paper and in patches; Q applied the
+  series with his own comment edits + a clang-format pass and pushed it
+  to codeberg as the `errors` branch (fc61ec5, single squashed commit
+  on v0.3.0-Urn base) — not yet merged to master, not yet tagged.
+- 0.4.0 name pending Q's tag; my vote on record: Eyrie.
+
+## session 26 — classes drafted (C1-C18 open), tree-sitter landed for real, the rules logged
+
+Task: Q applied the errors series to codeberg `errors` (his own comment
+edits + clang format, "pushed to temp branch (errors) not published yet"),
+read the guide, and opened the next feature: classes — "the big one, the
+main design stands frozen". the frozen surface from his words: classes
+with metaclasses + private/public methods (fu, pub, default private, no
+private keyword), maybe wren-private fields, single inheritance cpp-style
+":", fields as normal let, monomorphic inline cache from day one, fast
+lane stays, native classes (strings) support the same surface, c++-style
+operator overloading + `operator Target` conversions. open questions
+handed to me wholesale: this vs self/me/my, ctor naming (oklangcpp's
+ctor/dtor vs init vs class-name vs dunders), dtor (he already leaned no —
+prefer explicit + defer), super always called, static keyword, identity
+operator yes/no, isinstance + hierarchy invariants ("one class for
+builtins right?"), arity overloading wren-style, native handler shape.
+plus session asks: land the tree-sitter patch that never landed, push the
+collab repo (two local commits from 25 were never pushed), do some repo
+cleanup, refresh the codeberg protocol (i had floated pushing there —
+wrong), and log three new rules permanently: GUIDE-grade markdown for
+every written thing, ASCII-only comments in patches, no round references
+in comments, comments short + non-repeating.
+
+Work Log:
+- resync + full state read: codeberg master at d5707dc = release v0.3.0
+  (Urn — Q overrode my Continuum suggestion, his call), tag v0.3.0,
+  `errors` branch fc61ec5 (the applied series, 77 files +3644/-511 vs
+  release). collab repo: my last two commits unpushed, remote had moved
+  (bench auto-run). tree-sitter: Q's v0.2.0 (72b061f) carries try/catch/
+  throw AND `finalize` still, no defer/deferr — my claimed update sat
+  uncommitted in the sandbox clone. oklangcpp: unreachable from the
+  sandbox (no such public repo on codeberg) — noted in the draft, real
+  postmortem needs Q to paste the files.
+- intel pass that shaped the draft: the full v0.2.0 grammar read — Q's
+  class sketch already has class_decl / class_let_decl / class_fu_decl /
+  class_operator_decl with static|pub|async mods, `inherits` keyword (vs
+  his message's ":" — flagged as C1), the overridable operator set
+  (prefix ++ -- ! ~, infix + - * / % ^ & | << >> + compounds +
+  comparisons, postfix () []), conversion operators as plain idents,
+  `===` already in binary_expr, `let mut` binding shape, f-string
+  interpolation, then/otherwise conditional. oklang lexer truth:
+  TOKEN_CLASS/SUPER/THIS/INHERITS exist, `export` is the module-level
+  word (pub is class-body-only in the sketch), throw/catch/defer/deferr
+  all shipped. okobject.h: 8 object types, 24-bit type field, header
+  has room. okvm.c perform_add still carries Q's day-0 TODO
+  ("strictly lhs? TBD after we add classes") — quoted and answered as
+  C14.
+- CLASSES.md drafted (docs/drafts/, ~560 lines): the frozen surface
+  spec'd by example in real oklang syntax; the object model (ONE
+  metaclass `Class` for everything, `Class : Object`, classof(Class)
+  == Class as the only self-loop, builtins num/bool/str/array/map/
+  function/nil under Object, sealed); fields ruled wren-outside/
+  C++-inside (the Vec2 operator+ argument forces sibling access);
+  methods private = hierarchy-internal, pub survives overrides; `this`
+  kept (C2) — lexical, non-assignable, upvalue-capturable; construction
+  = ClassName.new (overridable `static fu new`) + `fu init` + compile-
+  time-checked super ordering; no dtor ever; statics as class-receiver
+  methods (one INVOKE mechanism, static operators allowed, callable
+  classes opt-in via `static fu operator ()`); operators with the set
+  trimmed at ++/-- (sugar, rejects the C++ dummy-int) and compounds as
+  in-place variants; left-dispatch only (C14, answering the TODO);
+  conversions into the existing `as` lane incl. operator str/num/bool;
+  `===` formalized as primitive identity, `==` overloadable with
+  identity default; isinstance/classof as builtin fns; natives as
+  sealed class objects with ok_native_fn entries (receiver = argv[0]);
+  MIC from day one costing nothing because C15 freezes method tables
+  at definition (no reopen = no invalidation protocol, ever); no new
+  NaN-box tags (the box is full — GUIDE §8), OBJ_CLASS + OBJ_INSTANCE
+  in the 24-bit info field; codegen sketch (CLASS, GET_FIELD/SET_FIELD,
+  guarded variants, INVOKE+MIC, SUPER_INVOKE) done honestly per the
+  "codegen shape first" rule; exceptions stay {:kind,:what} maps in
+  0.5.0 (C16 — the unification is its own round); kwargs deferred
+  again with the reason. rulings C1-C18 OPEN for Q at the end. patch
+  plan 30-34 sketched. 0.5.0 name: my pick Citadel.
+- patch 29 (the tree-sitter one, landed for real this time): defer_stmt
+  + deferr_stmt added, `finalize` deleted from try_stmt + highlights,
+  the unnecessary [$.try_stmt] conflict removed, corpus updated (the
+  "try: binding + finalize" test rewritten; two new defer/deferr
+  tests — first cut had stale expectations against a grammar shape
+  that never shipped, caught by tree-sitter test and fixed against
+  `tree-sitter parse` ground truth), parser regenerated with CLI
+  0.27.1 (noted: parser.c churns wholesale across CLI versions), 132/
+  132 corpus green, smoke-parsed the real defer/deferr/try e2e files
+  from Q's errors branch with zero ERROR nodes. delivered as
+  patches/29-tree-sitter-defer-deferr.patch + download/ mirror; the
+  sandbox ts clone carries it as local branch z-errors-syntax (NOT
+  pushed — codeberg is Q's).
+- the rules logged permanently in Z-GUIDE (standing protocol section):
+  the doc standard (GUIDE-0.4.0-errors.md is the bar, markdown
+  canonical, PDF a courtesy), the comment rules (ASCII only, no round
+  references, short + on point + non-repeating, clang-format before
+  delivery), and the codeberg line strengthened (never push, not
+  branches, not tags, not even helpfully; satellite repos follow the
+  same rule).
+- cleanup: collab repo — BENCH-NOTES-v0.0.5.md moved to bench/ (was
+  squatting the root), hyper/ moved to archive/hyper/ (the original
+  import kit; bench/ carries the evolved live copies the workflow
+  actually runs), dorg3/REVIEW-dorg3.md moved to archive/review-guides/
+  (a session-13 deliverable living alone in a one-file root dir; the dir
+  is gone), bench/ok-reg + bench/ok-stack untracked + .gitignore'd
+  (420KB of locally-built binaries; the workflow builds its own from
+  codeberg), .gitignore created (there was none). sandbox — err.log/
+  out.log strays deleted from the oklang worktree, core.fileMode off in
+  the ts clone (filesystem mode-noise), stash zeroed. oklang codeberg
+  branches untouched (register stays until Q deletes it per the
+  standing note).
+- pushed: local master rebased onto origin (bench auto-run commit),
+  everything from 25 + 26 delivered — this entry, CLASSES.md,
+  Z-GUIDE amendments, patches/29 + README entry, cleanup commit.
+
+Stage Summary:
+- classes round 1 done: a complete design draft with every one of Q's
+  questions answered and ruled C1-C18, grounded in his own grammar
+  sketch + the shipped code (the perform_add TODO answered where it
+  was asked). zero oklang code this round, by design — patch 29 is the
+  whole code delta and it is tree-sitter.
+- next: Q rules C1-C18 (or another whiteboard round first — his
+  call); then patches 30-34 in the usual rhythm. the errors branch is
+  his to merge + tag (Eyrie). oklangcpp postmortem section awaits
+  pasted files if he wants it grounded in the real wreckage.
