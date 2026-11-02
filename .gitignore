@@ -1,0 +1,8 @@
+# bench binaries are built locally by run-benchmarks.sh
+bench/ok-reg
+bench/ok-stack
+
+# logs
+*.log
+err.log
+out.log
