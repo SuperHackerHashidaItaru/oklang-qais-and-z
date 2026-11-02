@@ -75,7 +75,7 @@ print(d.describe());           // rex has 4 legs, a lab
 // statics live on the class object — C9
 class Counter {
   static let mut count = 0;
-  static fu bump() { count = count + 1; }   // hmm — see C9's statics note
+  static fu bump() { count = count + 1; }   // bare 'count' = the static field (see §7)
   pub static fu value() { return count; }
 }
 Counter.bump();
@@ -369,6 +369,13 @@ exposes them; the default is private; there is no `private` keyword.
   separate static dispatch path in the VM.
 - static lookup walks the parent chain like instance lookup
   (metaclass inheritance without a metaclass per class).
+- **bare names inside statics resolve: local, then param, then the
+  STATIC fields of the enclosing hierarchy, then the usual outward
+  walk.** same ladder as instance methods (§5) with the static table in
+  the field slot — one resolution rule, two tables. a static and a
+  field may share a name (different tables); a bare read inside a
+  static sees the static, inside an instance method the field. if that
+  ever surprises anyone, the fix is `this.x`, which works in both.
 - **static operators are allowed** — including `static fu operator
   ()(args)`, which makes the class itself callable: `Foo(args)` becomes
   user-defined sugar (typically `return Foo.new(args)`). the DEFAULT
