@@ -1999,3 +1999,106 @@ still flagged (yield keyword joins the grammar list).
   items (read side, type/class identity, call, versioning). then OR-4
   (project.ok + the build pipeline, the pub-export harvest). delta
   blue stays the 0.9.0 meter.
+
+## session 38 (2026-11-03): OR-3 lands (Q's green light, patches 47 + 48)
+
+- context: Q's message answered the four OPEN items with one line, "we
+  should support everything we have and expose to the abi", and added
+  three catches from a skim (no full review yet, by his own note):
+  plain mallocs in okmodules.c ("we have own allocators that we get
+  from user and they should be honored"), no api for reading a module's
+  exports/imports ("otherwise how is cli gonna even read the exported
+  table?"), and two surface questions - why modules cannot be globbed,
+  why pub cannot re-export. the answers, in order: patch 47, patch 47,
+  and tests (they always could; nothing was hidden, now it is pinned).
+- patch 47, the allocator discipline + the read api: every byte the
+  module spine touches rides the user's ok_allocators now (paths,
+  arenas, traces, the pending tree, registry keys, import lists, the fs
+  loader's buffers - the loader contract is explicit: allocate with the
+  table you gave ok_specs, the instance frees with its release). one
+  libc free remains, realpath's own buffer, by design (the hit is
+  copied onto the user's table, the registry only frees what it
+  allocated). the registry read api in ok.h: module count/path/value/
+  find, per-module import edges (the graph, deduped, load order - the
+  records grew the list, prepare hands the TU's edges to its caller),
+  export enumeration over any module value (declaration order through
+  the namespace class's own_names). the glob/pub pins: surfaceglob
+  (module value globbed under a new name, the SAME name, a
+  multi-segment root, from-imported members, read back through a
+  global from C) and surfacepub (re-export of a member and of a whole
+  module, from-imports of the re-exports; the same name stays the
+  ordinary duplicate-local rule, exactly as Q expected it would).
+- patch 48, OR-3: the capability system first (ok_specs.caps_dropped,
+  the {0} default refuses nothing, OK_CAP_ALL locks; ok_caps_get/drop,
+  the ratchet is drop-only by construction; the CLI maps --restrict,
+  --sandbox=locked, --deny/--allow; a dropped NATIVE_LOAD skips the
+  native probe entirely and the 404 teaches why). ok_module.h: the
+  descriptor, ok_type_tag, and the ok_api vtable per the ruling - the
+  everything surface plus the two entries the first real module forced
+  (view: string-view construction, no native can spell its arguments
+  without it; module_export: the mount callback's class/constant
+  export, the namespace freezes when mount returns). the table is
+  static and stateless, stashable forever. the loader lane: the vtable
+  grows load_native with a miss/broken contract (empty err = keep
+  searching, a message = the hard error; the default lane stats before
+  opening so misses stay clean), the ladder now probes ok candidates by
+  asking the loader to READ them (the library never stats files itself
+  anymore - the old stat() violated M14 for memory-backed loaders), and
+  the native lane is first-class at every rung (base+ext, or the exact
+  path when the import spells the extension; canonicalize, registry,
+  then open RTLD_NOW|RTLD_LOCAL, resolve ok_native_export, hand it the
+  api table). register_native: abi + name checks (the descriptor must
+  match the import stem), on_load with on_unload on failure, fn
+  staging + the mount window (marked for the whole staging+mount+build
+  stretch - see the bug list), duplicate exports refuse, the sealed
+  namespace, the record (is_native, the descriptor for ok_free's
+  on_unload sweep, the default lane's handles close after it).
+  ok_native_force_load + `ok run --native m.so app.ok` (registered
+  under the declared name, bare imports resolve, the probe is
+  length-bounded because the import literal is a lexer slice).
+  ok_set_loader + ok_load_native_default for host composition.
+- the matrix earned its keep again, twice. one: the aggressive lane
+  caught the mount window - the staged fn values were marked only
+  DURING mount_classes, rode unmarked through the namespace build, and
+  aggressive gc swept them (plain passed, hello.greet answered with the
+  namespace instance itself). the window is now marked from staging to
+  registration. two: the probe-as-read restructure let directories
+  reach ftell (fopen opens them on linux, ftell answers garbage-huge,
+  asan died on the allocation request) - the fs read now stats for a
+  regular file first and caps the size at 1 GiB. also caught by hand:
+  my gate loop pointed plain at build-plain instead of build-gcc (the
+  435-failure panic was my own loop, not the tree).
+- receipts: the sample module (native_hello: greet + Greeter class +
+  the magic constant + on_load observable in the output prefix), the
+  abi and name mismatch fixtures with their messages, --restrict
+  refusing with the capability error, the force-load fixture, the
+  retired "not available yet" lane (a broken candidate is now the hard
+  error with the loader's reason as the note). the runners (bash + C++)
+  run every fixture's declared build.sh first and grew the `// okflags:`
+  directive (the okpath precedent, --native paths resolve against the
+  test's dir). the capi harness grew the memory-backed loader section:
+  a three-module virtual graph over mem:/ paths with zero filesystem,
+  the registry read over virtual keys, the ratchet, and a locked
+  instance still computing (std included - it is built-in pure compute,
+  not capability gated).
+- tree-sitter: patch 44 is superseded - Q landed its whole scope
+  himself (1a24245 "defer and modules support": import/from/as, pub
+  declmods, the spans grammar, highlights, corpus, the regen files).
+  nothing left on that flank; the collab repo's 44 stays in history.
+- gates: e2e 488/488 x7 (plain, threaded, asan, aggressive, asan+aggr,
+  threaded-asan, threaded-asan-aggr; 483 -> 488 with 5 native
+  fixtures), unit x3, embed x3, capi 201 x5 (140 -> 201), delta blue
+  flat (1.40654e7 in 0.62s, the hot paths untouched).
+- delivered: patches/47-module-allocators-and-read-api.patch,
+  patches/48-or3-sandbox-natives-loader.patch, README entries,
+  MODULES.md amended (OR-3 LANDED, the round-three rulings, the OPEN
+  items answered), DECISIONS.md D23, this entry.
+- next: OR-4, project.ok + the build pipeline - manifest discovery
+  (walk up from the entry file), the evaluator (full-stdlib no-natives
+  instance, the pub project-table harvest through the patch-47 read
+  api), deps (project/raw/native, recursive), native targets with
+  declared build commands, the consent policy, .okbuild stamps, ok
+  build/where, auto-build, the fixture farm. then the full guide (md +
+  pdf, master -> present, Q's ask: "a full guide structured from master
+  -> where we at now, once the whole feature is complete"). delta blue
+  stays the 0.9.0 meter.

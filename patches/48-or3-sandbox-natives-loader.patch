@@ -1,0 +1,2971 @@
+diff --git a/.gitignore b/.gitignore
+index 0d4b94b..db0402d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -3,3 +3,6 @@ build/
+ build*/
+ out.log
+ err.log
++
++# OR-3 native fixture artifacts: build.sh builds them, never ship them
++tests/e2e/tests/modules/*/*.so
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 280036f..58508ac 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -59,6 +59,8 @@ target_sources(ok PRIVATE
+   src/okglobals_store.c
+   src/oklexer.c
+   src/okmm.c
++  src/okapi.c
++  src/okdylib.c
+   src/okmodules.c
+   src/okobject.c
+   src/okobject_store.c
+@@ -94,6 +96,11 @@ target_include_directories(ok PUBLIC
+ )
+ 
+ target_link_libraries(ok PUBLIC m)
++# OR-3: the dynamic-library wrapper links the platform loader. modern glibc
++# (2.34+) folds dl into libc, older libcs and friends need it explicit.
++if(UNIX)
++  target_link_libraries(ok PUBLIC ${CMAKE_DL_LIBS})
++endif()
+ 
+ target_compile_options(ok PRIVATE
+   -Wall
+diff --git a/cli/src/main.c b/cli/src/main.c
+index 13f1806..739ca8b 100644
+--- a/cli/src/main.c
++++ b/cli/src/main.c
+@@ -5,24 +5,148 @@
+ #include <string.h>
+ 
+ #include "ok/ok.h"
++#include "ok/ok_module.h"
+ 
+ static void repl(ok* p_ok);
+ static void run_file(ok* p_ok, const char* p_path);
+ static char* read_file(const char* p_path);
+ 
++// ---------------------------------------------------------------- the capability flags
++
++// one cap name -> bit. unknown names refuse the run with usage (a typo'd
++// --deny must never silently deny nothing).
++static bool cap_of_name(const char* p_name, size_t p_length, uint32_t* p_out) {
++  if (p_length == 6 && memcmp(p_name, "native", 6) == 0) {
++    *p_out = OK_CAP_NATIVE_LOAD;
++    return true;
++  }
++  if (p_length == 5 && memcmp(p_name, "build", 5) == 0) {
++    *p_out = OK_CAP_NATIVE_BUILD;
++    return true;
++  }
++  if (p_length == 4 && memcmp(p_name, "host", 4) == 0) {
++    *p_out = OK_CAP_HOST;
++    return true;
++  }
++  if (p_length == 3 && memcmp(p_name, "all", 3) == 0) {
++    *p_out = OK_CAP_ALL;
++    return true;
++  }
++  return false;
++}
++
++// parse a comma-separated cap list ("native,build"). false = unknown name.
++static bool parse_caps(const char* p_list, uint32_t* p_out) {
++  uint32_t caps = 0;
++  const char* cursor = p_list;
++  for (;;) {
++    const char* comma = strchr(cursor, ',');
++    const size_t length = comma != NULL ? (size_t)(comma - cursor) : strlen(cursor);
++    uint32_t cap = 0;
++    if (length == 0 || !cap_of_name(cursor, length, &cap)) {
++      return false;
++    }
++    caps |= cap;
++    if (comma == NULL) {
++      break;
++    }
++    cursor = comma + 1;
++  }
++  *p_out = caps;
++  return true;
++}
++
++static void usage(void) {
++  fprintf(stderr,
++          "usage: ok [run] [flags] [path]\n"
++          "       ok\n"
++          "flags:\n"
++          "  --dump                   compile and disassemble only\n"
++          "  --native <path>          force-load a native module (repeatable)\n"
++          "  --restrict               drop native load, native build, and host caps\n"
++          "  --sandbox=locked         drop every capability (pure compute)\n"
++          "  --deny=<list>            drop caps (native, build, host, all)\n"
++          "  --allow=<list>           narrow a previous deny (parse time only)\n");
++}
++
+ int main(int argc, char** argv) {
+   ok_specs specs = {0};
++  const char* natives[16];
++  uint32_t natives_count = 0;
++  bool dump = false;
++  const char* path = NULL;
++  bool bad = false;
++
++  int i = 1;
++  if (i < argc && strcmp(argv[i], "run") == 0) {
++    i++; // the explicit form: `ok run [flags] path` is `ok [flags] path`
++  }
++  for (; i < argc; ++i) {
++    const char* arg = argv[i];
++    if (strcmp(arg, "--dump") == 0) {
++      dump = true;
++    } else if (strcmp(arg, "--native") == 0) {
++      if (i + 1 >= argc || natives_count == 16) {
++        bad = true;
++        break;
++      }
++      natives[natives_count++] = argv[++i];
++    } else if (strcmp(arg, "--restrict") == 0) {
++      specs.caps_dropped |= OK_CAP_NATIVE_LOAD | OK_CAP_NATIVE_BUILD | OK_CAP_HOST;
++    } else if (strcmp(arg, "--sandbox=locked") == 0) {
++      specs.caps_dropped = OK_CAP_ALL;
++    } else if (strncmp(arg, "--deny=", 7) == 0) {
++      uint32_t caps = 0;
++      if (!parse_caps(arg + 7, &caps)) {
++        bad = true;
++        break;
++      }
++      specs.caps_dropped |= caps;
++    } else if (strncmp(arg, "--allow=", 8) == 0) {
++      uint32_t caps = 0;
++      if (!parse_caps(arg + 8, &caps)) {
++        bad = true;
++        break;
++      }
++      // parse-time only: narrowing a deny before the instance exists. the
++      // ratchet itself is untouched (nothing grants after ok_create).
++      specs.caps_dropped &= ~caps;
++    } else if (arg[0] == '-' && arg[1] != '\0') {
++      bad = true;
++      break;
++    } else if (path == NULL) {
++      path = arg;
++    } else {
++      bad = true;
++      break;
++    }
++  }
++
++  if (bad) {
++    usage();
++    return 64;
++  }
++
+   ok* ok = ok_create(specs);
+-  if (argc == 1) {
+-    repl(ok);
+-  } else if (argc == 2) {
+-    run_file(ok, argv[1]);
+-  } else if (argc == 3 && strcmp(argv[1], "--dump") == 0) {
+-    // compile and disassemble only: the inspection tool, dry run mode
++  if (dump) {
+     ok_debug_dump_bytecode(ok, true, true);
+-    run_file(ok, argv[2]);
++  }
++  // force-loads happen before the run: scripts import the modules by their
++  // declared names, the registry answers.
++  for (uint32_t n = 0; n < natives_count; ++n) {
++    if (!ok_native_force_load(ok, natives[n], NULL)) {
++      ok_free(ok);
++      return 70;
++    }
++  }
++  if (path == NULL && natives_count == 0) {
++    repl(ok);
++  } else if (path != NULL) {
++    run_file(ok, path);
+   } else {
+-    fprintf(stderr, "usage: ok [--dump] [path]");
++    usage();
++    ok_free(ok);
++    return 64;
+   }
+   ok_free(ok);
+ }
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index ed32e12..b7fd4be 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -244,6 +244,20 @@ ok_value ok_coro_current(ok* p_ok);
+ // catch), or the call site is not a native at all.
+ bool ok_native_suspend(ok* p_ok);
+ 
++/* capabilities (OR-3) */
++
++// the granted set (a subset of what the instance was born with: unknown
++// bits are never invented). the families: OK_CAP_NATIVE_LOAD (dlopen
++// natives, import + force-load), OK_CAP_NATIVE_BUILD (declared build
++// commands, the OR-4 half), OK_CAP_HOST (fs/env/clock stdlib as it lands).
++// see ok_specs.h for the birth mask.
++uint32_t ok_caps_get(ok* p_ok);
++
++// the ratchet's only write: DROP. a grant is impossible after ok_create by
++// construction, nothing can clear these bits: not a native, not a script,
++// not a manifest. that one-way door is the security property.
++void ok_caps_drop(ok* p_ok, uint32_t p_caps);
++
+ /* modules (embedder side, OR-3) */
+ 
+ // the loaded-module registry, load order. file modules key by their resolved
+diff --git a/include/ok/ok_fwd.h b/include/ok/ok_fwd.h
+index 070fc06..6312fd6 100644
+--- a/include/ok/ok_fwd.h
++++ b/include/ok/ok_fwd.h
+@@ -7,6 +7,10 @@ extern "C" {
+ 
+ typedef struct ok_allocators ok_allocators;
+ typedef struct ok_specs ok_specs;
++typedef struct ok_dylib ok_dylib;
++typedef struct ok_loader ok_loader;
++typedef struct ok_api ok_api;
++typedef struct ok_native_module ok_native_module;
+ typedef struct ok ok;
+ typedef struct ok_native_type ok_native_type;
+ 
+diff --git a/include/ok/ok_module.h b/include/ok/ok_module.h
+new file mode 100644
+index 0000000..1aa5bd4
+--- /dev/null
++++ b/include/ok/ok_module.h
+@@ -0,0 +1,250 @@
++#ifndef OK_MODULE_H
++#define OK_MODULE_H
++
++// OR-3 "O Resolution" - the native module ABI.
++//
++// a native module is a shared object exporting exactly ONE symbol:
++//
++//   OK_API const ok_native_module* ok_native_export(const ok_api* p_api);
++//
++// it never links against oklang symbols (no -rdynamic, no collisions,
++// several vms coexist in one process): every reach into the vm goes through
++// the ok_api table the loader hands to ok_native_export. static embedders
++// keep using ok.h directly; this header is the dynamic lane.
++//
++// the api table is STATIC and stateless: every entry routes through its ok*
++// (or value) argument, so a module may stash the pointer at export time and
++// it stays valid for the process lifetime. the same table serves every ok
++// instance.
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "ok/ok.h"
++#include "ok/ok_fwd.h"
++#include "ok/ok_source.h"
++#include "ok/ok_specs.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif // __cplusplus
++
++// the ABI number: a single integer, bumped on ANY change to the vtable, the
++// descriptor layouts, or the tag enum. every module carries the number it
++// was built against; the loader checks at load (and a module may check the
++// api's number the other way, refusing a host it does not know). mismatch
++// refuses with the rebuild message. no semver, no compat promises pre-1.0:
++// "rebuild your natives" is the honest stance. the one discipline kept
++// anyway: vtable entries are APPEND-ONLY, never repurposed, never reordered.
++#define OK_NATIVE_ABI 1u
++
++// the one symbol a native shared object exports. msvc needs dllexport on
++// the building side and dllimport on the consuming side; everywhere else
++// default visibility is fine (and -fvisibility=hidden builds export only
++// this). the wrapper is compile-time, no runtime dispatch.
++#if defined(_WIN32)
++#  if defined(OK_MODULE_BUILDING)
++#    define OK_API __declspec(dllexport)
++#  else
++#    define OK_API __declspec(dllimport)
++#  endif
++#else
++#  define OK_API __attribute__((visibility("default")))
++#endif
++
++typedef struct ok_native_fn_def {
++  const char* name;
++  uint16_t arity; // counts the receiver where applicable; OK_NATIVE_ARITY_ANY allowed
++  ok_native_fn call;
++} ok_native_fn_def;
++
++typedef struct ok_native_module {
++  uint32_t abi;        // must equal OK_NATIVE_ABI, checked at load
++  const char* name;    // self-declared; must match the import stem for graph loads
++  const char* version; // the module's own version string, display only
++  uint32_t fn_count;
++  const ok_native_fn_def* fns;
++  // the non-function surface (classes, constants): called after the fn
++  // members are staged and before the namespace freezes. define classes
++  // (api->class_new, api->class_define_native_method, api->class_freeze)
++  // and export them, plus any constant values, with api->module_export.
++  // false fails the load.
++  bool (*mount_classes)(ok* p_ok);
++  // lifecycle. on_load runs at load, before the namespace is built; on_unload
++  // at ok_free, never mid-run (the lua lesson), and after a failed on_load.
++  // on_unload is for releasing the module's own C resources: do not allocate
++  // or call into the api beyond simple teardown.
++  bool (*on_load)(ok* p_ok);
++  void (*on_unload)(ok* p_ok);
++} ok_native_module;
++
++typedef const ok_native_module* (*ok_native_export_fn)(const ok_api* p_api);
++
++// the type tag every value answers, the read side's discriminator. identity
++// itself stays word equality (===): free, no entry needed.
++typedef enum {
++  OK_TYPE_NIL = 0,
++  OK_TYPE_BOOL,
++  OK_TYPE_NUM,
++  OK_TYPE_STR,
++  OK_TYPE_ARRAY,
++  OK_TYPE_MAP,
++  OK_TYPE_FN,
++  OK_TYPE_CLASS,
++  OK_TYPE_INSTANCE,
++  OK_TYPE_CORO,
++  OK_TYPE_NATIVE,
++} ok_type_tag;
++
++// the api vtable (M14: "the vm only cares about its vtable"). carries the
++// whole ok.h surface a module needs, both directions, per Q's ruling:
++// "support everything we have and expose to the abi". deliberately OUT of
++// v1: method enumeration, dynamic member get/set, subclass creation from
++// native, global define/get (a native's registration is its module
++// membership, the global namespace stays the host's).
++struct ok_api {
++  uint32_t abi; // OK_NATIVE_ABI
++  // view construction: the module builds the string views every other
++  // entry takes (value_string, native_error, class_new, module_export,
++  // ...). p_chars is borrowed for the call only, NUL-termination not
++  // required. [NEW with OR-3's landing: a native cannot even spell its
++  // arguments without it, the sample module found the gap]
++  ok_string_view (*view)(const char* p_chars, uint64_t p_length);
++  // values: the write side (construct)
++  ok_value (*value_null)(void);
++  ok_value (*value_string)(ok* p_ok, ok_string_view p_string);
++  ok_value (*value_number)(double p_value);
++  ok_value (*value_bool)(bool p_value);
++  ok_value (*array_new)(ok* p_ok, const ok_value* p_items, uint32_t p_count);
++  ok_value (*map_new)(ok* p_ok, const ok_value* p_pairs, uint32_t p_pair_count);
++  bool (*map_set)(ok* p_ok, ok_value p_map, ok_value p_key, ok_value p_value);
++  ok_value (*native_value_new)(ok* p_ok, void* p_data, ok_native_destructor p_destructor, ok_native_tracer p_tracer);
++  // values: the read side (inspect + unwrap)
++  ok_type_tag (*value_type)(ok_value p_value);
++  double (*value_as_number)(ok_value p_value);
++  bool (*value_as_bool)(ok_value p_value);
++  ok_cstring_view (*value_as_string)(ok_value p_value); // owned by the value, never freed by the native;
++                                                        // the chars are a NUL-terminated vm string, strlen
++                                                        // is the native-side length (ok.h's
++                                                        // ok_cstring_view_get_length is a library symbol)
++  uint32_t (*array_len)(ok_value p_value);
++  ok_value (*array_get)(ok_value p_value, uint32_t p_index); // out of bounds: null
++  uint32_t (*map_len)(ok_value p_value);
++  bool (*map_get)(ok_value p_map, ok_value p_key, ok_value* p_out); // false: absent/illegal/not-a-map
++  void* (*value_as_native_value)(ok_value p_value);
++  // type + class identity: a native type-checks its arguments constantly,
++  // and a native class must recognize instances of itself (and of user
++  // subclasses)
++  ok_value (*classof)(ok* p_ok, ok_value p_value);
++  bool (*is_instance)(ok* p_ok, ok_value p_value, ok_value p_class);
++  ok_cstring_view (*class_name)(ok* p_ok, ok_value p_class); // owned by the class, never freed by the native;
++                                                             // NUL-terminated, same as value_as_string
++  // calls: a native invoking a script callback (sort comparators, event
++  // hooks, the future asio), ok_call's exact shape
++  bool (*call)(ok* p_ok, ok_value p_callee, uint8_t p_argc, const ok_value* p_argv, ok_value* p_out);
++  // classes (the ok.h door)
++  ok_value (*class_new)(ok* p_ok, ok_string_view p_name, ok_value p_parent);
++  bool (*class_define_native_method)(ok* p_ok,
++                                     ok_value p_class,
++                                     ok_string_view p_name,
++                                     uint16_t p_arity_including_receiver,
++                                     ok_native_fn p_cb,
++                                     bool p_pub);
++  bool (*class_freeze)(ok* p_ok, ok_value p_class);
++  // module building: export one value under a pub name in the module being
++  // loaded. ONLY valid inside mount_classes (the namespace freezes when
++  // mount returns); anywhere else it fails with false.
++  bool (*module_export)(ok* p_ok, ok_string_view p_name, ok_value p_value);
++  // errors + roots
++  bool (*native_error)(ok* p_ok, ok_string_view p_message);
++  bool (*native_throw)(ok* p_ok, ok_value p_value);
++  uint32_t (*root)(ok* p_ok, ok_value p_value);
++  bool (*unroot)(ok* p_ok, uint32_t p_root);
++  // coro primitives (the asio door)
++  ok_value (*coro_new)(ok* p_ok, ok_value p_body);
++  bool (*coro_resume)(ok* p_ok, ok_value p_coro, ok_value p_arg, bool p_has_arg, ok_value* p_out);
++  uint32_t (*coro_status)(ok* p_ok, ok_value p_coro);
++  ok_value (*coro_current)(ok* p_ok);
++  bool (*native_suspend)(ok* p_ok);
++};
++
++// the dynamic-library hooks, host-provided like malloc: the host supplies
++// open/sym/close from its own packaging (an audited loader, a whitelisted
++// one, memory-backed test doubles), the platform wrapper is the DEFAULT
++// (ok_specs.dylib NULL), and a platform with nothing gets the structural
++// refusal. this is also the structural sandbox denial made concrete: a
++// table whose open always fails denies loading by construction.
++struct ok_dylib {
++  // each returns NULL (open/sym) with a message in p_err on failure
++  void* (*open)(void* p_ctx, const char* p_path, char* p_err, size_t p_err_capacity);
++  void* (*sym)(void* p_ctx, void* p_handle, const char* p_name, char* p_err, size_t p_err_capacity);
++  void (*close)(void* p_ctx, void* p_handle);
++  void* p_ctx;
++};
++
++// the loader vtable: the host installs one per ok instance, the library
++// never touches the filesystem for imports on its own. the default (never
++// installed automatically for embedders, the CLI's shape): fs reads + the
++// dylib-based native lane. a NULL read_source refuses every file module; a
++// NULL load_native denies natives through this loader.
++struct ok_loader {
++  // reads the source at an absolute path into *p_out. the code buffer MUST
++  // be allocated with the ok_allocators this instance was created with (the
++  // embedder hands the same table in ok_specs): the instance frees it with
++  // its release call after the module's tree is consumed. false =
++  // unreadable. p_out->path is the canonical spelling (borrowed).
++  bool (*read_source)(void* p_ctx, const char* p_path, ok_source* p_out);
++  // loads a native module at an absolute path. on success: *p_out is the
++  // descriptor (borrowed, valid while the module stays loaded), *p_handle
++  // is an opaque handle the LOADER owns (a host loader manages its own;
++  // the default lane closes its handles at ok_free). p_api is the table to
++  // hand the module's ok_native_export. false = not a native / unreadable /
++  // no export symbol, with a message in *p_err when p_err is non-NULL.
++  bool (*load_native)(void* p_ctx,
++                      const char* p_path,
++                      const ok_api* p_api,
++                      const ok_native_module** p_out,
++                      void** p_handle,
++                      char* p_err,
++                      size_t p_err_capacity);
++  void* p_ctx;
++};
++
++// install the loader BEFORE ok_run. replaces the default (the CLI's fs
++// lane) wholesale: a host that only wants custom sources but keeps the
++// native lane wraps ok_load_native_default (p_ctx = the ok*, see below).
++void ok_set_loader(ok* p_ok, ok_loader p_loader);
++
++// the default native loader, exposed for composition: opens through the
++// dylib hooks the instance was created with (specs->dylib, else the
++// platform wrapper), resolves ok_native_export, and hands it p_api. use it
++// as a custom loader's load_native with p_ctx set to the ok*.
++bool ok_load_native_default(ok* p_ok,
++                            const char* p_path,
++                            const ok_native_module** p_out,
++                            void** p_handle,
++                            char* p_err,
++                            size_t p_err_capacity);
++
++// the platform's dylib table (dlopen family / LoadLibrary), or NULL where
++// the platform has nothing (the host-provided hooks are the answer there).
++const ok_dylib* ok_dylib_platform(void);
++
++// the shared-library extension this platform's native lane probes for
++// (".so", ".dll"): the ladder's native candidate form.
++const char* ok_dylib_extension(void);
++
++// force-load a native module outside any project (M3's last resort,
++// `ok run --native m.so app.ok`): loads through the instance's loader and
++// registers it under p_name (or the descriptor's own declared name when
++// p_name is NULL). scripts then import it by that bare name. the
++// OK_CAP_NATIVE_LOAD gate applies; failures print their own diagnostic and
++// return false.
++bool ok_native_force_load(ok* p_ok, const char* p_path, const char* p_name);
++
++#ifdef __cplusplus
++}
++#endif // __cplusplus
++
++#endif // OK_MODULE_H
+diff --git a/include/ok/ok_specs.h b/include/ok/ok_specs.h
+index eb804e2..f7799d0 100644
+--- a/include/ok/ok_specs.h
++++ b/include/ok/ok_specs.h
+@@ -3,6 +3,7 @@
+ 
+ #include "ok_fwd.h"
+ #include <stddef.h>
++#include <stdint.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -18,8 +19,32 @@ struct ok_allocators {
+   ok_release release;
+ };
+ 
++// OR-3 "O Resolution" - the capability families. they fail differently, so
++// they gate differently: LOAD is arbitrary native code in-process (the
++// escape hatch), BUILD is arbitrary code out-of-process (build commands,
++// OR-4's half), HOST is data-plane leakage (fs/env/clock, the stdlib as it
++// lands). the mask is a bitmask; presets are sugar.
++typedef enum {
++  OK_CAP_NATIVE_LOAD = 1u << 0,  // dlopen natives (import + force-load)
++  OK_CAP_NATIVE_BUILD = 1u << 1, // run declared native build commands (OR-4)
++  OK_CAP_HOST = 1u << 2,         // host-touching stdlib (fs/env/clock, later)
++  OK_CAP_ALL = 0xffffffffu,
++} ok_cap;
++
+ struct ok_specs {
+   ok_allocators allocators;
++  // capabilities refused at birth (the ratchet's starting point). 0, the
++  // {0} default, refuses nothing: every existing embedder keeps the full
++  // surface. an embedder that wants the locked stance writes OK_CAP_ALL.
++  // after ok_create the mask only ever grows (ok_caps_drop); nothing, not a
++  // native, not a script, not a manifest, can shrink it.
++  uint32_t caps_dropped;
++  // host-provided dynamic-loading hooks (malloc-style): NULL means the
++  // platform default (the dlopen family, LoadLibrary on windows). a host on
++  // a platform with no loader (consoles, bare newlib, wasm without dlopen)
++  // installs its own table here, or leaves natives off entirely (drop
++  // OK_CAP_NATIVE_LOAD, or let the default refusal speak).
++  const ok_dylib* dylib;
+ };
+ 
+ #ifdef __cplusplus
+diff --git a/src/ok.c b/src/ok.c
+index 5210d68..a6d16b2 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -3,6 +3,7 @@
+ 
+ #define OK_GC_EXPOSE
+ #include "ok/ok.h"
++#include "ok/ok_module.h"
+ #include "okcompiler.h"
+ #include "okdebug.h"
+ #include "okgc.h"
+@@ -431,6 +432,12 @@ ok* ok_create(ok_specs p_specs) {
+   okay->alloc = create_allocators(&okay->raw_alloc);
+   okay->dump_bytecode = false;
+   okay->dump_skip_run = false;
++  // OR-3: the capability ratchet's birth state and the resolved dylib
++  // table (the host's hooks, else the platform wrapper, else NULL: the
++  // no-loading stance). set before anything can allocate: the loader and
++  // the caps gates read them.
++  okay->caps_dropped = p_specs.caps_dropped;
++  okay->dylib = p_specs.dylib != NULL ? p_specs.dylib : ok_dylib_platform();
+ 
+   object_store_init(&okay->objects_store, &okay->alloc);
+ 
+@@ -569,6 +576,30 @@ void ok_retain_source(ok* p_ok, bool p_retain) {
+   p_ok->vm.retain_source = p_retain;
+ }
+ 
++/* capabilities (OR-3) */
++
++// the ratchet's read side: the granted set, always a subset of what the
++// instance was born with. unknown bits are not invented.
++uint32_t ok_caps_get(ok* p_ok) {
++  return OK_CAP_ALL & ~p_ok->caps_dropped;
++}
++
++// the ratchet's only write: DROP. grants are impossible after ok_create by
++// construction (nothing can clear these bits), which is the security
++// property: not a native, not a script, not a manifest can escalate.
++void ok_caps_drop(ok* p_ok, uint32_t p_caps) {
++  p_ok->caps_dropped |= p_caps;
++}
++
++/* the loader (OR-3, the public ok_module.h door) */
++
++// install the loader before ok_run. replaces the default (fs reads + the
++// dylib native lane) wholesale: a host that only wants custom sources but
++// keeps the native lane wraps ok_load_native_default (ok_module.h).
++void ok_set_loader(ok* p_ok, ok_loader p_loader) {
++  ok_modules_set_loader(&p_ok->modules, p_loader);
++}
++
+ /* modules (embedder side, OR-3) */
+ 
+ // the registry read side: what got loaded, in load order. file modules key
+diff --git a/src/okapi.c b/src/okapi.c
+new file mode 100644
+index 0000000..3dc5179
+--- /dev/null
++++ b/src/okapi.c
+@@ -0,0 +1,324 @@
++// OR-3 "O Resolution" - the ok_api vtable, the native module ABI's whole
++// reach into the vm.
++//
++// one STATIC, STATELESS table per process (Q's ruling: "support everything
++// we have and expose to the abi"): every entry trampolines to its ok.h
++// counterpart and routes through the ok* (or value) argument it is handed,
++// so the table captures no instance state. a module stashes the pointer at
++// export time and it stays valid forever; the same table serves every ok
++// instance in the process, and freeing one instance never dangles another
++// module's stash.
++//
++// the one entry with state on the side is module_export: it appends to the
++// module system's active mount window (okmodules.h), which exists only
++// between a native's mount_classes start and its namespace freeze.
++
++#include "ok/ok.h"
++#include "ok/ok_module.h"
++
++#include "okobject.h"
++#include "okstate.h"
++#include "okstring.h"
++#include "okvalue.h"
++#include "okvm.h"
++
++// ---------------------------------------------------------------- view construction
++
++static ok_string_view api_view(const char* p_chars, uint64_t p_length) {
++  if (p_length == OK_STRING_VIEW_CALCULATE_LENGTH) {
++    // the NUL-terminated literal lane: the module spells it with the same
++    // sentinel ok.h's constructors use
++    return ok_create_string_view(p_chars, OK_STRING_VIEW_CALCULATE_LENGTH, true);
++  }
++  return ok_create_string_view(p_chars, p_length, false);
++}
++
++// ---------------------------------------------------------------- values: write
++
++static ok_value api_value_null(void) {
++  return ok_value_null();
++}
++
++static ok_value api_value_string(ok* p_ok, ok_string_view p_string) {
++  return ok_value_string(p_ok, p_string);
++}
++
++static ok_value api_value_number(double p_value) {
++  return ok_value_number(p_value);
++}
++
++static ok_value api_value_bool(bool p_value) {
++  return ok_value_bool(p_value);
++}
++
++static ok_value api_array_new(ok* p_ok, const ok_value* p_items, uint32_t p_count) {
++  return ok_array_new(p_ok, p_items, p_count);
++}
++
++static ok_value api_map_new(ok* p_ok, const ok_value* p_pairs, uint32_t p_pair_count) {
++  return ok_map_new(p_ok, p_pairs, p_pair_count);
++}
++
++static bool api_map_set(ok* p_ok, ok_value p_map, ok_value p_key, ok_value p_value) {
++  return ok_map_set(p_ok, p_map, p_key, p_value);
++}
++
++static ok_value api_native_value_new(ok* p_ok, void* p_data, ok_native_destructor p_destructor,
++                                     ok_native_tracer p_tracer) {
++  return ok_native_value_new(p_ok, p_data, p_destructor, p_tracer);
++}
++
++// ---------------------------------------------------------------- values: read
++
++// the one-call discriminator. OK_TYPE_FN covers every callable value (a
++// closure, a native function, a bound method); OK_TYPE_NATIVE is the native
++// DATA wrapper (ok_native_value_new's product), the thing a raylib-shaped
++// module wraps its handles in.
++static ok_type_tag api_value_type(ok_value p_value) {
++  if (IS_VALUE_STRICTLY_NULL(p_value)) {
++    return OK_TYPE_NIL;
++  }
++  if (IS_VALUE_STRICTLY_BOOL(p_value)) {
++    return OK_TYPE_BOOL;
++  }
++  if (IS_VALUE_NUMBER(p_value)) {
++    return OK_TYPE_NUM;
++  }
++  if (IS_VALUE_STRING(p_value)) {
++    return OK_TYPE_STR;
++  }
++  if (IS_VALUE_ARRAY(p_value)) {
++    return OK_TYPE_ARRAY;
++  }
++  if (IS_VALUE_MAP(p_value)) {
++    return OK_TYPE_MAP;
++  }
++  if (IS_VALUE_CLASS(p_value)) {
++    return OK_TYPE_CLASS;
++  }
++  if (IS_VALUE_INSTANCE(p_value)) {
++    return OK_TYPE_INSTANCE;
++  }
++  if (IS_VALUE_CORO(p_value)) {
++    return OK_TYPE_CORO;
++  }
++  if (IS_VALUE_CLOSURE(p_value) || IS_VALUE_NATIVE_FUNCTION(p_value) || IS_VALUE_BOUND_METHOD(p_value)) {
++    return OK_TYPE_FN;
++  }
++  if (IS_VALUE_NATIVE_VALUE(p_value)) {
++    return OK_TYPE_NATIVE;
++  }
++  return OK_TYPE_NIL; // defensive: the space is covered above
++}
++
++static double api_value_as_number(ok_value p_value) {
++  return ok_value_as_number(p_value);
++}
++
++static bool api_value_as_bool(ok_value p_value) {
++  return ok_value_as_bool(p_value);
++}
++
++static ok_cstring_view api_value_as_string(ok_value p_value) {
++  return ok_value_as_string(p_value);
++}
++
++static uint32_t api_array_len(ok_value p_value) {
++  return ok_array_len(p_value);
++}
++
++static ok_value api_array_get(ok_value p_value, uint32_t p_index) {
++  return ok_array_get(p_value, p_index);
++}
++
++static uint32_t api_map_len(ok_value p_value) {
++  return ok_map_len(p_value);
++}
++
++static bool api_map_get(ok_value p_map, ok_value p_key, ok_value* p_out) {
++  return ok_map_get(p_map, p_key, p_out);
++}
++
++static void* api_value_as_native_value(ok_value p_value) {
++  return ok_value_as_native_value(p_value);
++}
++
++// ---------------------------------------------------------------- type + class identity
++
++static ok_value api_classof(ok* p_ok, ok_value p_value) {
++  return OBJECT_AS_VALUE(vm_classof(&p_ok->vm, p_value));
++}
++
++static bool api_is_instance(ok* p_ok, ok_value p_value, ok_value p_class) {
++  if (!IS_VALUE_CLASS(p_class)) {
++    return false;
++  }
++  return vm_is_instance(&p_ok->vm, p_value, VALUE_AS_CLASS(p_class));
++}
++
++static ok_cstring_view api_class_name(ok* p_ok, ok_value p_class) {
++  (void)p_ok;
++  const ok_cstring_view empty = {NULL, 0};
++  if (!IS_VALUE_CLASS(p_class)) {
++    return empty;
++  }
++  const object_string* name = VALUE_AS_CLASS(p_class)->name;
++  return ok_create_cstring_view(name->string.chars, string_get_length(&name->string));
++}
++
++// ---------------------------------------------------------------- calls
++
++static bool api_call(ok* p_ok, ok_value p_callee, uint8_t p_argc, const ok_value* p_argv, ok_value* p_out) {
++  return ok_call(p_ok, p_callee, p_argc, p_argv, p_out);
++}
++
++// ---------------------------------------------------------------- classes
++
++static ok_value api_class_new(ok* p_ok, ok_string_view p_name, ok_value p_parent) {
++  return ok_class_new(p_ok, p_name, p_parent);
++}
++
++static bool api_class_define_native_method(ok* p_ok,
++                                           ok_value p_class,
++                                           ok_string_view p_name,
++                                           uint16_t p_arity_including_receiver,
++                                           ok_native_fn p_cb,
++                                           bool p_pub) {
++  return ok_class_define_native_method(p_ok, p_class, p_name, p_arity_including_receiver, p_cb, p_pub);
++}
++
++static bool api_class_freeze(ok* p_ok, ok_value p_class) {
++  return ok_class_freeze(p_ok, p_class);
++}
++
++// ---------------------------------------------------------------- module building
++
++static bool api_module_export(ok* p_ok, ok_string_view p_name, ok_value p_value) {
++  native_mount* mount = p_ok->modules.mounting;
++  if (mount == NULL || mount->failure != NULL) {
++    return false;
++  }
++  if (p_name.chars == NULL || ok_string_view_get_length(&p_name) == 0) {
++    mount->failure = "a mount export needs a name.";
++    return false;
++  }
++  // a duplicate export name is a hard load failure (M13's collision rule)
++  for (uint32_t i = 0; i < mount->count; ++i) {
++    if (strlen(mount->names[i]) == ok_string_view_get_length(&p_name) &&
++        memcmp(mount->names[i], p_name.chars, ok_string_view_get_length(&p_name)) == 0) {
++      mount->failure = "duplicate export name in the mount callback.";
++      return false;
++    }
++  }
++  if (mount->count == mount->capacity) {
++    const uint32_t grown = mount->capacity == 0 ? 4 : mount->capacity * 2;
++    char** names = p_ok->raw_alloc.reallocate(mount->names, sizeof(char*) * grown);
++    if (names == NULL) {
++      mount->failure = "out of memory while staging a mount export.";
++      return false;
++    }
++    mount->names = names;
++    mount->capacity = grown;
++  }
++  const uint32_t length = (uint32_t)ok_string_view_get_length(&p_name);
++  char* copy = p_ok->raw_alloc.allocate(length + 1);
++  if (copy == NULL) {
++    mount->failure = "out of memory while staging a mount export.";
++    return false;
++  }
++  memcpy(copy, p_name.chars, length);
++  copy[length] = '\0';
++  // the value rides the marked mount window (mark_modules), not a guard
++  if (!value_array_append(&mount->values, p_value)) {
++    p_ok->raw_alloc.release(copy);
++    mount->failure = "out of memory while staging a mount export.";
++    return false;
++  }
++  mount->names[mount->count++] = copy;
++  return true;
++}
++
++// ---------------------------------------------------------------- errors + roots
++
++static bool api_native_error(ok* p_ok, ok_string_view p_message) {
++  return ok_native_error(p_ok, p_message);
++}
++
++static bool api_native_throw(ok* p_ok, ok_value p_value) {
++  return ok_native_throw(p_ok, p_value);
++}
++
++static uint32_t api_root(ok* p_ok, ok_value p_value) {
++  return ok_root(p_ok, p_value);
++}
++
++static bool api_unroot(ok* p_ok, uint32_t p_root) {
++  return ok_unroot(p_ok, p_root);
++}
++
++// ---------------------------------------------------------------- coro primitives
++
++static ok_value api_coro_new(ok* p_ok, ok_value p_body) {
++  return ok_coro_new(p_ok, p_body);
++}
++
++static bool api_coro_resume(ok* p_ok, ok_value p_coro, ok_value p_arg, bool p_has_arg, ok_value* p_out) {
++  return ok_coro_resume(p_ok, p_coro, p_arg, p_has_arg, p_out);
++}
++
++static uint32_t api_coro_status(ok* p_ok, ok_value p_coro) {
++  return ok_coro_status(p_ok, p_coro);
++}
++
++static ok_value api_coro_current(ok* p_ok) {
++  return ok_coro_current(p_ok);
++}
++
++static bool api_native_suspend(ok* p_ok) {
++  return ok_native_suspend(p_ok);
++}
++
++// ---------------------------------------------------------------- the table
++
++static const ok_api g_ok_api = {
++    OK_NATIVE_ABI,
++    api_view,
++    api_value_null,
++    api_value_string,
++    api_value_number,
++    api_value_bool,
++    api_array_new,
++    api_map_new,
++    api_map_set,
++    api_native_value_new,
++    api_value_type,
++    api_value_as_number,
++    api_value_as_bool,
++    api_value_as_string,
++    api_array_len,
++    api_array_get,
++    api_map_len,
++    api_map_get,
++    api_value_as_native_value,
++    api_classof,
++    api_is_instance,
++    api_class_name,
++    api_call,
++    api_class_new,
++    api_class_define_native_method,
++    api_class_freeze,
++    api_module_export,
++    api_native_error,
++    api_native_throw,
++    api_root,
++    api_unroot,
++    api_coro_new,
++    api_coro_resume,
++    api_coro_status,
++    api_coro_current,
++    api_native_suspend,
++};
++
++const ok_api* ok_api_table(void) {
++  return &g_ok_api;
++}
+diff --git a/src/okdylib.c b/src/okdylib.c
+new file mode 100644
+index 0000000..1941342
+--- /dev/null
++++ b/src/okdylib.c
+@@ -0,0 +1,244 @@
++// OR-3 "O Resolution" - the dynamic-library platform wrapper + the default
++// native loader lane.
++//
++// two real implementations, one ifdef (the plan's line): the dlopen family
++// (linux, the bsds, solaris/illumos, aix, haiku, and macos, whose mach-o
++// speaks the same api) and windows LoadLibrary/GetProcAddress/FreeLibrary.
++// everything else (consoles, bare newlib, wasi without a dynamic linker)
++// has NOTHING, which is exactly the case the host-provided ok_dylib hooks
++// exist for: the host installs its own table in ok_specs, or accepts the
++// structural refusal.
++//
++// loading discipline (MODULES.md section 7): open with the local,
++// resolve-now mode so a module's symbols never leak into another's
++// namespace, resolve exactly one symbol (ok_native_export), and never
++// dlclose mid-run. the default lane's handles close at ok_free, after every
++// on_unload has fired.
++
++#define _XOPEN_SOURCE 700 // dlopen (XSI) + dlerror
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#include "ok/ok.h"
++#include "ok/ok_module.h"
++
++#include "okstate.h"
++
++// one formatted error into the caller's lane, NULL-safe (a NULL p_err just
++// formats nowhere, the caller only wanted the boolean)
++static void err_set(char* p_err, size_t p_capacity, const char* p_format, ...) {
++  if (p_err == NULL || p_capacity == 0) {
++    return;
++  }
++  va_list args;
++  va_start(args, p_format);
++  vsnprintf(p_err, p_capacity, p_format, args);
++  va_end(args);
++}
++
++// ---------------------------------------------------------------- the wrapper
++
++#if defined(_WIN32)
++
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++
++static void* dylib_open_windows(void* p_ctx, const char* p_path, char* p_err, size_t p_err_capacity) {
++  (void)p_ctx;
++  HMODULE handle = LoadLibraryA(p_path);
++  if (handle == NULL) {
++    err_set(p_err, p_err_capacity, "LoadLibrary failed with GetLastError %lu.", (unsigned long)GetLastError());
++    return NULL;
++  }
++  return (void*)handle;
++}
++
++static void* dylib_sym_windows(void* p_ctx, void* p_handle, const char* p_name, char* p_err, size_t p_err_capacity) {
++  (void)p_ctx;
++  FARPROC sym = GetProcAddress((HMODULE)p_handle, p_name);
++  if (sym == NULL) {
++    err_set(p_err, p_err_capacity, "GetProcAddress('%s') failed with GetLastError %lu.", p_name,
++            (unsigned long)GetLastError());
++    return NULL;
++  }
++  return (void*)sym;
++}
++
++static void dylib_close_windows(void* p_ctx, void* p_handle) {
++  (void)p_ctx;
++  FreeLibrary((HMODULE)p_handle);
++}
++
++static const ok_dylib g_dylib_windows = {
++    dylib_open_windows,
++    dylib_sym_windows,
++    dylib_close_windows,
++    NULL,
++};
++
++const ok_dylib* ok_dylib_platform(void) {
++  return &g_dylib_windows;
++}
++
++const char* ok_dylib_extension(void) {
++  return ".dll";
++}
++
++#elif defined(__unix__) || defined(__APPLE__) || defined(__HAIKU__)
++
++#include <dlfcn.h>
++
++static void* dylib_open_posix(void* p_ctx, const char* p_path, char* p_err, size_t p_err_capacity) {
++  (void)p_ctx;
++  // RTLD_LOCAL (default on most, explicit everywhere): a module's symbols
++  // never enter another's namespace. RTLD_NOW: resolve at open, missing
++  // symbols refuse the load instead of firing mid-run.
++  void* handle = dlopen(p_path, RTLD_NOW | RTLD_LOCAL);
++  if (handle == NULL) {
++    const char* reason = dlerror();
++    err_set(p_err, p_err_capacity, "%s", reason != NULL ? reason : "dlopen failed.");
++    return NULL;
++  }
++  return handle;
++}
++
++static void* dylib_sym_posix(void* p_ctx, void* p_handle, const char* p_name, char* p_err, size_t p_err_capacity) {
++  (void)p_ctx;
++  (void)dlerror(); // clear any stale error before the probe
++  void* sym = dlsym(p_handle, p_name);
++  if (sym == NULL) {
++    const char* reason = dlerror();
++    err_set(p_err, p_err_capacity, "%s", reason != NULL ? reason : "dlsym failed.");
++    return NULL;
++  }
++  return sym;
++}
++
++static void dylib_close_posix(void* p_ctx, void* p_handle) {
++  (void)p_ctx;
++  dlclose(p_handle);
++}
++
++static const ok_dylib g_dylib_posix = {
++    dylib_open_posix,
++    dylib_sym_posix,
++    dylib_close_posix,
++    NULL,
++};
++
++const ok_dylib* ok_dylib_platform(void) {
++  return &g_dylib_posix;
++}
++
++const char* ok_dylib_extension(void) {
++  return ".so";
++}
++
++#else
++
++// nothing: this platform has no dynamic loader. the host-provided ok_dylib
++// hooks (ok_specs) are the lane here, or natives stay off entirely.
++const ok_dylib* ok_dylib_platform(void) {
++  return NULL;
++}
++
++const char* ok_dylib_extension(void) {
++  return ".so"; // inert: no probe ever runs without a dylib table
++}
++
++#endif
++
++// ---------------------------------------------------------------- the default loader lane
++
++// the api table lives in okapi.c; the loader hands it to ok_native_export.
++const ok_api* ok_api_table(void);
++
++// the default lane's handle bookkeeping: every handle this loader opens is
++// appended to the instance's list and closed at ok_free (after the
++// on_unload sweep). host-installed load_native implementations manage their
++// own handles, we never see theirs.
++static bool track_handle(module_system* p_modules, void* p_handle) {
++  if (p_handle == NULL) {
++    return true;
++  }
++  if (p_modules->native_handles_count == p_modules->native_handles_capacity) {
++    const uint32_t grown = p_modules->native_handles_capacity == 0 ? 4 : p_modules->native_handles_capacity * 2;
++    void** handles = p_modules->ok->raw_alloc.reallocate(p_modules->native_handles, sizeof(void*) * grown);
++    if (handles == NULL) {
++      return false;
++    }
++    p_modules->native_handles = handles;
++    p_modules->native_handles_capacity = grown;
++  }
++  p_modules->native_handles[p_modules->native_handles_count++] = p_handle;
++  return true;
++}
++
++bool ok_load_native_default(ok* p_ok,
++                            const char* p_path,
++                            const ok_native_module** p_out,
++                            void** p_handle,
++                            char* p_err,
++                            size_t p_err_capacity) {
++  err_set(p_err, p_err_capacity, "%s", "");
++  const ok_dylib* dylib = p_ok->dylib;
++  if (dylib == NULL) {
++    err_set(p_err, p_err_capacity,
++            "this ok instance has no dynamic loading: the platform provides none and ok_specs.dylib is NULL.");
++    return false;
++  }
++  // the existence probe FIRST, so an ordinary miss stays clean: the loader's
++  // contract distinguishes "nothing native here" (empty message, the search
++  // continues) from "a native candidate exists but is broken" (a message,
++  // the hard error). a file that is not a regular file is a miss, not a
++  // broken native (the ladder's directory candidates die here).
++  struct stat info;
++  if (stat(p_path, &info) != 0 || !S_ISREG(info.st_mode)) {
++    return false; // clean miss: no message
++  }
++  char err[256];
++  void* handle = dylib->open(dylib->p_ctx, p_path, err, sizeof(err));
++  if (handle == NULL) {
++    err_set(p_err, p_err_capacity, "%s", err);
++    return false;
++  }
++  ok_native_export_fn export_fn =
++      (ok_native_export_fn)(uintptr_t)dylib->sym(dylib->p_ctx, handle, "ok_native_export", err, sizeof(err));
++  if (export_fn == NULL) {
++    dylib->close(dylib->p_ctx, handle);
++    err_set(p_err, p_err_capacity, "%s", err);
++    return false;
++  }
++  const ok_native_module* descriptor = export_fn(ok_api_table());
++  if (descriptor == NULL) {
++    dylib->close(dylib->p_ctx, handle);
++    err_set(p_err, p_err_capacity, "ok_native_export returned NULL.");
++    return false;
++  }
++  if (!track_handle(&p_ok->modules, handle)) {
++    dylib->close(dylib->p_ctx, handle);
++    err_set(p_err, p_err_capacity, "out of memory while tracking the module handle.");
++    return false;
++  }
++  *p_out = descriptor;
++  *p_handle = handle;
++  return true;
++}
++
++// the loader-vtable shape of the default lane, installed by ok_modules_init
++// next to the fs read (okmodules.c): p_ctx is the module system (both
++// halves reach what they need through it).
++bool ok_load_native_thunk(void* p_ctx,
++                          const char* p_path,
++                          const ok_api* p_api,
++                          const ok_native_module** p_out,
++                          void** p_handle,
++                          char* p_err,
++                          size_t p_err_capacity) {
++  (void)p_api; // the default lane always hands out the shared static table
++  return ok_load_native_default(((module_system*)p_ctx)->ok, p_path, p_out, p_handle, p_err, p_err_capacity);
++}
+diff --git a/src/okgc.c b/src/okgc.c
+index d552bc0..d90cc41 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -294,6 +294,8 @@ static bool mark_value_array(gc* p_gc, value_array* p_array) {
+ // OR-1: the module registry's namespaces and the pending-roots window (the
+ // roots a TU built but its constants have not adopted yet). the canonical
+ // path strings and the namespace classes ride through the instances.
++// OR-3: the native mount window's staged values ride here too (between
++// api->module_export and the namespace freeze).
+ static bool mark_modules(gc* p_gc) {
+   module_system* modules = p_gc->modules;
+   for (uint32_t i = 0; i < modules->loaded.count; ++i) {
+@@ -301,7 +303,13 @@ static bool mark_modules(gc* p_gc) {
+       return false;
+     }
+   }
+-  return mark_value_array(p_gc, &modules->pending_roots);
++  if (!mark_value_array(p_gc, &modules->pending_roots)) {
++    return false;
++  }
++  if (modules->mounting != NULL && !mark_value_array(p_gc, &modules->mounting->values)) {
++    return false;
++  }
++  return true;
+ }
+ 
+ static bool mark(gc* p_gc) {
+diff --git a/src/okmodules.c b/src/okmodules.c
+index d1f4d44..dd1532c 100644
+--- a/src/okmodules.c
++++ b/src/okmodules.c
+@@ -88,6 +88,14 @@ static char* mod_strdup(const ok_allocators* p_a, const char* p_text) {
+ static bool fs_read_source(void* p_ctx, const char* p_path, ok_source* p_out) {
+   module_system* modules = (module_system*)p_ctx;
+   const ok_allocators* a = &modules->ok->raw_alloc;
++  // a regular file only: fopen alone happily "opens" a directory on linux,
++  // and ftell then answers a garbage-huge size (the allocation blast asan
++  // caught). the probe contract needs the read to fail for anything that is
++  // not a file.
++  struct stat info;
++  if (stat(p_path, &info) != 0 || !S_ISREG(info.st_mode)) {
++    return false;
++  }
+   FILE* file = fopen(p_path, "rb");
+   if (file == NULL) {
+     return false;
+@@ -98,7 +106,8 @@ static bool fs_read_source(void* p_ctx, const char* p_path, ok_source* p_out) {
+   }
+   const long size = ftell(file);
+   rewind(file);
+-  if (size < 0) {
++  if (size < 0 || (unsigned long)size > (1u << 30)) {
++    // unreadable or absurd: refuse rather than trust ftell on exotic nodes
+     fclose(file);
+     return false;
+   }
+@@ -192,24 +201,78 @@ static bool str_list_append(str_list* p_list, const ok_allocators* p_a, const ch
+   return true;
+ }
+ 
+-// a module source is a regular file: fopen alone happily "opens" a directory,
+-// which would let the ladder bind a directory as a module and die at the read.
+-static bool file_readable(const char* p_path) {
+-  struct stat info;
+-  if (stat(p_path, &info) != 0) {
+-    return false;
++// does the text end with the given suffix?
++static bool ends_with(const char* p_text, const char* p_suffix) {
++  const size_t length = strlen(p_text);
++  const size_t suffix = strlen(p_suffix);
++  return length >= suffix && memcmp(p_text + length - suffix, p_suffix, suffix) == 0;
++}
++
++// one resolved import: everything load_module needs, nothing more. the
++// canonical is owned; the source's code is the loader's read (the driver
++// frees it with the user's release); natives carry no source, only the
++// loader's descriptor and handle.
++typedef struct {
++  char* canonical;
++  ok_source source;
++  bool is_native;
++  const ok_native_module* descriptor;
++  void* handle;
++} resolved_module;
++
++static void resolved_init(resolved_module* p_resolved) {
++  p_resolved->canonical = NULL;
++  p_resolved->source.code = NULL;
++  p_resolved->source.path = NULL;
++  p_resolved->is_native = false;
++  p_resolved->descriptor = NULL;
++  p_resolved->handle = NULL;
++}
++
++static void resolved_deinit(const ok_allocators* p_a, resolved_module* p_resolved) {
++  if (p_resolved->source.code != NULL) {
++    mod_free(p_a, (void*)p_resolved->source.code);
+   }
+-  if (!S_ISREG(info.st_mode)) {
+-    return false;
++  if (p_resolved->canonical != NULL) {
++    mod_free(p_a, p_resolved->canonical);
+   }
+-  FILE* file = fopen(p_path, "rb");
+-  if (file == NULL) {
+-    return false;
++  resolved_init(p_resolved);
++}
++
++// consume the resolved's read buffer (the loader's allocation): the one
++// free per exit, idempotent so the caller's resolved_deinit never doubles.
++static void resolved_consume_code(const ok_allocators* p_a, resolved_module* p_resolved) {
++  if (p_resolved->source.code != NULL) {
++    mod_free(p_a, (void*)p_resolved->source.code);
++    p_resolved->source.code = NULL;
+   }
+-  fclose(file);
+-  return true;
+ }
+ 
++// the registry's probe, needed by the ladder (defined in the registry
++// section below)
++static ok_module_record* registry_find(module_system* p_modules, const char* p_canonical);
++
++// canonicalize (symlinks resolved): the registry key, the class name, and
++// the stack-trace path all use this one spelling. realpath's own buffer is
++// libc's, so a hit is copied onto the user's allocators and the original
++// released: the registry only ever frees what it allocated. a realpath
++// refusal (exotic fs, or a memory-backed loader's virtual path) keeps the
++// found path itself as the key.
++static char* canonicalize_path(const ok_allocators* p_a, char* p_found) {
++  char* real = realpath(p_found, NULL);
++  if (real == NULL) {
++    return p_found;
++  }
++  char* owned = mod_strdup(p_a, real);
++  free(real);
++  mod_free(p_a, p_found);
++  return owned; // NULL only on OOM
++}
++
++// the module source probe is the loader's read: the library never stats
++// or opens files itself (M14), and a memory-backed loader serves virtual
++// paths through the same door. a failed read is a plain miss.
++
+ // lexical join + normalize: dir's segments, then rel's, with '.' skipped and
+ // '..' popping. rel never starts with '/' (the parser rejects absolute
+ // paths). the result rides the user's allocators; NULL = OOM.
+@@ -261,36 +324,101 @@ static char* join_normalize(const ok_allocators* p_a, const char* p_dir, const o
+ }
+ 
+ // the resolution ladder at one candidate location (M3/M6): the exact file,
+-// then + ".ok", then + "/index.ok". a native candidate (.so today - the
+-// platform table widens with OR-3) is detected but not loaded: natives land
+-// with OR-3's sandboxed loader, and the error says so.
+-static char* ladder_at(const ok_allocators* p_a, const char* p_base, str_list* p_tried, bool* p_native_found) {
++// then + ".ok", then + "/index.ok", each probed through the loader's read,
++// then the native candidate, probed through load_native. the
++// OK_CAP_NATIVE_LOAD gate applies: a refused capability skips the native
++// probe entirely. p_native_error carries the loader's message when a
++// native candidate EXISTS but is broken: that is a hard error, not a miss.
++static bool probe_ladder(module_system* p_modules,
++                         const char* p_base,
++                         str_list* p_tried,
++                         char* p_native_error,
++                         size_t p_native_error_capacity,
++                         resolved_module* p_out) {
++  const ok_allocators* a = &p_modules->ok->raw_alloc;
+   static const char* const forms[] = {"", ".ok", "/index.ok"};
++  const char* ext = ok_dylib_extension();
++
+   for (uint32_t f = 0; f < 3; ++f) {
+     const size_t base_length = strlen(p_base);
+-    char* candidate = (char*)mod_alloc(p_a, base_length + strlen(forms[f]) + 1);
++    char* candidate = (char*)mod_alloc(a, base_length + strlen(forms[f]) + 1);
+     if (candidate == NULL) {
+-      return NULL;
++      return false;
+     }
+     memcpy(candidate, p_base, base_length);
+     strcpy(candidate + base_length, forms[f]);
+-    if (file_readable(candidate)) {
+-      return candidate;
++    // a candidate named like a native is a native candidate, never an ok
++    // source: reading a shared object as code would parse garbage
++    if (ends_with(candidate, ext)) {
++      str_list_append(p_tried, a, candidate); // best effort: the trace wants it
++      mod_free(a, candidate);
++      continue;
++    }
++    if (p_modules->loader.read_source != NULL &&
++        p_modules->loader.read_source(p_modules->loader.p_ctx, candidate, &p_out->source)) {
++      p_out->canonical = canonicalize_path(a, candidate);
++      if (p_out->canonical == NULL) {
++        mod_free(a, (void*)p_out->source.code);
++        p_out->source.code = NULL;
++        return false;
++      }
++      p_out->source.path = p_out->canonical;
++      return true;
+     }
+-    str_list_append(p_tried, p_a, candidate); // best effort: the trace wants it
+-    mod_free(p_a, candidate);
++    str_list_append(p_tried, a, candidate); // best effort: the trace wants it
++    mod_free(a, candidate);
++  }
++
++  // the native lane (M6: natives are first-class at every step)
++  if ((p_modules->ok->caps_dropped & OK_CAP_NATIVE_LOAD) != 0 || p_modules->loader.load_native == NULL) {
++    return false;
+   }
+-  const size_t base_length = strlen(p_base);
+-  char* native_candidate = (char*)mod_alloc(p_a, base_length + 4);
+-  if (native_candidate != NULL) {
+-    memcpy(native_candidate, p_base, base_length);
+-    strcpy(native_candidate + base_length, ".so");
+-    if (file_readable(native_candidate)) {
+-      *p_native_found = true;
++  char* candidate = NULL;
++  if (ends_with(p_base, ext)) {
++    candidate = mod_strdup(a, p_base); // the explicit spelling: import "./x.so"
++  } else {
++    const size_t base_length = strlen(p_base);
++    candidate = (char*)mod_alloc(a, base_length + strlen(ext) + 1);
++    if (candidate != NULL) {
++      memcpy(candidate, p_base, base_length);
++      strcpy(candidate + base_length, ext);
+     }
+-    mod_free(p_a, native_candidate);
+   }
+-  return NULL;
++  if (candidate == NULL) {
++    return false;
++  }
++  char* canonical = canonicalize_path(a, candidate);
++  if (canonical == NULL) {
++    return false;
++  }
++  // an already-registered native answers from the registry (a module loads
++  // once per ok instance, ever)
++  if (registry_find(p_modules, canonical) != NULL) {
++    p_out->canonical = canonical;
++    p_out->is_native = true;
++    return true;
++  }
++  const ok_native_module* descriptor = NULL;
++  void* handle = NULL;
++  char err[256];
++  err[0] = '\0';
++  const bool loaded = p_modules->loader.load_native(p_modules->loader.p_ctx, canonical, ok_api_table(), &descriptor,
++                                                   &handle, err, sizeof(err));
++  if (!loaded) {
++    if (err[0] != '\0') {
++      // the loader's contract: a message means a native EXISTS here but is
++      // broken. that is a hard error, the caller reports it.
++      snprintf(p_native_error, p_native_error_capacity, "%s", err);
++    }
++    str_list_append(p_tried, a, canonical); // best effort: the trace wants it
++    mod_free(a, canonical);
++    return false;
++  }
++  p_out->canonical = canonical;
++  p_out->is_native = true;
++  p_out->descriptor = descriptor;
++  p_out->handle = handle;
++  return true;
+ }
+ 
+ // the importing file's directory ("" -> "."). a copy on the user's allocators.
+@@ -356,6 +484,22 @@ static ok_module_record* registry_find(module_system* p_modules, const char* p_c
+   return NULL;
+ }
+ 
++// the bare-name probe for force-loaded natives: only they register under a
++// bare name (file keys are absolute, std keys carry the "std/" prefix). the
++// import literal is a LEXER SLICE, not a NUL-terminated string: the compare
++// is length-bounded, never a strcmp over the view.
++static ok_module_record* registry_find_native(module_system* p_modules, const ok_string_view p_name) {
++  const uint64_t length = ok_string_view_get_length(&p_name);
++  for (uint32_t i = 0; i < p_modules->loaded.count; ++i) {
++    const ok_module_record* record = &p_modules->loaded.data[i];
++    if (record->is_native && strlen(record->canonical) == length &&
++        memcmp(record->canonical, p_name.chars, length) == 0) {
++      return &p_modules->loaded.data[i];
++    }
++  }
++  return NULL;
++}
++
+ // ---------------------------------------------------------------- namespaces
+ 
+ // build one module namespace: a fresh class (module_namespace = true, so
+@@ -567,18 +711,333 @@ static bool materialize_ns(module_system* p_modules, pending_ns* p_node, value*
+ 
+ // ---------------------------------------------------------------- module loading
+ 
+-// load (or find) one module by canonical path, depth-first. the site + the
+-// importing source position every diagnostic this can raise.
++// build one namespace from live (name, value) pairs: the native lane's
++// builder (the fn table + the mount window's exports). same shape as
++// build_namespace: fresh module-namespace class, one immutable field per
++// export in order, frozen, instantiated, filled. the values are either
++// guarded by the caller or already rooted (the mount window is marked).
++static bool build_namespace_members(module_system* p_modules,
++                                    const char* p_canonical,
++                                    const char* const* p_names,
++                                    const value* p_values,
++                                    uint32_t p_count,
++                                    value* p_out) {
++  ok* okay = p_modules->ok;
++  object_specs specs = {&okay->alloc, &okay->objects_store};
++  gc* collector = okay->alloc.gc;
++
++  object_string* name = string_interner_intern(
++      &okay->interner, ok_create_string_view(p_canonical, (uint32_t)strlen(p_canonical), true), &specs);
++  if (name == NULL) {
++    return false;
++  }
++  if (!gc_guard_up(collector, OBJECT_AS_VALUE(name))) {
++    return false;
++  }
++  object_class* klass = create_object_class(name, okay->vm.object_singleton, &specs);
++  gc_guard_down(collector); // the class roots its name from here
++  if (klass == NULL) {
++    return false;
++  }
++  klass->module_namespace = true;
++  if (!gc_guard_up(collector, OBJECT_AS_VALUE(klass))) {
++    return false;
++  }
++  for (uint32_t i = 0; i < p_count; ++i) {
++    object_string* field_name = string_interner_intern(
++        &okay->interner, ok_create_string_view(p_names[i], (uint32_t)strlen(p_names[i]), true), &specs);
++    if (field_name == NULL) {
++      gc_guard_down(collector);
++      return false;
++    }
++    if (!gc_guard_up(collector, OBJECT_AS_VALUE(field_name))) {
++      gc_guard_down(collector);
++      return false;
++    }
++    const object_string* previous_owner = NULL;
++    const bool added =
++        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */, &previous_owner);
++    gc_guard_down(collector); // the class owns the name now
++    if (!added) {
++      gc_guard_down(collector);
++      return false;
++    }
++  }
++  if (!object_class_freeze(klass)) {
++    gc_guard_down(collector);
++    return false;
++  }
++  object_instance* inst = create_object_instance(klass, &specs);
++  gc_guard_down(collector); // the instance roots the class
++  if (inst == NULL) {
++    return false;
++  }
++  if (!gc_guard_up(collector, OBJECT_AS_VALUE(inst))) {
++    return false;
++  }
++  for (uint32_t i = 0; i < p_count; ++i) {
++    inst->fields[i] = p_values[i]; // the store roots each value
++  }
++  *p_out = OBJECT_AS_VALUE(inst);
++  gc_guard_down(collector);
++  return true;
++}
++
++// one diagnostic without an import site: the force-load lane (the CLI's
++// --native). bare `error: message` + a note, same renderer as the rest.
++static void plain_report(const char* p_path, const char* p_message) {
++  bool panic = false;
++  bool had_error = false;
++  okdiag_report(&panic,
++                &had_error,
++                p_path,
++                NULL,
++                NULL,
++                false,
++                REPORT_SEVERITY_ERROR,
++                ok_create_string_view(p_message, OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                NULL);
++}
++
++// the register lane's one report: at the import site when there is one,
++// bare with the module's own path when there is not (force-load).
++static void module_report_or_plain(const ok_source* p_from_source,
++                                   const token* p_site,
++                                   const char* p_display,
++                                   const char* p_message) {
++  if (p_from_source != NULL) {
++    module_report(p_from_source, p_site, p_message);
++  } else {
++    plain_report(p_display, p_message);
++  }
++}
++
++// a formatted report for the same two lanes (the messages that name the
++// module). NULL p_message.chars degrades to p_fallback.
++static void module_report_or_plain_fmt(const ok_source* p_from_source,
++                                       const token* p_site,
++                                       const char* p_display,
++                                       const string* p_message,
++                                       const char* p_fallback) {
++  module_report_or_plain(p_from_source, p_site, p_display,
++                         p_message->chars != NULL ? p_message->chars : p_fallback);
++}
++
++// the last path segment of a canonical, extension stripped: the import
++// stem the native name check compares against ("/a/b/hello.so" -> "hello").
++static bool import_stem_of(const char* p_canonical, char* p_buffer, size_t p_capacity) {
++  const char* last = strrchr(p_canonical, '/');
++  const char* stem = last != NULL ? last + 1 : p_canonical;
++  size_t length = strlen(stem);
++  const char* ext = ok_dylib_extension();
++  const size_t ext_length = strlen(ext);
++  if (length > ext_length && memcmp(stem + length - ext_length, ext, ext_length) == 0) {
++    length -= ext_length;
++  }
++  if (length == 0 || length + 1 > p_capacity) {
++    return false;
++  }
++  memcpy(p_buffer, stem, length);
++  p_buffer[length] = '\0';
++  return true;
++}
++
++// the native registration: everything after load_native said yes. checks
++// abi + name, runs the lifecycle, stages the members, freezes, registers.
++// p_key overrides the registry key (the force-load lane registers under
++// the declared name); p_display names the shared object in diagnostics.
++// p_from_source/p_site locate the import site (both NULL = force-load).
++static ok_result register_native(module_system* p_modules,
++                                  const ok_native_module* p_descriptor,
++                                  void* p_handle,
++                                  const char* p_key,
++                                  const char* p_display,
++                                  const ok_source* p_from_source,
++                                  const token* p_site,
++                                  const char* p_import_stem) {
++  ok* okay = p_modules->ok;
++  const ok_allocators* a = &okay->raw_alloc;
++
++  // the abi check (both directions is the module's own job at export time,
++  // comparing against the api table it was handed)
++  if (p_descriptor->abi != OK_NATIVE_ABI) {
++    string message = asprint(&okay->alloc,
++                             "module '%s': abi %u, expected %u, rebuild it against include/ok/ok_module.h.",
++                             p_display,
++                             (unsigned)p_descriptor->abi,
++                             (unsigned)OK_NATIVE_ABI);
++    module_report_or_plain_fmt(p_from_source, p_site, p_display, &message, "native module abi mismatch.");
++    string_deinit(&message, &okay->alloc);
++    return OK_COMPILE_ERROR;
++  }
++  // the name check (graph loads): the descriptor's declared name and the
++  // import's stem must agree, so a moved or renamed .so cannot lie about
++  // what it is. force-loads skip it (the name IS the registration).
++  if (p_import_stem != NULL && strcmp(p_descriptor->name, p_import_stem) != 0) {
++    string message =
++        asprint(&okay->alloc, "the shared object declares the name '%s', the import stem is '%s'.", p_descriptor->name,
++                p_import_stem);
++    module_report_or_plain_fmt(p_from_source, p_site, p_display, &message, "native module name mismatch.");
++    string_deinit(&message, &okay->alloc);
++    return OK_COMPILE_ERROR;
++  }
++
++  // on_load: the module's C init, before anything else touches it. a failed
++  // on_load fires on_unload (its cleanup chance) and refuses the load.
++  if (p_descriptor->on_load != NULL && !p_descriptor->on_load(okay)) {
++    if (p_descriptor->on_unload != NULL) {
++      p_descriptor->on_unload(okay);
++    }
++    string message = asprint(&okay->alloc, "module '%s': the on_load callback failed.", p_display);
++    module_report_or_plain_fmt(p_from_source, p_site, p_display, &message, "native on_load failed.");
++    string_deinit(&message, &okay->alloc);
++    return OK_COMPILE_ERROR;
++  }
++
++  // stage the fn members (guarded one at a time into the marked mount
++  // window, then the values list carries them). the window is marked for
++  // the WHOLE staging+mount+build stretch: aggressive gc collects on every
++  // allocation, and the staged values ride the window until the namespace
++  // instance's fields root them (the matrix caught exactly this window).
++  native_mount mount;
++  mount.names = NULL;
++  value_array_init(&mount.values, &okay->alloc);
++  mount.count = 0;
++  mount.capacity = 0;
++  mount.failure = NULL;
++  p_modules->mounting = &mount;
++
++  for (uint32_t i = 0; i < p_descriptor->fn_count; ++i) {
++    const ok_native_fn_def* fn = &p_descriptor->fns[i];
++    if (fn->name == NULL || fn->call == NULL) {
++      continue;
++    }
++    if (fn->arity != OK_NATIVE_ARITY_ANY && fn->arity > UINT8_MAX) {
++      mount.failure = "a native function arity above 255 is not representable.";
++      break;
++    }
++    // duplicate fn names refuse the load (M13's collision rule)
++    bool duplicate = false;
++    for (uint32_t j = 0; j < mount.count; ++j) {
++      if (strcmp(mount.names[j], fn->name) == 0) {
++        duplicate = true;
++        break;
++      }
++    }
++    if (duplicate) {
++      mount.failure = "duplicate export name in the fn table.";
++      break;
++    }
++    if (mount.count == mount.capacity) {
++      const uint32_t grown = mount.capacity == 0 ? 8 : mount.capacity * 2;
++      char** names = mod_realloc(a, mount.names, sizeof(char*) * grown);
++      if (names == NULL) {
++        mount.failure = "out of memory while staging the module's functions.";
++        break;
++      }
++      mount.names = names;
++      mount.capacity = grown;
++    }
++    object_specs obj_specs = {&okay->alloc, &okay->objects_store};
++    object_native_function* native = create_object_native_function(
++        ok_create_string_view(fn->name, (uint32_t)strlen(fn->name), true), fn->arity, fn->call, &obj_specs);
++    if (native == NULL) {
++      mount.failure = "out of memory while staging the module's functions.";
++      break;
++    }
++    if (!gc_guard_up(&okay->gc, OBJECT_AS_VALUE(native))) {
++      mount.failure = "out of memory while staging the module's functions.";
++      break;
++    }
++    if (!value_array_append(&mount.values, OBJECT_AS_VALUE(native))) {
++      gc_guard_down(&okay->gc);
++      mount.failure = "out of memory while staging the module's functions.";
++      break;
++    }
++    gc_guard_down(&okay->gc); // the marked window roots it now
++    mount.names[mount.count++] = mod_strdup(a, fn->name);
++    if (mount.names[mount.count - 1] == NULL) {
++      mount.count--; // the value stays staged, the name slot is retried never: OOM refuses below
++      mount.failure = "out of memory while staging the module's functions.";
++      break;
++    }
++  }
++
++  // the mount window: the class surface (and any constants) joins the same
++  // list, api->module_export appends through the same marked window
++  if (mount.failure == NULL && p_descriptor->mount_classes != NULL) {
++    const bool mounted = p_descriptor->mount_classes(okay);
++    if (!mounted) {
++      mount.failure = mount.failure != NULL ? mount.failure : "the mount callback failed.";
++    }
++  }
++
++  ok_result result = OK;
++  value namespace = NULL_AS_VALUE();
++  if (mount.failure != NULL) {
++    string message = asprint(&okay->alloc, "module '%s': %s", p_display, mount.failure);
++    module_report_or_plain_fmt(p_from_source, p_site, p_display, &message, "native module mount failed.");
++    string_deinit(&message, &okay->alloc);
++    result = OK_COMPILE_ERROR;
++  } else if (!build_namespace_members(p_modules, p_key, (const char* const*)mount.names, mount.values.data,
++                                      mount.count, &namespace)) {
++    module_report_or_plain(p_from_source, p_site, p_display, "out of memory while building the module's namespace.");
++    result = OK_INIT_ERROR;
++  } else {
++    ok_module_record record;
++    record.canonical = mod_strdup(a, p_key);
++    record.name = VALUE_AS_INSTANCE(namespace)->klass->name;
++    record.namespace_class = VALUE_AS_INSTANCE(namespace)->klass;
++    record.namespace = namespace;
++    record.imports = NULL;
++    record.imports_count = 0;
++    record.is_native = true;
++    record.descriptor = p_descriptor;
++    if (!gc_guard_up(&okay->gc, namespace)) {
++      ok_module_record_deinit(&record, &okay->alloc);
++      module_report_or_plain(p_from_source, p_site, p_display, "out of memory while registering the module.");
++      result = OK_INIT_ERROR;
++    } else {
++      const bool registered = record.canonical != NULL && ok_module_records_append(&p_modules->loaded, record);
++      gc_guard_down(&okay->gc);
++      if (!registered) {
++        ok_module_record_deinit(&record, &okay->alloc);
++        module_report_or_plain(p_from_source, p_site, p_display, "out of memory while registering the module.");
++        result = OK_INIT_ERROR;
++      }
++    }
++  }
++
++  p_modules->mounting = NULL; // the namespace (or the failure) owns everything now
++
++  for (uint32_t i = 0; i < mount.count; ++i) {
++    mod_free(a, mount.names[i]);
++  }
++  if (mount.names != NULL) {
++    mod_free(a, mount.names);
++  }
++  value_array_deinit(&mount.values, &okay->alloc);
++  (void)p_handle; // closed by the default lane at ok_free, never mid-run
++  return result;
++}
++
++// load (or find) one module, depth-first. the site + the importing source
++// position every diagnostic this can raise; a NULL site is the force-load
++// lane (bare reporting, the module's own path as the location).
+ static ok_result load_module(module_system* p_modules,
+-                            const char* p_canonical,
++                            resolved_module* p_resolved,
+                             const ok_source* p_from_source,
+                             const token* p_site) {
+   ok* okay = p_modules->ok;
+   const ok_allocators* a = &okay->raw_alloc;
++  const char* p_canonical = p_resolved->canonical;
+ 
+   // loaded already? one TU per module, ever (the registry is the cache).
++  // the probe's read (a cache hit re-read the source for nothing) dies
++  // here. the RESOLVED stays the caller's: prepare still views the canonical.
+   ok_module_record* found = registry_find(p_modules, p_canonical);
+   if (found != NULL) {
++    resolved_consume_code(a, p_resolved);
+     return OK;
+   }
+   // in the active chain? a cycle (M13): the design is in the importer's
+@@ -607,23 +1066,25 @@ static ok_result load_module(module_system* p_modules,
+     return OK_COMPILE_ERROR;
+   }
+ 
+-  // read + parse
+-  ok_source source;
+-  source.code = NULL;
+-  source.path = p_canonical;
+-  if (p_modules->loader.read_source == NULL || !p_modules->loader.read_source(p_modules->loader.p_ctx, p_canonical, &source)) {
+-    module_report(p_from_source, p_site, "module source is unreadable (the resolver found it, the read failed).");
+-    module_note(p_from_source, p_site, p_canonical);
+-    return OK_COMPILE_ERROR;
++  // the native lane: the loader already opened the shared object and handed
++  // back the descriptor. the import's stem rides the chain for the name
++  // check (binding_segments' spelling of the last segment).
++  if (p_resolved->is_native) {
++    char stem[256];
++    return register_native(p_modules, p_resolved->descriptor, p_resolved->handle, p_canonical, p_canonical,
++                           p_from_source, p_site, import_stem_of(p_canonical, stem, sizeof(stem)) ? stem : NULL);
+   }
++
++  // parse (the source is the probe's read, its path the canonical)
+   parser parser;
+-  parser_specs parser_specs = {.alloc = &okay->alloc, .source = &source};
++  parser_specs parser_specs = {.alloc = &okay->alloc, .source = &p_resolved->source};
+   parser_init(&parser, parser_specs);
+   parse_result parsed = parser_parse(&parser);
+   if (parsed.status != PARSE_OK) {
+     parser_deinit(&parser);
+     parse_result_deinit(&parsed);
+-    mod_free(a, (void*)source.code);
++    resolved_consume_code(a, p_resolved);
++    p_resolved->source.code = NULL;
+     return OK_PARSE_ERROR;
+   }
+ 
+@@ -634,20 +1095,20 @@ static ok_result load_module(module_system* p_modules,
+   char** imports_owned = NULL; // ownership moves to the record below
+   uint32_t imports_owned_count = 0;
+   const ok_result prepared = ok_modules_prepare(
+-      p_modules, parsed.root, &source, &bindings, &imports_owned, &imports_owned_count);
++      p_modules, parsed.root, &p_resolved->source, &bindings, &imports_owned, &imports_owned_count);
+   p_modules->chain_depth--;
+   if (prepared != OK) {
+     parser_deinit(&parser);
+     parse_result_deinit(&parsed);
+     ok_import_binding_array_deinit(&bindings, &okay->alloc);
+-    mod_free(a, (void*)source.code);
++    resolved_consume_code(a, p_resolved);
+     return prepared;
+   }
+ 
+   // compile in module mode: pub top-levels recorded, the export epilogue
+   // emitted, an early top-level return refused.
+   compile_specs compile_specs;
+-  compile_specs.source = &source;
++  compile_specs.source = &p_resolved->source;
+   compile_specs.root = parsed.root;
+   bool err = false;
+   compile_specs.top_level_declarations = ok_get_top_level_declarations(okay, &err);
+@@ -655,7 +1116,7 @@ static ok_result load_module(module_system* p_modules,
+     parser_deinit(&parser);
+     parse_result_deinit(&parsed);
+     ok_import_binding_array_deinit(&bindings, &okay->alloc);
+-    mod_free(a, (void*)source.code);
++    resolved_consume_code(a, p_resolved);
+     return OK_INIT_ERROR;
+   }
+   compile_specs.imports = (ok_import_bindings){bindings.data, bindings.count};
+@@ -668,7 +1129,7 @@ static ok_result load_module(module_system* p_modules,
+   if (compiled.status != COMPILE_OK) {
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    mod_free(a, (void*)source.code);
++    resolved_consume_code(a, p_resolved);
+     return OK_COMPILE_ERROR;
+   }
+ 
+@@ -678,18 +1139,18 @@ static ok_result load_module(module_system* p_modules,
+   if (!gc_guard_up(&okay->gc, OBJECT_AS_VALUE(compiled.function))) {
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    mod_free(a, (void*)source.code);
++    resolved_consume_code(a, p_resolved);
+     module_report(p_from_source, p_site, "out of memory while running the module's top level.");
+     return OK_INIT_ERROR;
+   }
+   // run: one source registration per module (stack traces stay honest in
+   // multi-file runs), seeds staged like any <main>.
+-  const uint32_t source_id = vm_begin_source(&okay->vm, source.code, source.path);
++  const uint32_t source_id = vm_begin_source(&okay->vm, p_resolved->source.code, p_resolved->source.path);
+   if (source_id == VM_SOURCE_UNSTAMPED) {
+     gc_guard_down(&okay->gc);
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    mod_free(a, (void*)source.code);
++    resolved_consume_code(a, p_resolved);
+     return OK_INIT_ERROR;
+   }
+   ok_stamp_source_ids(compiled.function, source_id);
+@@ -705,7 +1166,7 @@ static ok_result load_module(module_system* p_modules,
+   if (err || ran.status != RUNTIME_OK) {
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    mod_free(a, (void*)source.code);
++    resolved_consume_code(a, p_resolved);
+     // the runtime error already printed with the module's own path and
+     // trace; this note ties it to the import that pulled it in.
+     module_note(p_from_source, p_site, "while loading this module (its top level failed).");
+@@ -717,7 +1178,7 @@ static ok_result load_module(module_system* p_modules,
+   if (!build_namespace(p_modules, p_canonical, &compiled.exports, &namespace)) {
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    mod_free(a, (void*)source.code);
++    resolved_consume_code(a, p_resolved);
+     module_report(p_from_source, p_site, "out of memory while building the module's namespace.");
+     return OK_INIT_ERROR;
+   }
+@@ -728,11 +1189,13 @@ static ok_result load_module(module_system* p_modules,
+   record.namespace = namespace;
+   record.imports = imports_owned;
+   record.imports_count = imports_owned_count;
++  record.is_native = false;
++  record.descriptor = NULL;
+   if (!gc_guard_up(&okay->gc, namespace)) {
+     ok_module_record_deinit(&record, &okay->alloc);
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    mod_free(a, (void*)source.code);
++    resolved_consume_code(a, p_resolved);
+     module_report(p_from_source, p_site, "out of memory while registering the module.");
+     return OK_INIT_ERROR;
+   }
+@@ -740,7 +1203,7 @@ static ok_result load_module(module_system* p_modules,
+   gc_guard_down(&okay->gc);
+   parse_result_deinit(&parsed);
+   module_exports_deinit(&compiled.exports, &okay->alloc);
+-  mod_free(a, (void*)source.code);
++  resolved_consume_code(a, p_resolved);
+   if (!registered) {
+     ok_module_record_deinit(&record, &okay->alloc);
+     module_report(p_from_source, p_site, "out of memory while registering the module.");
+@@ -854,6 +1317,8 @@ static ok_result std_build_module(module_system* p_modules, const std_module_def
+       record.namespace = namespace;
+       record.imports = NULL;
+       record.imports_count = 0;
++      record.is_native = false;
++      record.descriptor = NULL;
+       if (!gc_guard_up(&okay->gc, namespace)) {
+         ok_module_record_deinit(&record, &okay->alloc);
+         result = OK_INIT_ERROR;
+@@ -873,26 +1338,29 @@ static ok_result std_build_module(module_system* p_modules, const std_module_def
+ 
+ // ---------------------------------------------------------------- resolution
+ 
+-// resolve one import path from one importing file. produces the canonical
+-// (realpath'd, malloc'd) path, or prints the teaching 404 with the full
+-// trace of locations and forms tried (and returns false).
++// resolve one import path from one importing file. produces the resolved
++// module (canonical + the loader's read, or the native lane's descriptor),
++// or prints the teaching 404 with the full trace of locations and forms
++// tried (and returns false).
+ static bool resolve_import(module_system* p_modules,
+                            const ok_string_view p_path,
+                            const char* p_from_dir,
+                            const ok_source* p_source,
+                            const token* p_site,
+-                           char** p_out_canonical) {
++                           resolved_module* p_out) {
+   const ok_allocators* a = &p_modules->ok->raw_alloc;
+   str_list tried;
+   str_list_init(&tried);
+-  char* found = NULL;
+-  bool native_found = false;
++  char native_error[256];
++  native_error[0] = '\0';
++  bool resolved = false;
+ 
+   if (view_starts_with(p_path, "./") || view_starts_with(p_path, "../")) {
+-    // the file-relative lane (M3): raw ok files, no project needed.
++    // the file-relative lane (M3): raw ok files and natives, no project
++    // needed.
+     char* joined = join_normalize(a, p_from_dir, p_path);
+     if (joined != NULL) {
+-      found = ladder_at(a, joined, &tried, &native_found);
++      resolved = probe_ladder(p_modules, joined, &tried, native_error, sizeof(native_error), p_out);
+       mod_free(a, joined);
+     }
+   } else if (view_equals(p_path, "std")) {
+@@ -930,22 +1398,36 @@ static bool resolve_import(module_system* p_modules,
+       str_list_deinit(&tried, a);
+       return false;
+     }
+-    char* owned = mod_strdup(a, canonical);
+-    if (owned == NULL) {
++    p_out->canonical = mod_strdup(a, canonical);
++    if (p_out->canonical == NULL) {
+       str_list_deinit(&tried, a);
+       return false;
+     }
+     str_list_deinit(&tried, a);
+-    *p_out_canonical = owned;
+     return true;
+   } else {
++    // a bare name: a force-loaded native answers first (its registry key is
++    // its declared name, ok_native_force_load's lane). the copy is
++    // length-bounded: the import literal is a lexer slice, not a C string.
++    if (registry_find_native(p_modules, p_path) != NULL) {
++      const uint64_t length = ok_string_view_get_length(&p_path);
++      char* owned = (char*)mod_alloc(a, length + 1);
++      if (owned != NULL) {
++        memcpy(owned, p_path.chars, length);
++        owned[length] = '\0';
++      }
++      p_out->canonical = owned;
++      p_out->is_native = true;
++      str_list_deinit(&tried, a);
++      return p_out->canonical != NULL;
++    }
+     // the OKPATH lane: colon-separated roots, the same ladder at each.
+     const char* okpath = getenv("OKPATH");
+     if (okpath != NULL && *okpath != '\0') {
+       char* roots = mod_strdup(a, okpath);
+       if (roots != NULL) {
+         char* cursor = roots;
+-        while (cursor != NULL && *cursor != '\0' && found == NULL) {
++        while (cursor != NULL && *cursor != '\0' && !resolved) {
+           char* colon = strchr(cursor, ':');
+           if (colon != NULL) {
+             *colon = '\0';
+@@ -953,7 +1435,7 @@ static bool resolve_import(module_system* p_modules,
+           if (*cursor != '\0') {
+             char* joined = join_normalize(a, cursor, p_path);
+             if (joined != NULL) {
+-              found = ladder_at(a, joined, &tried, &native_found);
++              resolved = probe_ladder(p_modules, joined, &tried, native_error, sizeof(native_error), p_out);
+               mod_free(a, joined);
+             }
+           }
+@@ -964,11 +1446,13 @@ static bool resolve_import(module_system* p_modules,
+     }
+   }
+ 
+-  if (found == NULL) {
+-    if (native_found) {
+-      module_report(p_source,
+-                    p_site,
+-                    "a native module was found, but native loading is not available yet.");
++  if (!resolved) {
++    // a native candidate existed but is broken: the hard error, its own
++    // message is the note (a text file named .so, a corrupt image, a
++    // missing ok_native_export)
++    if (native_error[0] != '\0') {
++      module_report(p_source, p_site, "the native module could not be loaded.");
++      module_note(p_source, p_site, native_error);
+       str_list_deinit(&tried, a);
+       return false;
+     }
+@@ -977,6 +1461,10 @@ static bool resolve_import(module_system* p_modules,
+     for (uint32_t i = 0; i < tried.count; ++i) {
+       module_note(p_source, p_site, tried.items[i]);
+     }
++    if ((p_modules->ok->caps_dropped & OK_CAP_NATIVE_LOAD) != 0) {
++      module_note(p_source, p_site,
++                  "native modules are not searched: OK_CAP_NATIVE_LOAD is dropped in this ok instance.");
++    }
+     if (tried.count == 0) {
+       module_note(p_source, p_site, "no locations were searched: file-relative paths need './' or '../', "
+                                     "bare names search OKPATH (unset).");
+@@ -986,38 +1474,22 @@ static bool resolve_import(module_system* p_modules,
+     str_list_deinit(&tried, a);
+     return false;
+   }
+-
+-  // canonicalize (symlinks resolved): the registry key, the class name, and
+-  // the stack-trace path all use this one spelling. realpath's own buffer is
+-  // libc's, so a hit is copied onto the user's allocators and the original
+-  // released: the registry only ever frees what it allocated.
+-  char* real = realpath(found, NULL);
+-  if (real == NULL) {
+-    *p_out_canonical = found; // realpath refused (exotic fs): the found path is the key
+-  } else {
+-    char* owned = mod_strdup(a, real);
+-    free(real);
+-    mod_free(a, found);
+-    if (owned == NULL) {
+-      str_list_deinit(&tried, a);
+-      module_report(p_source, p_site, "out of memory while resolving the module path.");
+-      return false;
+-    }
+-    *p_out_canonical = owned;
+-  }
+   str_list_deinit(&tried, a);
+   return true;
+ }
+ 
+ // the binding segments (M5): the import literal's own segments, '.' skipped,
+ // '..' popped where possible and dropped at the front (they climb toward the
+-// importer's directory - the NAME is the remainder), a trailing '.ok'
+-// stripped. "a/b" -> [a, b]; "./util.ok" -> [util]; "../lib/h" -> [lib, h].
++// importer's directory - the NAME is the remainder), a trailing '.ok' or the
++// native extension stripped. "a/b" -> [a, b]; "./util.ok" -> [util];
++// "../lib/h" -> [lib, h]; "./x.so" -> [x].
+ static bool binding_segments(const ok_allocators* p_a,
+                               const ok_string_view p_path,
+                               char*** p_out,
+                               uint32_t* p_out_count) {
+   const uint64_t length = ok_string_view_get_length(&p_path);
++  const char* ext = ok_dylib_extension();
++  const uint64_t ext_length = (uint64_t)strlen(ext);
+   char** segments = NULL;
+   uint32_t count = 0;
+   uint32_t capacity = 0;
+@@ -1045,6 +1517,8 @@ static bool binding_segments(const ok_allocators* p_a,
+       uint64_t name_length = seg_length;
+       if (name_length > 3 && memcmp(p_path.chars + i + name_length - 3, ".ok", 3) == 0) {
+         name_length -= 3;
++      } else if (name_length > ext_length && memcmp(p_path.chars + i + name_length - ext_length, ext, ext_length) == 0) {
++        name_length -= ext_length;
+       }
+       if (name_length == 0) {
+         i = j + 1;
+@@ -1129,20 +1603,23 @@ ok_result ok_modules_prepare(module_system* p_modules,
+     const token* site = &import->statement.node.token;
+ 
+     char* canonical = NULL;
+-    if (!resolve_import(p_modules, path, from_dir, p_source, site, &canonical)) {
++    resolved_module resolved;
++    resolved_init(&resolved);
++    if (!resolve_import(p_modules, path, from_dir, p_source, site, &resolved)) {
+       result = OK_COMPILE_ERROR;
+       break;
+     }
+-    const ok_result loaded = load_module(p_modules, canonical, p_source, site);
++    canonical = resolved.canonical; // borrowed view for the edge bookkeeping
++    const ok_result loaded = load_module(p_modules, &resolved, p_source, site);
+     if (loaded != OK) {
+-      mod_free(a, canonical);
++      resolved_deinit(a, &resolved);
+       result = loaded;
+       break;
+     }
+     ok_module_record* record = registry_find(p_modules, canonical);
+     // cannot be NULL: load_module just registered it (or it was there)
+     if (record == NULL) {
+-      mod_free(a, canonical);
++      resolved_deinit(a, &resolved);
+       module_report(p_source, site, "internal error: the loaded module did not register.");
+       result = OK_INIT_ERROR;
+       break;
+@@ -1160,7 +1637,7 @@ ok_result ok_modules_prepare(module_system* p_modules,
+         const uint32_t grown = imports_capacity == 0 ? 8 : imports_capacity * 2;
+         char** grown_imports = (char**)mod_realloc(a, imports, sizeof(char*) * grown);
+         if (grown_imports == NULL) {
+-          mod_free(a, canonical);
++          resolved_deinit(a, &resolved);
+           result = OK_INIT_ERROR;
+           break;
+         }
+@@ -1169,13 +1646,13 @@ ok_result ok_modules_prepare(module_system* p_modules,
+       }
+       imports[imports_count] = mod_strdup(a, canonical);
+       if (imports[imports_count] == NULL) {
+-        mod_free(a, canonical);
++        resolved_deinit(a, &resolved);
+         result = OK_INIT_ERROR;
+         break;
+       }
+       imports_count++;
+     }
+-    mod_free(a, canonical);
++    resolved_deinit(a, &resolved);
+     canonical = NULL;
+ 
+     if (import->symbols.count == 0) {
+@@ -1440,14 +1917,31 @@ void ok_modules_init(module_system* p_modules, ok* p_ok, allocators* p_alloc) {
+   p_modules->name_arena = NULL;
+   p_modules->name_arena_count = 0;
+   p_modules->name_arena_capacity = 0;
++  p_modules->mounting = NULL;
++  p_modules->native_handles = NULL;
++  p_modules->native_handles_count = 0;
++  p_modules->native_handles_capacity = 0;
++  // the CLI default loader: fs reads (this file) + the dylib-based native
++  // lane (okdylib.c). both halves reach the instance through the shared ctx.
+   ok_loader loader;
+   loader.read_source = fs_read_source;
+-  loader.p_ctx = p_modules; // the default loader reaches the user's allocators
++  loader.load_native = ok_load_native_thunk;
++  loader.p_ctx = p_modules;
+   p_modules->loader = loader;
+ }
+ 
+ void ok_modules_deinit(module_system* p_modules) {
+   const ok_allocators* a = &p_modules->ok->raw_alloc;
++  // the native lifecycle first, while the vm is fully alive: on_unload is
++  // for releasing the module's own C resources (the lua lesson: never
++  // mid-run, only here). the default lane's handles close after, so the
++  // unload code is still mapped while it runs.
++  for (uint32_t i = 0; i < p_modules->loaded.count; ++i) {
++    const ok_module_record* record = &p_modules->loaded.data[i];
++    if (record->is_native && record->descriptor != NULL && record->descriptor->on_unload != NULL) {
++      record->descriptor->on_unload(p_modules->ok);
++    }
++  }
+   ok_module_records_deinit(&p_modules->loaded, p_modules->loaded.alloc);
+   value_array_deinit(&p_modules->pending_roots, p_modules->pending_roots.alloc);
+   for (uint32_t i = 0; i < p_modules->name_arena_count; ++i) {
+@@ -1459,9 +1953,70 @@ void ok_modules_deinit(module_system* p_modules) {
+   p_modules->name_arena = NULL;
+   p_modules->name_arena_count = 0;
+   p_modules->name_arena_capacity = 0;
++  // the default lane's handles (a host load_native owns its own)
++  if (p_modules->ok->dylib != NULL) {
++    for (uint32_t i = 0; i < p_modules->native_handles_count; ++i) {
++      p_modules->ok->dylib->close(p_modules->ok->dylib->p_ctx, p_modules->native_handles[i]);
++    }
++  }
++  if (p_modules->native_handles != NULL) {
++    mod_free(a, p_modules->native_handles);
++  }
++  p_modules->native_handles = NULL;
++  p_modules->native_handles_count = 0;
++  p_modules->native_handles_capacity = 0;
+   p_modules->ok = NULL;
+ }
+ 
+ void ok_modules_set_loader(module_system* p_modules, ok_loader p_loader) {
+   p_modules->loader = p_loader;
+ }
++
++// ---------------------------------------------------------------- force-load (OR-3)
++
++// `ok run --native m.so app.ok` (M3's last resort): load a native outside
++// any project, register it under its declared name (or p_name), so bare
++// imports resolve to it. the capability gate applies, failures print their
++// own diagnostic (no import site exists yet).
++bool ok_native_force_load(ok* p_ok, const char* p_path, const char* p_name) {
++  module_system* modules = &p_ok->modules;
++  const ok_allocators* a = &p_ok->raw_alloc;
++
++  if ((p_ok->caps_dropped & OK_CAP_NATIVE_LOAD) != 0) {
++    plain_report(p_path, "native loading is refused: OK_CAP_NATIVE_LOAD is dropped in this ok instance.");
++    return false;
++  }
++  if (modules->loader.load_native == NULL) {
++    plain_report(p_path, "this ok instance's loader has no native lane.");
++    return false;
++  }
++  const ok_native_module* descriptor = NULL;
++  void* handle = NULL;
++  char err[256];
++  err[0] = '\0';
++  if (!modules->loader.load_native(modules->loader.p_ctx, p_path, ok_api_table(), &descriptor, &handle, err,
++                                   sizeof(err))) {
++    if (err[0] != '\0') {
++      plain_report(p_path, "the native module could not be loaded.");
++      fprintf(stderr, "note: %s\n", err);
++    } else {
++      plain_report(p_path, "no native module at this path.");
++    }
++    return false;
++  }
++  const char* key = p_name != NULL ? p_name : descriptor->name;
++  if (registry_find(modules, key) != NULL) {
++    string message = asprint(&p_ok->alloc, "a module is already registered under the name '%s'.", key);
++    plain_report(p_path, message.chars != NULL ? message.chars : "a module is already registered under that name.");
++    string_deinit(&message, &p_ok->alloc);
++    return false;
++  }
++  char* key_owned = mod_strdup(a, key);
++  if (key_owned == NULL) {
++    plain_report(p_path, "out of memory while registering the module.");
++    return false;
++  }
++  const ok_result registered = register_native(modules, descriptor, handle, key_owned, p_path, NULL, NULL, NULL);
++  mod_free(a, key_owned);
++  return registered == OK;
++}
+diff --git a/src/okmodules.h b/src/okmodules.h
+index 17b5373..6005f7c 100644
+--- a/src/okmodules.h
++++ b/src/okmodules.h
+@@ -19,8 +19,8 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+-#include "ok/ok_fwd.h"
+ #include "ok/ok.h"
++#include "ok/ok_module.h"
+ #include "ok/ok_source.h"
+ #include "ok/ok_string.h"
+ 
+@@ -35,33 +35,45 @@
+ // blowing it (the draft's depth guard - there was no existing one to share).
+ #define OK_MODULES_MAX_DEPTH 128
+ 
+-typedef struct ok_loader {
+-  // reads the source at an absolute path into *p_out. the code buffer MUST
+-  // be allocated with the ok_allocators this ok instance was created with
+-  // (the embedder passes the same table in ok_specs): the instance frees it
+-  // with its release call after the module's tree is consumed. false =
+-  // unreadable (the driver turns it into the 404's IO note). path: borrowed,
+-  // the canonical spelling.
+-  bool (*read_source)(void* p_ctx, const char* p_path, ok_source* p_out);
+-  // load_native arrives with OR-3 (sandbox + the ok_api vtable). NULL today.
+-  void* p_ctx;
+-} ok_loader;
++// the loader vtable is the PUBLIC one (ok_module.h, OR-3): read_source for
++// ok modules, load_native for the native lane. the CLI default (installed
++// by init) is fs reads + the dylib-based native loader; an embedder
++// replaces the whole table through ok_set_loader.
+ 
+ // one loaded module. the registry is a plain array probed by strcmp on the
+ // canonical path - module counts are tens, not thousands, and the load path
+ // is not hot; the okmap upgrade can come when a profile asks for it.
+ typedef struct {
+-  char* canonical;             // the resolved absolute path (owned, user allocators)
++  char* canonical;             // the registry key: resolved absolute path, "std/<stem>", or a
++                               // force-loaded native's declared name (owned, user allocators)
+   object_string* name;         // the canonical, interned (the namespace class's name)
+   object_class* namespace_class;
+   value namespace;             // the sealed namespace instance
+-  // OR-3: the module's own imports, the graph edge list (deduped canonical
+-  // paths in load order). owned, user allocators. the read side is
++  // the module's own imports, the graph edge list (deduped canonical paths
++  // in load order). owned, user allocators. the read side is
+   // ok_module_import_count / ok_module_import_path (ok.h).
+   char** imports;
+   uint32_t imports_count;
++  // OR-3: a native module. the descriptor is borrowed (the dylib handle
++  // keeps it alive until ok_free's close sweep); on_unload fires there.
++  bool is_native;
++  const ok_native_module* descriptor;
+ } ok_module_record;
+ 
++// the mount window (OR-3): a native module's non-function exports, staged
++// between mount_classes' start and the namespace freeze. api->module_export
++// (okapi.c) appends here; the loader turns the list into namespace fields.
++// the values ride UNROOTED between export and freeze, so mark_modules walks
++// the window and every append is a gc-safe moment (the guard stack is not
++// deep enough for a mount's worth of values).
++typedef struct {
++  char** names;                // owned copies, user allocators
++  value_array values;
++  uint32_t count;
++  uint32_t capacity;
++  const char* failure;         // NULL, or the reason a mount export was refused
++} native_mount;
++
+ ARRAY_DECLARE_DEFAULT(ok_module_records, ok_module_record)
+ ARRAY_DECLARE_DEFAULT(ok_import_binding_array, ok_import_binding)
+ 
+@@ -82,7 +94,16 @@ typedef struct module_system {
+   char** name_arena;
+   uint32_t name_arena_count;
+   uint32_t name_arena_capacity;
+-  ok_loader loader;            // the host's loader (init installs the fs default)
++  ok_loader loader;            // the host's loader (init installs the fs + dylib default)
++  // OR-3: the active native mount window (NULL outside mount_classes).
++  // api->module_export appends here; mark_modules walks it.
++  native_mount* mounting;
++  // OR-3: handles opened by the DEFAULT native lane (the dylib table lives
++  // in ok->dylib). closed at ok_free after the on_unload sweep. host
++  // load_native implementations own their own handles.
++  void** native_handles;
++  uint32_t native_handles_count;
++  uint32_t native_handles_capacity;
+ } module_system;
+ 
+ void ok_modules_init(module_system* p_modules, ok* p_ok, allocators* p_alloc);
+@@ -111,9 +132,24 @@ ok_result ok_modules_prepare(module_system* p_modules,
+                              char*** p_out_imports,
+                              uint32_t* p_out_imports_count);
+ 
+-// the gc's walk (called from okgc.c's mark): the registry's namespaces and
+-// the pending-roots window. canonical/name/class strings ride the class
+-// (reachable through the namespace instance), so only the values need walks.
++// okapi.c: the shared static ok_api table (OR-3). stateless trampolines
++// over the ok.h surface, one table per process, every ok instance.
++const ok_api* ok_api_table(void);
++
++// the gc's walk (called from okgc.c's mark): the registry's namespaces, the
++// pending-roots window, and the native mount window's staged values.
++// canonical/name/class strings ride the class (reachable through the
++// namespace instance), so only the values need walks.
+ bool ok_modules_mark(gc* p_gc, module_system* p_modules);
+ 
++// OR-3: the dylib-based default native lane's vtable thunk (okdylib.c).
++// p_ctx is the module system (the default loader pair shares one ctx).
++bool ok_load_native_thunk(void* p_ctx,
++                          const char* p_path,
++                          const ok_api* p_api,
++                          const ok_native_module** p_out,
++                          void** p_handle,
++                          char* p_err,
++                          size_t p_err_capacity);
++
+ #endif // OK_MODULES_H
+diff --git a/src/okstate.h b/src/okstate.h
+index 0150a83..67ba35c 100644
+--- a/src/okstate.h
++++ b/src/okstate.h
+@@ -41,6 +41,11 @@ struct ok {
+   ok_source source; // the CURRENT run's source (code borrowed for the run)
+   allocators alloc; // gc-hooked wrapper
+   ok_allocators raw_alloc;
++  // OR-3: the capability ratchet's state (granted = OK_CAP_ALL & ~caps_dropped,
++  // only ever shrinking after ok_create) and the resolved dylib table
++  // (ok_specs.dylib, else the platform wrapper, else NULL = no loading).
++  uint32_t caps_dropped;
++  const ok_dylib* dylib;
+   bool dump_bytecode;
+   bool dump_skip_run;
+ };
+diff --git a/tests/capi/src/main.c b/tests/capi/src/main.c
+index 1a8b421..ce9198f 100644
+--- a/tests/capi/src/main.c
++++ b/tests/capi/src/main.c
+@@ -12,9 +12,11 @@
+ // is under test.
+ 
+ #include <ok/ok.h>
++#include <ok/ok_module.h>
+ 
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ static int g_checks = 0;
+@@ -134,6 +136,50 @@ static bool run(ok* p_ok, const char* p_code) {
+   return ok_run(p_ok, source) == OK;
+ }
+ 
++// ---------- the memory-backed loader (OR-3's embedder example) ----------
++// a virtual import graph served from static storage: zero filesystem. the
++// read buffers come from the instance's own (default, libc) allocators,
++// which is the documented loader contract: the instance frees them with its
++// release call after each tree is consumed.
++typedef struct {
++  const char* path;
++  const char* code;
++} mem_source;
++
++static const mem_source g_mem_sources[] = {
++    {"mem:/main.ok",
++     "import \"./answer.ok\";\n"
++     "import \"std/array\";\n"
++     "glob let the_answer = answer.value;\n"
++     "glob let deep_answer = answer.deep_value;\n"
++     "glob let array_len = std.array.len([1, 2, 3]);\n"},
++    {"mem:/answer.ok",
++     "import \"./deep.ok\";\n"
++     "pub let value = 6;\n"
++     "pub let deep_value = deep.val;\n"
++     "pub fu hi() { return \"mem-hi\"; }\n"},
++    {"mem:/deep.ok",
++     "pub let val = 7;\n"},
++};
++
++static bool mem_read_source(void* p_ctx, const char* p_path, ok_source* p_out) {
++  (void)p_ctx;
++  for (uint32_t i = 0; i < (uint32_t)(sizeof(g_mem_sources) / sizeof(g_mem_sources[0])); ++i) {
++    if (strcmp(g_mem_sources[i].path, p_path) == 0) {
++      const size_t n = strlen(g_mem_sources[i].code);
++      char* copy = (char*)malloc(n + 1);
++      if (copy == NULL) {
++        return false;
++      }
++      memcpy(copy, g_mem_sources[i].code, n + 1);
++      p_out->code = copy;
++      p_out->path = p_path;
++      return true;
++    }
++  }
++  return false;
++}
++
+ int main(void) {
+   ok_specs specs = {};
+   ok* p_ok = ok_create(specs);
+@@ -489,6 +535,83 @@ int main(void) {
+     ok_free(m_ok);
+   }
+ 
++  // ---------- 12. the embedder loader + the capability ratchet (OR-3) ----------
++  {
++    ok_specs lspecs = {};
++    ok* l_ok = ok_create(lspecs);
++    CHECK(l_ok != NULL);
++
++    ok_loader loader;
++    loader.read_source = mem_read_source;
++    loader.load_native = NULL; // natives are denied through this loader, by construction
++    loader.p_ctx = NULL;
++    ok_set_loader(l_ok, loader);
++
++    // the whole graph runs from memory: the virtual entry, a two-deep chain,
++    // and the std registry (which never needs the loader)
++    ok_source entry = {g_mem_sources[0].code, g_mem_sources[0].path};
++    CHECK(ok_run(l_ok, entry) == OK);
++    ok_value answer = ok_value_null();
++    CHECK(ok_global_get(l_ok, sv("the_answer"), &answer));
++    CHECK(ok_value_is_number(answer) && ok_value_as_number(answer) == 6.0);
++    ok_value deep_answer = ok_value_null();
++    CHECK(ok_global_get(l_ok, sv("deep_answer"), &deep_answer));
++    CHECK(ok_value_is_number(deep_answer) && ok_value_as_number(deep_answer) == 7.0);
++    ok_value array_len = ok_value_null();
++    CHECK(ok_global_get(l_ok, sv("array_len"), &array_len));
++    CHECK(ok_value_is_number(array_len) && ok_value_as_number(array_len) == 3.0);
++
++    // the registry read side over virtual keys: realpath refuses them, the
++    // resolved path itself is the key (the documented fallback)
++    CHECK(ok_module_count(l_ok) == 3); // answer, deep, std/array (load order)
++    CHECK(strcmp(ok_module_path(l_ok, 0), "mem:/deep.ok") == 0);
++    CHECK(strcmp(ok_module_path(l_ok, 1), "mem:/answer.ok") == 0);
++    CHECK(strcmp(ok_module_path(l_ok, 2), "std/array") == 0);
++    ok_value answer_module = ok_module_find(l_ok, "mem:/answer.ok");
++    CHECK(!ok_value_is_null(answer_module));
++    CHECK(ok_module_export_count(l_ok, answer_module) == 3);
++    CHECK(strcmp(ok_module_export_name(l_ok, answer_module, 0), "value") == 0);
++    CHECK(strcmp(ok_module_export_name(l_ok, answer_module, 2), "hi") == 0);
++    // the graph edges: the answer module imports deep (the entry's own
++    // edges, answer and std/array, belong to the entry TU, which is not a
++    // module and keeps no record)
++    CHECK(ok_module_import_count(l_ok, 1) == 1);
++    CHECK(strcmp(ok_module_import_path(l_ok, 1, 0), "mem:/deep.ok") == 0);
++    CHECK(ok_module_import_path(l_ok, 1, 1) == NULL);
++
++    // a native import through this loader is refused (no native lane), the
++    // 404 teaches
++    CHECK(!run(l_ok, "import \"./nope.so\";\n"));
++
++    // the ratchet: read, drop, read again. a grant is impossible.
++    CHECK(ok_caps_get(l_ok) == OK_CAP_ALL);
++    ok_caps_drop(l_ok, OK_CAP_NATIVE_LOAD | OK_CAP_HOST);
++    CHECK(ok_caps_get(l_ok) == (OK_CAP_ALL & ~(OK_CAP_NATIVE_LOAD | OK_CAP_HOST)));
++    ok_caps_drop(l_ok, 0); // a no-op drop changes nothing
++    CHECK(ok_caps_get(l_ok) == (OK_CAP_ALL & ~(OK_CAP_NATIVE_LOAD | OK_CAP_HOST)));
++
++    ok_free(l_ok);
++
++    // a locked instance is pure compute: every capability refused at birth,
++    // the language itself runs
++    ok_specs locked_specs = {};
++    locked_specs.caps_dropped = OK_CAP_ALL;
++    ok* s_ok = ok_create(locked_specs);
++    CHECK(s_ok != NULL);
++    CHECK(ok_caps_get(s_ok) == 0);
++    CHECK(run(s_ok, "glob let locked_sum = 1 + 1;\n"));
++    ok_value locked_sum = ok_value_null();
++    CHECK(ok_global_get(s_ok, sv("locked_sum"), &locked_sum));
++    CHECK(ok_value_is_number(locked_sum) && ok_value_as_number(locked_sum) == 2.0);
++    // the std registry is built-in pure compute: a locked instance still
++    // imports it (the gates are native load, native build, and host surface)
++    CHECK(run(s_ok, "import \"std/array\";\nglob let locked_len = std.array.len([4, 5]);\n"));
++    ok_value locked_len = ok_value_null();
++    CHECK(ok_global_get(s_ok, sv("locked_len"), &locked_len));
++    CHECK(ok_value_is_number(locked_len) && ok_value_as_number(locked_len) == 2.0);
++    ok_free(s_ok);
++  }
++
+   ok_free(p_ok);
+ 
+   printf("capi: %d checks OK\n", g_checks);
+diff --git a/tests/e2e/src/main.cpp b/tests/e2e/src/main.cpp
+index c986cce..a5c706f 100644
+--- a/tests/e2e/src/main.cpp
++++ b/tests/e2e/src/main.cpp
+@@ -39,11 +39,12 @@ int decode_system_status(int status) {
+   return status;
+ }
+ 
+-run_result run_oklang(const std::string_view path, const std::string_view okpath, const std::string_view okpath_value) {
++run_result run_oklang(const std::string_view path, const std::string_view okpath, const std::string_view okpath_value,
++                      const std::string_view flags = "") {
+   std::stringstream cmd;
+   std::string stdout_file = "out.log";
+   std::string stderr_file = "err.log";
+-  cmd << "OKPATH=\"" << okpath_value << "\" \"" << okpath << "\" "
++  cmd << "OKPATH=\"" << okpath_value << "\" \"" << okpath << "\" " << flags << (flags.empty() ? "" : " ")
+       << "\"" << path << "\" > " << stdout_file << " 2> " << stderr_file;
+ 
+   std::string cmd_str = cmd.str();
+@@ -148,6 +149,62 @@ std::string parse_okpath(const std::filesystem::path& path) {
+   return "";
+ }
+ 
++// the `// okflags: --restrict --native x.so` directive (OR-3): CLI flags for
++// this one run. relative --native paths resolve against the test file's
++// directory, exactly the okpath precedent.
++std::string parse_okflags(const std::filesystem::path& path) {
++  std::regex okflags_re(R"(//\s*okflags:\s*(.*))");
++  std::ifstream fs(path);
++  std::string line;
++  while (std::getline(fs, line)) {
++    std::smatch match;
++    if (std::regex_search(line, match, okflags_re)) {
++      const std::string value = match[1].str();
++      const std::filesystem::path dir = path.parent_path();
++      std::string expanded;
++      std::string prev;
++      size_t start = 0;
++      for (;;) {
++        const size_t space = value.find(' ', start);
++        std::string part = value.substr(start, space == std::string::npos ? std::string::npos : space - start);
++        if (!part.empty()) {
++          if (prev == "--native" && !part.starts_with("/")) {
++            part = (dir / part).string();
++          }
++          if (!expanded.empty()) {
++            expanded += " ";
++          }
++          expanded += part;
++          prev = part;
++        }
++        if (space == std::string::npos) {
++          break;
++        }
++        start = space + 1;
++      }
++      return expanded;
++    }
++  }
++  return "";
++}
++
++// the native fixture builds (OR-3): every build.sh under the tests root,
++// from its own directory, before any test runs. the declared-build contract:
++// whatever toolchain, idempotent, quiet on success.
++void build_native_fixtures(const std::string& tests_path) {
++  for (auto& entry : std::filesystem::recursive_directory_iterator(tests_path)) {
++    if (entry.path().filename() != "build.sh") {
++      continue;
++    }
++    const std::string dir = entry.path().parent_path().string();
++    const std::string cmd = "cd \"" + dir + "\" && bash build.sh";
++    if (decode_system_status(system(cmd.c_str())) != 0) {
++      std::println(stderr, "FIXTURE BUILD FAILED: {}", entry.path().string());
++      std::exit(1);
++    }
++  }
++}
++
+ int main(int argc, char** argv) {
+   bool has_debug_build = false;
+   if (argc < 3) {
+@@ -169,6 +226,8 @@ int main(int argc, char** argv) {
+ 
+   uint32_t ok = 0, notok = 0, skipped = 0;
+ 
++  build_native_fixtures(tests_path);
++
+   for (auto& entry : std::filesystem::recursive_directory_iterator(tests_path)) {
+     if (entry.path().extension() != ".ok")
+       continue;
+@@ -185,8 +244,9 @@ int main(int argc, char** argv) {
+     }
+ 
+     const std::string okpath_value = parse_okpath(entry.path());
++    const std::string flags = parse_okflags(entry.path());
+     auto tc = parse_test_file(test_path);
+-    auto rr = run_oklang(test_path, okpath, okpath_value);
++    auto rr = run_oklang(test_path, okpath, okpath_value, flags);
+ 
+     if (!tc.has_expectation) {
+       std::println("{}[NOTOK]{}: '{}'", COLOR_RED, COLOR_RESET, test_path);
+diff --git a/tests/e2e/tests/modules/native_badabi/badabi.c b/tests/e2e/tests/modules/native_badabi/badabi.c
+new file mode 100644
+index 0000000..1f466cd
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_badabi/badabi.c
+@@ -0,0 +1,16 @@
++// the abi mismatch fixture: built against a wrong OK_NATIVE_ABI.
++#include "ok/ok_module.h"
++static const ok_native_module badabi_module = {
++    99, // not OK_NATIVE_ABI: the loader must refuse with the rebuild message
++    "badabi",
++    "0.0.1",
++    0,
++    NULL,
++    NULL,
++    NULL,
++    NULL,
++};
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  (void)p_api;
++  return &badabi_module;
++}
+diff --git a/tests/e2e/tests/modules/native_badabi/build.sh b/tests/e2e/tests/modules/native_badabi/build.sh
+new file mode 100755
+index 0000000..e8d76d9
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_badabi/build.sh
+@@ -0,0 +1,4 @@
++#!/bin/sh
++set -e
++cd "$(dirname "$0")"
++gcc -shared -fPIC -I../../../../../include -o badabi.so badabi.c
+diff --git a/tests/e2e/tests/modules/native_badabi/main.ok b/tests/e2e/tests/modules/native_badabi/main.ok
+new file mode 100644
+index 0000000..c5e7210
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_badabi/main.ok
+@@ -0,0 +1,2 @@
++import "./badabi";
++// expect error: abi 99, expected 1, rebuild it against include/ok/ok_module.h.
+diff --git a/tests/e2e/tests/modules/native_badname/badname.c b/tests/e2e/tests/modules/native_badname/badname.c
+new file mode 100644
+index 0000000..801641b
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_badname/badname.c
+@@ -0,0 +1,17 @@
++// the name mismatch fixture: the shared object declares a different name
++// than the import stem.
++#include "ok/ok_module.h"
++static const ok_native_module badname_module = {
++    OK_NATIVE_ABI,
++    "impostor", // not "badname": the check must catch it
++    "0.0.1",
++    0,
++    NULL,
++    NULL,
++    NULL,
++    NULL,
++};
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  (void)p_api;
++  return &badname_module;
++}
+diff --git a/tests/e2e/tests/modules/native_badname/build.sh b/tests/e2e/tests/modules/native_badname/build.sh
+new file mode 100755
+index 0000000..f588b58
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_badname/build.sh
+@@ -0,0 +1,4 @@
++#!/bin/sh
++set -e
++cd "$(dirname "$0")"
++gcc -shared -fPIC -I../../../../../include -o badname.so badname.c
+diff --git a/tests/e2e/tests/modules/native_badname/main.ok b/tests/e2e/tests/modules/native_badname/main.ok
+new file mode 100644
+index 0000000..656978d
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_badname/main.ok
+@@ -0,0 +1,2 @@
++import "./badname";
++// expect error: the shared object declares the name 'impostor', the import stem is 'badname'.
+diff --git a/tests/e2e/tests/modules/native_force/build.sh b/tests/e2e/tests/modules/native_force/build.sh
+new file mode 100755
+index 0000000..6b55857
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_force/build.sh
+@@ -0,0 +1,4 @@
++#!/bin/sh
++set -e
++cd "$(dirname "$0")"
++gcc -shared -fPIC -I../../../../../include -o forced.so forced.c
+diff --git a/tests/e2e/tests/modules/native_force/forced.c b/tests/e2e/tests/modules/native_force/forced.c
+new file mode 100644
+index 0000000..516d326
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_force/forced.c
+@@ -0,0 +1,33 @@
++// the force-load fixture: registered under its declared name, imported bare.
++#include <stdio.h>
++#include <string.h>
++
++#include "ok/ok_module.h"
++static const ok_api* api = NULL;
++static ok_value forced_greet(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  ok_cstring_view name = api->value_as_string(p_argv[0]);
++  char buffer[128];
++  snprintf(buffer, sizeof(buffer), "forced says %s", name.chars);
++  return api->value_string(p_ok, api->view(buffer, OK_STRING_VIEW_CALCULATE_LENGTH));
++}
++static const ok_native_fn_def forced_fns[] = {
++    {"greet", 1, forced_greet},
++};
++static const ok_native_module forced_module = {
++    OK_NATIVE_ABI,
++    "forced",
++    "1.0.0",
++    1,
++    forced_fns,
++    NULL,
++    NULL,
++    NULL,
++};
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  if (p_api == NULL || p_api->abi != OK_NATIVE_ABI) {
++    return NULL;
++  }
++  api = p_api;
++  return &forced_module;
++}
+diff --git a/tests/e2e/tests/modules/native_force/main.ok b/tests/e2e/tests/modules/native_force/main.ok
+new file mode 100644
+index 0000000..7715c99
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_force/main.ok
+@@ -0,0 +1,6 @@
++// `ok run --native forced.so app.ok` (M3's last resort): the module is
++// registered under its declared name before the run, bare imports resolve.
++// okflags: --native forced.so
++import "forced";
++
++print forced.greet("hi"); // expect: forced says hi
+diff --git a/tests/e2e/tests/modules/native_hello/build.sh b/tests/e2e/tests/modules/native_hello/build.sh
+new file mode 100755
+index 0000000..030aa10
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_hello/build.sh
+@@ -0,0 +1,5 @@
++#!/bin/sh
++# the fixture's declared build: a raw gcc command (M12: whatever toolchain).
++set -e
++cd "$(dirname "$0")"
++gcc -shared -fPIC -I../../../../../include -o hello.so hello.c
+diff --git a/tests/e2e/tests/modules/native_hello/hello.c b/tests/e2e/tests/modules/native_hello/hello.c
+new file mode 100644
+index 0000000..0a505dd
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_hello/hello.c
+@@ -0,0 +1,100 @@
++// the OR-3 sample native module: one function, one class, one constant.
++// the build is a raw gcc command on purpose (M12: any toolchain, no
++// coupling): gcc -shared -fPIC -I<repo>/include -o hello.so hello.c
++//
++// the shape to copy for real modules: OK_API on the one export, the api
++// stashed at export time, every reach into the vm through it.
++
++#include <stdio.h>
++#include <string.h>
++
++#include "ok/ok_module.h"
++
++static const ok_api* api = NULL;
++static const char* g_prefix = "unloaded"; // on_load proves it ran
++
++// greet(name): "hello, <name>!"
++static ok_value hello_greet(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  if (p_argc != 1 || api->value_type(p_argv[0]) != OK_TYPE_STR) {
++    api->native_error(p_ok, api->view("greet expects one string.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  // the read side's views are NUL-terminated vm strings: strlen is the
++  // native-side length (ok.h's ok_cstring_view_get_length is a library
++  // symbol, and a native links against none of those)
++  ok_cstring_view name = api->value_as_string(p_argv[0]);
++  char buffer[256];
++  size_t room = strlen(name.chars);
++  if (room > 200) {
++    room = 200;
++  }
++  snprintf(buffer, sizeof(buffer), "%s, %.*s!", g_prefix, (int)room, name.chars);
++  return api->value_string(p_ok, api->view(buffer, OK_STRING_VIEW_CALCULATE_LENGTH));
++}
++
++// Greeter.greet(name): the class-method lane (the receiver rides argv[0])
++static ok_value greeter_greet(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  if (p_argc != 2 || api->value_type(p_argv[1]) != OK_TYPE_STR) {
++    api->native_error(p_ok, api->view("Greeter.greet expects one string.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  ok_cstring_view name = api->value_as_string(p_argv[1]);
++  char buffer[256];
++  size_t room = strlen(name.chars);
++  if (room > 200) {
++    room = 200;
++  }
++  snprintf(buffer, sizeof(buffer), "hi, %.*s!", (int)room, name.chars);
++  return api->value_string(p_ok, api->view(buffer, OK_STRING_VIEW_CALCULATE_LENGTH));
++}
++
++// the non-function surface: a class and a constant, exported through
++// api->module_export inside the mount callback.
++static bool hello_mount(ok* p_ok) {
++  ok_value greeter = api->class_new(p_ok, api->view("Greeter", 7), api->value_null());
++  if (api->value_type(greeter) != OK_TYPE_CLASS) {
++    return false;
++  }
++  if (!api->class_define_native_method(p_ok, greeter, api->view("greet", 5), 2, greeter_greet,
++                                       true)) {
++    return false;
++  }
++  if (!api->class_freeze(p_ok, greeter)) {
++    return false;
++  }
++  if (!api->module_export(p_ok, api->view("Greeter", 7), greeter)) {
++    return false;
++  }
++  return api->module_export(p_ok, api->view("magic", 5), api->value_number(42));
++}
++
++static bool hello_on_load(ok* p_ok) {
++  (void)p_ok;
++  g_prefix = "hello";
++  return true;
++}
++
++static const ok_native_fn_def hello_fns[] = {
++    {"greet", 1, hello_greet},
++};
++
++static const ok_native_module hello_module = {
++    OK_NATIVE_ABI,
++    "hello",
++    "1.0.0",
++    1,
++    hello_fns,
++    hello_mount,
++    hello_on_load,
++    NULL, // on_unload: the sample holds no C resources
++};
++
++// the one symbol. the module checks the host back: the both-directions
++// discipline (we may refuse a host we do not know).
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  if (p_api == NULL || p_api->abi != OK_NATIVE_ABI) {
++    return NULL;
++  }
++  api = p_api;
++  return &hello_module;
++}
+diff --git a/tests/e2e/tests/modules/native_hello/main.ok b/tests/e2e/tests/modules/native_hello/main.ok
+new file mode 100644
+index 0000000..8b499f0
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_hello/main.ok
+@@ -0,0 +1,12 @@
++// the OR-3 acceptance lane: a native module end to end, the sample shape
++import "./hello";
++from "./hello" import greet, magic;
++
++print hello.greet("oklang"); // expect: hello, oklang!
++print greet("world"); // expect: hello, world!
++print magic; // expect: 42
++print hello.magic; // expect: 42
++
++let g = hello.Greeter();
++print g.greet("class"); // expect: hi, class!
++print hello.Greeter().greet("again"); // expect: hi, again!
+diff --git a/tests/e2e/tests/modules/native_hint/main.ok b/tests/e2e/tests/modules/native_hint/main.ok
+index a0cf84d..e9fd344 100644
+--- a/tests/e2e/tests/modules/native_hint/main.ok
++++ b/tests/e2e/tests/modules/native_hint/main.ok
+@@ -1,2 +1,5 @@
++// a native candidate that exists but is not loadable: the hard error with
++// the loader's own reason as the note (a text file named .so, a corrupt
++// image, a missing ok_native_export all land here)
+ import "./fake";
+-// expect error: native loading is not available yet
++// expect error: the native module could not be loaded.
+diff --git a/tests/e2e/tests/modules/native_restrict/main.ok b/tests/e2e/tests/modules/native_restrict/main.ok
+new file mode 100644
+index 0000000..9e76154
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_restrict/main.ok
+@@ -0,0 +1,5 @@
++// the sandbox refusal: --restrict drops OK_CAP_NATIVE_LOAD, the native
++// candidate is never even probed, the 404 teaches why.
++// okflags: --restrict
++import "../native_hello/hello";
++// expect error: OK_CAP_NATIVE_LOAD is dropped in this ok instance.

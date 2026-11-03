@@ -388,3 +388,27 @@ project.ok exports its table with module-level `pub`, not `glob` -
 is a plain module; OR-4's evaluator harvests the pub export through
 the ordinary module machinery. the sandbox would have kept the global
 from leaking anyway, but the manifest models the right shape.
+
+## D23 — the native module ABI [LOCKED 2026-11-03, patch 48]
+Q's ruling on the ok_api vtable's scope: "we should support everything
+we have and expose to the abi". the read side (value_type/as_number/
+as_bool/as_string/array_len/array_get/map_len/map_get), type and class
+identity (classof/is_instance/class_name), native-to-script calls, and
+the coro primitives including native_suspend are all in; versioning is
+a single OK_NATIVE_ABI integer, checked at load, no semver, "rebuild
+your natives" is the honest pre-1.0 stance, entries append-only. two
+entries the draft missed and the first real module could not live
+without: api->view (string-view construction - a native links against
+no oklang symbols, so it cannot call ok_create_string_view) and
+api->module_export (the mount callback's export primitive: a class or
+constant joins the module through it, the namespace freezes when mount
+returns). the table is STATIC and stateless, one per process: every
+entry routes through its ok* argument, a module stashes the pointer at
+export time and it stays valid forever, several vms coexist, no
+dangling. deliberately OUT of v1 (recorded so it is a decision, not an
+oversight): method enumeration, dynamic member get/set, subclass
+creation from native, global define/get (a native's registration is
+its module membership, the global namespace stays the host's). same
+ruling, same patch: the read side's ok_cstring_view chars are
+NUL-terminated vm strings (every object string's storage carries its
+terminator), strlen is the native-side length.

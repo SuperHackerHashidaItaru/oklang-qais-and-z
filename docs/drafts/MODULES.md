@@ -8,6 +8,9 @@ landed first: string interning is patch 41 (D20, 427/427 x5) and the coro
 C API is patch 42 (D21, LANDED - appendix A), so ok_module.h's vtable
 inherits it instead of breaking later. **OR-1 is LANDED** (session 36,
 patches 43 + 44, Q applied to modules-staging: the spine, 471/471 x5).
+**OR-3 is LANDED** (session 38, patches 47 + 48: the allocator discipline
+Q caught in review, the registry read api, then sandbox + natives + the
+embedder loader, 488/488 x7).
 
 amendments, round two (2026-11-03, Q's landing review):
 - RULED: **project.ok exports its table with module-level `pub`, not
@@ -19,6 +22,36 @@ amendments, round two (2026-11-03, Q's landing review):
   half only, no editorial asides, and standard punctuation only: comma,
   colon, period. no dash, no em dash, no semicolon (D22, patch 45 swept
   the whole tree; new code follows it from here on).
+
+amendments, round three (2026-11-03, Q's OR-3 green light):
+- RULED: **everything we have, exposed to the abi** - "we should support
+  everything we have and expose to the abi". the four OPEN items are IN
+  (the read side, type/class identity, calls, the single-integer
+  versioning), and the first real module forced two additions the draft
+  missed: api->view (string-view construction, a native cannot even
+  spell its arguments without it) and api->module_export (the mount
+  callback's export primitive, classes and constants through it). the
+  table is static and stateless: stashed at export time, valid for the
+  process lifetime (D23).
+- RULED: **the user's allocators are honored everywhere** - Q's review
+  caught plain mallocs in okmodules.c ("we have own allocators that we
+  get from user and they should be honored"). patch 47 routed the whole
+  module spine through them, loader contract included.
+- RULED: **the module registry read api** - "there should be an api for
+  modules export/imports otherwise how is cli gonna even read the
+  exported table?" ok.h grows it (patch 47): the loaded list, each
+  module's import edges, any module value's export enumeration.
+- NOTE (implementation deltas from the draft's section 7, all in patch
+  48): the ok_api table carries value_null, value_as_native_value and
+  native_value_new beyond the draft's list (the everything ruling); the
+  ladder probes ok-module candidates through the loader's read instead
+  of the library stat()-ing files (M14 taken literally - the memory
+  loader in the capi test is the proof); realpath stays a
+  canonicalization AID with a pure fallback (virtual paths key by the
+  resolved path itself); a loadable-but-broken native is a hard error
+  with the loader's own reason as the note; the descriptor's mount
+  callback exports through api->module_export rather than mutating the
+  namespace (the namespace freezes when mount returns).
 
 amendments (2026-11-03, Q's review round on this draft - the two RULED
 ones are folded in below, the api-surface items are answered and marked
@@ -677,7 +710,11 @@ reads this section + WORKLOG and resumes - that is the whole point.
   (the seed names, the method spellings) ride the same deprecation
   window. none of this is 0.8.0 behavior: the aliases all work, the
   removals are the next version's to schedule.
-- **OR-3 - sandbox + natives + the embedder loader** (was P4+P7 + the
+- **OR-3 - sandbox + natives + the embedder loader** — **LANDED (session
+  38, patch 48, on modules-staging: 488/488 x7, capi 201 x5, the sample
+  module + the memory-loader test as the embedder example, the whole
+  scope below incl. the everything-in-the-abi ruling and the two
+  additions it forced, view + module_export)** — (was P4+P7 + the
   new sandbox section; loading is born gated): the capability system
   FIRST (ok_specs caps, the ratchet, ok_caps_get/drop, CLI --restrict/
   --sandbox/--allow/--deny, gating the host-touching surface); then
@@ -786,6 +823,9 @@ RULED (landing review, round two, 2026-11-03):
 
 OPEN for Q (Z's recommendations, awaiting the nod before OR-3 finalizes
 the vtable):
+[ANSWERED 2026-11-03, Q's green light: "we should support everything we
+have and expose to the abi" - all four IN, landed in patch 48. the two
+entries the plan missed (view, module_export) rode along, D23.]:
 - **the vtable read side** (value_type / as_number / as_bool / as_string
   / array_len / array_get / map_len / map_get): the draft shipped
   write-only, which is not enough - a native that cannot read its

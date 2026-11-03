@@ -114,6 +114,18 @@ disabled pending the account move.
   no em dash, no semicolon (a semicolon inside a quoted syntax example
   is code, not prose, and is fine). every message you write or touch
   follows this, not just modules work.
+- **allocations: the user's allocators, everywhere (session 38).** no
+  plain malloc/calloc/realloc/free/strdup in library code, ever — the
+  ok_allocators from ok_specs are the only door (Q: "we have own
+  allocators that we get from user and they should be honored"). the
+  one legal libc free is a libc allocation being released (realpath's
+  buffer, copied onto the user's table first). the loader contract is
+  part of this: read_source buffers come from the instance's table.
+- **native modules link against nothing (D23, session 38).** a dlopen'd
+  module calls through the ok_api vtable only — never ok.h functions,
+  never ok_create_string_view (api->view is the door), never
+  ok_cstring_view_get_length (the views are NUL-terminated, strlen is
+  the native-side length).
 
 ## hard-won rules (each one cost a round)
 

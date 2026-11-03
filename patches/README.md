@@ -742,3 +742,128 @@ missing member, bare root, unknown module, immutability, the OKPATH
 shadow, std inside file-module chains, value passing; std_not_module_yet
 retired), unit x3, embed x3, capi 140 x3, delta blue flat (1.40654e7 in
 0.64s).
+
+## 47 — module allocators + the registry read api + the surface pins
+
+Q's landing review caught it in one skim: okmodules.c was full of plain
+mallocs. the codebase's discipline is the user-provided ok_allocators
+(every byte the vm touches goes through them) and the module spine rode
+libc instead. this patch routes EVERYTHING through the user's table: the
+path plumbing (joins, ladders, traces, the name arena, the pending tree,
+the segment buffers), the registry's canonical paths and import lists,
+and the fs loader's read buffers - the loader contract is now explicit
+(okmodules.h): a read_source buffer must come from the ok_allocators the
+instance was created with, the instance frees it with its release call.
+the one libc free left is realpath's own buffer (libc allocates it,
+libc releases it, the registry only ever frees what IT allocated: a
+realpath hit is copied onto the user's table first). the read side is
+api_surface too now (Q: "there should be an api for modules
+export/imports otherwise how is cli gonna even read the exported
+table?"): ok.h grows the module registry read - ok_module_count/path/
+value/find (what got loaded, load order, keyed by canonical path,
+"std/<stem>", or a force-loaded native's declared name),
+ok_module_import_count/import_path (each module's own graph edges,
+deduped, load order), and ok_module_export_count/name/get over any
+module value (declaration order, the namespace's own_names). the
+registry record grows the imports list; ok_modules_prepare hands the
+TU's resolved edges to its caller (the record, or the entry run's
+discard).
+
+the round's other question, answered with tests instead of words: glob
+and pub were never hidden from the surface. `glob let g = <module
+value>` works in every shape (the module itself, the same name, a
+multi-segment root namespace, from-imported members, read back from C
+through a global), and `pub let re = <imported member>` re-exports
+freely - only the SAME name is the ordinary duplicate-local rule (M13),
+which is exactly what Q expected ("we cant bind the same name, but we
+can bind to another name"). two fixture dirs (surfaceglob, surfacepub)
+pin all of it so it can never regress silently.
+
+applies on modules-staging after 46. gates: e2e 483/483 x4 (2 new
+fixture dirs), unit x3, embed x3, capi 170 x1 (30 new checks: the
+registry read over the std lane, glob-of-module read back from C).
+
+## 48 — OR-3: sandbox, natives, the embedder loader
+
+loading is born gated, the whole plan of it (Q: "right when we allow
+for loading (that is now!)"). four pieces, one patch.
+
+the capability system: ok_specs grows caps_dropped (0, the {0} default,
+refuses nothing - every existing embedder keeps the full surface;
+OK_CAP_ALL is the locked stance) and the ok_dylib hooks; ok.h grows
+ok_caps_get (the granted set) and ok_caps_drop (the ratchet: drop only,
+never grant, nothing can shrink the mask - the security property by
+construction). three families (NATIVE_LOAD, NATIVE_BUILD, OR-4's half,
+HOST for fs/env/clock as they land). the CLI maps them: --restrict
+(drops load+build+host), --sandbox=locked (everything), granular
+--deny=native,build / --allow=host (parse-time composition, the ratchet
+untouched), and the native probe itself is SKIPPED under a dropped
+OK_CAP_NATIVE_LOAD - the 404 teaches why.
+
+ok_module.h (new, include/ok/): the native ABI. OK_API (msvc
+dllexport/dllimport, default visibility elsewhere), the
+ok_native_module descriptor (abi, name, version, fn table, mount, on_
+load/on_unload), ok_type_tag, and the ok_api vtable - Q's ruling, "we
+should support everything we have and expose to the abi": the write
+side + value_null, the read side + value_as_native_value, classof/
+is_instance/class_name, call, the class door, native_error/throw, root/
+unroot, the coro primitives incl native_suspend, and two entries the
+plan did not list that the first real module could not live without:
+view (string-view construction - a native cannot even spell its
+arguments without it) and module_export (the mount callback's export
+primitive: classes and constants through api->module_export, the
+namespace freezes when mount returns). the table is STATIC and
+STATELESS (every entry routes through its ok* argument): a module
+stashes it at export time, it stays valid for the process lifetime,
+several vms coexist. OK_NATIVE_ABI is a single integer (1), checked at
+load; the module checks the host back (the sample demonstrates).
+append-only entries, no semver, "rebuild your natives" is the honest
+pre-1.0 stance.
+
+the loader: the vtable grows load_native (false + empty err = clean
+miss, false + a message = a native EXISTS but is broken, the hard
+error; the default lane stats before opening so ordinary misses stay
+clean). the ladder probes ok-module candidates by ASKING THE LOADER TO
+READ THEM - the library never stats or opens files itself anymore (the
+old ladder's stat() violated M14 for memory-backed loaders, the capi
+test proves the fix: a three-module virtual graph over "mem:/" paths,
+zero filesystem). natives are first-class at every rung (M6): the
+ladder probes base+ext (and the exact path when the import spells the
+extension), canonicalizes, checks the registry, then loads. loading =
+open (RTLD_NOW|RTLD_LOCAL, LoadLibrary on windows, host hooks first,
+platform wrapper default, nothing on platforms with nothing) + resolve
+ok_native_export + hand it the api table. then register_native: abi
+check, name check (the descriptor's name must equal the import stem),
+on_load (a failure fires on_unload), fn staging + the mount window
+(marked for the WHOLE staging+mount+build stretch - the aggressive
+lane caught exactly that window sweeping staged values), duplicate
+export names refuse (M13), the sealed namespace, the registry record
+(is_native, the descriptor for the on_unload sweep at ok_free, the
+default lane's handles close after it, never mid-run).
+
+ok run --native m.so app.ok: ok_native_force_load registers under the
+declared name, bare imports resolve to it (the registry probe is
+length-bounded - the import literal is a lexer slice, never a C
+string). ok_set_loader installs a host loader wholesale;
+ok_load_native_default is exposed for composition (custom sources, the
+stock native lane).
+
+receipts: the sample module (tests/e2e/tests/modules/native_hello:
+one function, one class, one constant, on_load observable) runs end to
+end - import "./hello", from-imports, Greeter() construction, method
+dispatch; abi-mismatch and name-mismatch fixtures print their messages;
+--restrict refuses with the capability error; the capi harness grows a
+memory-backed loader section (201 checks now: the virtual graph, the
+registry read over virtual keys, the ratchet, a locked instance still
+computing). the fixtures declare raw gcc build commands (build.sh, M12:
+whatever toolchain) and both runners (bash + the C++ main) run them
+first, plus a new `// okflags:` directive (the okpath precedent) so
+per-test CLI flags exist. the old "native loading is not available
+yet" lane is retired (natives load now); a broken candidate (a text
+file named .so, a corrupt image, a missing export) is the hard error
+with the loader's own reason as the note.
+
+applies on modules-staging after 47. gates: e2e 488/488 x7 (plain,
+threaded, asan, aggressive, asan+aggr, threaded-asan,
+threaded-asan-aggr; 5 new native fixtures), unit x3, embed x3, capi
+201 x5, delta blue flat (1.40654e7 in 0.62s).

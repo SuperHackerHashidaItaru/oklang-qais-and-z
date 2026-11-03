@@ -1,0 +1,1248 @@
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index ba68e26..ed32e12 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -244,6 +244,31 @@ ok_value ok_coro_current(ok* p_ok);
+ // catch), or the call site is not a native at all.
+ bool ok_native_suspend(ok* p_ok);
+ 
++/* modules (embedder side, OR-3) */
++
++// the loaded-module registry, load order. file modules key by their resolved
++// absolute path, std modules by "std/<stem>", force-loaded natives by their
++// declared name (ok_module.h's lane). the read side the CLI and embedders
++// harvest exports through: a module value's pub exports, declaration order.
++uint32_t ok_module_count(ok* p_ok);
++// NULL (or a null value) when the index is out of range.
++const char* ok_module_path(ok* p_ok, uint32_t p_index);
++ok_value ok_module_value(ok* p_ok, uint32_t p_index);
++// a loaded module's value by registry key, or a null value when not loaded.
++ok_value ok_module_find(ok* p_ok, const char* p_canonical);
++
++// module <p_index>'s own imports (the graph edges): deduped registry keys,
++// load order. 0 (or NULL) when out of range.
++uint32_t ok_module_import_count(ok* p_ok, uint32_t p_index);
++const char* ok_module_import_path(ok* p_ok, uint32_t p_index, uint32_t p_import);
++
++// one module value's pub exports, declaration order. p_module is any module
++// namespace (an ok_module_value/ok_module_find result, or a module binding
++// handed back by script through a native). a non-module answers 0/NULL/null.
++uint32_t ok_module_export_count(ok* p_ok, ok_value p_module);
++const char* ok_module_export_name(ok* p_ok, ok_value p_module, uint32_t p_index);
++ok_value ok_module_export_get(ok* p_ok, ok_value p_module, uint32_t p_index);
++
+ /* output */
+ 
+ // print statements route through p_cb when set. the default (NULL) keeps the
+diff --git a/src/ok.c b/src/ok.c
+index 9cdd02e..5210d68 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -539,10 +539,21 @@ ok_result ok_run(ok* p_ok, ok_source p_source) {
+       // adopted by its compiled constants, and its bindings are spent.
+       p_ok->modules.pending_roots.count = 0;
+       for (uint32_t i = 0; i < p_ok->modules.name_arena_count; ++i) {
+-        free(p_ok->modules.name_arena[i]);
++        p_ok->raw_alloc.release(p_ok->modules.name_arena[i]);
+       }
+       p_ok->modules.name_arena_count = 0;
+-      result = ok_modules_prepare(&p_ok->modules, parsed.root, &p_ok->source, &bindings);
++      char** entry_imports = NULL;
++      uint32_t entry_imports_count = 0;
++      result = ok_modules_prepare(&p_ok->modules, parsed.root, &p_ok->source, &bindings, &entry_imports,
++                                  &entry_imports_count);
++      // the entry TU is not a module: its edge list is information for the
++      // host (the registry reads it per module), not state we keep.
++      for (uint32_t i = 0; i < entry_imports_count; ++i) {
++        p_ok->raw_alloc.release(entry_imports[i]);
++      }
++      if (entry_imports != NULL) {
++        p_ok->raw_alloc.release(entry_imports);
++      }
+     }
+   }
+   if (result == OK) {
+@@ -558,6 +569,105 @@ void ok_retain_source(ok* p_ok, bool p_retain) {
+   p_ok->vm.retain_source = p_retain;
+ }
+ 
++/* modules (embedder side, OR-3) */
++
++// the registry read side: what got loaded, in load order. file modules key
++// by their canonical absolute path, std modules by "std/<stem>", force-
++// loaded natives by their declared name (the ok_module.h lane). this is the
++// surface the CLI (and OR-4's manifest harvest) reads a module's exports
++// through, and the embedder's window into what a run pulled in.
++uint32_t ok_module_count(ok* p_ok) {
++  return p_ok->modules.loaded.count;
++}
++
++const char* ok_module_path(ok* p_ok, uint32_t p_index) {
++  if (p_index >= p_ok->modules.loaded.count) {
++    return NULL;
++  }
++  return p_ok->modules.loaded.data[p_index].canonical;
++}
++
++ok_value ok_module_value(ok* p_ok, uint32_t p_index) {
++  if (p_index >= p_ok->modules.loaded.count) {
++    return ok_value_null();
++  }
++  return p_ok->modules.loaded.data[p_index].namespace;
++}
++
++ok_value ok_module_find(ok* p_ok, const char* p_canonical) {
++  if (p_canonical == NULL) {
++    return ok_value_null();
++  }
++  for (uint32_t i = 0; i < p_ok->modules.loaded.count; ++i) {
++    if (strcmp(p_ok->modules.loaded.data[i].canonical, p_canonical) == 0) {
++      return p_ok->modules.loaded.data[i].namespace;
++    }
++  }
++  return ok_value_null();
++}
++
++uint32_t ok_module_import_count(ok* p_ok, uint32_t p_index) {
++  if (p_index >= p_ok->modules.loaded.count) {
++    return 0;
++  }
++  return p_ok->modules.loaded.data[p_index].imports_count;
++}
++
++const char* ok_module_import_path(ok* p_ok, uint32_t p_index, uint32_t p_import) {
++  if (p_index >= p_ok->modules.loaded.count || p_import >= p_ok->modules.loaded.data[p_index].imports_count) {
++    return NULL;
++  }
++  return p_ok->modules.loaded.data[p_index].imports[p_import];
++}
++
++// a module namespace's class, or NULL for anything else (the read API's
++// gate: only sealed namespace instances answer the export enumeration).
++static const object_class* module_namespace_class_of(ok_value p_module) {
++  if (!IS_VALUE_INSTANCE(p_module)) {
++    return NULL;
++  }
++  const object_class* klass = VALUE_AS_INSTANCE(p_module)->klass;
++  if (!klass->module_namespace) {
++    return NULL;
++  }
++  return klass;
++}
++
++// one module's pub exports, declaration order. p_module is any module value
++// (an ok_module_value/ok_module_find result, or a module binding passed back
++// by script through a native). 0 for anything that is not a module namespace.
++uint32_t ok_module_export_count(ok* p_ok, ok_value p_module) {
++  (void)p_ok;
++  const object_class* klass = module_namespace_class_of(p_module);
++  if (klass == NULL) {
++    return 0;
++  }
++  return klass->own_names.count;
++}
++
++const char* ok_module_export_name(ok* p_ok, ok_value p_module, uint32_t p_index) {
++  (void)p_ok;
++  const object_class* klass = module_namespace_class_of(p_module);
++  if (klass == NULL || p_index >= klass->own_names.count) {
++    return NULL;
++  }
++  return klass->own_names.data[p_index]->string.chars;
++}
++
++ok_value ok_module_export_get(ok* p_ok, ok_value p_module, uint32_t p_index) {
++  const object_class* klass = module_namespace_class_of(p_module);
++  if (klass == NULL || p_index >= klass->own_names.count) {
++    return ok_value_null();
++  }
++  object_instance* instance = VALUE_AS_INSTANCE(p_module);
++  const object_string* name = klass->own_names.data[p_index];
++  const field_entry* field = object_class_find_field(klass, name);
++  if (field == NULL) {
++    return ok_value_null(); // unreachable on a frozen namespace
++  }
++  return instance->fields[field->slot];
++}
++
+ /* classes (embedder side) */
+ 
+ bool ok_value_is_class(ok_value p_value) {
+diff --git a/src/okmodules.c b/src/okmodules.c
+index 9fdea68..d1f4d44 100644
+--- a/src/okmodules.c
++++ b/src/okmodules.c
+@@ -31,23 +31,63 @@
+ #include "okvm.h"
+ 
+ // the arrays okmodules.h declares (this file is their one definition site).
+-// a registry record owns its canonical path (raw strdup); the deinit hook is
+-// the array macro's per-element call.
++// a registry record owns its canonical path and its import list (raw copies
++// through the user's allocators); the deinit hook is the array macro's
++// per-element call.
+ static void ok_module_record_deinit(ok_module_record* p_record, allocators* p_alloc) {
+-  (void)p_alloc;
+-  free(p_record->canonical);
++  for (uint32_t i = 0; i < p_record->imports_count; ++i) {
++    p_alloc->release(p_alloc, p_record->imports[i]);
++  }
++  if (p_record->imports != NULL) {
++    p_alloc->release(p_alloc, p_record->imports);
++  }
++  p_record->imports = NULL;
++  p_record->imports_count = 0;
++  p_alloc->release(p_alloc, p_record->canonical);
+   p_record->canonical = NULL;
+ }
+ 
+ ARRAY_DEFINE_DEFAULT(ok_module_records, ok_module_record, ok_module_record_deinit)
+ ARRAY_DEFINE_DEFAULT(ok_import_binding_array, ok_import_binding, ARRAY_DEFAULT_TYPE_DEINIT)
+ 
++// ---------------------------------------------------------------- the user's allocators
++
++// the module system's plumbing is raw bytes (paths, arenas, traces,
++// loader buffers), invisible to the gc, so it rides the USER's raw table
++// straight, never libc: a host that routes allocations through its own
++// allocator sees every byte this file touches. value-bearing arrays keep
++// the gc-hooked wrapper (ok->alloc), same as the rest of the library.
++static void* mod_alloc(const ok_allocators* p_a, const size_t p_size) {
++  return p_a->allocate(p_size);
++}
++
++static void* mod_realloc(const ok_allocators* p_a, void* p_ptr, const size_t p_size) {
++  return p_a->reallocate(p_ptr, p_size);
++}
++
++static void mod_free(const ok_allocators* p_a, void* p_ptr) {
++  p_a->release(p_ptr);
++}
++
++static char* mod_strdup(const ok_allocators* p_a, const char* p_text) {
++  const size_t length = strlen(p_text) + 1;
++  char* out = (char*)mod_alloc(p_a, length);
++  if (out != NULL) {
++    memcpy(out, p_text, length);
++  }
++  return out;
++}
++
+ // ---------------------------------------------------------------- the fs loader
+ 
+ // the CLI default. an embedder replaces it through ok_modules_set_loader
+ // (OR-3 exposes that door publicly); the language never guesses a filesystem.
++// the read buffer comes from the instance's own user allocators: the loader
++// contract (okmodules.h) is "a buffer the instance may free with its release
++// allocator", and the default loader honors it by construction.
+ static bool fs_read_source(void* p_ctx, const char* p_path, ok_source* p_out) {
+-  (void)p_ctx;
++  module_system* modules = (module_system*)p_ctx;
++  const ok_allocators* a = &modules->ok->raw_alloc;
+   FILE* file = fopen(p_path, "rb");
+   if (file == NULL) {
+     return false;
+@@ -62,7 +102,7 @@ static bool fs_read_source(void* p_ctx, const char* p_path, ok_source* p_out) {
+     fclose(file);
+     return false;
+   }
+-  char* buff = (char*)malloc((size_t)size + 1);
++  char* buff = (char*)mod_alloc(a, (size_t)size + 1);
+   if (buff == NULL) {
+     fclose(file);
+     return false;
+@@ -70,7 +110,7 @@ static bool fs_read_source(void* p_ctx, const char* p_path, ok_source* p_out) {
+   const size_t read = fread(buff, sizeof(char), (size_t)size, file);
+   fclose(file);
+   if (read != (size_t)size) {
+-    free(buff);
++    mod_free(a, buff);
+     return false;
+   }
+   buff[read] = '\0';
+@@ -108,8 +148,8 @@ static void module_note(const ok_source* p_source, const token* p_site, const ch
+ 
+ // ---------------------------------------------------------------- path plumbing
+ 
+-// a growable list of malloc'd strings (the 404's trace). raw malloc: these
+-// live only inside one resolve call.
++// a growable list of copied strings (the 404's trace). raw user-allocator
++// copies: these live only inside one resolve call.
+ typedef struct {
+   char** items;
+   uint32_t count;
+@@ -122,27 +162,29 @@ static void str_list_init(str_list* p_list) {
+   p_list->capacity = 0;
+ }
+ 
+-static void str_list_deinit(str_list* p_list) {
++static void str_list_deinit(str_list* p_list, const ok_allocators* p_a) {
+   for (uint32_t i = 0; i < p_list->count; ++i) {
+-    free(p_list->items[i]);
++    mod_free(p_a, p_list->items[i]);
++  }
++  if (p_list->items != NULL) {
++    mod_free(p_a, p_list->items);
+   }
+-  free(p_list->items);
+   p_list->items = NULL;
+   p_list->count = 0;
+   p_list->capacity = 0;
+ }
+ 
+-static bool str_list_append(str_list* p_list, const char* p_text) {
++static bool str_list_append(str_list* p_list, const ok_allocators* p_a, const char* p_text) {
+   if (p_list->count == p_list->capacity) {
+     const uint32_t grown = p_list->capacity == 0 ? 8 : p_list->capacity * 2;
+-    char** items = (char**)realloc(p_list->items, sizeof(char*) * grown);
++    char** items = (char**)mod_realloc(p_a, p_list->items, sizeof(char*) * grown);
+     if (items == NULL) {
+       return false;
+     }
+     p_list->items = items;
+     p_list->capacity = grown;
+   }
+-  char* copy = strdup(p_text);
++  char* copy = mod_strdup(p_a, p_text);
+   if (copy == NULL) {
+     return false;
+   }
+@@ -170,11 +212,11 @@ static bool file_readable(const char* p_path) {
+ 
+ // lexical join + normalize: dir's segments, then rel's, with '.' skipped and
+ // '..' popping. rel never starts with '/' (the parser rejects absolute
+-// paths). the result is malloc'd; NULL = OOM.
+-static char* join_normalize(const char* p_dir, const ok_string_view p_rel) {
++// paths). the result rides the user's allocators; NULL = OOM.
++static char* join_normalize(const ok_allocators* p_a, const char* p_dir, const ok_string_view p_rel) {
+   const size_t dir_length = strlen(p_dir);
+   const uint64_t rel_length = ok_string_view_get_length(&p_rel);
+-  char* out = (char*)malloc(dir_length + rel_length + 4);
++  char* out = (char*)mod_alloc(p_a, dir_length + rel_length + 4);
+   if (out == NULL) {
+     return NULL;
+   }
+@@ -222,11 +264,11 @@ static char* join_normalize(const char* p_dir, const ok_string_view p_rel) {
+ // then + ".ok", then + "/index.ok". a native candidate (.so today - the
+ // platform table widens with OR-3) is detected but not loaded: natives land
+ // with OR-3's sandboxed loader, and the error says so.
+-static char* ladder_at(const char* p_base, str_list* p_tried, bool* p_native_found) {
++static char* ladder_at(const ok_allocators* p_a, const char* p_base, str_list* p_tried, bool* p_native_found) {
+   static const char* const forms[] = {"", ".ok", "/index.ok"};
+   for (uint32_t f = 0; f < 3; ++f) {
+     const size_t base_length = strlen(p_base);
+-    char* candidate = (char*)malloc(base_length + strlen(forms[f]) + 1);
++    char* candidate = (char*)mod_alloc(p_a, base_length + strlen(forms[f]) + 1);
+     if (candidate == NULL) {
+       return NULL;
+     }
+@@ -235,33 +277,33 @@ static char* ladder_at(const char* p_base, str_list* p_tried, bool* p_native_fou
+     if (file_readable(candidate)) {
+       return candidate;
+     }
+-    str_list_append(p_tried, candidate); // best effort: the trace wants it
+-    free(candidate);
++    str_list_append(p_tried, p_a, candidate); // best effort: the trace wants it
++    mod_free(p_a, candidate);
+   }
+   const size_t base_length = strlen(p_base);
+-  char* native_candidate = (char*)malloc(base_length + 4);
++  char* native_candidate = (char*)mod_alloc(p_a, base_length + 4);
+   if (native_candidate != NULL) {
+     memcpy(native_candidate, p_base, base_length);
+     strcpy(native_candidate + base_length, ".so");
+     if (file_readable(native_candidate)) {
+       *p_native_found = true;
+     }
+-    free(native_candidate);
++    mod_free(p_a, native_candidate);
+   }
+   return NULL;
+ }
+ 
+-// the importing file's directory ("" -> "."). returns a malloc'd copy.
+-static char* directory_of(const char* p_path) {
++// the importing file's directory ("" -> "."). a copy on the user's allocators.
++static char* directory_of(const ok_allocators* p_a, const char* p_path) {
+   const char* last = strrchr(p_path, '/');
+   if (last == NULL) {
+-    return strdup(".");
++    return mod_strdup(p_a, ".");
+   }
+   if (last == p_path) {
+-    return strdup("/");
++    return mod_strdup(p_a, "/");
+   }
+   const size_t length = (size_t)(last - p_path);
+-  char* dir = (char*)malloc(length + 1);
++  char* dir = (char*)mod_alloc(p_a, length + 1);
+   if (dir == NULL) {
+     return NULL;
+   }
+@@ -284,19 +326,20 @@ static bool view_equals(const ok_string_view p_view, const char* p_text) {
+ 
+ // ---------------------------------------------------------------- the registry
+ 
+-// the per-run name arena (root names the binding table views). raw malloc,
+-// freed at the next ok_run's reset (ok.c) and at deinit.
++// the per-run name arena (root names the binding table views). user
++// allocators, freed at the next ok_run's reset (ok.c) and at deinit.
+ static char* arena_strdup(module_system* p_modules, const char* p_text) {
++  const ok_allocators* a = &p_modules->ok->raw_alloc;
+   if (p_modules->name_arena_count == p_modules->name_arena_capacity) {
+     const uint32_t grown = p_modules->name_arena_capacity == 0 ? 16 : p_modules->name_arena_capacity * 2;
+-    char** arena = (char**)realloc(p_modules->name_arena, sizeof(char*) * grown);
++    char** arena = (char**)mod_realloc(a, p_modules->name_arena, sizeof(char*) * grown);
+     if (arena == NULL) {
+       return NULL;
+     }
+     p_modules->name_arena = arena;
+     p_modules->name_arena_capacity = grown;
+   }
+-  char* copy = strdup(p_text);
++  char* copy = mod_strdup(a, p_text);
+   if (copy == NULL) {
+     return NULL;
+   }
+@@ -393,7 +436,7 @@ static bool build_namespace(module_system* p_modules,
+ // nodes OWN their names (strdup) - the segment buffers they came from die
+ // with each import statement, the tree lives until materialization.
+ typedef struct pending_ns {
+-  char* name;               // the segment, owned
++  char* name;               // the segment, owned (user allocators)
+   value module_leaf;        // set when a module lands exactly here
+   bool has_leaf;
+   struct pending_ns* children;
+@@ -401,8 +444,8 @@ typedef struct pending_ns {
+   uint32_t children_capacity;
+ } pending_ns;
+ 
+-static void pending_ns_init(pending_ns* p_node, const char* p_name) {
+-  p_node->name = strdup(p_name);
++static void pending_ns_init(const ok_allocators* p_a, pending_ns* p_node, const char* p_name) {
++  p_node->name = mod_strdup(p_a, p_name);
+   p_node->module_leaf = NULL_AS_VALUE();
+   p_node->has_leaf = false;
+   p_node->children = NULL;
+@@ -410,19 +453,21 @@ static void pending_ns_init(pending_ns* p_node, const char* p_name) {
+   p_node->children_capacity = 0;
+ }
+ 
+-static void pending_ns_deinit(pending_ns* p_node) {
++static void pending_ns_deinit(const ok_allocators* p_a, pending_ns* p_node) {
+   for (uint32_t i = 0; i < p_node->children_count; ++i) {
+-    pending_ns_deinit(&p_node->children[i]);
++    pending_ns_deinit(p_a, &p_node->children[i]);
+   }
+-  free(p_node->children);
+-  free(p_node->name);
++  if (p_node->children != NULL) {
++    mod_free(p_a, p_node->children);
++  }
++  mod_free(p_a, p_node->name);
+   p_node->name = NULL;
+   p_node->children = NULL;
+   p_node->children_count = 0;
+   p_node->children_capacity = 0;
+ }
+ 
+-static pending_ns* pending_ns_child(pending_ns* p_node, const char* p_name) {
++static pending_ns* pending_ns_child(const ok_allocators* p_a, pending_ns* p_node, const char* p_name) {
+   for (uint32_t i = 0; i < p_node->children_count; ++i) {
+     if (strcmp(p_node->children[i].name, p_name) == 0) {
+       return &p_node->children[i];
+@@ -430,7 +475,7 @@ static pending_ns* pending_ns_child(pending_ns* p_node, const char* p_name) {
+   }
+   if (p_node->children_count == p_node->children_capacity) {
+     const uint32_t grown = p_node->children_capacity == 0 ? 4 : p_node->children_capacity * 2;
+-    pending_ns* children = (pending_ns*)realloc(p_node->children, sizeof(pending_ns) * grown);
++    pending_ns* children = (pending_ns*)mod_realloc(p_a, p_node->children, sizeof(pending_ns) * grown);
+     if (children == NULL) {
+       return NULL;
+     }
+@@ -438,7 +483,7 @@ static pending_ns* pending_ns_child(pending_ns* p_node, const char* p_name) {
+     p_node->children_capacity = grown;
+   }
+   pending_ns* child = &p_node->children[p_node->children_count++];
+-  pending_ns_init(child, p_name);
++  pending_ns_init(p_a, child, p_name);
+   return child;
+ }
+ 
+@@ -529,6 +574,7 @@ static ok_result load_module(module_system* p_modules,
+                             const ok_source* p_from_source,
+                             const token* p_site) {
+   ok* okay = p_modules->ok;
++  const ok_allocators* a = &okay->raw_alloc;
+ 
+   // loaded already? one TU per module, ever (the registry is the cache).
+   ok_module_record* found = registry_find(p_modules, p_canonical);
+@@ -577,7 +623,7 @@ static ok_result load_module(module_system* p_modules,
+   if (parsed.status != PARSE_OK) {
+     parser_deinit(&parser);
+     parse_result_deinit(&parsed);
+-    free((void*)source.code);
++    mod_free(a, (void*)source.code);
+     return OK_PARSE_ERROR;
+   }
+ 
+@@ -585,13 +631,16 @@ static ok_result load_module(module_system* p_modules,
+   p_modules->chain[p_modules->chain_depth++] = p_canonical;
+   ok_import_binding_array bindings;
+   ok_import_binding_array_init(&bindings, &okay->alloc);
+-  const ok_result prepared = ok_modules_prepare(p_modules, parsed.root, &source, &bindings);
++  char** imports_owned = NULL; // ownership moves to the record below
++  uint32_t imports_owned_count = 0;
++  const ok_result prepared = ok_modules_prepare(
++      p_modules, parsed.root, &source, &bindings, &imports_owned, &imports_owned_count);
+   p_modules->chain_depth--;
+   if (prepared != OK) {
+     parser_deinit(&parser);
+     parse_result_deinit(&parsed);
+     ok_import_binding_array_deinit(&bindings, &okay->alloc);
+-    free((void*)source.code);
++    mod_free(a, (void*)source.code);
+     return prepared;
+   }
+ 
+@@ -606,7 +655,7 @@ static ok_result load_module(module_system* p_modules,
+     parser_deinit(&parser);
+     parse_result_deinit(&parsed);
+     ok_import_binding_array_deinit(&bindings, &okay->alloc);
+-    free((void*)source.code);
++    mod_free(a, (void*)source.code);
+     return OK_INIT_ERROR;
+   }
+   compile_specs.imports = (ok_import_bindings){bindings.data, bindings.count};
+@@ -619,7 +668,7 @@ static ok_result load_module(module_system* p_modules,
+   if (compiled.status != COMPILE_OK) {
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    free((void*)source.code);
++    mod_free(a, (void*)source.code);
+     return OK_COMPILE_ERROR;
+   }
+ 
+@@ -629,7 +678,7 @@ static ok_result load_module(module_system* p_modules,
+   if (!gc_guard_up(&okay->gc, OBJECT_AS_VALUE(compiled.function))) {
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    free((void*)source.code);
++    mod_free(a, (void*)source.code);
+     module_report(p_from_source, p_site, "out of memory while running the module's top level.");
+     return OK_INIT_ERROR;
+   }
+@@ -640,7 +689,7 @@ static ok_result load_module(module_system* p_modules,
+     gc_guard_down(&okay->gc);
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    free((void*)source.code);
++    mod_free(a, (void*)source.code);
+     return OK_INIT_ERROR;
+   }
+   ok_stamp_source_ids(compiled.function, source_id);
+@@ -656,7 +705,7 @@ static ok_result load_module(module_system* p_modules,
+   if (err || ran.status != RUNTIME_OK) {
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    free((void*)source.code);
++    mod_free(a, (void*)source.code);
+     // the runtime error already printed with the module's own path and
+     // trace; this note ties it to the import that pulled it in.
+     module_note(p_from_source, p_site, "while loading this module (its top level failed).");
+@@ -668,20 +717,22 @@ static ok_result load_module(module_system* p_modules,
+   if (!build_namespace(p_modules, p_canonical, &compiled.exports, &namespace)) {
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    free((void*)source.code);
++    mod_free(a, (void*)source.code);
+     module_report(p_from_source, p_site, "out of memory while building the module's namespace.");
+     return OK_INIT_ERROR;
+   }
+   ok_module_record record;
+-  record.canonical = strdup(p_canonical);
++  record.canonical = mod_strdup(a, p_canonical);
+   record.name = VALUE_AS_INSTANCE(namespace)->klass->name;
+   record.namespace_class = VALUE_AS_INSTANCE(namespace)->klass;
+   record.namespace = namespace;
++  record.imports = imports_owned;
++  record.imports_count = imports_owned_count;
+   if (!gc_guard_up(&okay->gc, namespace)) {
+-    free(record.canonical);
++    ok_module_record_deinit(&record, &okay->alloc);
+     parse_result_deinit(&parsed);
+     module_exports_deinit(&compiled.exports, &okay->alloc);
+-    free((void*)source.code);
++    mod_free(a, (void*)source.code);
+     module_report(p_from_source, p_site, "out of memory while registering the module.");
+     return OK_INIT_ERROR;
+   }
+@@ -689,9 +740,9 @@ static ok_result load_module(module_system* p_modules,
+   gc_guard_down(&okay->gc);
+   parse_result_deinit(&parsed);
+   module_exports_deinit(&compiled.exports, &okay->alloc);
+-  free((void*)source.code);
++  mod_free(a, (void*)source.code);
+   if (!registered) {
+-    free(record.canonical);
++    ok_module_record_deinit(&record, &okay->alloc);
+     module_report(p_from_source, p_site, "out of memory while registering the module.");
+     return OK_INIT_ERROR;
+   }
+@@ -763,6 +814,7 @@ static bool std_canonical_of(const std_module_def* p_def, char* p_buffer, size_t
+ // pays for it.
+ static ok_result std_build_module(module_system* p_modules, const std_module_def* p_def) {
+   ok* okay = p_modules->ok;
++  const ok_allocators* a = &okay->raw_alloc;
+   char canonical[32];
+   if (!std_canonical_of(p_def, canonical, sizeof(canonical))) {
+     return OK_INIT_ERROR;
+@@ -796,18 +848,20 @@ static ok_result std_build_module(module_system* p_modules, const std_module_def
+       result = OK_INIT_ERROR;
+     } else {
+       ok_module_record record;
+-      record.canonical = strdup(canonical);
++      record.canonical = mod_strdup(a, canonical);
+       record.name = VALUE_AS_INSTANCE(namespace)->klass->name;
+       record.namespace_class = VALUE_AS_INSTANCE(namespace)->klass;
+       record.namespace = namespace;
++      record.imports = NULL;
++      record.imports_count = 0;
+       if (!gc_guard_up(&okay->gc, namespace)) {
+-        free(record.canonical);
++        ok_module_record_deinit(&record, &okay->alloc);
+         result = OK_INIT_ERROR;
+       } else {
+         const bool registered = record.canonical != NULL && ok_module_records_append(&p_modules->loaded, record);
+         gc_guard_down(&okay->gc);
+         if (!registered) {
+-          free(record.canonical);
++          ok_module_record_deinit(&record, &okay->alloc);
+           result = OK_INIT_ERROR;
+         }
+       }
+@@ -828,6 +882,7 @@ static bool resolve_import(module_system* p_modules,
+                            const ok_source* p_source,
+                            const token* p_site,
+                            char** p_out_canonical) {
++  const ok_allocators* a = &p_modules->ok->raw_alloc;
+   str_list tried;
+   str_list_init(&tried);
+   char* found = NULL;
+@@ -835,17 +890,17 @@ static bool resolve_import(module_system* p_modules,
+ 
+   if (view_starts_with(p_path, "./") || view_starts_with(p_path, "../")) {
+     // the file-relative lane (M3): raw ok files, no project needed.
+-    char* joined = join_normalize(p_from_dir, p_path);
++    char* joined = join_normalize(a, p_from_dir, p_path);
+     if (joined != NULL) {
+-      found = ladder_at(joined, &tried, &native_found);
+-      free(joined);
++      found = ladder_at(a, joined, &tried, &native_found);
++      mod_free(a, joined);
+     }
+   } else if (view_equals(p_path, "std")) {
+     // the bare root imports nothing: the std library is a tree of modules.
+     module_report(p_source,
+                   p_site,
+                   "the std root is a namespace: import a module under it, like \"std/array\".");
+-    str_list_deinit(&tried);
++    str_list_deinit(&tried, a);
+     return false;
+   } else if (view_starts_with(p_path, "std/")) {
+     // the std lane (M8, OR-2): the built-in registry only. it never falls
+@@ -862,32 +917,32 @@ static bool resolve_import(module_system* p_modules,
+                                stem.chars);
+       module_report(p_source, p_site, message.chars != NULL ? message.chars : "no such std module.");
+       string_deinit(&message, &p_modules->ok->alloc);
+-      str_list_deinit(&tried);
++      str_list_deinit(&tried, a);
+       return false;
+     }
+     if (std_build_module(p_modules, def) != OK) {
+       module_report(p_source, p_site, "out of memory while building the module's namespace.");
+-      str_list_deinit(&tried);
++      str_list_deinit(&tried, a);
+       return false;
+     }
+     char canonical[32];
+     if (!std_canonical_of(def, canonical, sizeof(canonical))) {
+-      str_list_deinit(&tried);
++      str_list_deinit(&tried, a);
+       return false;
+     }
+-    char* owned = strdup(canonical);
++    char* owned = mod_strdup(a, canonical);
+     if (owned == NULL) {
+-      str_list_deinit(&tried);
++      str_list_deinit(&tried, a);
+       return false;
+     }
+-    str_list_deinit(&tried);
++    str_list_deinit(&tried, a);
+     *p_out_canonical = owned;
+     return true;
+   } else {
+     // the OKPATH lane: colon-separated roots, the same ladder at each.
+     const char* okpath = getenv("OKPATH");
+     if (okpath != NULL && *okpath != '\0') {
+-      char* roots = strdup(okpath);
++      char* roots = mod_strdup(a, okpath);
+       if (roots != NULL) {
+         char* cursor = roots;
+         while (cursor != NULL && *cursor != '\0' && found == NULL) {
+@@ -896,15 +951,15 @@ static bool resolve_import(module_system* p_modules,
+             *colon = '\0';
+           }
+           if (*cursor != '\0') {
+-            char* joined = join_normalize(cursor, p_path);
++            char* joined = join_normalize(a, cursor, p_path);
+             if (joined != NULL) {
+-              found = ladder_at(joined, &tried, &native_found);
+-              free(joined);
++              found = ladder_at(a, joined, &tried, &native_found);
++              mod_free(a, joined);
+             }
+           }
+           cursor = colon != NULL ? colon + 1 : NULL;
+         }
+-        free(roots);
++        mod_free(a, roots);
+       }
+     }
+   }
+@@ -914,7 +969,7 @@ static bool resolve_import(module_system* p_modules,
+       module_report(p_source,
+                     p_site,
+                     "a native module was found, but native loading is not available yet.");
+-      str_list_deinit(&tried);
++      str_list_deinit(&tried, a);
+       return false;
+     }
+     // the 404 must teach (M3): every location and form tried, plus the hint.
+@@ -928,24 +983,29 @@ static bool resolve_import(module_system* p_modules,
+     } else {
+       module_note(p_source, p_site, "add the module's directory to OKPATH, or fix the path.");
+     }
+-    str_list_deinit(&tried);
++    str_list_deinit(&tried, a);
+     return false;
+   }
+ 
+   // canonicalize (symlinks resolved): the registry key, the class name, and
+-  // the stack-trace path all use this one spelling.
+-  char* canonical = realpath(found, NULL);
+-  if (canonical == NULL) {
+-    canonical = found; // realpath refused (exotic fs): the found path is the key
++  // the stack-trace path all use this one spelling. realpath's own buffer is
++  // libc's, so a hit is copied onto the user's allocators and the original
++  // released: the registry only ever frees what it allocated.
++  char* real = realpath(found, NULL);
++  if (real == NULL) {
++    *p_out_canonical = found; // realpath refused (exotic fs): the found path is the key
+   } else {
+-    free(found);
+-  }
+-  *p_out_canonical = canonical;
+-  str_list_deinit(&tried);
+-  if (canonical == NULL) {
+-    module_report(p_source, p_site, "out of memory while resolving the module path.");
+-    return false;
++    char* owned = mod_strdup(a, real);
++    free(real);
++    mod_free(a, found);
++    if (owned == NULL) {
++      str_list_deinit(&tried, a);
++      module_report(p_source, p_site, "out of memory while resolving the module path.");
++      return false;
++    }
++    *p_out_canonical = owned;
+   }
++  str_list_deinit(&tried, a);
+   return true;
+ }
+ 
+@@ -953,7 +1013,10 @@ static bool resolve_import(module_system* p_modules,
+ // '..' popped where possible and dropped at the front (they climb toward the
+ // importer's directory - the NAME is the remainder), a trailing '.ok'
+ // stripped. "a/b" -> [a, b]; "./util.ok" -> [util]; "../lib/h" -> [lib, h].
+-static bool binding_segments(const ok_string_view p_path, char*** p_out, uint32_t* p_out_count) {
++static bool binding_segments(const ok_allocators* p_a,
++                              const ok_string_view p_path,
++                              char*** p_out,
++                              uint32_t* p_out_count) {
+   const uint64_t length = ok_string_view_get_length(&p_path);
+   char** segments = NULL;
+   uint32_t count = 0;
+@@ -968,11 +1031,11 @@ static bool binding_segments(const ok_string_view p_path, char*** p_out, uint32_
+     const bool is_dot = seg_length == 1 && p_path.chars[i] == '.';
+     const bool is_dotdot = seg_length == 2 && p_path.chars[i] == '.' && p_path.chars[i + 1] == '.';
+     if (is_dotdot && count > 0) {
+-      free(segments[--count]);
++      mod_free(p_a, segments[--count]);
+     } else if (!is_dot && !is_dotdot && seg_length > 0) {
+       if (count == capacity) {
+         const uint32_t grown = capacity == 0 ? 4 : capacity * 2;
+-        char** grown_segments = (char**)realloc(segments, sizeof(char*) * grown);
++        char** grown_segments = (char**)mod_realloc(p_a, segments, sizeof(char*) * grown);
+         if (grown_segments == NULL) {
+           goto oom;
+         }
+@@ -987,7 +1050,7 @@ static bool binding_segments(const ok_string_view p_path, char*** p_out, uint32_
+         i = j + 1;
+         continue;
+       }
+-      char* segment = (char*)malloc(name_length + 1);
++      char* segment = (char*)mod_alloc(p_a, name_length + 1);
+       if (segment == NULL) {
+         goto oom;
+       }
+@@ -1005,17 +1068,21 @@ static bool binding_segments(const ok_string_view p_path, char*** p_out, uint32_
+   return true;
+ oom:
+   for (uint32_t k = 0; k < count; ++k) {
+-    free(segments[k]);
++    mod_free(p_a, segments[k]);
++  }
++  if (segments != NULL) {
++    mod_free(p_a, segments);
+   }
+-  free(segments);
+   return false;
+ }
+ 
+-static void free_segments(char** p_segments, uint32_t p_count) {
++static void free_segments(const ok_allocators* p_a, char** p_segments, uint32_t p_count) {
+   for (uint32_t i = 0; i < p_count; ++i) {
+-    free(p_segments[i]);
++    mod_free(p_a, p_segments[i]);
++  }
++  if (p_segments != NULL) {
++    mod_free(p_a, p_segments);
+   }
+-  free(p_segments);
+ }
+ 
+ // ---------------------------------------------------------------- prepare (the graph phase)
+@@ -1023,18 +1090,28 @@ static void free_segments(char** p_segments, uint32_t p_count) {
+ ok_result ok_modules_prepare(module_system* p_modules,
+                              ast_root* p_root,
+                              const ok_source* p_source,
+-                             ok_import_binding_array* p_bindings) {
++                             ok_import_binding_array* p_bindings,
++                             char*** p_out_imports,
++                             uint32_t* p_out_imports_count) {
+   ok* okay = p_modules->ok;
+-  char* from_dir = directory_of(p_source->path);
++  const ok_allocators* a = &okay->raw_alloc;
++  char* from_dir = directory_of(a, p_source->path);
+   if (from_dir == NULL) {
+     return OK_INIT_ERROR;
+   }
+   ok_result result = OK;
+ 
++  // the TU's resolved imports (the graph edges): deduped canonical paths,
++  // load order. ownership moves to the caller on success (the record, or
++  // the entry run's discard), stays here on failure.
++  char** imports = NULL;
++  uint32_t imports_count = 0;
++  uint32_t imports_capacity = 0;
++
+   // the TU's root forest + the deferred bindings awaiting their roots
+   pending_ns forest;
+-  pending_ns_init(&forest, "");
+-  uint32_t* deferred = NULL;      // binding indices (raw malloc)
++  pending_ns_init(a, &forest, "");
++  uint32_t* deferred = NULL;      // binding indices (raw user allocators)
+   char** deferred_roots = NULL; // parallel: the arena'd root name each lands under
+   uint32_t deferred_count = 0;
+   uint32_t deferred_capacity = 0;
+@@ -1058,19 +1135,48 @@ ok_result ok_modules_prepare(module_system* p_modules,
+     }
+     const ok_result loaded = load_module(p_modules, canonical, p_source, site);
+     if (loaded != OK) {
+-      free(canonical);
++      mod_free(a, canonical);
+       result = loaded;
+       break;
+     }
+     ok_module_record* record = registry_find(p_modules, canonical);
+     // cannot be NULL: load_module just registered it (or it was there)
+-    free(canonical);
+-    canonical = NULL;
+     if (record == NULL) {
++      mod_free(a, canonical);
+       module_report(p_source, site, "internal error: the loaded module did not register.");
+       result = OK_INIT_ERROR;
+       break;
+     }
++    // record the edge (dedup: the same module imported twice lists once)
++    bool edge_new = true;
++    for (uint32_t e = 0; e < imports_count; ++e) {
++      if (strcmp(imports[e], canonical) == 0) {
++        edge_new = false;
++        break;
++      }
++    }
++    if (edge_new) {
++      if (imports_count == imports_capacity) {
++        const uint32_t grown = imports_capacity == 0 ? 8 : imports_capacity * 2;
++        char** grown_imports = (char**)mod_realloc(a, imports, sizeof(char*) * grown);
++        if (grown_imports == NULL) {
++          mod_free(a, canonical);
++          result = OK_INIT_ERROR;
++          break;
++        }
++        imports = grown_imports;
++        imports_capacity = grown;
++      }
++      imports[imports_count] = mod_strdup(a, canonical);
++      if (imports[imports_count] == NULL) {
++        mod_free(a, canonical);
++        result = OK_INIT_ERROR;
++        break;
++      }
++      imports_count++;
++    }
++    mod_free(a, canonical);
++    canonical = NULL;
+ 
+     if (import->symbols.count == 0) {
+       // the path form: `import "a/b";` binds the root; `import "a/b" as c;`
+@@ -1089,7 +1195,7 @@ ok_result ok_modules_prepare(module_system* p_modules,
+       }
+       char** segments = NULL;
+       uint32_t segment_count = 0;
+-      if (!binding_segments(path, &segments, &segment_count)) {
++      if (!binding_segments(a, path, &segments, &segment_count)) {
+         module_report(p_source, site, "the import path has no name to bind.");
+         result = OK_COMPILE_ERROR;
+         break;
+@@ -1099,7 +1205,7 @@ ok_result ok_modules_prepare(module_system* p_modules,
+       // dies at the end of it).
+       char* root_owned = arena_strdup(p_modules, segments[0]);
+       if (root_owned == NULL) {
+-        free_segments(segments, segment_count);
++        free_segments(a, segments, segment_count);
+         result = OK_INIT_ERROR;
+         break;
+       }
+@@ -1112,7 +1218,7 @@ ok_result ok_modules_prepare(module_system* p_modules,
+         module_report(p_source,
+                       site,
+                       "the name 'std' is reserved for the standard library's namespace.");
+-        free_segments(segments, segment_count);
++        free_segments(a, segments, segment_count);
+         result = OK_COMPILE_ERROR;
+         break;
+       }
+@@ -1129,9 +1235,10 @@ ok_result ok_modules_prepare(module_system* p_modules,
+       if (!already_bound) {
+         if (bound_count == bound_capacity) {
+           const uint32_t grown = bound_capacity == 0 ? 4 : bound_capacity * 2;
+-          ok_string_view* grown_roots = (ok_string_view*)realloc(bound_roots, sizeof(ok_string_view) * grown);
++          ok_string_view* grown_roots =
++              (ok_string_view*)mod_realloc(a, bound_roots, sizeof(ok_string_view) * grown);
+           if (grown_roots == NULL) {
+-            free_segments(segments, segment_count);
++            free_segments(a, segments, segment_count);
+             result = OK_INIT_ERROR;
+             break;
+           }
+@@ -1145,9 +1252,9 @@ ok_result ok_modules_prepare(module_system* p_modules,
+       pending_ns* node = &forest;
+       bool conflict = false;
+       for (uint32_t i = 0; i < segment_count; ++i) {
+-        pending_ns* child = pending_ns_child(node, segments[i]);
++        pending_ns* child = pending_ns_child(a, node, segments[i]);
+         if (child == NULL) {
+-          free_segments(segments, segment_count);
++          free_segments(a, segments, segment_count);
+           result = OK_INIT_ERROR;
+           break;
+         }
+@@ -1173,12 +1280,12 @@ ok_result ok_modules_prepare(module_system* p_modules,
+         if (conflict) {
+           result = OK_COMPILE_ERROR;
+         }
+-        free_segments(segments, segment_count);
++        free_segments(a, segments, segment_count);
+         break;
+       }
+       node->module_leaf = record->namespace;
+       node->has_leaf = true;
+-      free_segments(segments, segment_count);
++      free_segments(a, segments, segment_count);
+ 
+       const ok_import_binding binding = {
+           .name = root_name,
+@@ -1194,10 +1301,10 @@ ok_result ok_modules_prepare(module_system* p_modules,
+         // (matched by name - the tree's arrays move as they grow)
+         if (deferred_count == deferred_capacity) {
+           const uint32_t grown = deferred_capacity == 0 ? 4 : deferred_capacity * 2;
+-          uint32_t* grown_deferred = (uint32_t*)realloc(deferred, sizeof(uint32_t) * grown);
+-          char** grown_roots = (char**)realloc(deferred_roots, sizeof(char*) * grown);
++          uint32_t* grown_deferred = (uint32_t*)mod_realloc(a, deferred, sizeof(uint32_t) * grown);
++          char** grown_roots = (char**)mod_realloc(a, deferred_roots, sizeof(char*) * grown);
+           if (grown_deferred == NULL || grown_roots == NULL) {
+-            free(grown_deferred != NULL ? grown_deferred : deferred);
++            mod_free(a, grown_deferred != NULL ? grown_deferred : deferred);
+             if (grown_roots != NULL) {
+               deferred_roots = grown_roots; // keep the bigger one; freed below
+             }
+@@ -1295,11 +1402,28 @@ ok_result ok_modules_prepare(module_system* p_modules,
+     }
+   }
+ 
+-  pending_ns_deinit(&forest);
+-  free(deferred);
+-  free(deferred_roots);
+-  free(bound_roots);
+-  free(from_dir);
++  pending_ns_deinit(a, &forest);
++  if (deferred != NULL) {
++    mod_free(a, deferred);
++  }
++  if (deferred_roots != NULL) {
++    mod_free(a, deferred_roots);
++  }
++  if (bound_roots != NULL) {
++    mod_free(a, bound_roots);
++  }
++  mod_free(a, from_dir);
++  if (result != OK) {
++    for (uint32_t i = 0; i < imports_count; ++i) {
++      mod_free(a, imports[i]);
++    }
++    if (imports != NULL) {
++      mod_free(a, imports);
++    }
++    return result;
++  }
++  *p_out_imports = imports;
++  *p_out_imports_count = imports_count;
+   return result;
+ }
+ 
+@@ -1318,17 +1442,20 @@ void ok_modules_init(module_system* p_modules, ok* p_ok, allocators* p_alloc) {
+   p_modules->name_arena_capacity = 0;
+   ok_loader loader;
+   loader.read_source = fs_read_source;
+-  loader.p_ctx = NULL;
++  loader.p_ctx = p_modules; // the default loader reaches the user's allocators
+   p_modules->loader = loader;
+ }
+ 
+ void ok_modules_deinit(module_system* p_modules) {
++  const ok_allocators* a = &p_modules->ok->raw_alloc;
+   ok_module_records_deinit(&p_modules->loaded, p_modules->loaded.alloc);
+   value_array_deinit(&p_modules->pending_roots, p_modules->pending_roots.alloc);
+   for (uint32_t i = 0; i < p_modules->name_arena_count; ++i) {
+-    free(p_modules->name_arena[i]);
++    mod_free(a, p_modules->name_arena[i]);
++  }
++  if (p_modules->name_arena != NULL) {
++    mod_free(a, p_modules->name_arena);
+   }
+-  free(p_modules->name_arena);
+   p_modules->name_arena = NULL;
+   p_modules->name_arena_count = 0;
+   p_modules->name_arena_capacity = 0;
+diff --git a/src/okmodules.h b/src/okmodules.h
+index 7569ad1..17b5373 100644
+--- a/src/okmodules.h
++++ b/src/okmodules.h
+@@ -36,9 +36,12 @@
+ #define OK_MODULES_MAX_DEPTH 128
+ 
+ typedef struct ok_loader {
+-  // reads the source at an absolute path into *p_out (code: a malloc'd,
+-  // NUL-terminated buffer the CALLER frees; path: the canonical path).
+-  // false = unreadable (the driver turns it into the 404's IO note).
++  // reads the source at an absolute path into *p_out. the code buffer MUST
++  // be allocated with the ok_allocators this ok instance was created with
++  // (the embedder passes the same table in ok_specs): the instance frees it
++  // with its release call after the module's tree is consumed. false =
++  // unreadable (the driver turns it into the 404's IO note). path: borrowed,
++  // the canonical spelling.
+   bool (*read_source)(void* p_ctx, const char* p_path, ok_source* p_out);
+   // load_native arrives with OR-3 (sandbox + the ok_api vtable). NULL today.
+   void* p_ctx;
+@@ -48,10 +51,15 @@ typedef struct ok_loader {
+ // canonical path - module counts are tens, not thousands, and the load path
+ // is not hot; the okmap upgrade can come when a profile asks for it.
+ typedef struct {
+-  char* canonical;             // the resolved absolute path (owned)
++  char* canonical;             // the resolved absolute path (owned, user allocators)
+   object_string* name;         // the canonical, interned (the namespace class's name)
+   object_class* namespace_class;
+   value namespace;             // the sealed namespace instance
++  // OR-3: the module's own imports, the graph edge list (deduped canonical
++  // paths in load order). owned, user allocators. the read side is
++  // ok_module_import_count / ok_module_import_path (ok.h).
++  char** imports;
++  uint32_t imports_count;
+ } ok_module_record;
+ 
+ ARRAY_DECLARE_DEFAULT(ok_module_records, ok_module_record)
+@@ -92,10 +100,16 @@ void ok_modules_set_loader(module_system* p_modules, ok_loader p_loader);
+ // same-root imports merge), and fills the ordered binding table the compiler
+ // consumes. p_bindings is caller-initialized and caller-deinitialized; the
+ // values inside are borrowed (the registry and pending_roots root them).
++// p_out_imports/p_out_imports_count receive the TU's own resolved imports
++// (deduped canonical paths, load order, user-allocator owned): the caller
++// attaches them to the module's registry record, or frees them (the entry
++// TU is not a module). NULL/0 on a failed prepare.
+ ok_result ok_modules_prepare(module_system* p_modules,
+                              ast_root* p_root,
+                              const ok_source* p_source,
+-                             ok_import_binding_array* p_bindings);
++                             ok_import_binding_array* p_bindings,
++                             char*** p_out_imports,
++                             uint32_t* p_out_imports_count);
+ 
+ // the gc's walk (called from okgc.c's mark): the registry's namespaces and
+ // the pending-roots window. canonical/name/class strings ride the class
+diff --git a/tests/capi/src/main.c b/tests/capi/src/main.c
+index 819d823..1a8b421 100644
+--- a/tests/capi/src/main.c
++++ b/tests/capi/src/main.c
+@@ -435,6 +435,60 @@ int main(void) {
+   CHECK(ok_coro_status(p_ok, ok_value_number(1)) == UINT32_MAX);
+   CHECK(!ok_value_is_coro(ok_value_string(p_ok, sv("x"))));
+ 
++  // ---------- 11. the module registry read side (OR-3) ----------
++  // its own instance: the lanes above never touch the module world, and this
++  // section must not see their globals. the std lane needs no filesystem.
++  {
++    ok_specs mspecs = {};
++    ok* m_ok = ok_create(mspecs);
++    CHECK(m_ok != NULL);
++    ok_set_print(m_ok, log_print, NULL);
++    CHECK(run(m_ok,
++              "import \"std/array\";\n"
++              "import \"std/map\";\n"
++              "glob let total = std.array.len([7, 8]);\n"
++              "glob let keys = std.map.len({\"a\": 1, \"b\": 2});\n"));
++    ok_value total = ok_value_null();
++    CHECK(ok_global_get(m_ok, sv("total"), &total));
++    CHECK(ok_value_is_number(total) && ok_value_as_number(total) == 2.0);
++    ok_value keys = ok_value_null();
++    CHECK(ok_global_get(m_ok, sv("keys"), &keys));
++    CHECK(ok_value_is_number(keys) && ok_value_as_number(keys) == 2.0);
++    CHECK(ok_module_count(m_ok) == 2);
++    // load order: array first, map second; out of range answers NULL
++    CHECK(strcmp(ok_module_path(m_ok, 0), "std/array") == 0);
++    CHECK(strcmp(ok_module_path(m_ok, 1), "std/map") == 0);
++    CHECK(ok_module_path(m_ok, 2) == NULL);
++    CHECK(ok_value_is_null(ok_module_value(m_ok, 2)));
++    ok_value arr = ok_module_find(m_ok, "std/array");
++    CHECK(!ok_value_is_null(arr));
++    CHECK(ok_value_is_null(ok_module_find(m_ok, "std/nope")));
++    // the export enumeration, declaration order
++    CHECK(ok_module_export_count(m_ok, arr) == 4);
++    CHECK(strcmp(ok_module_export_name(m_ok, arr, 0), "len") == 0);
++    CHECK(strcmp(ok_module_export_name(m_ok, arr, 1), "push") == 0);
++    CHECK(strcmp(ok_module_export_name(m_ok, arr, 2), "pop") == 0);
++    CHECK(strcmp(ok_module_export_name(m_ok, arr, 3), "remove") == 0);
++    CHECK(ok_module_export_name(m_ok, arr, 4) == NULL);
++    CHECK(!ok_value_is_null(ok_module_export_get(m_ok, arr, 0)));
++    CHECK(ok_value_is_null(ok_module_export_get(m_ok, arr, 4)));
++    // std modules import nothing
++    CHECK(ok_module_import_count(m_ok, 0) == 0);
++    CHECK(ok_module_import_path(m_ok, 0, 0) == NULL);
++    // a non-module value answers the empty enumeration
++    CHECK(ok_module_export_count(m_ok, ok_value_number(3)) == 0);
++    CHECK(ok_module_export_name(m_ok, ok_value_number(3), 0) == NULL);
++    CHECK(ok_value_is_null(ok_module_export_get(m_ok, ok_value_number(3), 0)));
++    // the module value is an ordinary value: glob it from script, read the
++    // same namespace back through the global
++    CHECK(run(m_ok, "import \"std/array\";\nglob let g = std.array;\n"));
++    CHECK(ok_module_count(m_ok) == 2); // cached: the second run loads nothing
++    ok_value g = ok_value_null();
++    CHECK(ok_global_get(m_ok, sv("g"), &g));
++    CHECK(ok_module_export_count(m_ok, g) == 4);
++    ok_free(m_ok);
++  }
++
+   ok_free(p_ok);
+ 
+   printf("capi: %d checks OK\n", g_checks);
+diff --git a/tests/e2e/tests/modules/surfaceglob/glib.ok b/tests/e2e/tests/modules/surfaceglob/glib.ok
+new file mode 100644
+index 0000000..d3f2f77
+--- /dev/null
++++ b/tests/e2e/tests/modules/surfaceglob/glib.ok
+@@ -0,0 +1,3 @@
++// pin: the module value is an ordinary value, glob takes it like any other
++pub let val = 11;
++pub fu hi() { return "surface-hi"; }
+diff --git a/tests/e2e/tests/modules/surfaceglob/main.ok b/tests/e2e/tests/modules/surfaceglob/main.ok
+new file mode 100644
+index 0000000..2384020
+--- /dev/null
++++ b/tests/e2e/tests/modules/surfaceglob/main.ok
+@@ -0,0 +1,21 @@
++// glob of module values, every shape (Q's ruling round: nothing is hidden
++// from the surface, the module value is just a value)
++import "./glib.ok";
++import "./pkg/inner.ok";
++
++// the module itself, under a new name
++glob let g = glib;
++print g.val; // expect: 11
++print g.hi(); // expect: surface-hi
++
++// the module itself, under the SAME name (global and local coexist)
++glob let glib_again = glib;
++print glib_again.val; // expect: 11
++
++// a multi-segment root namespace, globbed whole
++glob let gp = pkg;
++print gp.inner.val; // expect: 7
++
++// globbed from inside a function, the global survives scopes
++fu later() { return g.hi(); }
++print later(); // expect: surface-hi
+diff --git a/tests/e2e/tests/modules/surfaceglob/pkg/inner.ok b/tests/e2e/tests/modules/surfaceglob/pkg/inner.ok
+new file mode 100644
+index 0000000..d9534cd
+--- /dev/null
++++ b/tests/e2e/tests/modules/surfaceglob/pkg/inner.ok
+@@ -0,0 +1 @@
++pub let val = 7;
+diff --git a/tests/e2e/tests/modules/surfacepub/main.ok b/tests/e2e/tests/modules/surfacepub/main.ok
+new file mode 100644
+index 0000000..609892a
+--- /dev/null
++++ b/tests/e2e/tests/modules/surfacepub/main.ok
+@@ -0,0 +1,10 @@
++// pub re-export pins: a module may re-export imported members and modules
++import "./rexport.ok";
++
++print rexport.member; // expect: 21
++print rexport.whole.val; // expect: 21
++print rexport.whole.hi(); // expect: re-hi
++
++// from-import the re-exports like any pub surface
++from "./rexport.ok" import member;
++print member; // expect: 21
+diff --git a/tests/e2e/tests/modules/surfacepub/rexport.ok b/tests/e2e/tests/modules/surfacepub/rexport.ok
+new file mode 100644
+index 0000000..3e14e7c
+--- /dev/null
++++ b/tests/e2e/tests/modules/surfacepub/rexport.ok
+@@ -0,0 +1,6 @@
++// pin: pub re-exports, both shapes. the same NAME would be a duplicate
++// binding of the import (M13's ordinary rule), another name is free.
++import "./rexport_inner.ok" as inner;
++
++pub let member = inner.val;
++pub let whole = inner;
+diff --git a/tests/e2e/tests/modules/surfacepub/rexport_inner.ok b/tests/e2e/tests/modules/surfacepub/rexport_inner.ok
+new file mode 100644
+index 0000000..bc0f4ae
+--- /dev/null
++++ b/tests/e2e/tests/modules/surfacepub/rexport_inner.ok
+@@ -0,0 +1,2 @@
++pub let val = 21;
++pub fu hi() { return "re-hi"; }
