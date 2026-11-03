@@ -1649,3 +1649,54 @@ first stdlib-shaped resident) and the 0.9.0 heavy passes (constant
 folding, general fusion, DCE-lite, jump threading, tailcalls) that own
 the remaining allocation-shaped class-path gap. tree-sitter catch-up
 still flagged (yield keyword joins the grammar list).
+## session 33 (2026-11-03): two landed changes + the modules draft + delta blue
+
+- context: Q applied everything by hand to codeberg - classes-staging now
+  carries the classes work + the glob-class bug fix (7a59d1c) + the perf
+  pass (8896599 "some perf passes"), and the coro branch (1672c21) sits
+  on top with just coros. not tagged yet (Q hasn't reviewed). the coro
+  rulings are all closed (R20-R24, see COROS-LANDED.md).
+- Q's two rulings this round, both landed on modules-staging (my sandbox
+  branch off origin/coro) and delivered as patches 39/40 (verified
+  applying clean on 1672c21):
+  - patch 39, D17: defer continuation. a failing defer no longer halts
+    the chain - the rest run, the first failure's error propagates, the
+    failing thunk's callees get their cleanup, deferr rides along, oom
+    still stops everything. the cascade flag and the nil lane are gone;
+    the thunk frame flag is repurposed as the chronology marker. one
+    livelock found and pinned en route (accounting vs control flags).
+    defer_cascade.ok replaced by three continuation tests.
+  - patch 40, D18: Class -> type, Object -> object. seeds, interned
+    spellings, one error message, comments, five tests.
+  - gates after both: e2e 425/425 on plain, threaded, asan,
+    aggressive-gc.
+- the big MODULES draft: docs/drafts/MODULES.md. compile-time imports
+  with QUOTED paths (supersedes D9's spelling), one surface for ok files
+  and natives, the dlopen loader + ok_module.h descriptor (classes via
+  patch 34's door), okproject.ok strictly-in-ok with path deps and cmake
+  natives, the loader vtable (the embedding working-dir problem killed by
+  construction), CLI (ok run --native / ok build / ok where), the M1-M14
+  rulings for Q, and the P1-P8 session-sized patch series - the
+  session-cutoff protection Q asked for. each patch has scope + acceptance
+  so the next session reads the draft + WORKLOG and resumes cold.
+- delta blue: Q asked for the borrow-and-compare ("wren and python
+  already have one in wren's repo"). ported from wren's
+  test/benchmark/delta_blue.wren to bench/benchmarks/delta_blue.ok (first
+  run correct: 14065400, cross-checked against wren + python), runner at
+  bench/delta_blue_bench.py, results + the honest read in
+  bench/results/delta_blue.md. sandbox numbers: ok 249.7ms median /
+  ok-threaded 243.3 / wren 129.5 / python 201.9 - ok at 1.93x of wren,
+  dead center of the allocation-shaped classes gap PERF-PASS-1 predicted
+  for 0.9.0's heavy passes; the port also pays the ring-privacy accessor
+  tax wren doesn't (v.value() vs v.value), recorded as a finding with its
+  levers. beat python on nothing here - python 3.12 is genuinely fast at
+  this shape and that is worth knowing.
+- collab repo: this session's push (39/40, D17-D19, the MODULES draft,
+  the delta blue bench, this entry) rebased on top of the session-32
+  push that landed 37/38 on github after all (the re-issued PAT worked
+  from the other sandbox before context ran out - the log above is the
+  fuller record). one README/WORKLOG merge, no content lost.
+- next: Q rules M1-M14 (and the sub-rulings: stem binding, gcc fallback,
+  coro's std.coro home); then P1 (the grammar) opens the 0.6.0 lane.
+  0.9.0's heavy-pass list (constant folding, general fusion, DCE-lite,
+  jump threading, tailcalls) owns the delta blue gap after that.

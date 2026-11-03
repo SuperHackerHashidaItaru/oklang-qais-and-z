@@ -1,0 +1,378 @@
+From 0d6ec9d374986dd5fb386a82c27ed8008045ca06 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Tue, 3 Nov 2026 04:50:14 +0000
+Subject: [PATCH 2/2] rename: Class -> type, Object -> object (snake_case
+ stdlib doctrine)
+
+the two hierarchy roots join the builtin classes' lowercase convention
+(str/num/bool/array/map/function/nil/coro, and now object + type):
+- the seeds table: 'object' (the root singleton), 'type' (the metaclass)
+- the interned spellings in vm_init_singletons
+- the one internal error message that named the root
+- doc comments across src, and the five tests that used the old names
+
+object is the root every hierarchy funnels into (isinstance(x, object)
+is true for everything); type is the class of every class value
+(classof(num) === type, the one self-loop classof(type) === type).
+print output follows the names: <class object>, <class type>.
+425/425 on plain, threaded, asan, aggressive-gc.
+---
+ src/ok.c                                      | 12 ++++-----
+ src/okast.h                                   |  2 +-
+ src/okchunk.h                                 |  2 +-
+ src/okgc.c                                    |  4 +--
+ src/okvm.c                                    | 16 ++++++------
+ src/okvm.h                                    | 16 ++++++------
+ tests/e2e/tests/classes/builtin_classes.ok    | 26 +++++++++----------
+ tests/e2e/tests/classes/classof_isinstance.ok | 18 ++++++-------
+ tests/e2e/tests/classes/glob_class.ok         |  2 +-
+ tests/e2e/tests/classes/is_operator.ok        | 14 +++++-----
+ tests/e2e/tests/coros/basic.ok                |  2 +-
+ 11 files changed, 57 insertions(+), 57 deletions(-)
+
+diff --git a/src/ok.c b/src/ok.c
+index 71e600d..4be7c5a 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -63,7 +63,7 @@ static ok_value native_classof(ok* p_ok, uint8_t p_argc, const ok_value* p_argv)
+ }
+ 
+ // isinstance(v, C) (C12): the chain walk - true when C is classof(v) or one
+-// of its ancestors (Object at the root matches everything, including null
++// of its ancestors (object at the root matches everything, including null
+ // through nil). the exact-class check is `classof(v) == C` or the `is`
+ // operator; this is the family question.
+ static ok_value native_isinstance(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
+@@ -326,7 +326,7 @@ static bool ok_define_builtin_surfaces(ok* p_ok) {
+ // the value array can never drift apart (the old two hand-built arrays were
+ // position-paired by discipline alone). natives pull their hidden " name"
+ // global (the space prefix is what hides them); builtin classes pull the vm
+-// singletons; Object and Class ride the same walk.
++// singletons; object and type ride the same walk.
+ typedef enum {
+   SEED_NATIVE,       // the value is hidden-global " <name>" (a native fn)
+   SEED_BUILTIN_CLASS, // the value is vm->builtin_classes[class_id]
+@@ -356,8 +356,8 @@ static const seed_entry top_level_seeds[] = {
+     {"function", SEED_BUILTIN_CLASS, OK_BUILTIN_FUNCTION},
+     {"nil", SEED_BUILTIN_CLASS, OK_BUILTIN_NIL},
+     {"coro", SEED_BUILTIN_CLASS, OK_BUILTIN_CORO},
+-    {"Object", SEED_OBJECT, OK_BUILTIN_COUNT},
+-    {"Class", SEED_CLASS, OK_BUILTIN_COUNT},
++    {"object", SEED_OBJECT, OK_BUILTIN_COUNT},
++    {"type", SEED_CLASS, OK_BUILTIN_COUNT},
+ };
+ 
+ static top_level_declarations ok_get_top_level_declarations(ok* p_ok, bool* p_error) {
+@@ -397,7 +397,7 @@ static value_array ok_get_top_level_values(ok* p_ok, bool* p_error) {
+       temp = OBJECT_AS_VALUE(p_ok->vm.builtin_classes[seed->class_id]);
+       break;
+     case SEED_OBJECT:
+-      // Object and Class have no global storage; the vm singletons are
++      // object and type have no global storage; the vm singletons are
+       // the values (seeded fresh every run, rooted by mark_vm in between)
+       temp = OBJECT_AS_VALUE(p_ok->vm.object_singleton);
+       break;
+@@ -505,7 +505,7 @@ bool ok_value_is_class(ok_value p_value) {
+ }
+ 
+ // a C-defined class: created unfrozen (define its native methods, then
+-// ok_class_freeze). p_parent is a class value, or a null value for Object.
++// ok_class_freeze). p_parent is a class value, or a null value for object.
+ // returns a null value on failure. the returned class is NOT rooted - the
+ // definition-sequence calls below guard it across their own allocations,
+ // but if you allocate anything else in between (or keep it past the
+diff --git a/src/okast.h b/src/okast.h
+index 9517af8..24648cc 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -761,7 +761,7 @@ string ast_function_declaration_asprint(const ast_function_declaration* p_fu);
+ // `class Name : Parent { members }`. members are let declarations (fields,
+ // the binding's value is the per-instance initializer) and function
+ // declarations (methods; DECLARATION_PUB marks `pub fu`). the parent is an
+-// arbitrary expression evaluated at definition time (null = Object).
++// arbitrary expression evaluated at definition time (null = object).
+ typedef struct {
+   ast_declaration declaration;
+   token name;
+diff --git a/src/okchunk.h b/src/okchunk.h
+index 1fe3e4a..02c994c 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -318,7 +318,7 @@ typedef enum {
+                          //                          and call it, discard lane. a null slot is a no-op: the defer statement never executed on this
+                          //                          path (conditional defer, loop iteration that skipped it).
+   OP_CLASS,              // 2w:   (A, B, C)       -> r[A] = new class named k[B], parent r[C] (a class value;
+-                         //                          null means Object). tables start empty and unfrozen.
++                         //                          null means object). tables start empty and unfrozen.
+   OP_DEFINE_FIELD,       // 2w:   (p, A, B, C)    -> class r[A] gains field k[C]; p == 1: no initializer,
+                          //                          else r[B] is a thunk closure run with the fresh instance
+                          //                          as its receiver at construction time.
+diff --git a/src/okgc.c b/src/okgc.c
+index 801ab1a..537c6c2 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -222,7 +222,7 @@ static bool mark_execution_state(gc* p_gc, execution_state* exe) {
+ static bool mark_vm(gc* p_gc) {
+   vm* vm = p_gc->vm;
+   execution_state* exe = vm->current_execution_state;
+-  // the hierarchy roots: Object, Class, and the cached lookup names are
++  // the hierarchy roots: object, type, and the cached lookup names are
+   // referenced only here, so this mark is what keeps them immortal.
+   if (!mark_object(p_gc, (object*)vm->object_singleton) || !mark_object(p_gc, (object*)vm->class_singleton) ||
+       !mark_object(p_gc, (object*)vm->static_call_name) || !mark_object(p_gc, (object*)vm->init_method_name)) {
+@@ -234,7 +234,7 @@ static bool mark_vm(gc* p_gc) {
+       return false;
+     }
+   }
+-  // the builtin singletons root here exactly like Object and Class:
++  // the builtin singletons root here exactly like object and type:
+   // nothing else references them at startup, and every classof() answer
+   // funnels through one of them.
+   for (uint32_t i = 0; i < OK_BUILTIN_COUNT; ++i) {
+diff --git a/src/okvm.c b/src/okvm.c
+index 8d14d7b..8e50212 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -209,7 +209,7 @@ static object_string* intern_vm_string(vm* p_vm, const char* p_chars) {
+ bool vm_init_singletons(vm* p_vm) {
+   object_specs specs = {p_vm->alloc, p_vm->objects_store};
+   gc* gc = p_vm->alloc->gc;
+-  object_string* object_name = intern_vm_string(p_vm, "Object");
++  object_string* object_name = intern_vm_string(p_vm, "object");
+   if (object_name == NULL) {
+     return false;
+   }
+@@ -223,7 +223,7 @@ bool vm_init_singletons(vm* p_vm) {
+   }
+   // the root is born complete: no fields, no methods, frozen empty.
+   object_class_freeze(p_vm->object_singleton);
+-  object_string* class_name = intern_vm_string(p_vm, "Class");
++  object_string* class_name = intern_vm_string(p_vm, "type");
+   if (class_name == NULL) {
+     return false;
+   }
+@@ -254,7 +254,7 @@ bool vm_init_singletons(vm* p_vm) {
+     p_vm->op_names[i] = intern_vm_string(p_vm, class_operator_spelling((class_operator)i));
+   }
+   p_vm->op_names[CLASS_OP_CALL] = p_vm->static_call_name;
+-  // the seven builtin singletons (C10): under Object, created UNFROZEN here -
++  // the seven builtin singletons (C10): under object, created UNFROZEN here -
+   // the native method surface is mounted by ok_define_builtin_surfaces (the
+   // C-side step that owns their freeze, so the tables fill before the seal).
+   // the name rides the guard stack only across the class creation that
+@@ -1697,9 +1697,9 @@ static ok_value as_bool(vm* p_vm, value p_value, value* p_result) {
+ }
+ 
+ // classof (C10): every value is an instance of exactly one class. instances
+-// carry theirs, class values are all Class, every other object maps to its
++// carry theirs, class values are all type, every other object maps to its
+ // lane's builtin singleton. native values (opaque embedder payloads) sit
+-// directly under Object, and bound methods count as function - both are
++// directly under object, and bound methods count as function - both are
+ // recorded in the classes draft as the two judgment calls.
+ object_class* vm_classof(vm* p_vm, ok_value p_value) {
+   if (IS_VALUE_NUMBER(p_value) || IS_VALUE_INT(p_value)) {
+@@ -1738,8 +1738,8 @@ object_class* vm_classof(vm* p_vm, ok_value p_value) {
+   case OBJ_BOUND_METHOD:
+     return p_vm->builtin_classes[OK_BUILTIN_FUNCTION];
+   default:
+-    // native values are opaque payloads: Object directly. raw protos and
+-    // upvalues never surface as values; if one ever does, Object is the
++    // native values are opaque payloads: object directly. raw protos and
++    // upvalues never surface as values; if one ever does, object is the
+     // honest total answer.
+     return p_vm->object_singleton;
+   }
+@@ -4761,7 +4761,7 @@ static void* ok_dispatch_table[OP__COUNT] = {
+         parent = p_vm->object_singleton;
+       }
+       if (parent == NULL) {
+-        runtime_error(p_vm, OK_EK_INTERNAL, "class Object is missing.");
++        runtime_error(p_vm, OK_EK_INTERNAL, "class object is missing.");
+         FAIL_PATH();
+         DISPATCH();
+       }
+diff --git a/src/okvm.h b/src/okvm.h
+index ddbef3b..a47ac40 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -156,16 +156,16 @@ struct vm {
+   // interner watch; the vm interns its startup spellings here so they
+   // pointer-match the compiler's constants (member probes hit on ==).
+   string_interner* interner;
+-  // the two singletons every hierarchy funnels into: Object (the root, the
+-  // default parent) and Class (the class of every class value - there is
++  // the two singletons every hierarchy funnels into: object (the root, the
++  // default parent) and type (the class of every class value - there is
+   // exactly one metaclass, no tower). created at vm_init, traced via mark_vm.
+   struct object_class* object_singleton;
+   struct object_class* class_singleton;
+   // the seven builtin class singletons (C10), index-parallel to
+-  // builtin_class_id: str/num/bool/array/map/function/nil, all under Object,
++  // builtin_class_id: str/num/bool/array/map/function/nil, all under object,
+   // sealed by ok_define_builtin_surfaces after their native method tables
+   // are mounted. every value's classof() lands on one of these (or on
+-  // Class, or on a user class). traced via mark_vm like the two above.
++  // type, or on a user class). traced via mark_vm like the two above.
+   struct object_class* builtin_classes[OK_BUILTIN_COUNT];
+   // the cached spelling of the static call operator, so constructing through
+   // a class value never allocates its lookup name. rooted like the singletons.
+@@ -226,7 +226,7 @@ void vm_init(vm* p_vm, vm_specs p_specs);
+ // translation unit (the coro surface: the native ABI hands them an ok*, and
+ // the ok struct is private to ok.c). defined there.
+ vm* ok_vm(ok* p_ok);
+-// create Object/Class and the cached lookup names. call exactly once, after
++// create object/type and the cached lookup names. call exactly once, after
+ // the gc watches the vm (see the comment on the implementation).
+ bool vm_init_singletons(vm* p_vm);
+ void vm_deinit(vm* p_vm);
+@@ -251,8 +251,8 @@ void vm_clear_error(vm* p_vm);
+ bool vm_native_throw(vm* p_vm, ok_value p_value);
+ 
+ // classof (C10): the one class value every value is an instance of.
+-// instances -> their class, class values -> Class, everything else -> its
+-// lane's builtin singleton (native values -> Object, bound methods ->
++// instances -> their class, class values -> type, everything else -> its
++// lane's builtin singleton (native values -> object, bound methods ->
+ // function; both noted in the classes record). total: never NULL.
+ object_class* vm_classof(vm* p_vm, ok_value p_value);
+ 
+@@ -263,7 +263,7 @@ object_class* vm_classof(vm* p_vm, ok_value p_value);
+ bool vm_define_coro_surface(vm* p_vm);
+ 
+ // the chain-walk half of the family (C12): is p_value an instance of
+-// p_target or one of its descendants (Object at the root matches everything).
++// p_target or one of its descendants (object at the root matches everything).
+ bool vm_is_instance(vm* p_vm, ok_value p_value, const object_class* p_target);
+ 
+ #endif // OK_VM_H
+diff --git a/tests/e2e/tests/classes/builtin_classes.ok b/tests/e2e/tests/classes/builtin_classes.ok
+index bdf37e1..5345ac4 100644
+--- a/tests/e2e/tests/classes/builtin_classes.ok
++++ b/tests/e2e/tests/classes/builtin_classes.ok
+@@ -1,19 +1,19 @@
+ // the builtin class singletons as global values (C10): one per lane under
+-// Object, one metaclass for all of them. they are ordinary values - store
++// object, one metaclass for all of them. they are ordinary values - store
+ // them, pass them, compare them by identity.
+-print(num is Class); // expect: true
+-print(str is Class); // expect: true
+-print(bool is Class); // expect: true
+-print(array is Class); // expect: true
+-print(map is Class); // expect: true
+-print(function is Class); // expect: true
+-print(nil is Class); // expect: true
+-print(Object is Class); // expect: true
+-print(classof(str) === Class); // expect: true
++print(num is type); // expect: true
++print(str is type); // expect: true
++print(bool is type); // expect: true
++print(array is type); // expect: true
++print(map is type); // expect: true
++print(function is type); // expect: true
++print(nil is type); // expect: true
++print(object is type); // expect: true
++print(classof(str) === type); // expect: true
+ // under the root
+-print(isinstance(str, Object)); // expect: true
+-print(isinstance(nil, Object)); // expect: true
+-print(isinstance(Object, Object)); // expect: true
++print(isinstance(str, object)); // expect: true
++print(isinstance(nil, object)); // expect: true
++print(isinstance(object, object)); // expect: true
+ // identity comparison, the right semantics for class values
+ print(str == str); // expect: true
+ print(str == num); // expect: false
+diff --git a/tests/e2e/tests/classes/classof_isinstance.ok b/tests/e2e/tests/classes/classof_isinstance.ok
+index 7732688..decfca2 100644
+--- a/tests/e2e/tests/classes/classof_isinstance.ok
++++ b/tests/e2e/tests/classes/classof_isinstance.ok
+@@ -1,5 +1,5 @@
+ // classof + isinstance (C12): plain builtin functions, rebindable like the
+-// rest. classof(null) === nil, classof(Class) === Class - the one self-loop.
++// rest. classof(null) === nil, classof(type) === type - the one self-loop.
+ print(classof(1) == num); // expect: true
+ print(classof(1.5) == num); // expect: true
+ print(classof("x") == str); // expect: true
+@@ -8,9 +8,9 @@ print(classof([1]) == array); // expect: true
+ print(classof({:}) == map); // expect: true
+ print(classof(len) == function); // expect: true
+ print(classof(null) === nil); // expect: true
+-print(classof(Class) === Class); // expect: true
+-print(classof(num) === Class); // expect: true
+-class Animal : Object {}
++print(classof(type) === type); // expect: true
++print(classof(num) === type); // expect: true
++class Animal : object {}
+ class Dog : Animal {}
+ let d = Dog();
+ print(classof(d) == Dog); // expect: true
+@@ -18,11 +18,11 @@ print(classof(d) == Animal); // expect: false
+ // isinstance walks the chain; the root matches everything
+ print(isinstance(d, Dog)); // expect: true
+ print(isinstance(d, Animal)); // expect: true
+-print(isinstance(d, Object)); // expect: true
+-print(isinstance(null, Object)); // expect: true
++print(isinstance(d, object)); // expect: true
++print(isinstance(null, object)); // expect: true
+ print(isinstance(null, nil)); // expect: true
+-print(isinstance(1, Object)); // expect: true
+-print(isinstance(Class, Class)); // expect: true
+-print(isinstance(num, Object)); // expect: true
++print(isinstance(1, object)); // expect: true
++print(isinstance(type, type)); // expect: true
++print(isinstance(num, object)); // expect: true
+ print(isinstance(d, str)); // expect: false
+ print(isinstance(1, num)); // expect: true
+diff --git a/tests/e2e/tests/classes/glob_class.ok b/tests/e2e/tests/classes/glob_class.ok
+index 3ccb6cf..ceb8fde 100644
+--- a/tests/e2e/tests/classes/glob_class.ok
++++ b/tests/e2e/tests/classes/glob_class.ok
+@@ -32,4 +32,4 @@ kid().twice("x"); // expect: x
+ glob let inst = cc();
+ print(inst is cc); // expect: true
+ print(classof(inst) === cc); // expect: true
+-print(classof(cc) === Class); // expect: true
++print(classof(cc) === type); // expect: true
+diff --git a/tests/e2e/tests/classes/is_operator.ok b/tests/e2e/tests/classes/is_operator.ok
+index 030e37f..c1b2d28 100644
+--- a/tests/e2e/tests/classes/is_operator.ok
++++ b/tests/e2e/tests/classes/is_operator.ok
+@@ -11,20 +11,20 @@ print([1] is array); // expect: true
+ print({:} is map); // expect: true
+ print(null is nil); // expect: true
+ print(len is function); // expect: true
+-class Animal : Object {}
++class Animal : object {}
+ class Dog : Animal {}
+ let d = Dog();
+ print(d is Dog); // expect: true
+ // the exact-class ruling, pinned: `is` answers "what box", not "what family"
+ print(d is Animal); // expect: false
+-print(d is Object); // expect: false
++print(d is object); // expect: false
+ print(isinstance(d, Animal)); // expect: true
+-print(isinstance(d, Object)); // expect: true
++print(isinstance(d, object)); // expect: true
+ // every class value is an instance of the one metaclass
+-print(Dog is Class); // expect: true
+-print(Object is Class); // expect: true
+-print(Class is Class); // expect: true
+-print(d is Class); // expect: false
++print(Dog is type); // expect: true
++print(object is type); // expect: true
++print(type is type); // expect: true
++print(d is type); // expect: false
+ print(d is num); // expect: false
+ // where it reads right: the guard
+ fu check(v) {
+diff --git a/tests/e2e/tests/coros/basic.ok b/tests/e2e/tests/coros/basic.ok
+index 68407da..5584a5e 100644
+--- a/tests/e2e/tests/coros/basic.ok
++++ b/tests/e2e/tests/coros/basic.ok
+@@ -43,4 +43,4 @@ print(coro);                // expect: <class coro>
+ print(classof(c) === coro); // expect: true
+ print(c is coro);           // expect: true
+ print(isinstance(c, coro)); // expect: true
+-print(coro is Class);       // expect: true
++print(coro is type);       // expect: true

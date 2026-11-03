@@ -71,6 +71,11 @@ commit; then compile-time imports (`import x`, `import x as z`,
 `from x import y`), run-once top-level, module registry keyed by interned
 path, module exports as slot arrays (same index trick as globals), dynamic
 import as the explicitly-dynamic escape hatch.
+[update 2026-11-03: this wave is now 0.6.0 and much bigger — native module
+loading (dlopen + ok_module.h), okproject.ok, the loader vtable, the CLI
+build surface. the full draft with the M1-M14 rulings and the P1-P8
+session-sized patch series is docs/drafts/MODULES.md; the import spelling
+is now QUOTED paths (`import "std/io"`), superseding the plain form here.]
 
 **v0.0.10 — maps v2** (oct24 spec stands: open addressing, linear probing,
 parallel key/value arrays, backward-shift delete, no tombstones, splitmix64 +

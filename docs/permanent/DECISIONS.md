@@ -267,3 +267,35 @@ mixed-type `==` (error vs false — decide in the error-model round). implicit
 self order (classes round). REPL locals persistence. register-file clamp
 overflow (known, untriggered). ordered maps. hot-reload semantics v2. general-
 for final fate. `+=` sugar (bench readability, 10 minutes someday).
+
+---
+
+## D17 — defers continue past a failing defer [LOCKED 2026-11-03, patch 39]
+Q ruled zig/go-aligned: one failing defer no longer halts the cleanup
+chain. the remaining defers still run (the failing thunk's own callees get
+their defers run too), and the FIRST failure's error is what propagates -
+later failures in the same chain are dropped. the chronology marker (the
+thunk frame flag) makes the rule deterministic: an in-flight error that
+came from a defer IS the chain's first; an original error is replaceable
+by the first failing defer. the defer-owning try still cannot catch its
+own defer's failure (the consumed-record ruling, unchanged). oom stays the
+stop-everything lane. deferr (error-path-only defer) rides the same lanes.
+
+## D18 — the hierarchy roots are `object` and `type` [LOCKED 2026-11-03, patch 40]
+Class -> type, Object -> object, joining the snake_case builtin-class
+convention (str/num/bool/array/map/function/nil/coro/object/type). object
+is the root every hierarchy funnels into; type is the class of every class
+value (the one self-loop). prints follow the names: <class object>,
+<class type>. breaking rename, no aliases - pre-1.0 doctrine.
+
+## D19 — modules: the 0.6.0 wave [PROPOSED — draft is docs/drafts/MODULES.md]
+the compile-time import model of D9 carries (slot-array exports, run-once
+top level, hard-fail cycles, dynamic import as the escape hatch) with one
+spelling change: paths are QUOTED (`import "std/io"`), never python-plain.
+the wave expands to: one import surface for ok files AND native modules,
+the dlopen-based native loader + ok_module.h descriptor ABI (classes via
+the patch-34 door), okproject.ok (strictly ok, path deps only, cmake
+natives), the loader vtable that kills the embedding working-dir problem,
+and the CLI surface (ok run --native / ok build / ok where). the M1-M14
+rulings and the P1-P8 session-sized patch series await Q. nothing lands
+until the rulings come back.

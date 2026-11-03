@@ -516,3 +516,38 @@ pin), gc churn between resumes, the running status window, classes
 interplay (instances across parks, bound methods, construction inside),
 and the eight error lanes (yield outside/constructor/operator/defer,
 resume running, resume arity, body-not-a-fu, body arity).
+
+### 39 — defers: continuation on failure (zig/go doctrine)
+
+Q's ruling on the defer question: a failing defer must not halt the
+chain. run_pending_defers no longer nils the rest of the range - the
+remaining defers run, the failing thunk's own callees are torn down with
+THEIR defers run (cleanup on the way out, whatever failed), and the
+FIRST failure's error is what propagates. the chronology marker: the
+thunk frame flag (formerly the cascade check) now tells "the in-flight
+error IS a defer failure" from "an original error a defer may replace" -
+an in-flight defer failure is the chain's first, later failures drop
+against it. first-error accounting (capture/restore of the whole error
+lane, value gc-guarded across the rest of the chain). deferr rides the
+same lanes (one tag, compile-time distinction only). oom stays the
+stop-everything lane. defer_cascade + nil_pending_defers removed. the
+one livelock found en route (pre-captured in-flight reported as a new
+failure -> the dying-frame loop restarted without popping) is split into
+accounting vs control flags, pinned by construction. tests:
+defer_cascade.ok (the old halt semantics) replaced by
+defer_continuation.ok + defer_continuation_uncaught.ok +
+coros/defers_continuation.ok. the defer-owning try still cannot catch
+its own defer's failure (the consumed-record ruling, unchanged).
+gates: 425/425 on plain, threaded, asan, aggressive-gc.
+
+### 40 — rename: Class -> type, Object -> object
+
+the two hierarchy roots join the builtin classes' lowercase convention
+(str/num/bool/array/map/function/nil/coro, and now object + type): the
+seeds table, the interned spellings, the one internal error message that
+named the root, the doc comments, and the five tests that used the old
+names. object is the root (isinstance(x, object) is true for
+everything); type is the class of every class value (classof(num) ===
+type, the one self-loop). prints follow: <class object>, <class type>.
+Q ruled this alongside the coro snake_case lean (R24). gates: 425/425
+x4.

@@ -1,0 +1,753 @@
+// delta_blue.ok — the DeltaBlue constraint-solving benchmark for oklang.
+//
+// ported from wren/test/benchmark/delta_blue.wren (Bob Nystrom's wren port,
+// from the Smalltalk -> JavaScript -> Dart lineage, original copyright
+// 1996 John Maloney and Mario Wolczko / GNU Smalltalk license). same shape,
+// same iteration counts: 40 x (chain(100) + projection(100)).
+//
+// port notes (mechanical, no algorithm changes):
+// - wren's `a ? b : c` ternary is oklang's `a then b otherwise c`.
+// - wren's property get/set (`v.value`, `v.value = x`) maps to explicit
+//   pub accessor methods (`v.value()`, `v.set_value(x)`) - fields are
+//   ring-private in oklang, and the planner reads across classes.
+// - `todo.removeAt(-1)` is `pop(todo)`; `a.add(x)` is `push(a, x)`.
+// - ranges: wren's inclusive `0..n` is `for let i = 0 : n + 1` (oklang's
+//   numeric-for limit is exclusive), wren's exclusive `0...n` is `0 : n`.
+// - the backward scale division drops wren's `.floor`: every value on that
+//   lane is an exact integer by construction in this benchmark, so plain
+//   `/` produces the same results.
+// - method calls that must dispatch virtually go through `this.` - bare
+//   call sites bind to the lexically visible method.
+//
+// beware (kept from the original, per the wren header): this benchmark is
+// written in a grotesque style where the constraint model is built by
+// side-effects from constructors.
+
+// Strengths are used to measure the relative importance of constraints.
+// New strengths may be inserted in the strength hierarchy without
+// disrupting current constraints. Strengths cannot be created outside
+// this class, so == (identity) can be used for value comparison.
+class Strength {
+  let value_;
+  let name_;
+  fu init(value, name) {
+    this.value_ = value;
+    this.name_ = name;
+  }
+
+  pub fu value() { return value_; }
+  pub fu name() { return name_; }
+
+  pub fu next_weaker() { return ORDERED[value_]; }
+
+  pub static fu stronger(s1, s2) { return s1.value() < s2.value(); }
+  pub static fu weaker(s1, s2) { return s1.value() > s2.value(); }
+  pub static fu weakest(s1, s2) { return Strength.weaker(s1, s2) then s1 otherwise s2; }
+  pub static fu strongest(s1, s2) { return Strength.stronger(s1, s2) then s1 otherwise s2; }
+}
+
+// compile time computed constants.
+glob let REQUIRED = Strength(0, "required");
+glob let STRONG_REFERRED = Strength(1, "strongPreferred");
+glob let PREFERRED = Strength(2, "preferred");
+glob let STRONG_DEFAULT = Strength(3, "strongDefault");
+glob let NORMAL = Strength(4, "normal");
+glob let WEAK_DEFAULT = Strength(5, "weakDefault");
+glob let WEAKEST = Strength(6, "weakest");
+
+glob let ORDERED = [
+  WEAKEST, WEAK_DEFAULT, NORMAL, STRONG_DEFAULT, PREFERRED, STRONG_REFERRED
+];
+
+glob let mut ThePlanner = null;
+
+class Constraint {
+  let strength_;
+  fu init(strength) {
+    this.strength_ = strength;
+  }
+
+  pub fu strength() { return strength_; }
+
+  // Activate this constraint and attempt to satisfy it.
+  pub fu add_constraint() {
+    this.add_to_graph();
+    ThePlanner.incremental_add(this);
+  }
+
+  // Attempt to find a way to enforce this constraint. If successful,
+  // record the solution, perhaps modifying the current dataflow
+  // graph. Answer the constraint that this constraint overrides, if
+  // there is one, or null, if there isn't.
+  // Assume: I am not already satisfied.
+  pub fu satisfy(mark) {
+    this.choose_method(mark);
+    if not this.is_satisfied() {
+      if strength_ == REQUIRED {
+        print("Could not satisfy a required constraint!");
+      }
+      return null;
+    }
+
+    this.mark_inputs(mark);
+    let out = this.output();
+    let overridden = out.determined_by();
+    if overridden != null {
+      overridden.mark_unsatisfied();
+    }
+    out.set_determined_by(this);
+    if not ThePlanner.add_propagate(this, mark) {
+      print("Cycle encountered");
+    }
+    out.set_mark(mark);
+    return overridden;
+  }
+
+  pub fu destroy_constraint() {
+    if this.is_satisfied() {
+      ThePlanner.incremental_remove(this);
+    }
+    this.remove_from_graph();
+  }
+
+  // Normal constraints are not input constraints.  An input constraint
+  // is one that depends on external state, such as the mouse, the
+  // keybord, a clock, or some arbitraty piece of imperative code.
+  pub fu is_input() { return false; }
+}
+
+// Abstract superclass for constraints having a single possible output variable.
+class UnaryConstraint : Constraint {
+  let mut satisfied_ = false;
+  let mut my_output_ = null;
+  fu init(my_output, strength) {
+    super(strength);
+    this.satisfied_ = false;
+    this.my_output_ = my_output;
+    this.add_constraint();
+  }
+
+  // Adds this constraint to the constraint graph.
+  pub fu add_to_graph() {
+    my_output_.add_constraint(this);
+    satisfied_ = false;
+  }
+
+  // Decides if this constraint can be satisfied and records that decision.
+  pub fu choose_method(mark) {
+    satisfied_ = (my_output_.mark() != mark) and
+        Strength.stronger(this.strength(), my_output_.walk_strength());
+  }
+
+  // Returns true if this constraint is satisfied in the current solution.
+  pub fu is_satisfied() { return satisfied_; }
+
+  pub fu mark_inputs(mark) {
+    // has no inputs.
+  }
+
+  // Returns the current output variable.
+  pub fu output() { return my_output_; }
+
+  // Calculate the walkabout strength, the stay flag, and, if it is
+  // 'stay', the value for the current output of this constraint. Assume
+  // this constraint is satisfied.
+  pub fu recalculate() {
+    my_output_.set_walk_strength(this.strength());
+    my_output_.set_stay(not this.is_input());
+    if my_output_.stay() {
+      this.execute(); // Stay optimization.
+    }
+  }
+
+  // Records that this constraint is unsatisfied.
+  pub fu mark_unsatisfied() {
+    satisfied_ = false;
+  }
+
+  pub fu inputs_known(mark) { return true; }
+
+  pub fu remove_from_graph() {
+    if my_output_ != null {
+      my_output_.remove_constraint(this);
+    }
+    satisfied_ = false;
+  }
+}
+
+// Variables that should, with some level of preference, stay the same.
+// Planners may exploit the fact that instances, if satisfied, will not
+// change their output during plan execution.  This is called "stay
+// optimization".
+class StayConstraint : UnaryConstraint {
+  fu init(variable, strength) {
+    super(variable, strength);
+  }
+
+  pub fu execute() {
+    // Stay constraints do nothing.
+  }
+}
+
+// A unary input constraint used to mark a variable that the client
+// wishes to change.
+class EditConstraint : UnaryConstraint {
+  fu init(variable, strength) {
+    super(variable, strength);
+  }
+
+  // Edits indicate that a variable is to be changed by imperative code.
+  pub fu is_input() { return true; }
+
+  pub fu execute() {
+    // Edit constraints do nothing.
+  }
+}
+
+// Directions.
+glob let NONE = 1;
+glob let FORWARD = 2;
+glob let BACKWARD = 0;
+
+// Abstract superclass for constraints having two possible output
+// variables.
+class BinaryConstraint : Constraint {
+  let mut v1_;
+  let mut v2_;
+  let mut direction_;
+  fu init(v1, v2, strength) {
+    super(strength);
+    this.v1_ = v1;
+    this.v2_ = v2;
+    this.direction_ = NONE;
+    this.add_constraint();
+  }
+
+  pub fu direction() { return direction_; }
+  pub fu v1() { return v1_; }
+  pub fu v2() { return v2_; }
+
+  // Decides if this constraint can be satisfied and which way it
+  // should flow based on the relative strength of the variables related,
+  // and record that decision.
+  pub fu choose_method(mark) {
+    if v1_.mark() == mark {
+      if v2_.mark() != mark and
+          Strength.stronger(this.strength(), v2_.walk_strength()) {
+        direction_ = FORWARD;
+      } else {
+        direction_ = NONE;
+      }
+    }
+
+    if v2_.mark() == mark {
+      if v1_.mark() != mark and
+          Strength.stronger(this.strength(), v1_.walk_strength()) {
+        direction_ = BACKWARD;
+      } else {
+        direction_ = NONE;
+      }
+    }
+
+    if Strength.weaker(v1_.walk_strength(), v2_.walk_strength()) {
+      if Strength.stronger(this.strength(), v1_.walk_strength()) {
+        direction_ = BACKWARD;
+      } else {
+        direction_ = NONE;
+      }
+    } else {
+      if Strength.stronger(this.strength(), v2_.walk_strength()) {
+        direction_ = FORWARD;
+      } else {
+        direction_ = BACKWARD;
+      }
+    }
+  }
+
+  // Add this constraint to the constraint graph.
+  pub fu add_to_graph() {
+    v1_.add_constraint(this);
+    v2_.add_constraint(this);
+    direction_ = NONE;
+  }
+
+  // Answer true if this constraint is satisfied in the current solution.
+  pub fu is_satisfied() { return direction_ != NONE; }
+
+  // Mark the input variable with the given mark.
+  pub fu mark_inputs(mark) {
+    this.input().set_mark(mark);
+  }
+
+  // Returns the current input variable
+  pub fu input() { return direction_ == FORWARD then v1_ otherwise v2_; }
+
+  // Returns the current output variable.
+  pub fu output() { return direction_ == FORWARD then v2_ otherwise v1_; }
+
+  // Calculate the walkabout strength, the stay flag, and, if it is
+  // 'stay', the value for the current output of this
+  // constraint. Assume this constraint is satisfied.
+  pub fu recalculate() {
+    let ihn = this.input();
+    let out = this.output();
+    out.set_walk_strength(Strength.weakest(this.strength(), ihn.walk_strength()));
+    out.set_stay(ihn.stay());
+    if out.stay() {
+      this.execute();
+    }
+  }
+
+  // Record the fact that this constraint is unsatisfied.
+  pub fu mark_unsatisfied() {
+    direction_ = NONE;
+  }
+
+  pub fu inputs_known(mark) {
+    let i = this.input();
+    return i.mark() == mark or i.stay() or i.determined_by() == null;
+  }
+
+  pub fu remove_from_graph() {
+    if v1_ != null {
+      v1_.remove_constraint(this);
+    }
+    if v2_ != null {
+      v2_.remove_constraint(this);
+    }
+    direction_ = NONE;
+  }
+}
+
+// Relates two variables by the linear scaling relationship: "v2 =
+// (v1 * scale) + offset". Either v1 or v2 may be changed to maintain
+// this relationship but the scale factor and offset are considered
+// read-only.
+class ScaleConstraint : BinaryConstraint {
+  let mut scale_ = null;
+  let mut offset_ = null;
+  fu init(src, scale, offset, dest, strength) {
+    this.scale_ = scale;
+    this.offset_ = offset;
+    super(src, dest, strength);
+  }
+
+  // Adds this constraint to the constraint graph.
+  pub fu add_to_graph() {
+    super.add_to_graph();
+    scale_.add_constraint(this);
+    offset_.add_constraint(this);
+  }
+
+  pub fu remove_from_graph() {
+    super.remove_from_graph();
+    if scale_ != null {
+      scale_.remove_constraint(this);
+    }
+    if offset_ != null {
+      offset_.remove_constraint(this);
+    }
+  }
+
+  pub fu mark_inputs(mark) {
+    super.mark_inputs(mark);
+    scale_.set_mark(mark);
+    offset_.set_mark(mark);
+  }
+
+  // Enforce this constraint. Assume that it is satisfied.
+  pub fu execute() {
+    if this.direction() == FORWARD {
+      this.v2().set_value(this.v1().value() * scale_.value() + offset_.value());
+    } else {
+      // wren floors here; every value on this lane is an exact integer
+      // in this benchmark, so plain division is equivalent
+      this.v1().set_value((this.v2().value() - offset_.value()) / scale_.value());
+    }
+  }
+
+  // Calculate the walkabout strength, the stay flag, and, if it is
+  // 'stay', the value for the current output of this constraint. Assume
+  // this constraint is satisfied.
+  pub fu recalculate() {
+    let ihn = this.input();
+    let out = this.output();
+    out.set_walk_strength(Strength.weakest(this.strength(), ihn.walk_strength()));
+    out.set_stay(ihn.stay() and scale_.stay() and offset_.stay());
+    if out.stay() {
+      this.execute();
+    }
+  }
+}
+
+// Constrains two variables to have the same value.
+class EqualityConstraint : BinaryConstraint {
+  fu init(v1, v2, strength) {
+    super(v1, v2, strength);
+  }
+
+  // Enforce this constraint. Assume that it is satisfied.
+  pub fu execute() {
+    this.output().set_value(this.input().value());
+  }
+}
+
+// A constrained variable. In addition to its value, it maintain the
+// structure of the constraint graph, the current dataflow graph, and
+// various parameters of interest to the DeltaBlue incremental
+// constraint solver.
+class Variable {
+  let name_;
+  let mut value_;
+  let mut determined_by_;
+  let mut mark_;
+  let mut walk_strength_;
+  let mut stay_;
+  let mut constraints_;
+  fu init(name, value) {
+    this.constraints_ = [];
+    this.determined_by_ = null;
+    this.mark_ = 0;
+    this.walk_strength_ = WEAKEST;
+    this.stay_ = true;
+    this.name_ = name;
+    this.value_ = value;
+  }
+
+  pub fu constraints() { return constraints_; }
+  pub fu determined_by() { return determined_by_; }
+  pub fu set_determined_by(value) { determined_by_ = value; }
+  pub fu mark() { return mark_; }
+  pub fu set_mark(value) { mark_ = value; }
+  pub fu walk_strength() { return walk_strength_; }
+  pub fu set_walk_strength(value) { walk_strength_ = value; }
+  pub fu stay() { return stay_; }
+  pub fu set_stay(value) { stay_ = value; }
+  pub fu value() { return value_; }
+  pub fu set_value(new_value) { value_ = new_value; }
+
+  // Add the given constraint to the set of all constraints that refer
+  // this variable.
+  pub fu add_constraint(constraint) {
+    push(constraints_, constraint);
+  }
+
+  // Removes all traces of c from this variable.
+  pub fu remove_constraint(constraint) {
+    let mut fresh = [];
+    for let existing : constraints_ {
+      if existing != constraint {
+        push(fresh, existing);
+      }
+    }
+    constraints_ = fresh;
+    if determined_by_ == constraint {
+      determined_by_ = null;
+    }
+  }
+}
+
+// A Plan is an ordered list of constraints to be executed in sequence
+// to resatisfy all currently satisfiable constraints in the face of
+// one or more changing inputs.
+class Plan {
+  let mut list_;
+  fu init() {
+    this.list_ = [];
+  }
+
+  pub fu add_constraint(constraint) {
+    push(list_, constraint);
+  }
+
+  pub fu size() { return len(list_); }
+
+  pub fu execute() {
+    for let constraint : list_ {
+      constraint.execute();
+    }
+  }
+}
+
+class Planner {
+  let mut current_mark_;
+  fu init() {
+    this.current_mark_ = 0;
+  }
+
+  // Attempt to satisfy the given constraint and, if successful,
+  // incrementally update the dataflow graph.  Details: If satifying the
+  // constraint is successful, it may override a weaker constraint
+  // on its output. The algorithm attempts to resatisfy that
+  // constraint using some other method. This process is repeated
+  // until either a) it reaches a variable that was not previously
+  // determined by any constraint or b) it reaches a constraint that
+  // is too weak to be satisfied using any of its methods. The
+  // variables of constraints that have been processed are marked with
+  // a unique mark value so that we know where we've been. This allows
+  // the algorithm to avoid getting into an infinite loop even if the
+  // constraint graph has an inadvertent cycle.
+  pub fu incremental_add(constraint) {
+    let mark = this.new_mark();
+    let mut overridden = constraint.satisfy(mark);
+    while overridden != null {
+      overridden = overridden.satisfy(mark);
+    }
+  }
+
+  // Entry point for retracting a constraint. Remove the given
+  // constraint and incrementally update the dataflow graph.
+  // Details: Retracting the given constraint may allow some currently
+  // unsatisfiable downstream constraint to be satisfied. We therefore collect
+  // a list of unsatisfied downstream constraints and attempt to
+  // satisfy each one in turn. This list is traversed by constraint
+  // strength, strongest first, as a heuristic for avoiding
+  // unnecessarily adding and then overriding weak constraints.
+  // Assume: [c] is satisfied.
+  pub fu incremental_remove(constraint) {
+    let out = constraint.output();
+    constraint.mark_unsatisfied();
+    constraint.remove_from_graph();
+    let unsatisfied = this.remove_propagate_from(out);
+    let mut strength = REQUIRED;
+    while true {
+      for let u : unsatisfied {
+        if u.strength() == strength {
+          this.incremental_add(u);
+        }
+      }
+      strength = strength.next_weaker();
+      if strength == WEAKEST {
+        break;
+      }
+    }
+  }
+
+  // Select a previously unused mark value.
+  pub fu new_mark() {
+    current_mark_ = current_mark_ + 1;
+    return current_mark_;
+  }
+
+  // Extract a plan for resatisfaction starting from the given source
+  // constraints, usually a set of input constraints. This method
+  // assumes that stay optimization is desired; the plan will contain
+  // only constraints whose output variables are not stay. Constraints
+  // that do no computation, such as stay and edit constraints, are
+  // not included in the plan.
+  // Details: The outputs of a constraint are marked when it is added
+  // to the plan under construction. A constraint may be appended to
+  // the plan when all its input variables are known. A variable is
+  // known if either a) the variable is marked (indicating that has
+  // been computed by a constraint appearing earlier in the plan), b)
+  // the variable is 'stay' (i.e. it is a constant at plan execution
+  // time), or c) the variable is not determined by any
+  // constraint. The last provision is for past states of history
+  // variables, which are not stay but which are also not computed by
+  // any constraint.
+  // Assume: [sources] are all satisfied.
+  pub fu make_plan(sources) {
+    let mark = this.new_mark();
+    let plan = Plan();
+    let todo = sources;
+    while len(todo) > 0 {
+      let constraint = pop(todo);
+      if constraint.output().mark() != mark and constraint.inputs_known(mark) {
+        plan.add_constraint(constraint);
+        constraint.output().set_mark(mark);
+        this.add_constraints_consuming_to(constraint.output(), todo);
+      }
+    }
+    return plan;
+  }
+
+  // Extract a plan for resatisfying starting from the output of the
+  // given [constraints], usually a set of input constraints.
+  pub fu extract_plan_from_constraints(constraints) {
+    let sources = [];
+    for let constraint : constraints {
+      // if not in plan already and eligible for inclusion.
+      if constraint.is_input() and constraint.is_satisfied() {
+        push(sources, constraint);
+      }
+    }
+    return this.make_plan(sources);
+  }
+
+  // Recompute the walkabout strengths and stay flags of all variables
+  // downstream of the given constraint and recompute the actual
+  // values of all variables whose stay flag is true. If a cycle is
+  // detected, remove the given constraint and answer
+  // false. Otherwise, answer true.
+  // Details: Cycles are detected when a marked variable is
+  // encountered downstream of the given constraint. The sender is
+  // assumed to have marked the inputs of the given constraint with
+  // the given mark. Thus, encountering a marked node downstream of
+  // the output constraint means that there is a path from the
+  // constraint's output to one of its inputs.
+  pub fu add_propagate(constraint, mark) {
+    let todo = [constraint];
+    while len(todo) > 0 {
+      let d = pop(todo);
+      if d.output().mark() == mark {
+        this.incremental_remove(constraint);
+        return false;
+      }
+
+      d.recalculate();
+      this.add_constraints_consuming_to(d.output(), todo);
+    }
+
+    return true;
+  }
+
+  // Update the walkabout strengths and stay flags of all variables
+  // downstream of the given constraint. Answer a collection of
+  // unsatisfied constraints sorted in order of decreasing strength.
+  pub fu remove_propagate_from(out) {
+    out.set_determined_by(null);
+    out.set_walk_strength(WEAKEST);
+    out.set_stay(true);
+    let unsatisfied = [];
+    let todo = [out];
+    while len(todo) > 0 {
+      let v = pop(todo);
+      for let constraint : v.constraints() {
+        if not constraint.is_satisfied() {
+          push(unsatisfied, constraint);
+        }
+      }
+
+      let determining = v.determined_by();
+      for let next : v.constraints() {
+        if next != determining and next.is_satisfied() {
+          next.recalculate();
+          push(todo, next.output());
+        }
+      }
+    }
+
+    return unsatisfied;
+  }
+
+  pub fu add_constraints_consuming_to(v, coll) {
+    let determining = v.determined_by();
+    for let constraint : v.constraints() {
+      if constraint != determining and constraint.is_satisfied() {
+        push(coll, constraint);
+      }
+    }
+  }
+}
+
+glob let mut total = 0;
+
+// This is the standard DeltaBlue benchmark. A long chain of equality
+// constraints is constructed with a stay constraint on one end. An
+// edit constraint is then added to the opposite end and the time is
+// measured for adding and removing this constraint, and extracting
+// and executing a constraint satisfaction plan. There are two cases.
+// In case 1, the added constraint is stronger than the stay
+// constraint and values must propagate down the entire length of the
+// chain. In case 2, the added constraint is weaker than the stay
+// constraint so it cannot be accomodated. The cost in this case is,
+// of course, very low. Typical situations lie somewhere between these
+// two extremes.
+fu chain_test(n) {
+  ThePlanner = Planner();
+  let mut prev = null;
+  let mut first = null;
+  let mut last = null;
+
+  // Build chain of n equality constraints.
+  for let i = 0 : n + 1 {
+    let v = Variable("v", 0);
+    if prev != null {
+      EqualityConstraint(prev, v, REQUIRED);
+    }
+    if i == 0 {
+      first = v;
+    }
+    if i == n {
+      last = v;
+    }
+    prev = v;
+  }
+
+  StayConstraint(last, STRONG_DEFAULT);
+  let edit = EditConstraint(first, PREFERRED);
+  let plan = ThePlanner.extract_plan_from_constraints([edit]);
+  for let i = 0 : 100 {
+    first.set_value(i);
+    plan.execute();
+    total = total + last.value();
+  }
+}
+
+fu change(v, new_value) {
+  let edit = EditConstraint(v, PREFERRED);
+  let plan = ThePlanner.extract_plan_from_constraints([edit]);
+  for let i = 0 : 10 {
+    v.set_value(new_value);
+    plan.execute();
+  }
+
+  edit.destroy_constraint();
+}
+
+// This test constructs a two sets of variables related to each
+// other by a simple linear transformation (scale and offset). The
+// time is measured to change a variable on either side of the
+// mapping and to change the scale and offset factors.
+fu projection_test(n) {
+  ThePlanner = Planner();
+  let scale = Variable("scale", 10);
+  let offset = Variable("offset", 1000);
+  let mut src = null;
+  let mut dst = null;
+
+  let dests = [];
+  for let i = 0 : n {
+    src = Variable("src", i);
+    dst = Variable("dst", i);
+    push(dests, dst);
+    StayConstraint(src, NORMAL);
+    ScaleConstraint(src, scale, offset, dst, REQUIRED);
+  }
+
+  change(src, 17);
+  total = total + dst.value();
+  if dst.value() != 1170 {
+    print("Projection 1 failed");
+  }
+
+  change(dst, 1050);
+
+  total = total + src.value();
+  if src.value() != 5 {
+    print("Projection 2 failed");
+  }
+
+  change(scale, 5);
+  for let i = 0 : n - 1 {
+    total = total + dests[i].value();
+    if dests[i].value() != i * 5 + 1000 {
+      print("Projection 3 failed");
+    }
+  }
+
+  change(offset, 2000);
+  for let i = 0 : n - 1 {
+    total = total + dests[i].value();
+    if dests[i].value() != i * 5 + 2000 {
+      print("Projection 4 failed");
+    }
+  }
+}
+
+for let i = 0 : 40 {
+  chain_test(100);
+  projection_test(100);
+}
+
+print total;
