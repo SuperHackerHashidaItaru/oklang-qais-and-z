@@ -1700,3 +1700,85 @@ still flagged (yield keyword joins the grammar list).
   coro's std.coro home); then P1 (the grammar) opens the 0.6.0 lane.
   0.9.0's heavy-pass list (constant folding, general fusion, DCE-lite,
   jump threading, tailcalls) owns the delta blue gap after that.
+## session 34 (2026-11-03): universal interning lands (41, D20) + the vm_tick report + O Resolution goes FINAL
+
+- context: Q's tidy branch (coros + patches 39/40) opens the v0.7.0 lane.
+  this session: the two pre-modules tasks Q ordered, then the final
+  modules draft with all M1-M14 rulings folded in.
+- patch 41, D20 - universal string interning. Q's words: "intern all ok
+  strings thus we dont have to do so by hand in the compiler or other
+  parts". the answer turned out to be one choke point:
+  create_object_string now routes through the interner (reached via the
+  gc's watch, alloc->gc->interner - live from ok_create before any
+  string can exist), with the interner's own miss path on a new bare
+  creator (create_object_string_uninterned) so there is no re-entry.
+  literals, concat, conversions, class/method names, ok_value_string,
+  error maps, type tags - every site covered with zero signature
+  changes. the table flipped from strong/immortal roots to a WEAK set:
+  mark_interner deleted, sweep grows a pre-pass (sweep_interner) that
+  removes unmarked entries before the object walk frees them, via
+  string_interner_remove_at - the okmap family backward-shift, no
+  tombstones. the caller rooting discipline is unchanged (fresh vs
+  unmarked-table-entry were always the same contract - verified every
+  intern/create site guards or assigns into a rooted slot before the
+  next allocation). 'a' === 'a' is true; === itself untouched (raw word
+  identity - interning is what makes the words agree). the old C11 note
+  at the literal site predicted exactly this ruling and is replaced by
+  the D20 note. tests: strings/interning.ok + interning_churn.ok; two
+  old-doctrine expectations flipped (classes/identity.ok "a" === "a",
+  loops/fused_conditions.ok seq-same). receipts: 427/427 x5 (plain,
+  threaded, asan, aggressive-gc, asan+aggressive - aggressive is the
+  real judge here, collect-on-every-allocation hammers the weak table);
+  300k churned unique strings in 0.55s under a 64mb cap on plain (the
+  table pins nothing); delta blue still runs clean.
+- the vm_tick investigation (Q: "some missing api that comes with coros,
+  which is vm_tick or something - figure it out and report"). findings,
+  recorded in MODULES.md appendix A: the whole engine exists (coro_drive,
+  the parked-resumer chain, the yield barrier, R21/R22 lanes) but ok.h
+  has ZERO coro surface - an embedder cannot create, resume, or inspect
+  a coro from C (dorg3 would need a script trampoline). "vm_tick" as a
+  VM ready-queue pump is deliberately NOT ours (scheduler = stdlib =
+  casio, standing veto); what is missing is the primitive set the future
+  pump is built from: ok_coro_new / ok_coro_resume / ok_coro_status /
+  ok_coro_current (thin honest wrappers over coro_drive with ok_call's C
+  boundary discipline) + the ONE real piece of machinery:
+  ok_native_suspend - a native requesting suspension AT ITS RETURN
+  BOUNDARY (pending flag + the OP_CALL completion check parks the coro
+  like OP_YIELD would; the barrier still guards it). why now: OR-3's
+  ok_api vtable must carry the coro primitives from day one (adding
+  vtable entries later = ABI break; asio-style natives cannot exist
+  without them). proposed as patch 42 on the 0.7.0 lane, ~150 lines +
+  a tiny tests/capi/ harness that doubles as OR-3's memory-loader test
+  bed. awaiting Q's ruling on the shape.
+- MODULES.md goes FINAL ("O Resolution", renumbered 0.8.0 - the tidy
+  lane is v0.7.0): every M-ruling folded in. the deltas from the draft:
+  M5 is PATH binding (import "a/b" -> a.b.XXX, roots merge, as binds
+  the module - not my stem-only lean); M3/M6 make natives first-class
+  at every step of the resolution walk (loadable with NO project,
+  --force-native as last resort); M4 kills the dynamic lane entirely
+  this wave (P8 deleted, "totally fine right?" - yes, answered);
+  M10 is full-stdlib manifest eval with no natives (Q overruled my
+  pure-data lean; the powerful-build-script door stays one capability
+  bit open); M12 is declared build commands, any toolchain (not cmake
+  coupling); M13 covers cycles too. NEW: the sandboxing section Q
+  caught the draft missing - OK_CAP_NATIVE_LOAD/BUILD/HOST, ratchet
+  (drop never grant), control surfaces (ok_specs + CLI presets +
+  granular flags + the structural loader-vtable denial; env vars
+  rejected on purpose), the two security questions answered honestly
+  (builds = consent+capability, no pretended isolation; manifest
+  natives stay closed in v1 with a one-bit door). NEW: the ok_api
+  vtable in ok_module.h (natives never link oklang symbols - no
+  -rdynamic, no collisions) carrying the coro primitives from day one.
+  the patch series re-densed 8 -> 4 per Q's "too sparse": OR-1 the
+  compile-time spine (grammar+ladder+graph+pub+path-binding+diagnostics,
+  ~600 lines), OR-2 std re-home (std.coro per R24, flat aliases kept -
+  flattening is the NEXT stdlib version), OR-3 sandbox + natives + the
+  embedder loader (loading born gated), OR-4 okproject + build. ROADMAP
+  + D19 updated to match. OR-1 can start.
+- delivered: patches/41-universal-string-interning.patch (+ README
+  entry), docs/drafts/MODULES.md final, DECISIONS D19 closure + D20,
+  ROADMAP second update, this entry. language side: one commit
+  (764e26d) on modules-staging, clean on top of tidy when Q wants it.
+- next: Q rules on patch 42's shape (the coro C API + the tests/capi/
+  harness), then OR-1 opens the 0.8.0 lane. delta blue stays the 0.9.0
+  meter.

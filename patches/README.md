@@ -551,3 +551,24 @@ everything); type is the class of every class value (classof(num) ===
 type, the one self-loop). prints follow: <class object>, <class type>.
 Q ruled this alongside the coro snake_case lean (R24). gates: 425/425
 x4.
+
+### 41 — universal string interning (D20)
+
+every ok string is canonical: literals, concat results, conversions,
+class/method names, host-created values all route through the interner
+via ONE choke point (create_object_string, reaching it through the gc's
+watch - alloc->gc->interner; the interner's own miss path takes the new
+bare creator create_object_string_uninterned so there is no re-entry).
+'a' === 'a' is true; === itself is unchanged raw word identity. the
+table becomes a WEAK set: mark_interner deleted, sweep grows a pre-pass
+that removes unmarked entries (string_interner_remove_at - the okmap
+family backward-shift, no tombstones) before the object walk frees
+them, so dead canonicals never dangle. the caller rooting discipline is
+unchanged: fresh vs unmarked-table-entry were always the same contract.
+comments updated where the old doctrine was load-bearing (the literal
+site's C11 note, the interner header, native_coro_status, the
+method_map probe note). tests: strings/interning.ok +
+strings/interning_churn.ok (churn + rebirth + map round trip), and the
+two old-doctrine expectations flipped (classes/identity.ok,
+loops/fused_conditions.ok seq-same). 300k churned strings in 0.55s
+under a 64mb cap: the table pins nothing. gates: 427/427 x5.

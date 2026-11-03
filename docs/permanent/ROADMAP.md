@@ -76,6 +76,12 @@ loading (dlopen + ok_module.h), okproject.ok, the loader vtable, the CLI
 build surface. the full draft with the M1-M14 rulings and the P1-P8
 session-sized patch series is docs/drafts/MODULES.md; the import spelling
 is now QUOTED paths (`import "std/io"`), superseding the plain form here.]
+[second update, same day: the wave is FINAL and renumbered **0.8.0** — the
+tidy lane (defer continuation, type/object, universal interning D20, the
+coro C API) is v0.7.0. M1-M14 are ruled and closed, the capability
+sandbox is designed in, and the patch series is re-densed to four
+(OR-1..OR-4). the living draft is docs/drafts/MODULES.md, codename
+"O Resolution".]
 
 **v0.0.10 — maps v2** (oct24 spec stands: open addressing, linear probing,
 parallel key/value arrays, backward-shift delete, no tombstones, splitmix64 +

@@ -288,14 +288,43 @@ is the root every hierarchy funnels into; type is the class of every class
 value (the one self-loop). prints follow the names: <class object>,
 <class type>. breaking rename, no aliases - pre-1.0 doctrine.
 
-## D19 — modules: the 0.6.0 wave [PROPOSED — draft is docs/drafts/MODULES.md]
+## D19 — modules: the 0.8.0 wave, "O Resolution" [LOCKED on the M1-M14 rulings, 2026-11-03]
 the compile-time import model of D9 carries (slot-array exports, run-once
-top level, hard-fail cycles, dynamic import as the escape hatch) with one
-spelling change: paths are QUOTED (`import "std/io"`), never python-plain.
-the wave expands to: one import surface for ok files AND native modules,
-the dlopen-based native loader + ok_module.h descriptor ABI (classes via
-the patch-34 door), okproject.ok (strictly ok, path deps only, cmake
-natives), the loader vtable that kills the embedding working-dir problem,
-and the CLI surface (ok run --native / ok build / ok where). the M1-M14
-rulings and the P1-P8 session-sized patch series await Q. nothing lands
-until the rulings come back.
+top level, hard-fail cycles) with Q's ruled deltas: QUOTED paths (M1);
+path-binding namespaces — `import "a/b"` becomes a.b.XXX, roots merge,
+`as` binds the module (M5); natives first-class in the resolution walk at
+every step, loadable with no active project, `--force-native` as the last
+resort (M3/M6); NO dynamic lane this wave at all (M4); okproject.ok
+evaluated in a full-stdlib no-natives instance (M10) with DECLARED build
+commands instead of cmake coupling (M12); no package manager, maybe ever —
+vendor via git (M11); collisions and cycles both hard errors (M13); the
+VM stays out of it — loader vtable + ok_api vtable are the whole boundary
+(M14). NEW with the closure: the capability sandbox (OK_CAP_NATIVE_LOAD /
+NATIVE_BUILD / HOST, ratchet-only — drop never grant, CLI presets +
+embedder ok_specs + the structural loader-vtable denial) lands IN THE SAME
+PATCH as the native loader so loading is born gated. the patch series is
+re-densed to four (OR-1 spine, OR-2 std re-home, OR-3 sandbox+natives+
+embedder loader, OR-4 okproject+build — docs/drafts/MODULES.md). the coro
+C API (appendix A: ok_coro_new/resume/status/current +
+ok_native_suspend) is specced as patch 42 on the 0.7.0 lane beneath it,
+because the ok_api vtable must carry the coro primitives from day one.
+
+## D20 — every ok string is interned; === is content truth [LOCKED 2026-11-03, patch 41]
+Q ruled the flip the old C11 note was waiting for: the interner stops
+being a compiler-names-only table and becomes THE canonicalizer. every
+string - literals, concat results, conversions, class/method names,
+host-created values - settles on one canonical object per content, so
+`'a' === 'a'` is true (=== stays raw word identity; interning is what
+makes the words agree). the table is a WEAK set: mark never walks it,
+sweep removes unmarked entries first (okmap-family backward-shift, no
+tombstones), so a dead canonical never dangles in a probe chain and an
+interned string lives exactly as long as something else holds it. the
+single choke point is create_object_string (reaching the interner
+through the gc's watch), which is also the answer to "intern all ok
+strings without doing it by hand" - zero signature changes, every call
+site covered. amends D2's "no string interning anywhere" clause and
+D13's "interning stays OFF". the cost: one hash+probe per creation
+(hash was already computed for the header) and a rebirth probe when
+churned content returns; bounded memory proven (300k churned strings
+under a 64mb cap). gates: 427/427 x5 (plain, threaded, asan,
+aggressive-gc, asan+aggressive).

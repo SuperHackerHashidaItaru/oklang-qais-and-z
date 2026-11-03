@@ -1,0 +1,475 @@
+From 764e26d55288108e482a744796c0df77e281869d Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Tue, 3 Nov 2026 07:42:33 +0000
+Subject: [PATCH] strings: universal interning (D20) - every ok string is
+ canonical
+
+Q ruled the flip the C11 note was waiting for: the interner stops being
+a compiler-names-only table and becomes THE canonicalizer - literals,
+concat results, conversions, class/method names, host-created values
+all settle on one object per content, so 'a' === 'a' is true (=== stays
+raw word identity; interning is what makes the words agree).
+
+- the choke point: create_object_string routes through the interner
+  (reached via the gc's watch, alloc->gc->interner - live from
+  ok_create before any string can exist). the interner's own miss path
+  takes the new bare creator create_object_string_uninterned, so there
+  is no re-entry. every existing call site is covered with zero
+  signature changes.
+- the table is now a WEAK set: mark never walks it, sweep removes
+  unmarked entries first (string_interner_remove_at, the okmap family
+  backward-shift - no tombstones) so a dead canonical can never dangle
+  in a probe chain. interned strings live exactly as long as something
+  else holds them; the caller rooting discipline is unchanged (fresh
+  vs unmarked-table-entry were always the same contract).
+- comments updated where the old doctrine was load-bearing: the literal
+  site's C11 note, the interner header, native_coro_status's
+  immortality claim, the method_map probe note.
+- tests: strings/interning.ok + strings/interning_churn.ok; the two
+  old-doctrine expectations flipped (classes/identity.ok, and
+  loops/fused_conditions.ok's seq-same lane).
+- 300k churned strings in 0.55s under a 64mb cap on plain: the table
+  pins nothing.
+427/427 on plain, threaded, asan, aggressive-gc, asan+aggressive.
+---
+ src/okcompiler.c                           | 10 ++---
+ src/okgc.c                                 | 43 +++++++++++++--------
+ src/okintern.c                             | 40 +++++++++++++++++++-
+ src/okintern.h                             | 44 ++++++++++++++--------
+ src/okobject.c                             | 14 ++++++-
+ src/okobject.h                             | 18 ++++++++-
+ src/okvm.c                                 |  6 ++-
+ tests/e2e/tests/classes/identity.ok        |  6 ++-
+ tests/e2e/tests/loops/fused_conditions.ok  |  2 +-
+ tests/e2e/tests/strings/interning.ok       | 37 ++++++++++++++++++
+ tests/e2e/tests/strings/interning_churn.ok | 29 ++++++++++++++
+ 11 files changed, 203 insertions(+), 46 deletions(-)
+ create mode 100644 tests/e2e/tests/strings/interning.ok
+ create mode 100644 tests/e2e/tests/strings/interning_churn.ok
+
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 8823175..486daf2 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -3522,11 +3522,11 @@ static bool compile_string_expression(compiler* p_compiler,
+   }
+   allocators* alloc = p_compiler->alloc;
+   object_specs s = {alloc, p_compiler->objects_store};
+-  // literals stay UN-interned: === is word identity (C11) and identical
+-  // literals must remain distinct words. interning covers NAMES (member,
+-  // class, method spellings) - the lookup lane - never values. (interning
+-  // literals too would flip `"a" === "a"` to true: a contract change that
+-  // needs Q's ruling, not a perf patch's side effect.)
++  // literals intern like every string (D20, Q's ruling on the C11 note that
++  // used to live here): identical content is one canonical object, so
++  // `"a" === "a"` - and === against any runtime-built equal - is true. ===
++  // itself is still raw word identity; interning is what makes the words
++  // agree. the guard below stays load-bearing: the weak table roots nothing.
+   object_string* object_str = create_object_string(parsed_str, &s);
+   if (object_str == NULL) {
+     report_oom(p_compiler, (ast_node*)p_string);
+diff --git a/src/okgc.c b/src/okgc.c
+index 537c6c2..38e768e 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -276,19 +276,6 @@ static bool mark_globals_store(gc* p_gc) {
+   return true;
+ }
+ 
+-static bool mark_interner(gc* p_gc) {
+-  // strong roots: every canonical string is immortal by design (see the
+-  // lifetime policy on the struct) - identical to the lifetimes they already
+-  // hold as chunk constants or class-table keys.
+-  for (uint32_t i = 0; i < p_gc->interner->capacity; ++i) {
+-    object_string* entry = p_gc->interner->slots[i];
+-    if (entry != NULL && !mark_value(p_gc, OBJECT_AS_VALUE(entry))) {
+-      return false;
+-    }
+-  }
+-  return true;
+-}
+-
+ static bool mark(gc* p_gc) {
+   if (p_gc->vm != NULL && !mark_vm(p_gc)) {
+     return false;
+@@ -299,9 +286,10 @@ static bool mark(gc* p_gc) {
+   if (p_gc->globals_store != NULL && !mark_globals_store(p_gc)) {
+     return false;
+   }
+-  if (p_gc->interner != NULL && !mark_interner(p_gc)) {
+-    return false;
+-  }
++  // the interner is deliberately NOT marked: it is a weak set (D20). its
++  // dead entries are removed by sweep's pre-pass instead, and its live
++  // entries stay alive through whatever else references them (chunk
++  // constants, class tables, registers, host roots).
+   for (uint32_t i = 0; i < p_gc->guard_count; ++i) {
+     if (!mark_value(p_gc, p_gc->guarded[i])) {
+       return false;
+@@ -325,10 +313,33 @@ static bool mark_value_array(gc* p_gc, value_array* p_array) {
+   return true;
+ }
+ 
++// the interner's dead-entry pass (D20): the table is a WEAK set - mark
++// never walks it - so its unmarked entries must leave BEFORE the object walk
++// frees them (a freed canonical string would dangle in a probe chain).
++// removal is backward-shift: a shifted-in entry can land in the slot just
++// examined, so the walk re-examines the same index after a removal. each
++// removal decrements count, so the loop always terminates.
++static bool sweep_interner(gc* p_gc) {
++  string_interner* interner = p_gc->interner;
++  uint32_t i = 0;
++  while (i < interner->capacity) {
++    object_string* entry = interner->slots[i];
++    if (entry == NULL || object_is_marked((object*)entry)) {
++      i += 1u;
++      continue;
++    }
++    string_interner_remove_at(interner, i);
++  }
++  return true;
++}
++
+ static bool sweep(gc* p_gc) {
+   if (p_gc->object_store == NULL) {
+     return false;
+   }
++  if (p_gc->interner != NULL && !sweep_interner(p_gc)) {
++    return false;
++  }
+   object* prev = NULL;
+   object* curr = p_gc->object_store->objects;
+   while (curr != NULL) {
+diff --git a/src/okintern.c b/src/okintern.c
+index f3c3d43..b0c8336 100644
+--- a/src/okintern.c
++++ b/src/okintern.c
+@@ -133,8 +133,10 @@ object_string* string_interner_intern(string_interner* p_interner, ok_string_vie
+   }
+   // miss: create the canonical object, then insert. the creation may collect
+   // (aggressive mode); the new string is unrooted until the slot assignment
+-  // below, and the assignment itself cannot allocate.
+-  object_string* fresh = create_object_string(p_view, p_specs);
++  // below, and the assignment itself cannot allocate. the bare creator is
++  // load-bearing here: the public create_object_string routes through the
++  // interner, and a canonical object must not re-enter it.
++  object_string* fresh = create_object_string_uninterned(p_view, p_specs);
+   if (fresh == NULL) {
+     return NULL;
+   }
+@@ -145,3 +147,37 @@ object_string* string_interner_intern(string_interner* p_interner, ok_string_vie
+   p_interner->count += 1u;
+   return fresh;
+ }
++
++void string_interner_remove_at(string_interner* p_interner, uint32_t p_slot) {
++  // the collector's deletion: p_slot is a slot the sweep is standing on (its
++  // entry is known unmarked), so there is nothing to probe. the algorithm is
++  // the okmap family's backward-shift: the freed slot pulls backward any
++  // following entry whose probe chain crosses it, keeping every survivor
++  // reachable from its home slot. no tombstones, no rehash.
++  if (p_interner->capacity == 0 || p_slot >= p_interner->capacity || p_interner->slots[p_slot] == NULL) {
++    return; // defensive only: the sweep never hands us an empty slot
++  }
++  const uint32_t mask = p_interner->capacity - 1u;
++  uint32_t hole = p_slot;
++  for (;;) {
++    p_interner->slots[hole] = NULL;
++    uint32_t k = hole;
++    for (;;) {
++      k = (k + 1u) & mask;
++      if (p_interner->slots[k] == NULL) { // cluster ended: the hole is final
++        p_interner->count -= 1u;
++        return;
++      }
++      const uint32_t home = (uint32_t)p_interner->hashes[k] & mask;
++      // the entry at k may fill the hole iff its home is at-or-before the
++      // hole: distance(home -> k) >= distance(hole -> k), cyclically.
++      // otherwise keep walking.
++      if (((k - home) & mask) >= ((k - hole) & mask)) {
++        break;
++      }
++    }
++    p_interner->slots[hole] = p_interner->slots[k];
++    p_interner->hashes[hole] = p_interner->hashes[k];
++    hole = k;
++  }
++}
+diff --git a/src/okintern.h b/src/okintern.h
+index 6b11148..eb5706b 100644
+--- a/src/okintern.h
++++ b/src/okintern.h
+@@ -7,24 +7,30 @@
+ #include "okobject.h"
+ #include "okutils.h"
+ 
+-// the string interner: canonicalizes compiler-made strings (identifiers,
+-// literals, member names, the vm's startup names) so name lookups can hit
+-// pointer equality before falling back to content comparison. RUNTIME-built
+-// strings (concatenation, number formatting, host-created values) are never
+-// interned: their population is unbounded and equality stays content-based,
+-// which the probe fast paths handle by falling through on pointer mismatch.
++// the string interner: THE canonicalizer for every ok string (D20) -
++// compiler names (identifiers, member spellings, the vm's startup names) AND
++// runtime values (literals, concatenation, conversions, host-created strings)
++// all settle on one canonical object per content, so identity (===) is content
++// truth and every probe table hits the pointer fast path first.
+ //
+-// lifetime policy: the table holds STRONG references and the gc roots it
+-// (gc_watch_interner / mark_interner). interned strings are therefore
+-// immortal - identical to the lifetime they already have as chunk constants
+-// or class-table keys, so this changes no observable lifetime. when the
+-// pipeline-isolation spec lands, interning moves to its commit phase and the
+-// table becomes the module registry's canonical-name source.
++// lifetime policy: the table is a WEAK set - it roots nothing. mark never
++// walks it; the collector's sweep pre-pass removes unmarked entries
++// (backward-shift, no tombstones - the okmap family discipline) BEFORE the
++// object walk frees them, so a dead canonical string can never dangle in a
++// probe chain. an interned string lives exactly as long as something else
++// holds it: a chunk constant, a class table, a register, a host root. the
++// one cost of the doctrine: a string created and dropped in a loop re-hashes
++// on each rebirth (a probe, no allocation when the content still lives
++// somewhere - the common case for names and hot literals).
++//
++// the table is also the module registry's canonical-name source when the
++// modules wave lands (keyed, deduped paths).
+ 
+ typedef struct {
+   // open-addressed set of canonical object_string*: parallel slots + cached
+-  // hashes, linear probing, power-of-two capacity, no tombstones (eviction
+-  // never happens - the table only grows).
++  // hashes, linear probing, power-of-two capacity, no tombstones (deletion
++  // is the collector's backward-shift, which keeps every survivor reachable
++  // from its home slot).
+   object_string** slots;
+   hash_t* hashes; // cached; garbage in empty slots, read after the pointer check
+   uint32_t count;
+@@ -37,7 +43,9 @@ void string_interner_deinit(string_interner* p_interner);
+ 
+ // the canonical string for p_view: an existing entry when the content is
+ // already interned, otherwise a freshly created one (created + inserted
+-// through p_specs). the returned string is rooted by the interner itself.
++// through p_specs). the table is WEAK: the returned string is NOT rooted by
++// the interner - the caller roots it (guard, register/constant assignment,
++// adopting structure) exactly like any create_object_string result.
+ //
+ // gc discipline: the insert may grow the table, whose allocation can collect;
+ // the fresh string is created BEFORE inserting and is NOT yet reachable, so
+@@ -51,4 +59,10 @@ object_string* string_interner_intern(string_interner* p_interner, ok_string_vie
+ // reuse spellings without creating.
+ object_string* string_interner_find(const string_interner* p_interner, ok_string_view p_view);
+ 
++// remove the entry at p_slot (backward-shift). the collector's sweep
++// pre-pass is the only caller: it passes the slot it is standing on, so
++// there is no probe and no failure mode. the shifted-in entry (if any)
++// lands at p_slot - the caller re-examines the same index.
++void string_interner_remove_at(string_interner* p_interner, uint32_t p_slot);
++
+ #endif // OK_INTERN_H
+diff --git a/src/okobject.c b/src/okobject.c
+index e3810e4..c634673 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -1,6 +1,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++#define OK_GC_EXPOSE
+ #include "okgc.h"
+ #include "okobject.h"
+ #include "okobject_store.h"
+@@ -156,7 +157,7 @@ static void object_string_deinit(object_string* p_object_string, object_specs* p
+   object_deinit(&p_object_string->object);
+ }
+ 
+-object_string* create_object_string(const ok_string_view p_string, object_specs* p_specs) {
++object_string* create_object_string_uninterned(const ok_string_view p_string, object_specs* p_specs) {
+   object_string* object_str = (object_string*)p_specs->alloc->allocate(p_specs->alloc, sizeof(object_string));
+   if (object_str == NULL) {
+     return NULL;
+@@ -166,6 +167,17 @@ object_string* create_object_string(const ok_string_view p_string, object_specs*
+   return object_str;
+ }
+ 
++object_string* create_object_string(const ok_string_view p_string, object_specs* p_specs) {
++  // D20's one door: every string creation lands here and canonicalizes. the
++  // gc's interner watch is the channel (set in ok_create before the vm, the
++  // compiler, or any singleton can allocate a string); the interner's own
++  // miss path takes the bare creator above, so there is no re-entry.
++  if (p_specs->alloc->gc != NULL && p_specs->alloc->gc->interner != NULL) {
++    return string_interner_intern(p_specs->alloc->gc->interner, p_string, p_specs);
++  }
++  return create_object_string_uninterned(p_string, p_specs);
++}
++
+ static void object_function_init(object_function* p_object_function,
+                                  object_string* p_name,
+                                  uint16_t p_arity,
+diff --git a/src/okobject.h b/src/okobject.h
+index 5209742..cc3ff72 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -85,8 +85,20 @@ typedef struct {
+                // so map keys (and any future hashed user) never re-walk the bytes.
+ } object_string;
+ 
++// the single choke point (D20): EVERY ok string routes through the interner
++// - literals, concatenation results, conversions, class/method names,
++// host-created values. identical content is one canonical object, so ===
++// is content truth and probe tables hit the pointer fast path. reaches the
++// interner through the gc's watch (alloc->gc->interner, live from ok_create
++// before any string can exist); the NULL fallback is the bare creator
++// (reachable in principle only before ok_create, which creates no strings).
++// the result is NOT rooted by the weak table: root it like any fresh object.
+ object_string* create_object_string(const ok_string_view p_string, object_specs* p_specs);
+ 
++// the bare allocation, no interner. the interner's own miss path (a canonical
++// object must not re-enter the interner) and nothing else.
++object_string* create_object_string_uninterned(const ok_string_view p_string, object_specs* p_specs);
++
+ typedef struct {
+   ok_index index;
+   bool is_local;
+@@ -248,8 +260,10 @@ typedef struct method_entry {
+   uint8_t pub;
+ } method_entry;
+ 
+-// name-keyed method table: object_string* keys, content-compared probes
+-// (constants are not interned across chunks), cached hashes.
++// name-keyed method table: object_string* keys. all keys are interner
++// canonicals now (D20), so probes hit on the pointer; the content compare
++// stays as the belt for any pre-create fallback string (there are none in
++// practice). cached hashes.
+ MAP_DECLARE(method_map, object_string*, method_entry, const object_string*)
+ 
+ // the overloadable operator surface, as seen by the dispatch arms. each
+diff --git a/src/okvm.c b/src/okvm.c
+index 8e50212..30e66a4 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -836,8 +836,10 @@ static ok_value native_coro_resume(ok* p_ok, uint8_t p_argc, const ok_value* p_a
+ }
+ 
+ // `c.status()` - "ready" | "suspended" | "running" | "dead". interned
+-// spellings: the interner's canoncial strings are immortal and shared, so a
+-// status poll in a loop allocates nothing after the first call.
++// spellings: canonical objects shared with any other holder of the same
++// content (=== identity), and a poll loop reuses the live entry without
++// allocating. the interner is a weak set (D20): a status name nothing holds
++// dies at the next sweep and the next poll simply re-interns it.
+ static ok_value native_coro_status(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
+   vm* p_vm = ok_vm(p_ok);
+   if (p_argc != 1 || !IS_VALUE_CORO(p_argv[0])) {
+diff --git a/tests/e2e/tests/classes/identity.ok b/tests/e2e/tests/classes/identity.ok
+index 8913244..c10b8b1 100644
+--- a/tests/e2e/tests/classes/identity.ok
++++ b/tests/e2e/tests/classes/identity.ok
+@@ -11,10 +11,12 @@ print(null === null); // expect: true
+ print(true === true); // expect: true
+ print(true === 1); // expect: false
+ print(null === false); // expect: false
+-// strings: same allocation, not same content
+-print("a" === "a"); // expect: false
++// strings: one canonical object per content (D20 interning), so identity
++// is content truth - but never crosses a type boundary
++print("a" === "a"); // expect: true
+ let s = "a";
+ print(s === s); // expect: true
++print(("a" + "b") === "ab"); // expect: true
+ // heap values: the allocation is the identity
+ let arr = [1];
+ print(arr === arr); // expect: true
+diff --git a/tests/e2e/tests/loops/fused_conditions.ok b/tests/e2e/tests/loops/fused_conditions.ok
+index 9c8d36a..105344e 100644
+--- a/tests/e2e/tests/loops/fused_conditions.ok
++++ b/tests/e2e/tests/loops/fused_conditions.ok
+@@ -19,7 +19,7 @@ if a == 3 { print "eq-k"; } // expect: eq-k
+ if a == b { print "eq-bad"; }
+ if a != b { print "neq-reg"; } // expect: neq-reg
+ if a != 3 { print "neq-bad"; }
+-if "x" === "x" { print "seq-same"; } // distinct literal words: never taken
++if "x" === "x" { print "seq-same"; } // expect: seq-same
+ if 1 === 1.0 { print "seq-num"; } // expect: seq-num
+ if 1 === 2 { print "seq-bad"; }
+ 
+diff --git a/tests/e2e/tests/strings/interning.ok b/tests/e2e/tests/strings/interning.ok
+new file mode 100644
+index 0000000..d39f163
+--- /dev/null
++++ b/tests/e2e/tests/strings/interning.ok
+@@ -0,0 +1,37 @@
++// D20: every string is interned - identical content settles on one canonical
++// object, so === (raw word identity) is content truth for strings.
++print('a' === 'a'); // expect: true
++print("a" === 'a'); // expect: true
++print('a' === 'b'); // expect: false
++print('' === ''); // expect: true
++// runtime-built equals literal
++print(('a' + 'b') === 'ab'); // expect: true
++let x = 'he';
++let y = 'llo';
++print((x + y) === 'hello'); // expect: true
++// distinct builds of the same content agree
++print((x + y) === ('hel' + 'lo')); // expect: true
++// conversions land on the canonical object too
++print((12 as str) === '12'); // expect: true
++print((2.5 as str) === '2.5'); // expect: true
++print((true as str) === 'true'); // expect: true
++// == and != unchanged (value equality was already content-based)
++print('ab' == 'ab'); // expect: true
++print('a' != 'b'); // expect: true
++// the negated identity composes through !
++print(!('a' === 'a')); // expect: false
++print(!('a' === 'b')); // expect: true
++// compound-assign builds are canonical too
++let mut s = 'x';
++s += 'y';
++print(s === 'xy'); // expect: true
++// strings fetched from arrays join the same canon
++let arr = ['x', 'y'];
++print((arr[0] + arr[1]) === 'xy'); // expect: true
++// map keys: canonical or not, probing is by content
++let m = {'k': 1};
++print(m['k' + '']); // expect: 1
++// different content never collides; strings never equal other types
++print('ab' === 'ba'); // expect: false
++print('1' === 1); // expect: false
++print('' === null); // expect: false
+diff --git a/tests/e2e/tests/strings/interning_churn.ok b/tests/e2e/tests/strings/interning_churn.ok
+new file mode 100644
+index 0000000..0f56134
+--- /dev/null
++++ b/tests/e2e/tests/strings/interning_churn.ok
+@@ -0,0 +1,29 @@
++// churn: unique strings created and dropped each iteration. the interner is
++// a weak set (D20): dropped canonicals leave at the next sweep, so the loop
++// must stay correct no matter how many collections ran (the aggressive-gc
++// and asan gates are the real judges of that).
++let mut keep = '';
++for let i = 0 : 500 {
++  let s = 'item-' + i as str;
++  if i == 499 {
++    keep = s;
++  }
++}
++print(keep === 'item-499'); // expect: true
++// rebirth: the same content rebuilt after churn is one object again
++let again = 'item-' + 499 as str;
++print(again === keep); // expect: true
++// repeated growth, then compared against the equal literal
++let mut acc = '';
++for let i = 0 : 8 {
++  acc += 'ab';
++}
++print(acc === 'abababababababab'); // expect: true
++print((acc + '') === acc); // expect: true
++// interning survives a map round trip under churn
++let mut table = {:};
++for let i = 0 : 100 {
++  table['key' + i as str] = i;
++}
++print(table['key' + 42 as str]); // expect: 42
++print(table['key' + 7 as str] == 7); // expect: true
+-- 
+2.47.3
+
