@@ -108,6 +108,12 @@ disabled pending the account move.
   docs, the comment says what the code needs; (3) short and on point,
   no density walls, no repeating the same comment across sites. run
   clang-format on C before delivering a patch.
+- **error messages: the diagnostic doctrine (D22, session 37).** the
+  helpful half only, no editorial asides, no draft references (M-/OR-
+  numbers) in user text. punctuation: comma, colon, period — no dash,
+  no em dash, no semicolon (a semicolon inside a quoted syntax example
+  is code, not prose, and is fine). every message you write or touch
+  follows this, not just modules work.
 
 ## hard-won rules (each one cost a round)
 

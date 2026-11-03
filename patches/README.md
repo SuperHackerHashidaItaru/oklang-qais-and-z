@@ -655,8 +655,11 @@ delta blue unchanged (1.4e7 in 0.62s).
 
 ### 44 — tree-sitter: imports, pub, and the spans catch-up
 
-vs tree-sitter-oklang master 72b061f WITH patch 29 applied (apply 29
-first, then this). the import grammar catches up to OR-1: import_decl
+REGENERATED (session 37): Q's apply failed because the original was cut
+against master + 29 and the tree-sitter repo never took 29. this one is
+SELF-CONTAINED against clean master 72b061f: it folds 29 (defer/deferr)
+in, so it applies directly with no prerequisites. if 29 is already
+applied somewhere, use the previous version from git history instead. the import grammar catches up to OR-1: import_decl
 reshaped (no declmods - an import is its own statement kind now;
 glob import is a hard error in the language, the old corpus test
 rewritten), from_import_decl + import_specifier new, pub added to the
@@ -679,3 +682,63 @@ family fixed). the remaining 104 are pre-existing debt the grammar is
 versions behind on: varargs, two-binding for-in, classes
 operators/statics/details, coros, is/conversions. a full catch-up is
 its own session - Q rules on when.
+
+### 45 — the diagnostic doctrine (D22)
+
+Q's ruling from the OR-1 landing review, now standing for every
+diagnostic: the helpful half only (no editorial asides, no draft
+references like M9/OR-3 in user-facing text), and standard punctuation
+only: comma, colon, period. no dash, no em dash, no semicolon (a
+semicolon inside a quoted syntax example is code, not prose, and is
+legal). thirteen messages swept: the six OR-1 offenders (the two
+"python-plain" notes lose their editorial tail and keep the spelling
+hint, the chain-limit drops "design smell", the std/native/export
+messages drop their OR-numbers) plus seven pre-existing ones (the empty
+map literal, the two overloadability notes, the compound-operator
+message, the span-let field note, the two sealed-class messages). two
+e2e assertions updated with their messages. applies on modules-staging
+after 43. gates: 471/471 x5.
+
+### 46 — std: the re-home (OR-2)
+
+the std root is real: `import "std/array"` and friends resolve against
+a built-in registry that never touches the filesystem, OKPATH included
+(M8: nothing can shadow the standard library, the shadow test plants a
+poisoned std/array.ok on OKPATH and the builtin still answers). the
+table today: std.array (len/push/pop/remove), std.map (len/remove/get),
+std.io (print, the function face of the statement, same formatting and
+the same hook, %g included), std.math and std.str importable and empty
+until the stdlib growth version fills them (from-imports of missing
+members get the ordinary no-pub-export teaching error). the members are
+the SAME native function objects the flat spellings use, harvested from
+their hidden globals into the same sealed-namespace shape file modules
+get, so a std module value IS a module value: frozen, printable as
+<module std/array>, passable, boxable, from-importable. built lazily on
+first import (an embedder that never imports std never pays), rooted
+through the module registry, keyed "std/<stem>" which cannot collide
+with any realpath'd file key (those are always absolute).
+
+one grammar delta the tests forced: `print` is a keyword and std.io
+exports it, so member position after '.' and from-import names accept
+the print keyword (aliases stay plain identifiers) - the same special-
+casing `operator` already gets in member position.
+
+the flat surface stays as deprecated aliases per the ruling: the seeds
+(len/push/pop/remove/get/classof/isinstance), the method spellings
+(a.len()), and the print statement. old scripts are unchanged, the
+removal is the next stdlib version's call. the deprecation plan and the
+%g default's replacement by std.io's formatting are recorded in
+MODULES.md's OR-2 section as that version's scope.
+
+M8's root reservation now exempts the std/ lane only: `import
+"std/array"` binds the std root, a user file or OKPATH path whose first
+segment is std still gets the hard error. the bare `import "std"` is
+refused with a teaching message, and unknown std modules list the real
+table.
+
+applies on modules-staging after 43 + 45. gates: e2e 481/481 x5
+(10 new std tests: merge, io, empty modules, from-imports + aliases,
+missing member, bare root, unknown module, immutability, the OKPATH
+shadow, std inside file-module chains, value passing; std_not_module_yet
+retired), unit x3, embed x3, capi 140 x3, delta blue flat (1.40654e7 in
+0.64s).

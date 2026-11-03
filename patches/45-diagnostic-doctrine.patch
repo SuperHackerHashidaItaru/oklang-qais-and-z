@@ -1,0 +1,180 @@
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 1eedb84..3018c40 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -843,7 +843,7 @@ static bool record_module_export_if_pub(compiler* p_compiler,
+   if ((p_modifiers & DECLARATION_EXPORT) != 0) {
+     error_at(p_compiler,
+              p_author,
+-             ok_create_string_view("the export rule is 'pub' (M9), not 'export'.",
++             ok_create_string_view("the export rule is 'pub', not 'export'.",
+                                    OK_STRING_VIEW_CALCULATE_LENGTH,
+                                    true));
+     return false;
+@@ -1830,7 +1830,7 @@ static bool compile_class_declaration(compiler* p_compiler, ast_class_declaratio
+       if (let->span_bindings.count > 0) {
+         error_at(p_compiler,
+                  (ast_node*)member,
+-                 ok_create_string_view("a field is one name; span lets are not fields.",
++                 ok_create_string_view("a field is one name, span lets are not fields.",
+                                        OK_STRING_VIEW_CALCULATE_LENGTH, true));
+         return false;
+       }
+diff --git a/src/okmodules.c b/src/okmodules.c
+index fa0a202..7696b5c 100644
+--- a/src/okmodules.c
++++ b/src/okmodules.c
+@@ -556,7 +556,7 @@ static ok_result load_module(module_system* p_modules,
+   if (p_modules->chain_depth >= OK_MODULES_MAX_DEPTH) {
+     module_report(p_from_source,
+                   p_site,
+-                  "import chain too deep: the limit is 128 - a module graph this deep is a design smell.");
++                  "import chain too deep: the limit is 128.");
+     return OK_COMPILE_ERROR;
+   }
+ 
+@@ -725,7 +725,7 @@ static bool resolve_import(module_system* p_modules,
+     // until then it is honestly absent rather than OKPATH-shadowable.
+     module_report(p_source,
+                   p_site,
+-                  "the standard library is not module-shaped yet: the std re-home is OR-2. file-relative "
++                  "the standard library is not module-shaped yet. file-relative "
+                   "(\"./x\") and OKPATH imports work today.");
+     str_list_deinit(&tried);
+     return false;
+@@ -759,8 +759,7 @@ static bool resolve_import(module_system* p_modules,
+     if (native_found) {
+       module_report(p_source,
+                     p_site,
+-                    "native module found, but native loading lands with OR-3 (the sandbox + the loader) - "
+-                    "not yet.");
++                    "a native module was found, but native loading is not available yet.");
+       str_list_deinit(&tried);
+       return false;
+     }
+@@ -956,8 +955,7 @@ ok_result ok_modules_prepare(module_system* p_modules,
+       if (view_equals(root_name, "std")) {
+         module_report(p_source,
+                       site,
+-                      "the name 'std' is reserved for the standard library's namespace: import it as "
+-                      "\"std/...\" when OR-2 lands it.");
++                      "the name 'std' is reserved for the standard library's namespace.");
+         free_segments(segments, segment_count);
+         result = OK_COMPILE_ERROR;
+         break;
+diff --git a/src/okparser.c b/src/okparser.c
+index 06c4e23..d577bc6 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -803,7 +803,7 @@ ast_expression* parse_map_literal(parser* p_parser, token p_trigger) {
+     // is rejected here rather than guessed at.
+     error_at(p_parser,
+              p_parser->current,
+-             ok_create_string_view("empty '{}' is not an expression - the empty map literal is '{:}'.",
++             ok_create_string_view("empty '{}' is not an expression, the empty map literal is '{:}'.",
+                                    OK_STRING_VIEW_CALCULATE_LENGTH,
+                                    true));
+     goto fail_lists;
+@@ -1445,13 +1445,13 @@ static char* parse_operator_spelling(parser* p_parser) {
+   case TOKEN_BANG:
+     error_at(p_parser,
+              end,
+-             ok_create_string_view("'!' (truthiness) is not overloadable - truthiness is the control-flow substrate.",
++             ok_create_string_view("'!' (truthiness) is not overloadable, truthiness is the control-flow substrate.",
+                                    OK_STRING_VIEW_CALCULATE_LENGTH, true));
+     return NULL;
+   case TOKEN_BANG_EQUAL:
+     error_at(p_parser,
+              end,
+-             ok_create_string_view("'!=' is the negation of '==' and is not separately overloadable - define 'operator =='.",
++             ok_create_string_view("'!=' is the negation of '==' and is not separately overloadable, define 'operator =='.",
+                                    OK_STRING_VIEW_CALCULATE_LENGTH, true));
+     return NULL;
+   case TOKEN_CARET:
+@@ -1473,7 +1473,7 @@ static char* parse_operator_spelling(parser* p_parser) {
+   case TOKEN_SHIFT_RIGHT_EQUAL: {
+     string message = asprint(alloc,
+                              "operator '%.*s' has no dispatchable form in 0.5.0 (compound operators desugar to their "
+-                             "binary form; bitwise operators are not implemented).",
++                             "binary form, bitwise operators are not implemented).",
+                              end.length,
+                              end.start);
+     error_at(p_parser, end, ok_create_string_view_from_string(message));
+@@ -2969,7 +2969,7 @@ static ast_import_statement* parse_import_statement(parser* p_parser) {
+       error_at_noted(p_parser,
+                      p_parser->current,
+                      ok_create_string_view("expected a quoted import path.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+-                     ok_create_string_view("spell it import \"a/b\"; - the python-plain form is not the language.",
++                     ok_create_string_view("spell it import \"a/b\", the path is a quoted string.",
+                                            OK_STRING_VIEW_CALCULATE_LENGTH,
+                                            true));
+     } else {
+@@ -3041,7 +3041,7 @@ static ast_import_statement* parse_from_import_statement(parser* p_parser) {
+                      ok_create_string_view("expected a quoted import path after 'from'.",
+                                            OK_STRING_VIEW_CALCULATE_LENGTH,
+                                            true),
+-                     ok_create_string_view("spell it from \"a/b\" import x; - the python-plain form is not the language.",
++                     ok_create_string_view("spell it from \"a/b\" import x, the path is a quoted string.",
+                                            OK_STRING_VIEW_CALCULATE_LENGTH,
+                                            true));
+     } else {
+diff --git a/src/okvm.c b/src/okvm.c
+index 844de1c..a94973d 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -4991,7 +4991,7 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       object_closure* closure = VALUE_AS_CLOSURE(REG_AT(B));
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[C]);
+       if (klass->frozen) {
+-        runtime_error(p_vm, OK_EK_TYPE, "class %s is sealed; methods cannot be added.", klass->name->string.chars);
++        runtime_error(p_vm, OK_EK_TYPE, "class %s is sealed: methods cannot be added.", klass->name->string.chars);
+         FAIL_PATH();
+         DISPATCH();
+       }
+@@ -5132,7 +5132,7 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       object_closure* closure = VALUE_AS_CLOSURE(REG_AT(B));
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[C]);
+       if (klass->frozen) {
+-        runtime_error(p_vm, OK_EK_TYPE, "class %s is sealed; statics cannot be added.", klass->name->string.chars);
++        runtime_error(p_vm, OK_EK_TYPE, "class %s is sealed: statics cannot be added.", klass->name->string.chars);
+         FAIL_PATH();
+         DISPATCH();
+       }
+diff --git a/tests/e2e/tests/maps/empty_literal.ok b/tests/e2e/tests/maps/empty_literal.ok
+index bd2cb0f..33b934a 100644
+--- a/tests/e2e/tests/maps/empty_literal.ok
++++ b/tests/e2e/tests/maps/empty_literal.ok
+@@ -5,6 +5,6 @@ print len(m); // expect: 1
+ print m["k"]; // expect: true
+ 
+ // a bare {} in expression position is rejected - the empty map is {:}
+-let x = {}; // expect error: empty '{}' is not an expression - the empty map literal is '{:}'.
++let x = {}; // expect error: empty '{}' is not an expression, the empty map literal is '{:}'.
+ // a bare {} STATEMENT stays an empty block
+ { print "block"; } // expect: block
+diff --git a/tests/e2e/tests/modules/native_hint/main.ok b/tests/e2e/tests/modules/native_hint/main.ok
+index 486d2b8..a0cf84d 100644
+--- a/tests/e2e/tests/modules/native_hint/main.ok
++++ b/tests/e2e/tests/modules/native_hint/main.ok
+@@ -1,2 +1,2 @@
+ import "./fake";
+-// expect error: native loading lands with OR-3
++// expect error: native loading is not available yet
+diff --git a/tests/e2e/tests/modules/std_not_module_yet.ok b/tests/e2e/tests/modules/std_not_module_yet.ok
+index ef7a1f5..9ec6a60 100644
+--- a/tests/e2e/tests/modules/std_not_module_yet.ok
++++ b/tests/e2e/tests/modules/std_not_module_yet.ok
+@@ -1,3 +1,3 @@
+-// the std/ root is reserved (M8) and re-homes with OR-2
++// the std/ root is reserved (M8), it re-homes with the std module work
+ import "std/io";
+ // expect error: the standard library is not module-shaped yet
+diff --git a/tests/e2e/tests/modules/unquoted.ok b/tests/e2e/tests/modules/unquoted.ok
+index e37656a..1866667 100644
+--- a/tests/e2e/tests/modules/unquoted.ok
++++ b/tests/e2e/tests/modules/unquoted.ok
+@@ -1,3 +1,3 @@
+-// python-plain is not the language: the path is a quoted string
++// the path is a quoted string, spell it import "lib"
+ import lib;
+ // expect error: expected a quoted import path

@@ -367,3 +367,24 @@ the structural sandbox denial. v0.7.0 is named **"Epigone"**. OPEN for
 Q, Z recommending IN: the ok_api read side, type/class identity
 (classof/is_instance/class_name), native->script calls, and the
 single-integer OK_NATIVE_ABI versioning stance (MODULES.md section 11a).
+
+## D22 — the diagnostic doctrine [LOCKED 2026-11-03, patch 45]
+Q's ruling from the OR-1 landing review, standing for every diagnostic
+the language prints from now on. two halves. one: the message carries
+the helpful half only - the fix, the expectation, the location - and no
+editorial asides (the "python's plain import is not the language" tail
+is the example that died: the spelling hint stays, the commentary
+goes). internal draft references (M-numbers, OR-numbers) never appear
+in user-facing text either: the draft is docs, the message is a lesson.
+two: standard punctuation only - comma, colon, period. no dash, no em
+dash, no semicolon. semicolons inside quoted syntax examples are code,
+not prose, and stay legal. patch 45 swept the whole tree (13 messages:
+the six OR-1 offenders plus the seven pre-existing dashes and
+semicolons hiding in the parser, compiler, and vm).
+
+same review round, the manifest amendment recorded under D19/M10:
+project.ok exports its table with module-level `pub`, not `glob` -
+"it teaches bad practice of using glob to export stuff". the manifest
+is a plain module; OR-4's evaluator harvests the pub export through
+the ordinary module machinery. the sandbox would have kept the global
+from leaking anyway, but the manifest models the right shape.

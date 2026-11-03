@@ -1,0 +1,465 @@
+diff --git a/src/ok.c b/src/ok.c
+index 8b63b66..9cdd02e 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -50,6 +50,21 @@ static ok_value native_classof(ok* p_ok, uint8_t p_argc, const ok_value* p_argv)
+   return OBJECT_AS_VALUE(vm_classof(&p_ok->vm, p_argv[0]));
+ }
+ 
++// std.io's print (OR-2): the function face of the print statement, one
++// argument, the same formatting and the same hook. the statement stays
++// until the stdlib version that deprecates it; this native is a module
++// member only, never a seeded flat global.
++static ok_value native_print_fn(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  if (p_ok->vm.print_cb != NULL) {
++    p_ok->vm.print_cb(p_ok->vm.print_ctx, p_argv[0]);
++  } else {
++    value_debug_print(p_argv[0]);
++    puts("");
++  }
++  return NULL_AS_VALUE();
++}
++
+ // isinstance(v, C) (C12): the chain walk - true when C is classof(v) or one
+ // of its ancestors (object at the root matches everything, including null
+ // through nil). the exact-class check is `classof(v) == C` or the `is`
+@@ -261,6 +276,11 @@ static bool ok_define_core_natives(ok* p_ok) {
+       p_ok, ok_create_string_view(" classof", OK_STRING_VIEW_CALCULATE_LENGTH, true), 1, native_classof);
+   status &= ok_global_define_native_function(
+       p_ok, ok_create_string_view(" isinstance", OK_STRING_VIEW_CALCULATE_LENGTH, true), 2, native_isinstance);
++  // hidden like the rest, but deliberately NOT seeded flat: the function
++  // spelling of print is std.io's member (OR-2), the statement stays the
++  // flat way.
++  status &= ok_global_define_native_function(
++      p_ok, ok_create_string_view(" print", OK_STRING_VIEW_CALCULATE_LENGTH, true), 1, native_print_fn);
+   return status;
+ }
+ 
+diff --git a/src/okmodules.c b/src/okmodules.c
+index 7696b5c..9fdea68 100644
+--- a/src/okmodules.c
++++ b/src/okmodules.c
+@@ -1,14 +1,15 @@
+ // OR-1 "O Resolution" - the compile-time module spine, driver side.
+ //
+ // the shape (MODULES.md section 3): ok_modules_prepare walks one TU's import
+-// statements; each import resolves through the ladder (file-relative, then
+-// OKPATH - the std/ root lands with OR-2), then loads depth-first: read,
+-// parse, prepare ITS imports (recursion - the active chain catches cycles),
+-// compile in module mode (pub top-levels recorded), run the main (top-level
+-// code runs once, on first import, before the importer's), harvest the
+-// exports from the hidden globals into a sealed namespace instance, register.
+-// by the time the importer compiles, every binding is a live value riding
+-// its constant pool - the compiler resolves nothing at run time, ever.
++// statements; each import resolves through the ladder (file-relative, the
++// std/ registry, then OKPATH), then loads depth-first: read, parse, prepare
++// ITS imports (recursion - the active chain catches cycles), compile in
++// module mode (pub top-levels recorded), run the main (top-level code runs
++// once, on first import, before the importer's), harvest the exports from
++// the hidden globals into a sealed namespace instance, register. by the
++// time the importer compiles, every binding is a live value riding its
++// constant pool - the compiler resolves nothing at run time, ever. the std
++// modules (OR-2) are built-in: no source, no run, the same registry.
+ //
+ // diagnostics use the import site's own file:line:col through okdiag, so a
+ // module-world error reads exactly like every other oklang error.
+@@ -697,6 +698,125 @@ static ok_result load_module(module_system* p_modules,
+   return OK;
+ }
+ 
++// ---------------------------------------------------------------- the std modules (OR-2)
++
++// the built-in std registry. the std root resolves against this table ONLY
++// (M8): never the filesystem, never OKPATH, nothing can shadow it. the
++// members are the same native function objects the flat spellings use,
++// harvested from their hidden globals into the same sealed-namespace shape
++// file modules get, so a std module value IS a module value: same freezes,
++// same print shape, same from-import probe. math and str are importable
++// today and open empty, the stdlib growth version fills them, and the
++// resolution lane does not change when it does.
++typedef struct {
++  const char* export_name;
++  const char* hidden_global;
++} std_member_def;
++
++typedef struct {
++  const char* stem;
++  const std_member_def* members;
++  uint32_t member_count;
++} std_module_def;
++
++static const std_member_def std_array_members[] = {
++    {"len", " len"},
++    {"push", " push"},
++    {"pop", " pop"},
++    {"remove", " remove"},
++};
++static const std_member_def std_map_members[] = {
++    {"len", " len"},
++    {"remove", " remove"},
++    {"get", " get"},
++};
++static const std_member_def std_io_members[] = {
++    {"print", " print"},
++};
++static const std_module_def std_modules[] = {
++    {"array", std_array_members, sizeof(std_array_members) / sizeof(std_array_members[0])},
++    {"io", std_io_members, sizeof(std_io_members) / sizeof(std_io_members[0])},
++    {"map", std_map_members, sizeof(std_map_members) / sizeof(std_map_members[0])},
++    {"math", NULL, 0},
++    {"str", NULL, 0},
++};
++
++static const std_module_def* std_module_find(const ok_string_view p_stem) {
++  for (uint32_t i = 0; i < sizeof(std_modules) / sizeof(std_modules[0]); ++i) {
++    if (view_equals(p_stem, std_modules[i].stem)) {
++      return &std_modules[i];
++    }
++  }
++  return NULL;
++}
++
++// the registry key and display name of one std module: "std/<stem>". no
++// leading slash, so it can never collide with a realpath'd file key (those
++// are absolute, always).
++static bool std_canonical_of(const std_module_def* p_def, char* p_buffer, size_t p_capacity) {
++  const int written = snprintf(p_buffer, p_capacity, "std/%s", p_def->stem);
++  return written > 0 && (size_t)written < p_capacity;
++}
++
++// builds and registers one std module, idempotent through the registry.
++// built lazily on first import: an embedder that never touches std never
++// pays for it.
++static ok_result std_build_module(module_system* p_modules, const std_module_def* p_def) {
++  ok* okay = p_modules->ok;
++  char canonical[32];
++  if (!std_canonical_of(p_def, canonical, sizeof(canonical))) {
++    return OK_INIT_ERROR;
++  }
++  if (registry_find(p_modules, canonical) != NULL) {
++    return OK;
++  }
++
++  module_exports exports;
++  module_exports_init(&exports, &okay->alloc);
++  ok_result result = OK;
++  for (uint32_t i = 0; i < p_def->member_count; ++i) {
++    module_export entry;
++    entry.name = ok_create_string_view(p_def->members[i].export_name,
++                                       (uint32_t)strlen(p_def->members[i].export_name),
++                                       true);
++    entry.local = 0; // unused: only the compiler's epilogue reads it
++    entry.hidden = globals_store_get(&okay->globals_store,
++                                     ok_create_string_view(p_def->members[i].hidden_global,
++                                                           (uint32_t)strlen(p_def->members[i].hidden_global),
++                                                           true));
++    if (!IS_GLOBAL_VALID(entry.hidden) || !module_exports_append(&exports, entry)) {
++      result = OK_INIT_ERROR;
++      break;
++    }
++  }
++
++  if (result == OK) {
++    value namespace = NULL_AS_VALUE();
++    if (!build_namespace(p_modules, canonical, &exports, &namespace)) {
++      result = OK_INIT_ERROR;
++    } else {
++      ok_module_record record;
++      record.canonical = strdup(canonical);
++      record.name = VALUE_AS_INSTANCE(namespace)->klass->name;
++      record.namespace_class = VALUE_AS_INSTANCE(namespace)->klass;
++      record.namespace = namespace;
++      if (!gc_guard_up(&okay->gc, namespace)) {
++        free(record.canonical);
++        result = OK_INIT_ERROR;
++      } else {
++        const bool registered = record.canonical != NULL && ok_module_records_append(&p_modules->loaded, record);
++        gc_guard_down(&okay->gc);
++        if (!registered) {
++          free(record.canonical);
++          result = OK_INIT_ERROR;
++        }
++      }
++    }
++  }
++  module_exports_deinit(&exports, &okay->alloc);
++  return result;
++}
++
+ // ---------------------------------------------------------------- resolution
+ 
+ // resolve one import path from one importing file. produces the canonical
+@@ -720,15 +840,49 @@ static bool resolve_import(module_system* p_modules,
+       found = ladder_at(joined, &tried, &native_found);
+       free(joined);
+     }
+-  } else if (view_starts_with(p_path, "std/")) {
+-    // the std root is reserved (M8: unshadowable) and re-homes with OR-2 -
+-    // until then it is honestly absent rather than OKPATH-shadowable.
++  } else if (view_equals(p_path, "std")) {
++    // the bare root imports nothing: the std library is a tree of modules.
+     module_report(p_source,
+                   p_site,
+-                  "the standard library is not module-shaped yet. file-relative "
+-                  "(\"./x\") and OKPATH imports work today.");
++                  "the std root is a namespace: import a module under it, like \"std/array\".");
+     str_list_deinit(&tried);
+     return false;
++  } else if (view_starts_with(p_path, "std/")) {
++    // the std lane (M8, OR-2): the built-in registry only. it never falls
++    // through to OKPATH, so no directory on disk can shadow the standard
++    // library.
++    const ok_string_view stem = ok_create_string_view(p_path.chars + 4,
++                                                      ok_string_view_get_length(&p_path) - 4,
++                                                      false);
++    const std_module_def* def = std_module_find(stem);
++    if (def == NULL) {
++      string message = asprint(&p_modules->ok->alloc,
++                               "there is no std module '%.*s': the std modules are array, io, map, math, str.",
++                               (int)ok_string_view_get_length(&stem),
++                               stem.chars);
++      module_report(p_source, p_site, message.chars != NULL ? message.chars : "no such std module.");
++      string_deinit(&message, &p_modules->ok->alloc);
++      str_list_deinit(&tried);
++      return false;
++    }
++    if (std_build_module(p_modules, def) != OK) {
++      module_report(p_source, p_site, "out of memory while building the module's namespace.");
++      str_list_deinit(&tried);
++      return false;
++    }
++    char canonical[32];
++    if (!std_canonical_of(def, canonical, sizeof(canonical))) {
++      str_list_deinit(&tried);
++      return false;
++    }
++    char* owned = strdup(canonical);
++    if (owned == NULL) {
++      str_list_deinit(&tried);
++      return false;
++    }
++    str_list_deinit(&tried);
++    *p_out_canonical = owned;
++    return true;
+   } else {
+     // the OKPATH lane: colon-separated roots, the same ladder at each.
+     const char* okpath = getenv("OKPATH");
+@@ -951,8 +1105,10 @@ ok_result ok_modules_prepare(module_system* p_modules,
+       }
+       const ok_string_view root_name =
+           ok_create_string_view(root_owned, (uint32_t)strlen(root_owned), true);
+-      // the reserved root (M8): only the std/ lane may bind `std`.
+-      if (view_equals(root_name, "std")) {
++      // the reserved root (M8): only the std/ lane may bind `std`. a user
++      // file or directory named std (any relative or OKPATH path whose
++      // first segment is std) still cannot.
++      if (view_equals(root_name, "std") && !view_starts_with(path, "std/")) {
+         module_report(p_source,
+                       site,
+                       "the name 'std' is reserved for the standard library's namespace.");
+diff --git a/src/okparser.c b/src/okparser.c
+index d577bc6..d5be764 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -1633,7 +1633,10 @@ ast_expression* parse_access(
+   (void)is_right_associative;
+   allocators* alloc = p_parser->alloc;
+   advance(p_parser); // the '.'
+-  if (p_parser->previous.type != TOKEN_IDENTIFIER) {
++  // `print` is a keyword (the statement) and std.io's member carries the
++  // name anyway: in member position it always names the member, the
++  // statement never starts after a '.'.
++  if (p_parser->previous.type != TOKEN_IDENTIFIER && p_parser->previous.type != TOKEN_PRINT) {
+     error_at(p_parser,
+              p_parser->previous,
+              ok_create_string_view("expected a member name after '.'.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+@@ -3079,7 +3082,9 @@ static ast_import_statement* parse_from_import_statement(parser* p_parser) {
+     goto fail;
+   }
+   for (;;) {
+-    if (p_parser->current.type != TOKEN_IDENTIFIER) {
++    // `print` is a keyword and std.io exports it: an imported name may be
++    // the print keyword (aliases stay plain identifiers).
++    if (p_parser->current.type != TOKEN_IDENTIFIER && p_parser->current.type != TOKEN_PRINT) {
+       error_at(p_parser,
+                p_parser->current,
+                ok_create_string_view("expected an imported name.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+diff --git a/tests/e2e/tests/modules/std/bare.ok b/tests/e2e/tests/modules/std/bare.ok
+new file mode 100644
+index 0000000..a451a62
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/bare.ok
+@@ -0,0 +1,2 @@
++import "std";
++// expect error: the std root is a namespace
+diff --git a/tests/e2e/tests/modules/std/basic.ok b/tests/e2e/tests/modules/std/basic.ok
+new file mode 100644
+index 0000000..9b761c5
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/basic.ok
+@@ -0,0 +1,25 @@
++// the built-in std modules: array and map under one merged std root (M5)
++import "std/array";
++import "std/map";
++
++let a = [1, 2, 3];
++print(std.array.len(a)); // expect: 3
++std.array.push(a, 4);
++print(std.array.len(a)); // expect: 4
++print(std.array.pop(a)); // expect: 4
++print(std.array.remove(a, 0, 1)); // expect: null
++
++let m = {"k": 1, "j": 2};
++print(std.map.len(m)); // expect: 2
++print(std.map.get(m, "k")); // expect: 1
++print(std.map.get(m, "zz", 0)); // expect: 0
++std.map.remove(m, "k");
++print(std.map.len(m)); // expect: 1
++
++print(std.array); // expect: <module std/array>
++print(std.map); // expect: <module std/map>
++
++// a module value is an ordinary value: alias it, box it, call through it
++import "std/array" as arr;
++let box = {"m": arr};
++print(box["m"].len([1, 2])); // expect: 2
+diff --git a/tests/e2e/tests/modules/std/empty_modules.ok b/tests/e2e/tests/modules/std/empty_modules.ok
+new file mode 100644
+index 0000000..c61b1a9
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/empty_modules.ok
+@@ -0,0 +1,8 @@
++// math and str exist today and open empty: the stdlib growth version fills
++// them, the import lane does not change when it does
++import "std/math" as math;
++import "std/str" as str;
++
++print(math); // expect: <module std/math>
++print(str); // expect: <module std/str>
++print(isinstance(math, object)); // expect: true
+diff --git a/tests/e2e/tests/modules/std/flat_alias.ok b/tests/e2e/tests/modules/std/flat_alias.ok
+new file mode 100644
+index 0000000..45691c1
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/flat_alias.ok
+@@ -0,0 +1,9 @@
++// the flat spellings stay as deprecated aliases: old scripts keep running
++import "std/array";
++
++let a = [1];
++std.array.push(a, 2);
++push(a, 3);
++a.push(4);
++print(len(a)); // expect: 4
++print(a.len()); // expect: 4
+diff --git a/tests/e2e/tests/modules/std/from_array.ok b/tests/e2e/tests/modules/std/from_array.ok
+new file mode 100644
+index 0000000..a563723
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/from_array.ok
+@@ -0,0 +1,7 @@
++// from-imports bind the natives directly, aliases included
++from "std/array" import push, len as size;
++
++let a = [];
++push(a, 1);
++push(a, 2);
++print(size(a)); // expect: 2
+diff --git a/tests/e2e/tests/modules/std/from_missing.ok b/tests/e2e/tests/modules/std/from_missing.ok
+new file mode 100644
+index 0000000..10d8de2
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/from_missing.ok
+@@ -0,0 +1,2 @@
++from "std/math" import floor;
++// expect error: module 'std/math' has no pub export 'floor'
+diff --git a/tests/e2e/tests/modules/std/immutable.ok b/tests/e2e/tests/modules/std/immutable.ok
+new file mode 100644
+index 0000000..058bddc
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/immutable.ok
+@@ -0,0 +1,4 @@
++import "std/array";
++
++std.array.len = 5;
++// expect error: module namespaces are immutable
+diff --git a/tests/e2e/tests/modules/std/in_module/lib.ok b/tests/e2e/tests/modules/std/in_module/lib.ok
+new file mode 100644
+index 0000000..c4333ac
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/in_module/lib.ok
+@@ -0,0 +1,6 @@
++// a file module importing std: the same graph, std is just a node in it
++import "std/array";
++
++pub fu count(a) {
++  return std.array.len(a);
++}
+diff --git a/tests/e2e/tests/modules/std/in_module/main.ok b/tests/e2e/tests/modules/std/in_module/main.ok
+new file mode 100644
+index 0000000..a37e63d
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/in_module/main.ok
+@@ -0,0 +1,7 @@
++import "./lib.ok";
++import "std/map";
++
++let a = [1, 2, 3];
++print(lib.count(a)); // expect: 3
++let m = {"x": 1};
++print(std.map.get(m, "x")); // expect: 1
+diff --git a/tests/e2e/tests/modules/std/io.ok b/tests/e2e/tests/modules/std/io.ok
+new file mode 100644
+index 0000000..a5e7d64
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/io.ok
+@@ -0,0 +1,11 @@
++// std.io: the print function, same formatting as the statement
++import "std/io" as io;
++
++io.print("hello"); // expect: hello
++io.print(7); // expect: 7
++io.print(2.0); // expect: 2
++io.print(true); // expect: true
++
++from "std/io" import print as say;
++say("from-imported"); // expect: from-imported
++print "the statement stays"; // expect: the statement stays
+diff --git a/tests/e2e/tests/modules/std/shadow/main.ok b/tests/e2e/tests/modules/std/shadow/main.ok
+new file mode 100644
+index 0000000..a0bdb1e
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/shadow/main.ok
+@@ -0,0 +1,5 @@
++// okpath: .
++// the OKPATH dir holds std/array.ok, the std lane must not see it
++import "std/array";
++
++print(std.array.len([7, 8])); // expect: 2
+diff --git a/tests/e2e/tests/modules/std/shadow/std/array.ok b/tests/e2e/tests/modules/std/shadow/std/array.ok
+new file mode 100644
+index 0000000..b04f53b
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/shadow/std/array.ok
+@@ -0,0 +1,3 @@
++// poison: OKPATH can never serve the std root (M8)
++pub let len = "poison";
++pub let push = "poison";
+diff --git a/tests/e2e/tests/modules/std/unknown.ok b/tests/e2e/tests/modules/std/unknown.ok
+new file mode 100644
+index 0000000..132b8e5
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/unknown.ok
+@@ -0,0 +1,2 @@
++import "std/nope";
++// expect error: there is no std module 'nope'
+diff --git a/tests/e2e/tests/modules/std_not_module_yet.ok b/tests/e2e/tests/modules/std_not_module_yet.ok
+deleted file mode 100644
+index 9ec6a60..0000000
+--- a/tests/e2e/tests/modules/std_not_module_yet.ok
++++ /dev/null
+@@ -1,3 +0,0 @@
+-// the std/ root is reserved (M8), it re-homes with the std module work
+-import "std/io";
+-// expect error: the standard library is not module-shaped yet

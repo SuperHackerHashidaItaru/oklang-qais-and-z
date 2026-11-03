@@ -1,12 +1,24 @@
 # MODULES — the 0.8.0 wave, codename "O Resolution" (final)
 
-status: FINAL, amended once. the M1-M14 rulings came back (2026-11-03,
+status: FINAL, amended twice. the M1-M14 rulings came back (2026-11-03,
 recorded verbatim in section 11), the sandboxing gap Q caught is designed
 in (section 6), the patch series is re-densed per Q's "the plan was too
 sparse" (4 patches, was 8 - section 10). the pre-modules work Q ordered
 landed first: string interning is patch 41 (D20, 427/427 x5) and the coro
 C API is patch 42 (D21, LANDED - appendix A), so ok_module.h's vtable
-inherits it instead of breaking later.
+inherits it instead of breaking later. **OR-1 is LANDED** (session 36,
+patches 43 + 44, Q applied to modules-staging: the spine, 471/471 x5).
+
+amendments, round two (2026-11-03, Q's landing review):
+- RULED: **project.ok exports its table with module-level `pub`, not
+  `glob`** - "it teaches bad practice of using glob to export stuff".
+  the manifest is a plain module and the CLI harvests its pub export
+  (section 4, folded in). the sandbox would have kept the global from
+  leaking anyway, but the manifest should model the right shape.
+- RULED: **the diagnostic doctrine** - error messages carry the helpful
+  half only, no editorial asides, and standard punctuation only: comma,
+  colon, period. no dash, no em dash, no semicolon (D22, patch 45 swept
+  the whole tree; new code follows it from here on).
 
 amendments (2026-11-03, Q's review round on this draft - the two RULED
 ones are folded in below, the api-surface items are answered and marked
@@ -199,11 +211,16 @@ stdlib and NO natives loaded** (M10: "not limited, it can do whatever
 using stdlib, but it can't load native" - Q overruled my earlier
 no-natives-restricted-instance lean; the no-natives half stands for v1,
 the door for more is section 6's open question). it may not import (it is
-a script, not a module, in v1). the CLI reads one global:
+a script, not a module, in v1). the table is a module-level pub export
+(amended round two: Q ruled out the original `glob let` shape - "it
+teaches bad practice of using glob to export stuff". the manifest runs
+sandboxed so the global would never leak anyway, but the manifest should
+model the right shape: a plain module exporting one pub table, harvested
+by the same machinery OR-1 built for every other module):
 
 ```ok
 // project.ok
-glob let project = {
+pub let project = {
   "name": "myapp",
   "version": "0.1.0",
   "ok": "0.8",             // the oklang surface this project targets
@@ -248,8 +265,10 @@ rules:
   project.ok grows a "source" field and nothing here precludes it. the
   doctrine is: `git clone` is the dependency manager.
 - manifest evaluation errors are hard failures with the manifest's own
-  path:line:col. the manifest instance's capabilities: host caps minus
-  the native caps, always (section 6).
+  path:line:col, and so is a manifest that exports no pub `project`
+  table (the evaluator harvests the export through the ordinary OR-1
+  module machinery). the manifest instance's capabilities: host caps
+  minus the native caps, always (section 6).
 
 ## 5. resolution (the search order - M3, M6, with Q's stress made explicit)
 
@@ -603,7 +622,10 @@ each gated by the full matrix (427+ e2e x plain/threaded/asan/aggressive
 + new tests + WORKLOG entry). if a session dies mid-patch, the next one
 reads this section + WORKLOG and resumes - that is the whole point.
 
-- **OR-1 - the compile-time spine** (was P1+P2, the big one, ~600
+- **OR-1 - the compile-time spine** — **LANDED (session 36, patches 43 +
+  44, on modules-staging: 44 module tests, 427 -> 471, gates 471/471 x5,
+  the whole spine as scoped below, M5's root binding with single-segment
+  paths binding the module itself)** — (was P1+P2, the big one, ~600
   lines): the grammar (import/from/as, quoted paths, bare-identifier
   hard error) + tree-sitter catch-up; path normalization + the
   resolution ladder (relative + std + OKPATH, native candidates
@@ -618,19 +640,43 @@ reads this section + WORKLOG and resumes - that is the whole point.
   the multi-file e2e runner extension. acceptance: multi-file e2e
   (import chains, cycle errors, init order, pub/privacy, root merging,
   alias/from forms, cross-file traces), the whole old matrix green.
-- **OR-2 - std re-home** (was P3, the compatibility-sensitive one;
+- **OR-2 - std re-home** — **LANDED (session 37, patch 46: the built-in
+  std registry, never the filesystem, the shadow test proves OKPATH
+  cannot touch it; 10 std tests, 481/481 x5)** — (was P3, the
+  compatibility-sensitive one;
   SHRUNK by Q's review-round ruling - coro stays a core native, it does
-  NOT move): the std/ directory (io, math, str, array, map) with the
-  natives re-registered as module members; **coro is NOT part of this**
-  anymore - it is native like str/num/bool/map/array/type, it lives in
-  the api, and it is not gated in std (R24's std.coro home is overruled
-  by the ruling that the api carries it). **flat globals stay as
-  deprecated aliases - removal is the NEXT stdlib version's call, not
-  this wave's** (Q's sub-ruling: "flat ones keep it for now, we work on
-  this in stdlib next version"). the print-statement deprecation plan
-  (and the %g default's replacement by std.io's formatting) is written
-  down here as that version's scope. acceptance: old scripts unchanged
-  (aliases), new-style scripts pass, the std module table documented.
+  NOT move): the std/ modules with the natives re-registered as module
+  members; **coro is NOT part of this** - it is native like
+  str/num/bool/map/array/type, it lives in the api, and it is not gated
+  in std (R24's std.coro home is overruled by the ruling that the api
+  carries it). **flat globals stay as deprecated aliases - removal is
+  the NEXT stdlib version's call, not this wave's** (Q's sub-ruling:
+  "flat ones keep it for now, we work on this in stdlib next
+  version"). implementation notes: the std modules are built-in
+  (registry entries keyed "std/<stem>", built lazily on first import,
+  the members harvested from the natives' hidden globals into the same
+  sealed-namespace shape file modules get); one grammar delta rode
+  along, `print` is a keyword and std.io exports it so member position
+  and from-import names accept the print keyword (the `operator`
+  precedent).
+
+  **the std module table** (documented per the acceptance bar):
+
+  | module | members | notes |
+  |---|---|---|
+  | std.array | len, push, pop, remove | the array natives, receiver-first |
+  | std.map | len, remove, get | the map natives |
+  | std.io | print | the statement's function face, same hook, same %g |
+  | std.math | (empty) | opens with the stdlib growth version |
+  | std.str | (empty) | opens with the stdlib growth version |
+
+  **the next stdlib version's scope, written down here as ruled**: the
+  print STATEMENT deprecates in favor of std.io.print (one release of
+  warning docs first), and the %g number default replaces with
+  std.io's own formatting (the shortest-exact form). the flat aliases
+  (the seed names, the method spellings) ride the same deprecation
+  window. none of this is 0.8.0 behavior: the aliases all work, the
+  removals are the next version's to schedule.
 - **OR-3 - sandbox + natives + the embedder loader** (was P4+P7 + the
   new sandbox section; loading is born gated): the capability system
   FIRST (ok_specs caps, the ratchet, ok_caps_get/drop, CLI --restrict/
@@ -650,7 +696,7 @@ reads this section + WORKLOG and resumes - that is the whole point.
   memory with zero fs calls.
 - **OR-4 - project.ok + the build pipeline** (was P5+P6): manifest
   discovery (walk up from the ENTRY file), the evaluator (full-stdlib
-  no-natives instance, reads the `project` global), module roots, path
+  no-natives instance, harvests the manifest's pub `project` export),
   deps (project/raw/native, recursive), native targets with declared
   build commands, the consent policy, .okbuild staleness stamps, ok
   build/where, auto-build-on-import, the fixture farm (project with
@@ -725,6 +771,18 @@ RULED (folded into the draft above):
   platform wrapper as default fallback, plus the ability to turn the
   feature off entirely. unsupported platforms run the language; the
   off-switch is the structural sandbox denial.
+
+RULED (landing review, round two, 2026-11-03):
+- **the manifest exports with module-level `pub`, not `glob`** - glob is
+  the process-global escape hatch and the manifest should not teach it.
+  section 4 is folded; OR-4's evaluator harvests the pub export through
+  the ordinary module machinery.
+- **the diagnostic doctrine** (D22): error messages keep the helpful
+  half and drop the editorial ("python's plain import is not the
+  language" is out; "spell it import \"a/b\"" stays), and the
+  punctuation is comma, colon, period only - no dash, no em dash, no
+  semicolon. patch 45 swept the existing tree; it binds all future
+  diagnostics.
 
 OPEN for Q (Z's recommendations, awaiting the nod before OR-3 finalizes
 the vtable):

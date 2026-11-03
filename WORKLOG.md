@@ -1927,3 +1927,75 @@ still flagged (yield keyword joins the grammar list).
   natives + the loader - loading is born gated, and its vtable waits
   on the four OPEN items) and OR-4 (project.ok + build). delta blue
   stays the 0.9.0 meter.
+
+## session 37 (2026-11-03): Q lands OR-1, the review round (44 regenerated, D22, patches 45 + 46, OR-2 lands)
+
+- context: Q applied 43 to coro as modules-staging (ebfbec1, tree
+  identical to the sandbox c629e33 - verified before building on it).
+  the tree-sitter 44 did NOT apply on his side: the repo is clean
+  master 72b061f and 44 was cut against master + 29, which his repo
+  never took. the fix is not a rebase of his tree, it is a regeneration
+  of the patch: 44 is now SELF-CONTAINED against clean master (29
+  folded in), corpus re-verified 138/138, README entry rewritten. if
+  29 is already applied anywhere, the old 44 lives in git history.
+- the review round's two rulings, recorded: the manifest's table is a
+  module-level pub export, NOT a glob one ("it teaches bad practice of
+  using glob to export stuff" - the sandbox would have kept the global
+  from leaking anyway, but the manifest models the right shape. Z
+  agreed, it also means OR-4's evaluator is just the ordinary harvest);
+  and the diagnostic doctrine, D22: error messages carry the helpful
+  half only, no editorial asides, no draft references, and the
+  punctuation is comma, colon, period only. no dash, no em dash, no
+  semicolon. DECISIONS.md carries it, Z-GUIDE carries it so no fresh
+  session relearns it.
+- patch 45, the doctrine sweep: thirteen messages (the six OR-1
+  offenders - the two python-plain notes keep the spelling hint and
+  lose the editorial, the chain limit drops "design smell", the std/
+  native/export messages drop their OR-numbers - plus seven
+  pre-existing: empty map literal, both overloadability notes, the
+  compound-operator message, the span-let field note, both sealed-class
+  messages). two e2e assertions moved with their messages. gates
+  471/471 x5.
+- patch 46, OR-2, the std re-home: the std root resolves against a
+  BUILT-IN registry, never the filesystem, OKPATH included (the shadow
+  test plants a poisoned std/array.ok on OKPATH and the builtin still
+  answers). the table: std.array (len/push/pop/remove), std.map
+  (len/remove/get), std.io (print, the statement's function face, same
+  hook, same %g), std.math and std.str importable and empty until the
+  stdlib growth version. the members are the same native objects the
+  flat spellings use, harvested from their hidden globals into the
+  sealed-namespace shape - a std module value IS a module value, and
+  the registry roots it like any module (mark_modules walks the loaded
+  table). built lazily: an embedder that never imports std never pays.
+  keys are "std/<stem>", collision-free with file keys by construction
+  (realpaths are always absolute).
+- the grammar delta the tests forced: print is a keyword and std.io
+  exports it, so member position after '.' and from-import names
+  accept the print keyword (aliases stay identifiers) - the operator
+  precedent, applied once. the M8 root reservation now exempts the
+  std/ lane only; bare "std" and unknown stems get teaching errors
+  (the unknown one lists the real table).
+- one test bug of mine caught by the gate itself: the shadow test
+  asserted len([7]) == 7, the answer is 1. the gate stays honest.
+- receipts: 10 new std tests (merge, io, empty modules, from + alias,
+  missing member, bare root, unknown, immutability, OKPATH shadow,
+  std inside file-module chains, value passing; std_not_module_yet
+  retired), 471 -> 481; gates 481/481 x5 (plain, threaded, asan,
+  aggressive, asan+aggr); unit x3, embed x3, capi 140 x3; delta blue
+  flat (1.40654e7 in 0.64s). OR-1's acceptance held: old scripts
+  unchanged, the aliases all live.
+- the deprecation plan written down per the ruling (MODULES.md OR-2
+  section): the print statement deprecates for std.io.print, the %g
+  default replaces with std.io's formatting, the flat aliases ride the
+  same window - all next-stdlib-version behavior, none of it 0.8.0's.
+- delivered: patches/45-diagnostic-doctrine.patch,
+  patches/46-std-re-home.patch, patches/44 regenerated in place,
+  README entries, MODULES.md amended twice-over (the pub ruling, D22,
+  OR-1 + OR-2 LANDED markers, the std module table, the deprecation
+  plan), DECISIONS.md D22 (+ the manifest amendment under its parent),
+  Z-GUIDE's standing-rules list, this entry.
+- next: OR-3, sandbox + natives + the embedder loader - loading is
+  born gated, and its vtable still waits on Q's nod for the four OPEN
+  items (read side, type/class identity, call, versioning). then OR-4
+  (project.ok + the build pipeline, the pub-export harvest). delta
+  blue stays the 0.9.0 meter.
