@@ -441,3 +441,78 @@ chain 1.4->1.30x, poly 1.3->1.23x vs wren) and the core FLIPPED to ahead
 (loop_counter 1.17x, branch_toggle 1.18x, arithmetic_sum 1.24x,
 array_index 1.26x); what remains is allocation-shaped - 0.9.0's lane.
 also delivered: docs/drafts/COROS.md, the coroutine draft (R20-R24).
+
+### 37 — glob classes published null (the bug Q caught)
+
+`glob class cc { ... }` then `cc().pr("hi")` errored "value is not
+callable" and `print cc` said null, while locals worked - Q's report,
+root-caused in one read. compile_class_declaration ended with
+define_variable(varloc, value-at-varloc): for a LOCAL that shape is the
+register no-op (klass_reg IS the local), but for a GLOB the value location
+was the global slot itself, so write_global materialized it (LOAD_GLOBAL
+null) and stored it back - publishing null over the slot while the real
+class rode klass_reg untouched. the define now carries the class in
+klass_reg, the exact shape compile_function_declaration always used for
+glob fus; the alias case (`glob let cg = cc`) only ever worked when the
+register index happened to survive. also splits the committed-broken
+operator_errors.ok (three expect-error lanes in one file, but the vm halts
+at the first error and the runner checks the last message - it could never
+pass) into the three one-error-per-file tests the house convention wants,
+and adds glob_class.ok pinning the regression: direct instantiation,
+print, the glob-let alias, use from a function, a local subclass of a glob
+class, classof identity. gates: e2e 406x406 threaded + pure switch,
+classes family asan + aggressive-gc clean.
+
+### 38 — coros: the coroutine lane (R20-R24)
+
+the draft's pitch held: a coro is an object that owns an execution_state,
+and resume is a state swap plus a plain run_until(0). surface per the
+rulings: `coro` is the eighth builtin class (lowercase, always loaded now,
+future home std.coro), constructed through its native static
+`operator ()` - `coro(fu)` makes the coro, does not run it. `c.resume([v])`
+drives (first resume's argument is the body's argument; a suspended
+resume's argument lands in the parked yield expression - the two-way
+channel; returns the yielded value or the body's final value; dead answers
+null per R21). `c.status()` spells ready/suspended/running/dead. `yield`
+is a keyword (R23), statement and expression, bare = null.
+
+the mechanics that mattered: OP_YIELD parks the top frame in place (no
+pops, no upvalue closes, no defers) and returns RUNTIME_SUSPENDED straight
+out of the driver's run_until - sound because the yield barrier keeps
+every C-driven region (operator dispatch, construction, the defer unwind
+scan, native ok_call hops) yield-free by error, lua's C-call-boundary
+discipline, so nothing between a legal yield and the driver holds state.
+the surprise: the NORMAL scope-exit defer lane stages its thunks in the
+dispatch loop, so a defer containing a yield parks mid-cleanup and resumes
+honestly - generators-in-defers are real, only the error/unwind scan
+refuses. error death: the R22 sweep runs the body's defers on the coro's
+own state (the uncaught-at-top-level discipline), then the whole error
+lane transplants to the resumer - the resume call site is where a catch
+takes it. death frees the state; a dead coro costs its object.
+
+upvalue ownership (the real work the draft missed): an open upvalue's
+location indexes its OWNER's register array, never the running state's.
+main-state captures resolve through vm->main_state; coro captures carry
+the coro as a TRACED owner value on the upvalue, so a closure that
+escaped a parked coro pins the coro (and its register file) until the
+cell closes - the sweep cannot dangle it, close clears the pin.
+steady-state read/write loops measure flat; the capture path pays one
+word (churn micro ~10%). the gc grows mark_execution_state (one walk for
+the current state, the vm->resume_parked resumer chain, and every
+reachable coro's owned state).
+
+en route, two pre-existing bugs: the glob-classes null publish (patch 37,
+Q's report) and parse_expression's infix loop handing a NULL left to the
+next infix after any parse failure - a call node with a null callable
+that segfaulted the teardown (any parse error inside an infix chain
+could crash the cli; found while writing the coro tests).
+
+gates: e2e 423x423 (was 406) on threaded dispatch, pure switch, asan,
+and aggressive-gc. 17 new tests: the channel, bare yield, yield-from-
+nested-calls, coro-resumed-from-inside-a-coro, error crossing + R22 +
+runtime-kind errors, parked-vs-death defers, defer-containing-yield,
+upvalue ownership both directions (shared cells + the escaped-closure
+pin), gc churn between resumes, the running status window, classes
+interplay (instances across parks, bound methods, construction inside),
+and the eight error lanes (yield outside/constructor/operator/defer,
+resume running, resume arity, body-not-a-fu, body arity).

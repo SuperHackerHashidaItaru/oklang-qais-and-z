@@ -1,9 +1,66 @@
-# COROS — the coroutine draft (rulings R20+ open)
+# COROS — the coroutine lane (LANDED: patch 38, R20-R24 closed)
+
+status: IMPLEMENTED on `opt-lightweight` (fed4158, patch 38), one session
+after this draft. the rulings came back: R20 class + yield keyword (the
+class is `coro`, lowercase, per R24's snake_case lean - always loaded for
+now, future home `std.coro`), R21 resume-of-dead is null, R22 dead-by-error
+defers run, R23 yield is a keyword, R24 ships now as a builtin. no
+scheduler (standing veto; casio/asio is a later, separate conversation).
+
+the draft below is kept as the design record; the deltas that landed:
+
+- **construction is `coro(fu)`** - the overridden static `operator ()`
+  (patch 34's door), not `Coro.of`. `c.resume([v])`, `c.status()`. the
+  first resume's argument is the body's own argument; a suspended resume's
+  argument lands in the parked yield expression (so `return yield;` parks
+  null-out and the NEXT resume's argument is the return value).
+- **the yield barrier (new ruling, mine):** a yield under a C-driven region
+  - operator dispatch, construction, the defer UNWIND scan, a native
+  ok_call hop - is a runtime error, lua's C-call-boundary discipline. the
+  C frame holding the result bookkeeping cannot survive a suspension, so
+  OP_YIELD refuses: "cannot yield from inside a constructor / an operator
+  method / a defer", "cannot yield across a native call". this is why
+  suspension never crosses C at all: RUNTIME_SUSPENDED is only ever
+  produced by the resume driver's own run_until, and nothing between the
+  yield and it holds state.
+- **the surprise that works:** the NORMAL scope-exit defer lane
+  (OP_DEFER_RUN) stages its thunks inside the dispatch loop - no C frame -
+  so a defer containing a yield parks mid-cleanup and resumes honestly.
+  only the error/unwind scan refuses. generators-in-defers are real.
+- **errors transplant, not just propagate:** the death sweep runs the
+  body's defers on the coro's own state (R22, exactly the uncaught-at-
+  top-level discipline), then the whole error lane moves to the resumer's
+  state - the resume call site is where a catch takes it, and an uncaught
+  one reports once at the resumer's outermost level (the coro's frames are
+  gone from the trace; the resume site is the recorded location).
+- **upvalues needed real work the draft missed:** an open upvalue's location
+  indexes its OWNER's register array, never the running state's. cells
+  captured in the vm's own state resolve through `vm->main_state`; cells
+  captured in a coro carry the coro as a TRACED owner value on the upvalue
+  itself, so a closure that escaped a parked coro pins the coro (and its
+  register file) alive until the cell closes - the sweep cannot dangle it.
+  close clears the pin. steady-state read/write loops measure flat; the
+  capture path pays one word (the churn micro ~10%).
+- **the gc roots everything parked:** mark_vm walks the current state AND
+  the `resume_parked` chain (resumers suspended under a resume) AND each
+  reachable coro's owned state (the OBJ_CORO trace). aggressive-gc gate
+  runs the whole suite parked-and-churning.
+
+gates: e2e 423x423 (was 406) on threaded, pure switch, asan, and
+aggressive-gc. 17 tests in tests/e2e/tests/coros/ including the eight
+error lanes. two pre-existing bugs fixed en route: glob classes
+published null (patch 37, Q's report), and parse_expression's infix loop
+handed a NULL left to the next infix after any parse failure (a call node
+with a null callable - the teardown segfaulted the cli).
+
+---
+
+the original draft, as written against the classes-complete tree:
 
 status: DRAFT for Q, written against the classes-complete tree (your
 `classes-staging`, a1411d1) plus the lightweight-perf pass that just landed
 (patch 36: interning, poly-MIC, fused conditions, threaded dispatch). the
-verdict i'm asking for is scope-and-surface only — the mechanics are
+verdict i'm asking for is scope-and-surface only - the mechanics are
 already 80% paid for by machinery that exists, which is the whole reason
 this is "super easy but cool" instead of a project.
 
@@ -172,20 +229,22 @@ parking, watermark restore) were all paid for by errors/defer/classes.
 - the poly-mic / threaded-dispatch interaction: yield under both dispatch
   modes (the OP_YIELD handler is CASE()-shaped like every other)
 
-## 6. open rulings
+## 6. the rulings, closed
 
-- **R20**: the surface — A (Coro class + yield keyword), B (wren fibers),
-  or C (lua library). my recommendation: A.
-- **R21**: resume of a dead coro: null or error? (lean: null, it's the
-  "iterator exhausted" shape.)
-- **R22**: do a dead-by-error coro's pending defers run? (lean: yes — the
-  cascade lane already owns this for failing frames.)
-- **R23**: `yield` keyword vs `Coro.yield()` native. (lean: keyword; it
-  reserves a word we have no other plans for, and reads right.)
-- **R24**: does `Coro` ship in 0.6.0 with the module system (as the first
-  stdlib-shape resident) or land earlier as a bare builtin like the
-  classes-era natives? (lean: earlier — it's one frozen class, patch 34
-  already built that door.)
-- standing veto: no symmetric transfer, no coroutine priorities, no
-  scheduler — a Coro is driven by the holder's code, full stop. (the
-  wren/lua schedulers are stdlib, and stdlib is 0.6.0+'s conversation.)
+- **R20**: A - class + yield keyword. **RULED: yes**, the class is `coro`
+  (lowercase), hidden in `std.coro` when modules land, always loaded now.
+- **R21**: resume of a dead coro. **RULED: null** (the iterator-exhausted
+  shape) - including dead-by-error.
+- **R22**: do a dead-by-error coro's pending defers run? **RULED: yes** -
+  the death sweep runs them on the coro's own state before the lane
+  transplants.
+- **R23**: yield keyword vs native. **RULED: keyword.**
+- **R24**: ship now or with 0.6.0's modules? **RULED: now**, lowercase
+  `coro`, the eighth builtin class.
+- standing veto upheld: no symmetric transfer, no coroutine priorities, no
+  scheduler - a coro is driven by the holder's code, full stop. (the
+  wren/lua schedulers are stdlib, and stdlib is 0.6.0+'s conversation;
+  casio/asio is its own later project.)
+- added by implementation: the C-boundary ruling (yield under C-driven
+  regions errors), and upvalue ownership (open cells resolve through their
+  owner's array, escaped closures pin their coro).

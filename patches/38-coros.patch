@@ -1,0 +1,1941 @@
+diff --git a/src/ok.c b/src/ok.c
+index fedbc34..71e600d 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -28,6 +28,12 @@ struct ok {
+   bool dump_skip_run;
+ };
+ 
++// the vm's natives receive the ok* per the native ABI and reach the vm through
++// here (the struct above is this file's own business)
++vm* ok_vm(ok* p_ok) {
++  return &p_ok->vm;
++}
++
+ // the core builtins are receiver-first native functions: `len(a)` and
+ // `a.len()` are one C entry, mounted twice (free function + method on the
+ // array/map class singletons). str carries no methods in v0.5.0 - nothing
+@@ -304,6 +310,10 @@ static bool ok_define_builtin_surfaces(ok* p_ok) {
+                                                 /*p_pub*/ true,
+                                                 &specs);
+   }
++  // the coro surface (R20-R24): the native static `operator ()`
++  // (construction), `resume`, and `status`, mounted before the seal like
++  // every other builtin's methods
++  status &= vm_define_coro_surface(&p_ok->vm);
+   for (uint32_t i = 0; i < OK_BUILTIN_COUNT; ++i) {
+     // the seal (C15): from here the builtin tables are frozen like every
+     // script class's, which is what the fast lanes depend on.
+@@ -345,6 +355,7 @@ static const seed_entry top_level_seeds[] = {
+     {"map", SEED_BUILTIN_CLASS, OK_BUILTIN_MAP},
+     {"function", SEED_BUILTIN_CLASS, OK_BUILTIN_FUNCTION},
+     {"nil", SEED_BUILTIN_CLASS, OK_BUILTIN_NIL},
++    {"coro", SEED_BUILTIN_CLASS, OK_BUILTIN_CORO},
+     {"Object", SEED_OBJECT, OK_BUILTIN_COUNT},
+     {"Class", SEED_CLASS, OK_BUILTIN_COUNT},
+ };
+diff --git a/src/okast.c b/src/okast.c
+index b3cf3bf..7428466 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -35,6 +35,7 @@
+   X(AST_SUBSCRIPT_EXPRESSION, ast_subscript_expression)                                                                \
+   X(AST_FUNCTION_EXPRESSION, ast_function_expression)                                                                  \
+   X(AST_SPREAD_EXPRESSION, ast_spread_expression)                                                                      \
++  X(AST_YIELD_EXPRESSION, ast_yield_expression)                                                                      \
+   X(AST_EMPTY_STATEMENT, ast_empty_statement)                                                                          \
+   X(AST_EXPRESSION_STATEMENT, ast_expression_statement)                                                                \
+   X(AST_PRINT_STATEMENT, ast_print_statement)                                                                          \
+@@ -860,6 +861,38 @@ bool ast_spread_expression_print(const ast_spread_expression* p_spread) {
+   return res;
+ }
+ 
++void ast_yield_expression_init(ast_yield_expression* p_yield,
++                               const token p_token,
++                               ast_expression* p_value,
++                               ast_specs* p_specs) {
++  ast_expression_init(&p_yield->expression, AST_YIELD_EXPRESSION, p_token, p_specs);
++  p_yield->value = p_value;
++}
++
++void ast_yield_expression_deinit(ast_yield_expression* p_yield) {
++  allocators* alloc = p_yield->expression.node.alloc;
++  if (p_yield->value != NULL) {
++    ast_dispatch_deinit((ast_node*)p_yield->value);
++    alloc->release(alloc, p_yield->value);
++    p_yield->value = NULL;
++  }
++  ast_expression_deinit(&p_yield->expression);
++}
++
++bool ast_yield_expression_print(const ast_yield_expression* p_yield) {
++  bool res = printf("yield ") > 0;
++  res &= ast_dispatch_print((ast_node*)p_yield->value);
++  return res;
++}
++
++string ast_yield_expression_asprint(const ast_yield_expression* p_yield) {
++  allocators* alloc = p_yield->expression.node.alloc;
++  string value_str = ast_dispatch_asprint((ast_node*)p_yield->value);
++  string res = asprint(alloc, "yield %s", value_str.chars);
++  string_deinit(&value_str, alloc);
++  return res;
++}
++
+ string ast_spread_expression_asprint(const ast_spread_expression* p_spread) {
+   allocators* alloc = p_spread->expression.node.alloc;
+   string inner = ast_dispatch_asprint((ast_node*)p_spread->inner);
+diff --git a/src/okast.h b/src/okast.h
+index 3402ff2..9517af8 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -49,7 +49,8 @@ typedef enum {
+   AST_SUBSCRIPT_EXPRESSION,
+   AST_FUNCTION_EXPRESSION,
+   AST_SPREAD_EXPRESSION,
+-  AST_RANGE_EXPRESSION_END = AST_SPREAD_EXPRESSION,
++  AST_YIELD_EXPRESSION,
++  AST_RANGE_EXPRESSION_END = AST_YIELD_EXPRESSION,
+ 
+   AST_RANGE_STATEMENT_BEGIN,
+   AST_RANGE_PURE_STATEMENT_BEGIN,
+@@ -476,6 +477,24 @@ void ast_spread_expression_deinit(ast_spread_expression* p_spread);
+ bool ast_spread_expression_print(const ast_spread_expression* p_spread);
+ string ast_spread_expression_asprint(const ast_spread_expression* p_spread);
+ 
++// `yield [value]` - a coroutine's suspend point, an expression both ways:
++// the value goes out to the resumer, the next resume's argument is the
++// expression's own result. the parser fills a NULL value with a synthesized
++// null expression, so the compiler always has an operand (bare `yield` is
++// `yield null`).
++typedef struct {
++  ast_expression expression;
++  ast_expression* value;
++} ast_yield_expression;
++
++void ast_yield_expression_init(ast_yield_expression* p_yield,
++                               const token p_token,
++                               ast_expression* p_value,
++                               ast_specs* p_specs);
++void ast_yield_expression_deinit(ast_yield_expression* p_yield);
++bool ast_yield_expression_print(const ast_yield_expression* p_yield);
++string ast_yield_expression_asprint(const ast_yield_expression* p_yield);
++
+ typedef struct {
+   ast_statement statement;
+ } ast_empty_statement;
+diff --git a/src/okchunk.h b/src/okchunk.h
+index d4f2a8c..1fe3e4a 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -397,6 +397,13 @@ typedef enum {
+                          //                          an if/while condition, the bool never materializes in a named
+                          //                          register (the perform lands it in the lhs temp, which the jump
+                          //                          consumes). polarity p matches OP_JUMP_IF.
++  OP_YIELD,               // w:    (p, a', b')     -> suspend the running coroutine: the value p then k[b']
++                         //                          otherwise r[b'] goes OUT to the resumer, and the NEXT
++                         //                          resume's argument lands in r[a'] (the yield expression's
++                         //                          own result register). the frame parks in place - no pops, no
++                         //                          upvalue closes, no defers - and the run_until driving the
++                         //                          coroutine returns RUNTIME_SUSPENDED with the value.
++  OP_YIELD_LONG,          // 2w:   (p, A, B)       -> same, wide; ip += w
+   OP__COUNT,             // sentinel: the number of opcodes; must remain LAST (the threaded
+                          // dispatch table is sized by it).
+ } opcode;
+@@ -691,6 +698,7 @@ static inline uint32_t opcode_word_count(opcode p_op) {
+   case OP_STRICT_EQUAL_LONG:
+   case OP_IS_LONG:
+   case OP_JUMP_IF_CMP:
++  case OP_YIELD_LONG:
+     return 2;
+   case OP_GET_MEMBER:
+   case OP_INVOKE:
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 69ffd3d..8823175 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -595,6 +595,11 @@ static bool compile_null_expression(compiler* p_compiler,
+                                     _register p_dest,
+                                     uint32_t p_requested_count,
+                                     expression_result* p_out);
++static bool compile_yield_expression(compiler* p_compiler,
++                                     ast_yield_expression* p_yield,
++                                     _register p_dest,
++                                     uint32_t p_requested_count,
++                                     expression_result* p_out);
+ static bool compile_function_expression(compiler* p_compiler,
+                                         ast_function_expression* p_fu,
+                                         _register p_dest,
+@@ -883,6 +888,9 @@ static bool compile_expression(compiler* p_compiler,
+   case AST_NULL_EXPRESSION:
+     result = compile_null_expression(p_compiler, (ast_null_expression*)p_expression, p_dest, p_requested_count, p_out);
+     break;
++  case AST_YIELD_EXPRESSION:
++    result = compile_yield_expression(p_compiler, (ast_yield_expression*)p_expression, p_dest, p_requested_count, p_out);
++    break;
+   case AST_THIS_EXPRESSION:
+     result = compile_this_expression(p_compiler, (ast_this_expression*)p_expression, p_dest, p_requested_count, p_out);
+     break;
+@@ -5095,6 +5103,57 @@ static bool compile_null_expression(compiler* p_compiler,
+   return true;
+ }
+ 
++// `yield [value]` - the coroutine suspend point. the out-value compiles
++// into a temp (constants stay fused, p selects the pool), then one OP_YIELD:
++// a' is the frame-relative register the NEXT resume's argument lands in (the
++// expression's own result register), b' the out-value's source. the
++// expression's result is whatever that resume stages there - p_out points at
++// p_dest, a value only the runtime fills. never skipped for the discard lane:
++// `yield v;` as a statement still computes v and still parks.
++static bool compile_yield_expression(compiler* p_compiler,
++                                     ast_yield_expression* p_yield,
++                                     _register p_dest,
++                                     uint32_t p_requested_count,
++                                     expression_result* p_out) {
++  (void)p_requested_count; // yield is single-valued whatever the context asks
++  ast_node* author = (ast_node*)p_yield;
++  register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
++  const uint32_t checkpoint = regalloc->temp_top;
++  _register value_reg;
++  if (!register_allocator_allocate_temp(regalloc, &value_reg)) {
++    report_oom(p_compiler, author);
++    return false;
++  }
++  expression_result value_res;
++  if (!compile_expression(p_compiler, p_yield->value, value_reg, 1, &value_res)) {
++    return false;
++  }
++  bool is_constant = false;
++  if (!materialize_if_not_common(p_compiler, &is_constant, &value_res.value, author)) {
++    return false;
++  }
++  // the source is a constant index or a register index; p tells the handler which
++  if (p_dest.index > aprime_MAX || value_res.value.index > bprime_MAX) {
++    if (!emit_word2(p_compiler,
++                    encode_OPPABCQ(OP_YIELD_LONG, is_constant, p_dest.index, value_res.value.index, 0, 0),
++                    author)) {
++      report_oom(p_compiler, author);
++      return false;
++    }
++  } else if (!emit_word(p_compiler,
++                        encode_oppabprime(OP_YIELD, is_constant, p_dest.index, value_res.value.index),
++                        author)) {
++    report_oom(p_compiler, author);
++    return false;
++  }
++  register_allocator_reset_temps(regalloc, checkpoint);
++  p_out->count = 1;
++  p_out->type = EXPRESSION_VALUE;
++  p_out->lvalue = (lvalue){LVALUE_INVALID};
++  p_out->value = (location){p_dest.index, LOCATION_KIND_REGISTER, LOCATION_OK};
++  return true;
++}
++
+ bool compile_function_expression(compiler* p_compiler,
+                                  ast_function_expression* p_fu,
+                                  _register p_dest,
+diff --git a/src/okdebug.c b/src/okdebug.c
+index 2543508..f743cf8 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -122,6 +122,8 @@ static const char* const OPCODE_NAMES[] = {
+     "IS",
+     "IS_LONG",
+     "JUMP_IF_CMP",
++    "YIELD",
++    "YIELD_LONG",
+ };
+ typedef char opcode_names_in_sync[(sizeof(OPCODE_NAMES) / sizeof(OPCODE_NAMES[0]) == (size_t)OP__COUNT) ? 1 : -1];
+ 
+@@ -467,6 +469,12 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+   case OP_DEFER_RUN:
+     printf("defer run r%u", Alarge_of(instruction));
+     break;
++  case OP_YIELD:
++    printf("yield r%u -> r%u (resume arg)", bp, ap);
++    break;
++  case OP_YIELD_LONG:
++    printf("yield r%u -> r%u (resume arg)", B, A);
++    break;
+   case OP_RETURN:
+     if (bp == 0) {
+       printf("return r%u..top (passthrough)", ap);
+diff --git a/src/okgc.c b/src/okgc.c
+index c664226..801ab1a 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -191,6 +191,34 @@ static bool mark_value(gc* p_gc, value p_value) {
+   return true;
+ }
+ 
++static bool mark_execution_state(gc* p_gc, execution_state* exe) {
++  // a script-thrown value sits in the error lane from raise until the host
++  // clears it (ok_last_error keeps it readable past the failed run/call).
++  // across C boundaries where allocation happens, so it must root like a
++  // register (a thrown object surviving a collection mid-unwind).
++  if (exe->has_error && exe->error_is_script) {
++    if (!mark_value(p_gc, exe->error_value)) {
++      return false;
++    }
++  }
++  for (uint32_t i = 0; i < exe->registers.top; ++i) {
++    if (!mark_value(p_gc, exe->registers.array.data[i])) {
++      return false;
++    }
++  }
++  for (uint32_t i = 0; i < exe->call_stack.count; ++i) {
++    if (!mark_object(p_gc, (object*)exe->call_stack.data[i].closure)) {
++      return false;
++    }
++  }
++  for (object_upvalue* up = exe->open_upvalues; up != NULL; up = up->next) {
++    if (!mark_object(p_gc, (object*)up)) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ static bool mark_vm(gc* p_gc) {
+   vm* vm = p_gc->vm;
+   execution_state* exe = vm->current_execution_state;
+@@ -206,7 +234,7 @@ static bool mark_vm(gc* p_gc) {
+       return false;
+     }
+   }
+-  // the seven builtin singletons root here exactly like Object and Class:
++  // the builtin singletons root here exactly like Object and Class:
+   // nothing else references them at startup, and every classof() answer
+   // funnels through one of them.
+   for (uint32_t i = 0; i < OK_BUILTIN_COUNT; ++i) {
+@@ -214,27 +242,15 @@ static bool mark_vm(gc* p_gc) {
+       return false;
+     }
+   }
+-  // a script-thrown value sits in the error lane from raise until the host
+-  // clears it (ok_last_error keeps it readable past the failed run/call).
+-  // across C boundaries where allocation happens, so it must root like a
+-  // register (a thrown object surviving a collection mid-unwind).
+-  if (exe->has_error && exe->error_is_script) {
+-    if (!mark_value(p_gc, exe->error_value)) {
+-      return false;
+-    }
+-  }
+-  for (uint32_t i = 0; i < exe->registers.top; ++i) {
+-    if (!mark_value(p_gc, exe->registers.array.data[i])) {
+-      return false;
+-    }
+-  }
+-  for (uint32_t i = 0; i < exe->call_stack.count; ++i) {
+-    if (!mark_object(p_gc, (object*)exe->call_stack.data[i].closure)) {
+-      return false;
+-    }
++  if (!mark_execution_state(p_gc, exe)) {
++    return false;
+   }
+-  for (object_upvalue* up = exe->open_upvalues; up != NULL; up = up->next) {
+-    if (!mark_object(p_gc, (object*)up)) {
++  // the parked resumers: while a resume runs a coroutine's state, the states
++  // it suspended root here - their registers and call stacks hold live
++  // values the coro still reads when it yields back (a swapped-out state is
++  // invisible to the current-state walk above, this is its stand-in).
++  for (execution_state* parked = vm->resume_parked; parked != NULL; parked = parked->next_parked) {
++    if (!mark_execution_state(p_gc, parked)) {
+       return false;
+     }
+   }
+@@ -410,7 +426,11 @@ static bool trace_object(gc* p_gc, object* p_object) {
+     break;
+   }
+   case OBJ_UPVALUE: {
+-    if (!mark_value(p_gc, ((object_upvalue*)p_object)->closed)) {
++    // the closed snapshot, plus the owner pin: an open cell captured in a
++    // coro keeps that coro (and its register file) alive through the
++    // upvalue, exactly like a live register would
++    object_upvalue* upvalue = (object_upvalue*)p_object;
++    if (!mark_value(p_gc, upvalue->closed) || !mark_value(p_gc, upvalue->owner)) {
+       return false;
+     }
+     break;
+@@ -526,6 +546,20 @@ static bool trace_object(gc* p_gc, object* p_object) {
+     }
+     break;
+   }
++  case OBJ_CORO: {
++    // a parked (or ready) coroutine: the body closure, plus the whole owned
++    // execution state walked exactly like a live vm's - registers, call
++    // stack closures, open upvalues, the error lane. a RUNNING coro's state
++    // is the vm's current one (marked as itself, twice-marked is a no-op).
++    object_coro* coro = (object_coro*)p_object;
++    if (!mark_object(p_gc, (object*)coro->body)) {
++      return false;
++    }
++    if (coro->state != NULL && !mark_execution_state(p_gc, coro->state)) {
++      return false;
++    }
++    break;
++  }
+   }
+   return true;
+ }
+diff --git a/src/oklexer.c b/src/oklexer.c
+index 987bf51..aa241d5 100644
+--- a/src/oklexer.c
++++ b/src/oklexer.c
+@@ -291,6 +291,8 @@ static token_type lookup_identifier(lexer* p_lexer) {
+     }
+     break;
+   }
++  case 'y':
++    return check_keyword(p_lexer, 1, 4, "ield", TOKEN_YIELD);
+   case 'o': {
+     if (p_lexer->current - p_lexer->start > 1) {
+       switch (p_lexer->start[1]) {
+diff --git a/src/okobject.c b/src/okobject.c
+index d68e5e4..e3810e4 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -240,6 +240,7 @@ static void object_upvalue_deinit(object_upvalue* p_object_upvalue, object_specs
+   p_object_upvalue->closed = NULL_AS_VALUE();
+   p_object_upvalue->next = NULL;
+   p_object_upvalue->info = 0;
++  p_object_upvalue->owner = NULL_AS_VALUE(); // the vm's own state until a capture says otherwise
+   object_deinit(&p_object_upvalue->object);
+ }
+ 
+@@ -251,6 +252,10 @@ void object_upvalue_set_closed(object_upvalue* p_upvalue) {
+   p_upvalue->info |= UINT32_C(1) << 24;
+ }
+ 
++void object_upvalue_set_owner(object_upvalue* p_upvalue, value p_owner) {
++  p_upvalue->owner = p_owner;
++}
++
+ uint32_t object_upvalue_get_location(object_upvalue* p_upvalue) {
+   return p_upvalue->info & 0x00ffffff;
+ }
+@@ -664,6 +669,7 @@ static const char* const builtin_class_names[OK_BUILTIN_COUNT] = {
+     "map",
+     "function",
+     "nil",
++    "coro",
+ };
+ 
+ const char* builtin_class_name(builtin_class_id p_id) {
+@@ -780,6 +786,81 @@ bool object_class_define_native_method(object_class* p_class,
+   return set;
+ }
+ 
++// the static-table sibling: one door, the same discipline (the guard window,
++// the pub-survival and signature contract against the ancestors' STATICS, one
++// name one owner). the receiver of a static native is the class value itself,
++// which is exactly how the coro constructor wants its argv laid out.
++bool object_class_define_native_static_method(object_class* p_class,
++                                              ok_string_view p_name,
++                                              uint16_t p_arity,
++                                              ok_native_fn p_fn,
++                                              bool p_pub,
++                                              object_specs* p_specs) {
++  if (p_class->frozen) {
++    return false; // sealed (C15); the caller reports its own flavor
++  }
++  if (p_fn == NULL || p_name.chars == NULL) {
++    return false;
++  }
++  object_string* name = create_object_string(p_name, p_specs);
++  if (name == NULL) {
++    return false;
++  }
++  if (!gc_guard_up(p_specs->alloc->gc, OBJECT_AS_VALUE(name))) {
++    return false;
++  }
++  bool pub = p_pub;
++  const method_entry* inherited = NULL;
++  for (const object_class* c = p_class->parent; c != NULL; c = c->parent) {
++    inherited = method_map_get(&c->statics, name);
++    if (inherited != NULL) {
++      break;
++    }
++  }
++  if (inherited != NULL) {
++    if (inherited->pub && !p_pub) {
++      gc_guard_down(p_specs->alloc->gc);
++      return false; // no quiet narrowing of a pub ancestor
++    }
++    if (inherited->pub) {
++      pub = true; // pub survives overrides
++    }
++    if (method_entry_dispatch_argc(inherited) != (uint32_t)p_arity - 1u) {
++      gc_guard_down(p_specs->alloc->gc);
++      return false; // the signature contract
++    }
++  }
++  if (method_map_get(&p_class->statics, name) != NULL) {
++    gc_guard_down(p_specs->alloc->gc);
++    return false;
++  }
++  method_entry entry;
++  entry.closure = NULL;
++  entry.native = p_fn;
++  entry.name = name;
++  entry.arity = p_arity;
++  entry.owner = p_class;
++  entry.is_native = 1;
++  entry.pub = pub;
++  const bool set = method_map_set(&p_class->statics, name, entry);
++  gc_guard_down(p_specs->alloc->gc);
++  return set;
++}
++
++object_coro* create_object_coro(object_closure* p_body, object_specs* p_specs) {
++  object_coro* coro = (object_coro*)p_specs->alloc->allocate(p_specs->alloc, sizeof(object_coro));
++  if (coro == NULL) {
++    return NULL;
++  }
++  object_init(&coro->object, OBJ_CORO);
++  coro->body = p_body;
++  coro->state = NULL;
++  coro->resume_target = 0;
++  coro->status = CORO_READY;
++  object_store_append(p_specs->store, (object*)coro);
++  return coro;
++}
++
+ void object_dispatch_deinit(object* p_object, object_specs* p_specs) {
+   switch (object_get_type(p_object)) {
+   case OBJ_STRING:
+@@ -816,6 +897,17 @@ void object_dispatch_deinit(object* p_object, object_specs* p_specs) {
+   case OBJ_BOUND_METHOD:
+     object_deinit(p_object);
+     break;
++  case OBJ_CORO: {
++    // a parked coro's state dies with the object (a dead one already
++    // released its state at death - state is NULL)
++    object_coro* coro = (object_coro*)p_object;
++    if (coro->state != NULL) {
++      okvm_execution_state_dispose(coro->state, p_specs->alloc);
++      coro->state = NULL;
++    }
++    object_deinit(p_object);
++    break;
++  }
+   }
+ }
+ 
+@@ -881,5 +973,10 @@ void object_debug_print(object* p_object) {
+     printf("<method %s>", bound->entry->name->string.chars);
+     break;
+   }
++  case OBJ_CORO: {
++    const object_coro* coro = (const object_coro*)p_object;
++    printf("<coro %s>", coro_status_name(coro->status));
++    break;
++  }
+   }
+ }
+diff --git a/src/okobject.h b/src/okobject.h
+index 8111858..5209742 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -26,6 +26,7 @@
+ #define IS_VALUE_CLASS(value) value_is_object_type(value, OBJ_CLASS)
+ #define IS_VALUE_INSTANCE(value) value_is_object_type(value, OBJ_INSTANCE)
+ #define IS_VALUE_BOUND_METHOD(value) value_is_object_type(value, OBJ_BOUND_METHOD)
++#define IS_VALUE_CORO(value) value_is_object_type(value, OBJ_CORO)
+ 
+ #define VALUE_AS_STRING(value) ((object_string*)VALUE_AS_OBJECT(value))
+ #define VALUE_AS_FUNCTION(value) ((object_function*)VALUE_AS_OBJECT(value))
+@@ -38,6 +39,7 @@
+ #define VALUE_AS_CLASS(value) ((object_class*)VALUE_AS_OBJECT(value))
+ #define VALUE_AS_INSTANCE(value) ((object_instance*)VALUE_AS_OBJECT(value))
+ #define VALUE_AS_BOUND_METHOD(value) ((object_bound_method*)VALUE_AS_OBJECT(value))
++#define VALUE_AS_CORO(value) ((object_coro*)VALUE_AS_OBJECT(value))
+ // the defer tag's payload is an object_closure*, but it is not an object-tagged value.
+ // unwrap through the payload directly (the tag check is IS_VALUE_STRICTLY_DEFER, never IS_VALUE_CLOSURE).
+ #define VALUE_AS_DEFER(value) ((object_closure*)(uintptr_t)(VALUE_PAYLOAD(value)))
+@@ -59,6 +61,7 @@ typedef enum {
+   OBJ_CLASS,
+   OBJ_INSTANCE,
+   OBJ_BOUND_METHOD,
++  OBJ_CORO,
+ } object_type;
+ 
+ struct object {
+@@ -131,10 +134,18 @@ typedef struct object_upvalue {
+   uint32_t info; // 24 bit index into the stack + 1 bit for is_closed
+   value closed;
+   struct object_upvalue* next;
++  // the capture's owner: the null value = the vm's own state, otherwise the
++  // coro object whose state the location indexes. TRACED through the
++  // upvalue, so a closure that escaped a parked coro keeps the coro (and its
++  // register file) alive while its captured cells are still open - the
++  // upvalue-cell read resolves the owner's array, never the running state's.
++  // cleared at close (a snapshot needs no owner).
++  value owner;
+ } object_upvalue;
+ 
+ void object_upvalue_set_location(object_upvalue* p_upvalue, uint32_t p_location);
+ void object_upvalue_set_closed(object_upvalue* p_upvalue);
++void object_upvalue_set_owner(object_upvalue* p_upvalue, value p_owner);
+ uint32_t object_upvalue_get_location(object_upvalue* p_upvalue);
+ bool object_upvalue_is_closed(object_upvalue* p_upvalue);
+ value* object_upvalue_get_value(object_upvalue* p_upvalue, value* p_frame_window);
+@@ -273,7 +284,9 @@ const char* class_operator_spelling(class_operator p_op);
+ // carry no methods in v0.5.0 - nothing existed as a function builtin to
+ // mirror, and the ruling is no new stdlib). int and float share
+ // `num` (the box detail is not a class difference); `nil` is null's class
+-// and null is its sole instance.
++// and null is its sole instance. `coro` (R20-R24) joins them as the eighth:
++// the coroutine lane's class value, constructed through its native static
++// `operator ()`.
+ typedef enum {
+   OK_BUILTIN_STR = 0,
+   OK_BUILTIN_NUM,
+@@ -282,6 +295,7 @@ typedef enum {
+   OK_BUILTIN_MAP,
+   OK_BUILTIN_FUNCTION,
+   OK_BUILTIN_NIL,
++  OK_BUILTIN_CORO,
+   OK_BUILTIN_COUNT,
+ } builtin_class_id;
+ 
+@@ -349,6 +363,17 @@ bool object_class_define_native_method(object_class* p_class,
+                                        bool p_pub,
+                                        object_specs* p_specs);
+ 
++// the static-table sibling: append one native STATIC method (the receiver is
++// the class value itself). the same freeze seal and signature contract the
++// methods table carries, one table over. the coro constructor
++// (`coro(fu)`, the overridden static `operator ()`) rides this door.
++bool object_class_define_native_static_method(object_class* p_class,
++                                              ok_string_view p_name,
++                                              uint16_t p_arity,
++                                              ok_native_fn p_fn,
++                                              bool p_pub,
++                                              object_specs* p_specs);
++
+ // definition-time: append one own field. false = OOM or a redeclaration
+ // (p_previous_owner names the ancestor that already declared it).
+ bool object_class_add_field(object_class* p_class,
+@@ -414,6 +439,40 @@ typedef struct {
+ 
+ object_bound_method* create_object_bound_method(value p_receiver, const method_entry* p_entry, object_specs* p_specs);
+ 
++// the coroutine lifecycle, as status() spells it
++typedef enum {
++  CORO_READY = 0,     // constructed, never resumed: the body has not started
++  CORO_SUSPENDED,     // parked at a yield: frames alive, resumable
++  CORO_RUNNING,       // inside a resume call right now: resuming again errors
++  CORO_DEAD,          // returned or died by error: resume answers null
++} coro_status;
++
++// a coroutine: a closure plus, once first resumed, its own execution state
++// (register file, call stack, handler stack - the same shape the vm's main
++// state has). the state is allocated lazily at the first resume and released
++// at death, so a created-but-never-run coro costs one object. while parked the
++// object roots the state: the collector traces it like a live vm
++// (see mark_execution_state).
++struct execution_state; // okvm.h
++
++typedef struct object_coro {
++  object object;
++  object_closure* body;
++  struct execution_state* state; // NULL until the first resume, NULL again after death
++  uint16_t resume_target;         // the parked yield's result register (frame-relative)
++  uint8_t status;                 // coro_status
++} object_coro;
++
++object_coro* create_object_coro(object_closure* p_body, object_specs* p_specs);
++
++// the status word status() spells and print shows ("ready" .. "dead")
++const char* coro_status_name(uint8_t p_status);
++
++// release a coroutine's execution state (its arrays and its own allocation).
++// defined in okvm.c where the state's layout lives; declared here so the
++// object teardown can call it without including okvm.h.
++void okvm_execution_state_dispose(struct execution_state* p_state, allocators* p_alloc);
++
+ void object_dispatch_deinit(object* p_object, object_specs* p_specs);
+ void objects_list_deinit(object* p_head, object_specs* p_specs);
+ 
+diff --git a/src/okparser.c b/src/okparser.c
+index ff7d182..9ac507a 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -72,6 +72,7 @@ static ast_expression* parse_string(parser* p_parser, token p_trigger);
+ static ast_expression* parse_number(parser* p_parser, token p_trigger);
+ static ast_expression* parse_boolean(parser* p_parser, token p_trigger);
+ static ast_expression* parse_null(parser* p_parser, token p_trigger);
++static ast_expression* parse_yield(parser* p_parser, token p_trigger);
+ static ast_expression* parse_function(parser* p_parser, token p_trigger);
+ // static ast_expression* parse_this(parser* p_parser, token p_trigger);
+ // static ast_expression* parse_super(parser* p_parser, token p_trigger);
+@@ -176,6 +177,7 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_THROW] = {NULL, NULL, PREC_NONE},
+     [TOKEN_DEFER] = {NULL, NULL, PREC_NONE},
+     [TOKEN_DEFERR] = {NULL, NULL, PREC_NONE},
++    [TOKEN_YIELD] = {parse_yield, NULL, PREC_NONE},
+ };
+ 
+ void parser_init(parser* p_parser, parser_specs p_specs) {
+@@ -329,6 +331,13 @@ ast_expression* parse_expression(parser* p_parser, precedence p_precedence) {
+     tok = p_parser->previous;
+     lookahead = p_parser->current;
+     left = infix_rule.infix(p_parser, left, infix_rule.precedence, false, tok);
++    if (left == NULL) {
++      // a failed infix is a failed expression: continuing the loop would hand
++      // the next infix a NULL left (a call node with a null callable was
++      // exactly the crash this guard removed - found by a defer parse error
++      // inside a fu body reaching an open paren afterwards)
++      return NULL;
++    }
+     lookahead = p_parser->current;
+   }
+   return left;
+@@ -480,6 +489,68 @@ ast_expression* parse_null(parser* p_parser, token p_trigger) {
+   return (ast_expression*)null;
+ }
+ 
++// can p_type begin an expression? the yield value's presence test: `yield;`,
++// `yield)`, `yield,` and friends are the bare form (null out), anything that
++// can start an expression is the value.
++static bool token_starts_expression(token_type p_type) {
++  switch (p_type) {
++  case TOKEN_IDENTIFIER:
++  case TOKEN_NUMBER:
++  case TOKEN_STRING:
++  case TOKEN_LEFT_PAREN:
++  case TOKEN_LEFT_BRACE:
++  case TOKEN_LEFT_BRACKET:
++  case TOKEN_MINUS:
++  case TOKEN_PLUS:
++  case TOKEN_BANG:
++  case TOKEN_NOT:
++  case TOKEN_FU:
++  case TOKEN_SUPER:
++  case TOKEN_THIS:
++  case TOKEN_NULL:
++  case TOKEN_TRUE:
++  case TOKEN_FALSE:
++  case TOKEN_YIELD:
++    return true;
++  default:
++    return false;
++  }
++}
++
++// `yield [value]` - the coroutine suspend point. a prefix expression: the
++// value (when present) parses as a full expression, so `yield a + b;` hands
++// out `a + b` and `let x = yield f();` parks inside the call's result. the
++// bare form synthesizes a null node, keeping the compiler's operand
++// unconditional (`yield` is `yield null`).
++ast_expression* parse_yield(parser* p_parser, token p_trigger) {
++  allocators* alloc = p_parser->alloc;
++  ast_expression* value = NULL;
++  if (token_starts_expression(p_parser->current.type)) {
++    advance(p_parser); // the value's first token into previous
++    value = parse_expression(p_parser, PREC_NONE);
++    if (value == NULL) {
++      return NULL;
++    }
++  } else {
++    value = parse_null(p_parser, p_trigger);
++    if (value == NULL) {
++      return NULL;
++    }
++  }
++  ast_yield_expression* yield_expr = (ast_yield_expression*)alloc->allocate(alloc, sizeof(ast_yield_expression));
++  if (yield_expr == NULL) {
++    error_at(p_parser,
++             p_trigger,
++             ok_create_string_view("failed to allocate memory for yield node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    ast_dispatch_deinit((ast_node*)value);
++    alloc->release(alloc, value);
++    return NULL;
++  }
++  ast_specs s = {alloc};
++  ast_yield_expression_init(yield_expr, p_trigger, value, &s);
++  return (ast_expression*)yield_expr;
++}
++
+ static ast_expression* parse_function(parser* p_parser, token p_trigger) {
+   allocators* alloc = p_parser->alloc;
+   token fu_tok = p_parser->previous;
+diff --git a/src/oktoken.h b/src/oktoken.h
+index 616187d..e196d66 100644
+--- a/src/oktoken.h
++++ b/src/oktoken.h
+@@ -88,7 +88,8 @@
+   X(TOKEN_CATCH, "catch")                                                                                              \
+   X(TOKEN_THROW, "throw")                                                                                              \
+   X(TOKEN_DEFER, "defer")                                                                                              \
+-  X(TOKEN_DEFERR, "deferr")
++  X(TOKEN_DEFERR, "deferr")                                                                                             \
++  X(TOKEN_YIELD, "yield")
+ 
+ typedef enum {
+   TOKEN_ERROR = 0,
+@@ -176,6 +177,7 @@ typedef enum {
+   TOKEN_THROW,
+   TOKEN_DEFER,
+   TOKEN_DEFERR,
++  TOKEN_YIELD,
+ } token_type;
+ 
+ typedef struct {
+diff --git a/src/okvm.c b/src/okvm.c
+index 476de59..5ed6833 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -69,6 +69,7 @@ static bool call_value(vm* p_vm,
+                        uint32_t p_retc);
+ static object_upvalue* capture_upvalue(vm* p_vm, execution_state* p_exe, uint32_t p_register);
+ static void close_upvalues(execution_state* p_exe, uint32_t p_uptill);
++static inline value* upvalue_cell(vm* p_vm, execution_state* p_exe, object_upvalue* p_upvalue);
+ static interpret_result run_until(vm* p_vm, uint32_t p_call_depth);
+ static inline bool call(vm* p_vm,
+                         execution_state* p_exe,
+@@ -128,6 +129,8 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   }
+   // TODO: temp
+   p_vm->current_execution_state = p_vm->alloc->allocate(p_vm->alloc, sizeof(execution_state));
++  p_vm->main_state = p_vm->current_execution_state;
++  p_vm->resume_parked = NULL;
+   p_vm->current_execution_state->open_upvalues = NULL;
+   p_vm->current_execution_state->native_has_error = false;
+   p_vm->current_execution_state->error_pending = false;
+@@ -140,6 +143,10 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->current_execution_state->error_what[0] = '\0';
+   p_vm->current_execution_state->native_call_depth = 0;
+   p_vm->current_execution_state->defer_cascade = false;
++  p_vm->current_execution_state->owner_coro = NULL; // the vm's own state: no coro owns it
++  p_vm->current_execution_state->yield_barrier = 0;
++  p_vm->current_execution_state->yield_barrier_kind = 0;
++  p_vm->current_execution_state->next_parked = NULL;
+   handler_stack_init(&p_vm->current_execution_state->handlers, p_vm->alloc);
+   string_init(&p_vm->current_execution_state->native_error_message, NULL, 0, false, p_vm->alloc);
+   register_file_init_warm(&p_vm->current_execution_state->registers, STACK_SIZE, p_specs.alloc);
+@@ -581,8 +588,290 @@ static inline bool call_native_method(vm* p_vm,
+   return true;
+ }
+ 
+-// forward declarations for the operator dispatch lane (definitions sit after
+-// entry_visible_from, which they share with the member/invoke paths).
++// ============================== coroutines (R20-R24) ==============================
++//
++// a coro is an object that owns an execution_state: the same register file /
++// call stack / handler stack shape the vm's own state has. resume SWAPS the
++// vm's current state for the coro's, parks the resumer on vm.resume_parked
++// (the collector walks every parked state like the current one - their
++// registers and frames are live values), and drives the coro with a plain
++// run_until(0). OP_YIELD parks the top frame in place (no pops, no upvalue
++// closes, no defers) and returns RUNTIME_SUSPENDED straight out of THAT
++// run_until - the yield barrier guarantees no C-driven nested run_until sits
++// between the two, so suspension never has to cross a C frame (the discipline
++// lua calls "not yielding across a C-call boundary", enforced as an error).
++//
++// death: a returned body (or one that errored) frees the state - a dead coro
++// costs its object and nothing else. errors transplant to the resumer's lane
++// (after the R22 death sweep ran the body's defers on the coro's own state),
++// so the resume call site is where a catch sees them, and an uncaught one
++// propagates outward through the resumer's own levels like any native
++// failure. no scheduler, no transfer: a coro is driven by whoever holds it.
++
++typedef enum {
++  YIELD_BARRIER_CONSTRUCTOR = 0,
++  YIELD_BARRIER_OPERATOR,
++  YIELD_BARRIER_DEFER,
++} yield_barrier_kind;
++
++static const char* coro_status_names[4] = {"ready", "suspended", "running", "dead"};
++
++const char* coro_status_name(uint8_t p_status) {
++  return p_status <= (uint8_t)CORO_DEAD ? coro_status_names[p_status] : "dead";
++}
++
++// a fresh, all-empty state owned by p_coro. the register file warms at a
++// small window; the body's own call() grows it on demand. every slot in a
++// warm file reads null, which is the invariant mark_execution_state walks on.
++static execution_state* coro_state_create(vm* p_vm, object_coro* p_coro) {
++  allocators* alloc = p_vm->alloc;
++  execution_state* state = (execution_state*)alloc->allocate(alloc, sizeof(execution_state));
++  if (state == NULL) {
++    return NULL;
++  }
++  state->open_upvalues = NULL;
++  state->native_has_error = false;
++  state->error_pending = false;
++  state->error_reported = false;
++  state->error_hard = false;
++  state->error_is_script = false;
++  state->error_value = NULL_AS_VALUE();
++  state->error_kind = OK_EK_INTERNAL;
++  state->has_error = false;
++  state->error_what[0] = '\0';
++  state->native_call_depth = 0;
++  state->defer_cascade = false;
++  state->owner_coro = p_coro;
++  state->yield_barrier = 0;
++  state->yield_barrier_kind = 0;
++  state->next_parked = NULL;
++  handler_stack_init(&state->handlers, alloc);
++  string_init(&state->native_error_message, NULL, 0, false, alloc);
++  register_file_init_warm(&state->registers, 16, alloc);
++  call_stack_init(&state->call_stack, alloc);
++  return state;
++}
++
++// the state teardown, shared by death (coro_drive) and the object sweep
++// (object_dispatch_deinit's OBJ_CORO arm, through the header declaration).
++void okvm_execution_state_dispose(execution_state* p_state, allocators* p_alloc) {
++  call_stack_deinit(&p_state->call_stack, p_alloc);
++  register_file_deinit(&p_state->registers);
++  handler_stack_deinit(&p_state->handlers, p_alloc);
++  string_deinit(&p_state->native_error_message, p_alloc);
++  p_alloc->release(p_alloc, p_state);
++}
++
++// move the dying coro's error lane onto the resumer's. the resumer is
++// executing a native call with a clean lane (nothing in flight), so the
++// overwrite is total: kind, text, thrown value, the hard flag, and the
++// pending/reported bookkeeping all cross, and the source clears - its state
++// dies right after and nothing may read a moved lane.
++static void transplant_error_lane(execution_state* p_from, execution_state* p_to) {
++  memcpy(p_to->error_what, p_from->error_what, sizeof(p_to->error_what));
++  p_to->error_kind = p_from->error_kind;
++  p_to->error_value = p_from->error_value;
++  p_to->error_is_script = p_from->error_is_script;
++  p_to->error_hard = p_from->error_hard;
++  p_to->error_pending = p_from->error_pending;
++  p_to->error_reported = p_from->error_reported;
++  p_to->has_error = p_from->has_error;
++  p_from->error_pending = false;
++  p_from->error_hard = false;
++  p_from->has_error = false;
++  p_from->error_reported = false;
++  p_from->error_value = NULL_AS_VALUE();
++}
++
++// the resume driver. returns false with the error transplanted to the
++// resumer's lane (the resume call itself fails there - catchable at the call
++// site); true with *p_out as the yielded value (suspension) or the body's
++// final value (completion). a dead coro answers null (R21), a running one
++// errors (re-entrancy, however the chain reached it).
++static bool coro_drive(vm* p_vm, object_coro* p_coro, bool p_has_arg, value p_arg, value* p_out) {
++  execution_state* resumer = p_vm->current_execution_state;
++  switch ((coro_status)p_coro->status) {
++  case CORO_DEAD:
++    *p_out = NULL_AS_VALUE(); // R21: the iterator-exhausted shape
++    return true;
++  case CORO_RUNNING:
++    runtime_error(p_vm, OK_EK_VALUE, "resume of a running coroutine.");
++    return false;
++  case CORO_READY:
++  case CORO_SUSPENDED:
++    break;
++  }
++  if (p_coro->state == NULL) {
++    p_coro->state = coro_state_create(p_vm, p_coro);
++    if (p_coro->state == NULL) {
++      runtime_oom(p_vm, "out of memory: failed to allocate a coroutine state.");
++      return false;
++    }
++  }
++  execution_state* cs = p_coro->state;
++
++  // park the resumer, swap in the coro. from here until the swap-back, the
++  // collector roots the resumer through vm.resume_parked (its parked
++  // registers and frames are live - the coro reads them again when it yields
++  // back) and the coro through current_execution_state, like any state.
++  resumer->next_parked = p_vm->resume_parked;
++  p_vm->resume_parked = resumer;
++  p_vm->current_execution_state = cs;
++
++  bool staged_ok = true;
++  if (p_coro->status == CORO_READY) {
++    // the first resume: stage the body closure at window slot 0, the resume
++    // argument (when given) above it - the body's own parameters, exactly a
++    // call's shape - then let call_value do arity/defaults/varargs. the
++    // window rides the gc guard until the pushed frame roots the closure
++    // (call's own discipline), and reg->top covers both slots meanwhile.
++    register_file* reg = &cs->registers;
++    gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(p_coro->body));
++    reg->array.data[0] = OBJECT_AS_VALUE(p_coro->body);
++    reg->array.data[1] = p_has_arg ? p_arg : NULL_AS_VALUE();
++    reg->top = 2;
++    staged_ok = call_value(p_vm, cs, reg, 0, 0, p_has_arg ? 1u : 0u, 1u);
++    gc_guard_down(p_vm->alloc->gc);
++  } else {
++    // a suspended coro: the top frame is the yielder (nothing ran since the
++    // park), and the argument lands in the register the parked OP_YIELD
++    // named - the yield expression's own result slot.
++    call_frame* yielder = &cs->call_stack.data[cs->call_stack.count - 1];
++    cs->registers.array.data[yielder->registers_base + p_coro->resume_target] = p_arg;
++  }
++
++  interpret_result result = {.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
++  if (staged_ok) {
++    p_coro->status = CORO_RUNNING;
++    result = run_until(p_vm, 0);
++  } else {
++    // the staging itself failed (the body's arity contract, an oom): the
++    // error is already on the coro's state and no frame was ever pushed -
++    // the same death lane takes it (sweep is a no-op, the transplant is the
++    // resume call's failure)
++    result.status = RUNTIME_ERROR;
++  }
++
++  if (result.status == RUNTIME_ERROR) {
++    // the coro died by error. the R22 death sweep runs FIRST, on the coro's
++    // own state (still current): the propagation lane left the frames
++    // unpopped, and reset_error_state runs their defers exactly like an
++    // uncaught error at top level - innermost first, a failing defer
++    // cascades and replaces the lane. the resumer stays parked while the
++    // sweep's thunks allocate.
++    reset_error_state(p_vm);
++    // then the lane crosses (before the state dies - a moved lane, not a
++    // shared one), the state goes away, and the resume call fails in the
++    // resumer exactly where a catch can take it
++    transplant_error_lane(cs, resumer);
++    p_vm->current_execution_state = resumer;
++    p_vm->resume_parked = resumer->next_parked;
++    resumer->next_parked = NULL;
++    p_coro->status = CORO_DEAD;
++    p_coro->state = NULL;
++    okvm_execution_state_dispose(cs, p_vm->alloc);
++    return false;
++  }
++
++  // swap back + unpark, always
++  p_vm->current_execution_state = resumer;
++  p_vm->resume_parked = resumer->next_parked;
++  resumer->next_parked = NULL;
++
++  if (result.status == RUNTIME_SUSPENDED) {
++    // the OP_YIELD handler parked the frame and set the status
++    *p_out = result.top_level_return;
++    return true;
++  }
++
++  // RUNTIME_OK: the body returned. the defers already ran in bytecode (the
++  // compiler's scope exits), the state tears down, the value crosses.
++  p_coro->status = CORO_DEAD;
++  p_coro->state = NULL;
++  okvm_execution_state_dispose(cs, p_vm->alloc);
++  *p_out = result.top_level_return;
++  return true;
++}
++
++// `coro(fu)` - the overridden static operator (): argv[0] is the class value
++// itself, argv[1] the body. the body must be a plain closure (a fu or
++// lambda); a bound method or a native is refused with the honest message.
++static ok_value native_coro_construct(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  vm* p_vm = ok_vm(p_ok);
++  if (p_argc != 2 || !IS_VALUE_CLOSURE(p_argv[1])) {
++    runtime_error(p_vm, OK_EK_TYPE, "the coro body must be a fu.");
++    return NULL_AS_VALUE();
++  }
++  object_specs specs = {p_vm->alloc, p_vm->objects_store};
++  object_closure* body = VALUE_AS_CLOSURE(p_argv[1]);
++  gc_guard_up(p_vm->alloc->gc, p_argv[1]); // the coro rides the guard until the caller's window adopts it
++  object_coro* coro = create_object_coro(body, &specs);
++  gc_guard_down(p_vm->alloc->gc);
++  if (coro == NULL) {
++    runtime_oom(p_vm, "out of memory: failed to allocate a coroutine.");
++    return NULL_AS_VALUE();
++  }
++  return OBJECT_AS_VALUE(coro);
++}
++
++// `c.resume([v])` - the drive call. the first resume's argument (when given)
++// becomes the body's own argument; a suspended resume's argument lands in the
++// parked yield expression. resume returns the yielded value, or the body's
++// final value when it completes.
++static ok_value native_coro_resume(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  vm* p_vm = ok_vm(p_ok);
++  if (p_argc < 1 || p_argc > 2) {
++    runtime_error(p_vm,
++                  OK_EK_ARITY,
++                  "invalid call to method 'resume' of class 'coro': expected at most 1 argument, got %u.",
++                  (unsigned)(p_argc - 1u));
++    return NULL_AS_VALUE();
++  }
++  if (!IS_VALUE_CORO(p_argv[0])) {
++    runtime_error(p_vm, OK_EK_TYPE, "resume: the receiver is not a coro.");
++    return NULL_AS_VALUE();
++  }
++  object_coro* coro = VALUE_AS_CORO(p_argv[0]);
++  value out;
++  if (!coro_drive(p_vm, coro, p_argc == 2, p_argc == 2 ? p_argv[1] : NULL_AS_VALUE(), &out)) {
++    return NULL_AS_VALUE(); // the lane (transplanted to the resumer) carries the error
++  }
++  return out;
++}
++
++// `c.status()` - "ready" | "suspended" | "running" | "dead". interned
++// spellings: the interner's canoncial strings are immortal and shared, so a
++// status poll in a loop allocates nothing after the first call.
++static ok_value native_coro_status(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  vm* p_vm = ok_vm(p_ok);
++  if (p_argc != 1 || !IS_VALUE_CORO(p_argv[0])) {
++    runtime_error(p_vm, OK_EK_TYPE, "status: the receiver is not a coro.");
++    return NULL_AS_VALUE();
++  }
++  object_specs specs = {p_vm->alloc, p_vm->objects_store};
++  object_string* name = string_interner_intern(
++      p_vm->interner,
++      ok_create_string_view(coro_status_name(VALUE_AS_CORO(p_argv[0])->status), OK_STRING_VIEW_CALCULATE_LENGTH, true),
++      &specs);
++  if (name == NULL) {
++    runtime_oom(p_vm, "out of memory: failed to intern a status name.");
++    return NULL_AS_VALUE();
++  }
++  return OBJECT_AS_VALUE(name);
++}
++
++bool vm_define_coro_surface(vm* p_vm) {
++  object_specs specs = {p_vm->alloc, p_vm->objects_store};
++  object_class* klass = p_vm->builtin_classes[OK_BUILTIN_CORO];
++  bool status = true;
++  status &= object_class_define_native_static_method(
++      klass, ok_create_string_view("operator ()", 11, true), 2, native_coro_construct, /*p_pub*/ true, &specs);
++  status &= object_class_define_native_method(
++      klass, ok_create_string_view("resume", 6, true), OK_NATIVE_ARITY_ANY, native_coro_resume, true, &specs);
++  status &=
++      object_class_define_native_method(klass, ok_create_string_view("status", 6, true), 1, native_coro_status, true, &specs);
++  return status;
++}
+ static bool entry_visible_from(const method_entry* p_entry, const call_frame* p_frame);
+ static interpret_result error_interpret_result(void);
+ static interpret_result dispatch_operator_method(vm* p_vm,
+@@ -1258,6 +1547,15 @@ static inline bool object_as_str(vm* p_vm, object* p_obj, value* p_result) {
+     }
+     return as_str_printed(p_vm, str, p_result);
+   }
++  case OBJ_CORO: {
++    object_coro* coro = (object_coro*)p_obj;
++    string str = asprint(p_vm->alloc, "<coro %s>", coro_status_name(coro->status));
++    if (str.chars == NULL) {
++      runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert coro to string.");
++      return false;
++    }
++    return as_str_printed(p_vm, str, p_result);
++  }
+   }
+   runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert unknown object to string.");
+   return false;
+@@ -1437,6 +1735,8 @@ object_class* vm_classof(vm* p_vm, ok_value p_value) {
+     return p_vm->builtin_classes[OK_BUILTIN_ARRAY];
+   case OBJ_MAP:
+     return p_vm->builtin_classes[OK_BUILTIN_MAP];
++  case OBJ_CORO:
++    return p_vm->builtin_classes[OK_BUILTIN_CORO];
+   case OBJ_CLOSURE:
+   case OBJ_NATIVE_FUNCTION:
+   case OBJ_BOUND_METHOD:
+@@ -1671,8 +1971,7 @@ return_1_from_frame(vm* p_vm, execution_state* p_exe, call_frame* p_frame, uint1
+     break;
+   }
+   case RETURNED_UPVALUE: {
+-    registers->array.data[p_frame->return_base] =
+-        *object_upvalue_get_value(p_frame->closure->upvalues.data[p_index], registers->array.data);
++    registers->array.data[p_frame->return_base] = *upvalue_cell(p_vm, p_exe, p_frame->closure->upvalues.data[p_index]);
+     break;
+   }
+   case RETURNED_REGISTER: {
+@@ -1975,7 +2274,16 @@ static bool run_pending_defers(vm* p_vm, uint32_t p_from, uint32_t p_uptill) {
+     // rooting across the thunk's allocations either way.
+     const bool saved_pending = exe->error_pending;
+     exe->error_pending = false;
++    // the yield barrier: a defer thunk is a C-driven region (the chain scan
++    // holds the rest of the cascade in this C frame) - a yield from inside
++    // it could never resume honestly, so OP_YIELD refuses it
++    const uint8_t saved_barrier = exe->yield_barrier;
++    if (exe->yield_barrier == 0) {
++      exe->yield_barrier_kind = YIELD_BARRIER_DEFER;
++    }
++    exe->yield_barrier++;
+     const interpret_result result = run_until(p_vm, depth);
++    exe->yield_barrier = saved_barrier;
+     if (result.status == RUNTIME_OK) {
+       // the thunk survived (its own catches, if any, consumed their errors):
+       // the in-flight error continues outward exactly as it was
+@@ -2217,7 +2525,17 @@ static interpret_result dispatch_operator_method(vm* p_vm,
+     p_reg->top = saved_top;
+     return error_interpret_result();
+   }
++  // the yield barrier: an operator method is a C-driven region (the result
++  // copy back into the caller's register happens in THIS C frame after the
++  // nested run_until returns) - a yield from under it could never resume
++  // honestly, so OP_YIELD refuses it
++  const uint8_t saved_barrier = exe->yield_barrier;
++  if (exe->yield_barrier == 0) {
++    exe->yield_barrier_kind = YIELD_BARRIER_OPERATOR;
++  }
++  exe->yield_barrier++;
+   const interpret_result result = run_until(p_vm, depth);
++  exe->yield_barrier = saved_barrier;
+   p_reg->top = saved_top;
+   if (result.status != RUNTIME_OK) {
+     return result;
+@@ -2627,7 +2945,18 @@ static bool run_method_to_completion(vm* p_vm, object_closure* p_closure, value
+     reg->top = saved_top;
+     return false;
+   }
++  // the yield barrier: the construction lane (field initializer thunks,
++  // init methods) is a C-driven region - construct_instance publishes the
++  // instance and restores the watermark in ITS C frame after this run_until
++  // returns, so a yield from inside a constructor could never resume
++  // honestly. OP_YIELD refuses it.
++  const uint8_t saved_barrier = exe->yield_barrier;
++  if (exe->yield_barrier == 0) {
++    exe->yield_barrier_kind = YIELD_BARRIER_CONSTRUCTOR;
++  }
++  exe->yield_barrier++;
+   const interpret_result result = run_until(p_vm, depth);
++  exe->yield_barrier = saved_barrier;
+   reg->top = saved_top;
+   if (result.status != RUNTIME_OK) {
+     return false;
+@@ -2966,6 +3295,8 @@ static void* ok_dispatch_table[OP__COUNT] = {
+   [OP_IS] = &&L_OP_IS,
+   [OP_IS_LONG] = &&L_OP_IS_LONG,
+   [OP_JUMP_IF_CMP] = &&L_OP_JUMP_IF_CMP,
++  [OP_YIELD] = &&L_OP_YIELD,
++  [OP_YIELD_LONG] = &&L_OP_YIELD_LONG,
+   // the four pre-patch NAME forms never dispatch: the freeze pass rewrites
+   // every one before member code can run. the switch build silently skips an
+   // un-rewritten stray (no case label, no default); aliasing them to NOP
+@@ -3186,26 +3517,23 @@ static void* ok_dispatch_table[OP__COUNT] = {
+     CASE(OP_LOAD_UPVALUE): {
+       uint16_t ap = aprime_of(instruction);
+       uint16_t bp = bprime_of(instruction);
+-      REG_AT(ap) = *object_upvalue_get_value(
+-          frame->closure->upvalues.data[bp],
+-          reg->array.data); // upvalue locations are absolute in the register file, they are not frame relative
++      REG_AT(ap) = *upvalue_cell(p_vm, exe,
++                                 frame->closure->upvalues.data[bp]); // upvalue locations index the OWNER's register array
+       DISPATCH();
+     }
+     CASE(OP_LOAD_UPVALUE_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+-      REG_AT(A) = *object_upvalue_get_value(
+-          frame->closure->upvalues.data[B],
+-          reg->array.data); // upvalue locations are absolute in the register file, they are not frame relative
++      REG_AT(A) = *upvalue_cell(p_vm, exe,
++                               frame->closure->upvalues.data[B]); // upvalue locations index the OWNER's register array
+       DISPATCH();
+     }
+     CASE(OP_STORE_UPVALUE): {
+       const bool p = p_of(instruction);
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+-      *object_upvalue_get_value(frame->closure->upvalues.data[ap], reg->array.data) =
+-          resolve_operand(frame, reg, bp, p);
++      *upvalue_cell(p_vm, exe, frame->closure->upvalues.data[ap]) = resolve_operand(frame, reg, bp, p);
+       DISPATCH();
+     }
+     CASE(OP_STORE_UPVALUE_LONG): {
+@@ -3213,7 +3541,7 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+-      *object_upvalue_get_value(frame->closure->upvalues.data[A], reg->array.data) = resolve_operand(frame, reg, B, p);
++      *upvalue_cell(p_vm, exe, frame->closure->upvalues.data[A]) = resolve_operand(frame, reg, B, p);
+       DISPATCH();
+     }
+     CASE(OP_CLOSE_UPVALUES): {
+@@ -3300,6 +3628,89 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       ip = frame->ip;
+       DISPATCH();
+     }
++    // the coroutine suspend point. the guards first (outside a coro, or
++    // under a C-driven region / native hop: the yields that could never
++    // resume honestly), then the park: the value goes out, the frame's ip
++    // stays synced past this word, the resume-target register index rides
++    // the coro, the status flips, and THIS run_until - the coro's resume
++    // driver, the barriers guarantee no other - returns RUNTIME_SUSPENDED
++    // with the value. no pops, no upvalue closes, no defers: a parked coro
++    // is its frames, exactly as they were.
++    CASE(OP_YIELD): {
++      const bool p = p_of(instruction);
++      const uint16_t ap = aprime_of(instruction);
++      const uint16_t bp = bprime_of(instruction);
++      object_coro* coro = exe->owner_coro;
++      frame->ip = ip;
++      if (coro == NULL) {
++        runtime_error(p_vm, OK_EK_VALUE, "yield outside a coroutine.");
++        FAIL_PATH();
++        DISPATCH();
++      }
++      if (exe->yield_barrier > 0) {
++        switch ((yield_barrier_kind)exe->yield_barrier_kind) {
++        case YIELD_BARRIER_CONSTRUCTOR:
++          runtime_error(p_vm, OK_EK_VALUE, "cannot yield from inside a constructor.");
++          break;
++        case YIELD_BARRIER_OPERATOR:
++          runtime_error(p_vm, OK_EK_VALUE, "cannot yield from inside an operator method.");
++          break;
++        case YIELD_BARRIER_DEFER:
++        default:
++          runtime_error(p_vm, OK_EK_VALUE, "cannot yield from inside a defer.");
++          break;
++        }
++        FAIL_PATH();
++        DISPATCH();
++      }
++      if (exe->native_call_depth > 0) {
++        runtime_error(p_vm, OK_EK_VALUE, "cannot yield across a native call.");
++        FAIL_PATH();
++        DISPATCH();
++      }
++      const value out = resolve_operand(frame, reg, bp, p);
++      coro->resume_target = ap;
++      coro->status = CORO_SUSPENDED;
++      return (interpret_result){.status = RUNTIME_SUSPENDED, .top_level_return = out};
++    }
++    CASE(OP_YIELD_LONG): {
++      const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      object_coro* coro = exe->owner_coro;
++      frame->ip = ip;
++      if (coro == NULL) {
++        runtime_error(p_vm, OK_EK_VALUE, "yield outside a coroutine.");
++        FAIL_PATH();
++        DISPATCH();
++      }
++      if (exe->yield_barrier > 0) {
++        switch ((yield_barrier_kind)exe->yield_barrier_kind) {
++        case YIELD_BARRIER_CONSTRUCTOR:
++          runtime_error(p_vm, OK_EK_VALUE, "cannot yield from inside a constructor.");
++          break;
++        case YIELD_BARRIER_OPERATOR:
++          runtime_error(p_vm, OK_EK_VALUE, "cannot yield from inside an operator method.");
++          break;
++        case YIELD_BARRIER_DEFER:
++        default:
++          runtime_error(p_vm, OK_EK_VALUE, "cannot yield from inside a defer.");
++          break;
++        }
++        FAIL_PATH();
++        DISPATCH();
++      }
++      if (exe->native_call_depth > 0) {
++        runtime_error(p_vm, OK_EK_VALUE, "cannot yield across a native call.");
++        FAIL_PATH();
++        DISPATCH();
++      }
++      const value out = resolve_operand(frame, reg, B, p);
++      coro->resume_target = A;
++      coro->status = CORO_SUSPENDED;
++      return (interpret_result){.status = RUNTIME_SUSPENDED, .top_level_return = out};
++    }
+     CASE(OP_CLOSURE): {
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+@@ -6077,6 +6488,11 @@ static object_upvalue* capture_upvalue(vm* p_vm, execution_state* p_exe, uint32_
+     runtime_oom(p_vm, "out of memory: failed to allocate memory for upvalue.");
+     return NULL;
+   }
++  // the owner pin: a cell captured in a coro's state resolves through the
++  // coro (traced via the upvalue), a cell captured in the vm's own state
++  // stays null-owner (resolved through vm->main_state)
++  object_upvalue_set_owner(captured,
++                           p_exe->owner_coro != NULL ? OBJECT_AS_VALUE(p_exe->owner_coro) : NULL_AS_VALUE());
+   captured->next = upvalue;
+   if (prev == NULL) {
+     p_exe->open_upvalues = captured;
+@@ -6091,10 +6507,34 @@ static void close_upvalues(execution_state* p_exe, uint32_t p_uptill) {
+     object_upvalue* upvalue = p_exe->open_upvalues;
+     upvalue->closed = p_exe->registers.array.data[object_upvalue_get_location(upvalue)];
+     object_upvalue_set_closed(upvalue);
++    object_upvalue_set_owner(upvalue, NULL_AS_VALUE()); // a snapshot needs no owner pin
+     p_exe->open_upvalues = upvalue->next;
+   }
+ }
+ 
++// an open upvalue's location indexes its OWNER's register array, never the
++// running state's: a coro reads cells captured in its resumer (null owner,
++// the vm's own state) and cells it captured itself (the owner coro, pinned
++// alive through the upvalue's trace). closed cells never touch a window.
++static inline value* upvalue_cell(vm* p_vm, execution_state* p_exe, object_upvalue* p_upvalue) {
++  if (object_upvalue_is_closed(p_upvalue)) {
++    return &p_upvalue->closed;
++  }
++  value* window;
++  if (IS_VALUE_CORO(p_upvalue->owner)) {
++    object_coro* owner_coro = VALUE_AS_CORO(p_upvalue->owner);
++    // a dead owner's cells are all closed (death closes everything), so the
++    // fallback window is never actually read - it only keeps the resolve total
++    window = owner_coro->state != NULL ? owner_coro->state->registers.array.data
++                                       : p_vm->main_state->registers.array.data;
++  } else if (p_exe == p_vm->main_state) {
++    window = p_exe->registers.array.data; // the fast lane: running in the owning state
++  } else {
++    window = p_vm->main_state->registers.array.data;
++  }
++  return &window[object_upvalue_get_location(p_upvalue)];
++}
++
+ ARRAY_DEFINE_DEFAULT(register_array, value, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(vm_sources, vm_source_entry, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(handler_stack, handler_record, ARRAY_DEFAULT_TYPE_DEINIT)
+diff --git a/src/okvm.h b/src/okvm.h
+index 12c1e8e..d755be6 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -82,13 +82,32 @@ typedef struct {
+ 
+ ARRAY_DECLARE_DEFAULT(call_stack, call_frame)
+ 
+-typedef struct {
++typedef struct execution_state {
+   call_stack call_stack;
+   register_file registers;
+   object_upvalue* open_upvalues;
+   string native_error_message;
+   bool native_has_error;
+ 
++  // the coroutine ownership tag: NULL on the vm's own state, the running
++  // coro on a state a resume swapped in. OP_YIELD reads it to know whether
++  // the executing frame belongs to a coroutine at all (a plain function
++  // called from main that yields is the "yield outside a coroutine" error).
++  struct object_coro* owner_coro;
++
++  // the yield barrier: >0 while script runs inside a C-driven region whose
++  // C frame holds result bookkeeping after the nested run_until returns (an
++  // operator method dispatch, a construction lane, a defer thunk). a yield
++  // from under such a region can never resume honestly - the C code that
++  // would receive the suspended result is gone - so OP_YIELD refuses it,
++  // same discipline as lua's C-call boundary. the kind names the outermost
++  // region for the error message.
++  uint8_t yield_barrier;
++  uint8_t yield_barrier_kind;
++
++  // the parked-resumer chain head, see vm.resume_parked below.
++  struct execution_state* next_parked;
++
+   // the error lane. runtime_error RAISES into it. the dispatch loop's error
+   // exit (FAIL_PATH) attempts the unwind to a handler first, and only then
+   // reports. the one place where the live ip and the call stack still exist
+@@ -128,6 +147,16 @@ typedef struct {
+ 
+ struct vm {
+   execution_state* current_execution_state;
++  // the vm's own state (the one vm_init allocated), kept by handle: upvalue
++  // cells captured there resolve their window through it even while a resume
++  // has swapped current to a coro's state
++  execution_state* main_state;
++  // the resumer chain: while a resume runs a coroutine's state, the states it
++  // suspended (its resumer, and the resumer's resumer, ...) root here - the
++  // collector walks every one of them like the current state (their parked
++  // registers and frames are live values the coro may still read when it
++  // yields back). LIFO push/pop inside coro_drive.
++  execution_state* resume_parked;
+   // the string interner: canonical compiler-made names. rooted via the gc's
+   // interner watch; the vm interns its startup spellings here so they
+   // pointer-match the compiler's constants (member probes hit on ==).
+@@ -168,6 +197,11 @@ struct vm {
+ typedef enum {
+   RUNTIME_OK,
+   RUNTIME_ERROR,
++  // a coroutine parked at a yield: only the resume driver's run_until ever
++  // produces it (the yield barrier keeps every nested run_until from ever
++  // seeing a suspension), and only coro_drive consumes it - the yielded
++  // value rides top_level_return.
++  RUNTIME_SUSPENDED,
+ } runtime_status;
+ 
+ typedef struct {
+@@ -192,6 +226,11 @@ typedef struct {
+ } interpret_specs;
+ 
+ void vm_init(vm* p_vm, vm_specs p_specs);
++
++// the ok* -> vm* reach-through for natives defined in the vm's own
++// translation unit (the coro surface: the native ABI hands them an ok*, and
++// the ok struct is private to ok.c). defined there.
++vm* ok_vm(ok* p_ok);
+ // create Object/Class and the cached lookup names. call exactly once, after
+ // the gc watches the vm (see the comment on the implementation).
+ bool vm_init_singletons(vm* p_vm);
+@@ -222,6 +261,12 @@ bool vm_native_throw(vm* p_vm, ok_value p_value);
+ // function; both noted in the classes record). total: never NULL.
+ object_class* vm_classof(vm* p_vm, ok_value p_value);
+ 
++// mount the coro surface (R20-R24): the native static `operator ()`
++// (construction, `coro(fu)`) and the `resume`/`status` methods on the coro
++// builtin class. call before the builtin seal (ok_define_builtin_surfaces
++// freezes the tables right after).
++bool vm_define_coro_surface(vm* p_vm);
++
+ // the chain-walk half of the family (C12): is p_value an instance of
+ // p_target or one of its descendants (Object at the root matches everything).
+ bool vm_is_instance(vm* p_vm, ok_value p_value, const object_class* p_target);
+diff --git a/tests/e2e/tests/coros/basic.ok b/tests/e2e/tests/coros/basic.ok
+new file mode 100644
+index 0000000..68407da
+--- /dev/null
++++ b/tests/e2e/tests/coros/basic.ok
+@@ -0,0 +1,46 @@
++// R20-R24: the coro surface. coro(fu) constructs (the body does NOT run),
++// resume drives, yield is the two-way channel (the value goes out, the next
++// resume's argument is the yield expression's own result), the body's final
++// return is the last resume's value, a dead coro answers null (R21), and
++// status() spells the lifecycle.
++let c = coro(fu(n) {
++  print("start " + n as str);
++  let mut i = 0;
++  while i < n {
++    let got = yield i;
++    print("got " + got as str);
++    i = i + 1;
++  }
++  return "done";
++});
++print(c.status());          // expect: ready
++print(c);                   // expect: <coro ready>
++print(c.resume(2));         // expect: start 2
++// expect: 0
++print(c.resume("hello"));   // expect: got hello
++// expect: 1
++print(c.status());          // expect: suspended
++print(c.resume());          // expect: got null
++// expect: done
++print(c.resume());          // expect: null
++print(c.status());          // expect: dead
++print(c);                   // expect: <coro dead>
++print(c.resume());          // expect: null
++print(c.resume("x"));       // expect: null
++
++// the bare form: yield; is yield null; - and `return yield;` parks on the
++// way out (null), the NEXT resume's argument is the return value
++let b = coro(fu() {
++  yield;
++  return yield;
++});
++print(b.resume());   // expect: null
++print(b.resume());   // expect: null
++print(b.resume(42)); // expect: 42
++
++// the class value itself
++print(coro);                // expect: <class coro>
++print(classof(c) === coro); // expect: true
++print(c is coro);           // expect: true
++print(isinstance(c, coro)); // expect: true
++print(coro is Class);       // expect: true
+diff --git a/tests/e2e/tests/coros/classes_interplay.ok b/tests/e2e/tests/coros/classes_interplay.ok
+new file mode 100644
+index 0000000..e864a17
+--- /dev/null
++++ b/tests/e2e/tests/coros/classes_interplay.ok
+@@ -0,0 +1,42 @@
++// classes and coros compose both ways: instances constructed and held inside
++// a coro survive parks (their registers are the coro's state), and methods
++// called inside the body run in the coro's call tree (a yield under one
++// suspends the coro - the method frame parks with the rest).
++class Counter {
++  let mut n = 0;
++  fu init(n) { this.n = n; }
++  pub fu bump() {
++    this.n = this.n + 1;
++    return this.n;
++  }
++  pub fu value() { return this.n; }
++}
++let c = coro(fu() {
++  let k = Counter(10);
++  yield k.bump();
++  yield k.bump();
++  return k.value();
++});
++print(c.resume()); // expect: 11
++print(c.resume()); // expect: 12
++print(c.resume()); // expect: 12
++
++// a bound method value as the drive of an ordinary call inside the body
++let d = coro(fu() {
++  let k = Counter(0);
++  let b = k.bump;
++  yield b();
++  return b();
++});
++print(d.resume()); // expect: 1
++print(d.resume()); // expect: 2
++
++// construction inside the coro (no yield in the constructor - that lane is
++// barred, its own error test)
++let e = coro(fu() {
++  let k = Counter(5);
++  yield k.value();
++  return "made";
++});
++print(e.resume()); // expect: 5
++print(e.resume()); // expect: made
+diff --git a/tests/e2e/tests/coros/coro_in_coro.ok b/tests/e2e/tests/coros/coro_in_coro.ok
+new file mode 100644
+index 0000000..e5e67f4
+--- /dev/null
++++ b/tests/e2e/tests/coros/coro_in_coro.ok
+@@ -0,0 +1,19 @@
++// a coro resumed from inside another coro: the resume native runs under the
++// outer coro's state, swaps to the inner's, and swaps back - the outer's
++// parked frames root through the resumer chain while the inner runs.
++let inner = coro(fu() {
++  yield "i1";
++  return "idone";
++});
++let outer = coro(fu() {
++  print("outer got: " + inner.resume());
++  yield "o1";
++  print("outer got: " + inner.resume());
++  return "odone";
++});
++print(outer.resume());  // expect: outer got: i1
++// expect: o1
++print(outer.resume());  // expect: outer got: idone
++// expect: odone
++print(inner.status());  // expect: dead
++print(outer.status());  // expect: dead
+diff --git a/tests/e2e/tests/coros/defers.ok b/tests/e2e/tests/coros/defers.ok
+new file mode 100644
+index 0000000..9f3763a
+--- /dev/null
++++ b/tests/e2e/tests/coros/defers.ok
+@@ -0,0 +1,37 @@
++// defers at suspend are PARKED, not run (the frames stay exactly as they
++// were); they run at the coro's death, lifo - normal completion runs them in
++// bytecode at the scope exits, error death runs them in the death sweep.
++fu close(tag) {
++  print("closing " + tag);
++  return true;
++}
++let c = coro(fu() {
++  defer close("a");
++  defer close("b");
++  yield 1;
++  print("mid");
++  return "end";
++});
++print(c.resume()); // expect: 1
++print(c.resume()); // expect: mid
++// expect: closing b
++// expect: closing a
++// expect: end
++
++// a defer that yields on the NORMAL exit lane is bytecode-driven (the
++// OP_DEFER_RUN arm stages the thunk in the same dispatch loop): the coro
++// parks mid-cleanup and the chain finishes on the next resume.
++fu ydef() {
++  yield "from-defer";
++  print("defer tail");
++  return true;
++}
++let d = coro(fu() {
++  defer ydef();
++  print("body before return");
++  return 2;
++});
++print(d.resume()); // expect: body before return
++// expect: from-defer
++print(d.resume()); // expect: defer tail
++// expect: 2
+diff --git a/tests/e2e/tests/coros/error_crossing.ok b/tests/e2e/tests/coros/error_crossing.ok
+new file mode 100644
+index 0000000..8ee6e2b
+--- /dev/null
++++ b/tests/e2e/tests/coros/error_crossing.ok
+@@ -0,0 +1,49 @@
++// R22 + the transplant: an error inside a coro runs the body's defers (the
++// death sweep, on the coro's own state), then crosses to the resumer's lane -
++// the resume call site is where a catch sees it, and the coro is dead after.
++fu say(what) {
++  print(what);
++  return true;
++}
++
++let c = coro(fu() {
++  defer say("cleanup ran");
++  yield 1;
++  throw "boom";
++});
++print(c.resume()); // expect: 1
++try {
++  print(c.resume()); // the defer runs inside this call, before the catch
++} catch e {
++  // expect: cleanup ran
++  print("caught: " + e as str); // expect: caught: boom
++}
++print(c.status()); // expect: dead
++print(c.resume()); // expect: null
++
++// a runtime-raised error crosses the same way (kind + text, not a thrown value)
++let r = coro(fu() {
++  yield 1;
++  return [1][5];
++});
++print(r.resume()); // expect: 1
++try {
++  print(r.resume());
++} catch e {
++  print("kind: " + e["kind"] as str); // expect: kind: index
++}
++print(r.status()); // expect: dead
++
++// an error the body catches itself never leaves: the coro survives
++let s = coro(fu() {
++  try {
++    throw "inner";
++  } catch e {
++    print("inside caught: " + e as str);
++  }
++  yield 1;
++  return "ok";
++});
++print(s.resume()); // expect: inside caught: inner
++// expect: 1
++print(s.resume()); // expect: ok
+diff --git a/tests/e2e/tests/coros/errors/body_arity_error.ok b/tests/e2e/tests/coros/errors/body_arity_error.ok
+new file mode 100644
+index 0000000..2440180
+--- /dev/null
++++ b/tests/e2e/tests/coros/errors/body_arity_error.ok
+@@ -0,0 +1,8 @@
++// the body's own arity is a plain call contract: the first resume's argument
++// is the body's argument, so a one-parameter body resumed bare is the
++// ordinary too-few-arguments error (defaults and varargs work the same as
++// any call).
++let c = coro(fu(a) {
++  return a;
++});
++print(c.resume()); // expect error: invalid call to 'fu': expected 1 argument, got 0.
+diff --git a/tests/e2e/tests/coros/errors/body_not_fu_error.ok b/tests/e2e/tests/coros/errors/body_not_fu_error.ok
+new file mode 100644
+index 0000000..c225828
+--- /dev/null
++++ b/tests/e2e/tests/coros/errors/body_not_fu_error.ok
+@@ -0,0 +1,3 @@
++// the coro body must be a plain fu (a closure value); numbers, classes,
++// natives and bound methods are refused with the honest message.
++print(coro(5)); // expect error: the coro body must be a fu.
+diff --git a/tests/e2e/tests/coros/errors/resume_arity_error.ok b/tests/e2e/tests/coros/errors/resume_arity_error.ok
+new file mode 100644
+index 0000000..1d4b349
+--- /dev/null
++++ b/tests/e2e/tests/coros/errors/resume_arity_error.ok
+@@ -0,0 +1,6 @@
++// resume takes at most one value in (the yield expression's result).
++let c = coro(fu() {
++  yield 1;
++  return 2;
++});
++print(c.resume(1, 2)); // expect error: invalid call to method 'resume' of class 'coro': expected at most 1 argument, got 2.
+diff --git a/tests/e2e/tests/coros/errors/resume_running_error.ok b/tests/e2e/tests/coros/errors/resume_running_error.ok
+new file mode 100644
+index 0000000..abcc6ae
+--- /dev/null
++++ b/tests/e2e/tests/coros/errors/resume_running_error.ok
+@@ -0,0 +1,9 @@
++// re-entrancy: resuming a running coro (here: itself, through a glob the
++// body can reach) is the one drive error.
++glob let mut self_coro = null;
++let c = coro(fu() {
++  self_coro.resume();
++  return 0;
++});
++self_coro = c;
++print(c.resume()); // expect error: resume of a running coroutine.
+diff --git a/tests/e2e/tests/coros/errors/yield_in_constructor_error.ok b/tests/e2e/tests/coros/errors/yield_in_constructor_error.ok
+new file mode 100644
+index 0000000..67960ed
+--- /dev/null
++++ b/tests/e2e/tests/coros/errors/yield_in_constructor_error.ok
+@@ -0,0 +1,12 @@
++// a yield from inside a constructor can never resume honestly: the
++// construction lane's C frame (construct_instance) holds the instance
++// publishing and the watermark restore after the nested run_until returns.
++class K {
++  fu init() {
++    yield 1;
++  }
++}
++let c = coro(fu() {
++  return K();
++});
++print(c.resume()); // expect error: cannot yield from inside a constructor.
+diff --git a/tests/e2e/tests/coros/errors/yield_in_defer_error.ok b/tests/e2e/tests/coros/errors/yield_in_defer_error.ok
+new file mode 100644
+index 0000000..0a36b39
+--- /dev/null
++++ b/tests/e2e/tests/coros/errors/yield_in_defer_error.ok
+@@ -0,0 +1,13 @@
++// a yield from a defer running on the UNWIND lane (an error is in flight):
++// the scan's C frame holds the rest of the cascade. the normal scope-exit
++// lane is bytecode-driven and parks fine (see defers.ok) - this is the
++// error-path half.
++fu bad() {
++  yield 1;
++  return true;
++}
++let c = coro(fu() {
++  defer bad();
++  throw "x";
++});
++print(c.resume()); // expect error: cannot yield from inside a defer.
+diff --git a/tests/e2e/tests/coros/errors/yield_in_operator_error.ok b/tests/e2e/tests/coros/errors/yield_in_operator_error.ok
+new file mode 100644
+index 0000000..b4d7d24
+--- /dev/null
++++ b/tests/e2e/tests/coros/errors/yield_in_operator_error.ok
+@@ -0,0 +1,14 @@
++// a yield from inside an operator method dispatch: the operator lane's C
++// frame (dispatch_operator_method) copies the result into the caller's
++// register after the nested run_until returns - a parked operator has no
++// honest resume.
++class K {
++  pub fu operator +(o) {
++    yield 1;
++    return 2;
++  }
++}
++let c = coro(fu() {
++  return K() + 1;
++});
++print(c.resume()); // expect error: cannot yield from inside an operator method.
+diff --git a/tests/e2e/tests/coros/errors/yield_outside_error.ok b/tests/e2e/tests/coros/errors/yield_outside_error.ok
+new file mode 100644
+index 0000000..6c27201
+--- /dev/null
++++ b/tests/e2e/tests/coros/errors/yield_outside_error.ok
+@@ -0,0 +1,8 @@
++// yield is coro-only: a plain function called from main that yields is the
++// compile-time-impossible, runtime-honest refusal (any function can BECOME a
++// coro body, so the check lives in the opcode handler).
++fu plain() {
++  yield 1;
++  return 2;
++}
++print(plain()); // expect error: yield outside a coroutine.
+diff --git a/tests/e2e/tests/coros/gc_parked.ok b/tests/e2e/tests/coros/gc_parked.ok
+new file mode 100644
+index 0000000..dc3774f
+--- /dev/null
++++ b/tests/e2e/tests/coros/gc_parked.ok
+@@ -0,0 +1,27 @@
++// the collector must walk a parked coro's state like a live vm's (registers,
++// call stack closures, open upvalues) and the parked resumer's too. the
++// churn between resumes forces collections (every allocation, under the
++// aggressive gate) while both sides hold live values.
++let c = coro(fu() {
++  let keep = ["a", "b", "c"];
++  let mut n = 0;
++  while n < 3 {
++    yield keep[n];
++    n = n + 1;
++  }
++  return len(keep);
++});
++print(c.resume()); // expect: a
++let mut junk = 0;
++let mut i = 0;
++while i < 300 {
++  let trash = [i, i + 1, i + 2];
++  let m = {"k": i, "v": trash};
++  junk = junk + len(m["v"]) - 2;
++  i = i + 1;
++}
++print(junk);       // expect: 300
++print(c.resume()); // expect: b
++print(c.resume()); // expect: c
++print(c.resume()); // expect: 3
++print(c.status()); // expect: dead
+diff --git a/tests/e2e/tests/coros/nested_calls.ok b/tests/e2e/tests/coros/nested_calls.ok
+new file mode 100644
+index 0000000..c3e0787
+--- /dev/null
++++ b/tests/e2e/tests/coros/nested_calls.ok
+@@ -0,0 +1,20 @@
++// the coro's call tree is the coro's: a yield from a function the body called
++// suspends the WHOLE coro (what makes it a coroutine, not a generator loop).
++// inner(10) runs inside the coro's frames - its two yields park the coro,
++// its return value is just the call's result in the body.
++fu inner(a) {
++  yield a;
++  yield a + 1;
++  return a + 2;
++}
++let c = coro(fu() {
++  let r1 = inner(10);
++  let r2 = yield "mid";
++  print("r2: " + r2 as str);
++  return r1 + r2;
++});
++print(c.resume());  // expect: 10
++print(c.resume());  // expect: 11
++print(c.resume());  // expect: mid
++print(c.resume(5)); // expect: r2: 5
++// expect: 17
+diff --git a/tests/e2e/tests/coros/status_running.ok b/tests/e2e/tests/coros/status_running.ok
+new file mode 100644
+index 0000000..3cc83b6
+--- /dev/null
++++ b/tests/e2e/tests/coros/status_running.ok
+@@ -0,0 +1,15 @@
++// the running window: status() inside the body (through a glob the body can
++// reach) reports "running" - re-entrancy is what the status guards against.
++glob let mut me = null;
++let c = coro(fu() {
++  print(me.status());
++  yield 1;
++  return 0;
++});
++me = c;
++print(c.status());  // expect: ready
++print(c.resume());  // expect: running
++// expect: 1
++print(c.status());  // expect: suspended
++print(c.resume());  // expect: 0
++print(c.status());  // expect: dead
+diff --git a/tests/e2e/tests/coros/upvalues.ok b/tests/e2e/tests/coros/upvalues.ok
+new file mode 100644
+index 0000000..c863029
+--- /dev/null
++++ b/tests/e2e/tests/coros/upvalues.ok
+@@ -0,0 +1,33 @@
++// upvalues across the coro boundary. cells captured in the resumer resolve
++// through the vm's own register file even while the coro's state is current
++// (the shared-cell semantics: both sides see each other's writes), and cells
++// captured INSIDE the coro resolve through the coro's state - a closure that
++// escapes a parked coro pins the coro (and its register file) alive through
++// the upvalue's trace until the cell closes.
++let mut shared = 10;
++let c = coro(fu() {
++  print(shared);          // read the resumer's cell
++  shared = shared + 1;    // write it back
++  yield 1;
++  print(shared);          // see the resumer's mid-park write
++  return 0;
++});
++print(c.resume()); // expect: 10
++// expect: 1
++shared = 99;
++print(c.resume()); // expect: 99
++// expect: 0
++print(shared);     // expect: 99
++
++// the escaped closure: captures a cell of the coro's own frame
++let mut esc = null;
++let p = coro(fu() {
++  let x = 7;
++  esc = fu() { return x + 1; };
++  yield 1;
++  return 0;
++});
++print(p.resume()); // expect: 1
++print(esc());      // expect: 8
++print(p.resume()); // expect: 0
++print(esc());      // expect: 8

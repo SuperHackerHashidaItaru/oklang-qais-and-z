@@ -1,0 +1,123 @@
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 419d499..69ffd3d 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -1743,10 +1743,19 @@ static bool compile_class_declaration(compiler* p_compiler, ast_class_declaratio
+     report_oom(p_compiler, author);
+     return false;
+   }
++  // the class rides klass_reg: for a local that register IS the binding, so
++  // the define collapses to the initialized-marking no-op; for a global it
++  // is the temp register_for_location handed out, and this store is what
++  // actually publishes the class. (claiming the value already lived in the
++  // global slot - the old shape - made write_global load the slot's null
++  // back into itself: glob classes printed as null and were uncallable.)
+   return define_variable(
+       p_compiler,
+       varloc,
+-      (expression_result){EXPRESSION_LVALUE | EXPRESSION_VALUE, varloc, (lvalue){LVALUE_VARIABLE, varloc}, 1},
++      (expression_result){EXPRESSION_VALUE,
++                          (location){klass_reg.index, LOCATION_KIND_REGISTER, LOCATION_OK},
++                          (lvalue){LVALUE_VARIABLE, varloc},
++                          1},
+       author);
+ }
+ 
+diff --git a/tests/e2e/tests/classes/glob_class.ok b/tests/e2e/tests/classes/glob_class.ok
+new file mode 100644
+index 0000000..3ccb6cf
+--- /dev/null
++++ b/tests/e2e/tests/classes/glob_class.ok
+@@ -0,0 +1,35 @@
++// glob classes publish like glob fus: the class value is stored into the
++// global slot by the declaration itself. regression: the define used to
++// claim the value already lived in the global slot, so the store re-ran with
++// null - glob classes printed as null and cc() was "not callable", while
++// locals worked (their define is the register no-op).
++glob class cc {
++  pub fu pr(s) {
++    print s;
++  }
++}
++
++cc().pr("hi"); // expect: hi
++print(cc); // expect: <class cc>
++
++glob let cg = cc;
++cg().pr("ho"); // expect: ho
++
++fu use() {
++  return cc().pr("from fn");
++}
++use(); // expect: from fn
++
++class kid : cc {
++  pub fu twice(s) {
++    pr(s);
++    pr(s);
++  }
++}
++kid().twice("x"); // expect: x
++// expect: x
++
++glob let inst = cc();
++print(inst is cc); // expect: true
++print(classof(inst) === cc); // expect: true
++print(classof(cc) === Class); // expect: true
+diff --git a/tests/e2e/tests/classes/operator_arity_error.ok b/tests/e2e/tests/classes/operator_arity_error.ok
+new file mode 100644
+index 0000000..f30186f
+--- /dev/null
++++ b/tests/e2e/tests/classes/operator_arity_error.ok
+@@ -0,0 +1,11 @@
++// the operator arity lane: calling the method spelling directly keeps the
++// arity check (parameters only - the receiver is not counted).
++class Vec2 {
++  let x = 0;
++  fu init(x) { this.x = x; }
++  pub fu operator +(other) { return Vec2(x + other.x); }
++  fu operator *(k) { return Vec2(x * k); } // private
++  pub fu get() { return x; }
++}
++let a = Vec2(1);
++print(a.operator +(Vec2(1), Vec2(2)).get()); // expect error: invalid call to 'operator +': expected 1 argument, got 2
+diff --git a/tests/e2e/tests/classes/operator_private_error.ok b/tests/e2e/tests/classes/operator_private_error.ok
+new file mode 100644
+index 0000000..718e2c1
+--- /dev/null
++++ b/tests/e2e/tests/classes/operator_private_error.ok
+@@ -0,0 +1,11 @@
++// the operator privacy lane: a private operator is callable from inside the
++// class, never through the operator surface from outside.
++class Vec2 {
++  let x = 0;
++  fu init(x) { this.x = x; }
++  pub fu operator +(other) { return Vec2(x + other.x); }
++  fu operator *(k) { return Vec2(x * k); } // private
++  pub fu get() { return x; }
++}
++let a = Vec2(1);
++print(a * 2); // expect error: operator 'operator *' of class 'Vec2' is private
+diff --git a/tests/e2e/tests/classes/operator_errors.ok b/tests/e2e/tests/classes/operator_type_error.ok
+similarity index 60%
+rename from tests/e2e/tests/classes/operator_errors.ok
+rename to tests/e2e/tests/classes/operator_type_error.ok
+index 4fbcb42..c56c2a0 100644
+--- a/tests/e2e/tests/classes/operator_errors.ok
++++ b/tests/e2e/tests/classes/operator_type_error.ok
+@@ -1,4 +1,6 @@
+-// the operator error lanes: arity, no-operator type errors, and privacy.
++// the operator type-error lane: no operator match means the operand's own
++// surface is probed, and a num has no fields. one error per file - the vm
++// halts at the first error, so each lane gets its own run.
+ class Vec2 {
+   let x = 0;
+   fu init(x) { this.x = x; }
+@@ -8,7 +10,4 @@ class Vec2 {
+ }
+ let a = Vec2(1);
+ print((a + Vec2(2)).get()); // expect: 3
+-
+ print(a + 2); // expect error: class 'num' has no field or method 'x'
+-print(a * 2); // expect error: is private
+-print(a.operator +(Vec2(1), Vec2(2)).get()); // expect error: expects at most 1 argument

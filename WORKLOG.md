@@ -1572,3 +1572,80 @@ Stage Summary:
 - tree-sitter catch-up still flagged (is/=== tokens, classes grammar,
   and now OP_JUMP_IF_CMP is invisible to nothing external — bytecode
   only; no grammar change needed for it).
+
+
+## SESSION 32 — the classes bug Q caught, then COROS LANDED (patch 37 + 38)
+
+Session: 2026-11-03 (UTC+8). Reviewer: Z. Owner: qais.
+Tree: oklang `opt-lightweight` @ fed4158 (two commits on top of 2dfea99).
+
+Q aborted the coro run mid-flight with a bug report, and it was a good
+catch: `glob class cc {...}` published NULL - `cc().pr("hi")` errored
+"not callable", `print cc` said null, locals worked, and the glob-let
+alias only worked by register-index luck. one read to root cause:
+the class declaration's define claimed the value already lived in the
+global slot, so write_global loaded the slot's null back into itself
+while the class rode klass_reg untouched. fixed to the function-
+declaration shape; split the never-passable operator_errors.ok into
+three one-error files; glob_class.ok pins the regression. patch 37.
+
+then coros, per the R20-R24 rulings (all closed in
+docs/drafts/COROS.md): `coro` - lowercase, the eighth builtin class,
+always loaded for now (std.coro when modules land). `coro(fu)`
+constructs via the native static `operator ()`; `c.resume([v])` drives;
+`c.status()` reports; `yield` is a keyword, statement and expression.
+dead resume is null (R21), dead-by-error defers run (R22), no
+scheduler (the standing veto; casio/asio stays later).
+
+what the draft got right: it WAS super easy - the state swap, the
+park, the resume, all fit the existing machinery. what it missed:
+
+- the yield barrier. yields under C-driven regions (operator dispatch,
+  construction, the defer unwind scan, native ok_call hops) can never
+  resume honestly - the C frame holding the result bookkeeping is gone.
+  refused as runtime errors (lua's C-call-boundary discipline), which
+  is what makes RUNTIME_SUSPENDED driver-only: nothing between a legal
+  yield and the resume driver holds state. the pleasant surprise: the
+  NORMAL scope-exit defer lane is bytecode-driven (OP_DEFER_RUN stages
+  in the loop), so defer-with-yield parks mid-cleanup and resumes -
+  generators-in-defers are real. only the unwind scan refuses.
+- upvalue ownership. open cells index their OWNER's array, not the
+  running state's: main captures resolve through vm->main_state, coro
+  captures carry the coro as a traced owner value on the upvalue so an
+  escaped closure pins its parked coro until the cell closes. the
+  smoke test caught the garbage-read version of this instantly
+  (`got as str` probing a "class" that was another state's register).
+  steady-state loops measure flat; capture pays one word (~10% churn
+  micro). the gc grows mark_execution_state: one walk for current +
+  the resume_parked chain + every reachable coro's owned state.
+- error death is a transplant, not just propagation: sweep the body's
+  defers on the coro's own state (R22), move the whole lane to the
+  resumer, fail the resume call there. chained coros compose for free
+  (a coro resumer fails into ITS driver the same way).
+
+two pre-existing bugs fixed en route: the glob-classes null (patch 37)
+and parse_expression's infix loop continuing after a failed infix -
+NULL left into the next infix built a call node with a null callable
+and the teardown segfaulted (any parse error in an infix chain could
+crash the cli; found via a defer-of-print test typo).
+
+gates: e2e 423x423 (was 406) on threaded, pure switch, asan, and
+aggressive-gc. 17 coros tests incl. the eight error lanes.
+
+delivered: patches/37-glob-classes-fix.patch, patches/38-coros.patch,
+docs/drafts/COROS.md updated to LANDED with the rulings closed and the
+implementation deltas recorded, worklog (this entry). oklang side: two
+commits on opt-lightweight, clean on the codeberg branch when Q wants
+them. OPEN FOR Q: the two questions from the coro conversation -
+(a) defer-error continuation (zig/go-aligned chain-vs-first-fail; my
+lean is continue-the-chain, first-error-propagates, but it is a
+behavior change to the cascade and Q's call), and (b) Class/Object
+casing (my lean: rename to `type` and `object` - python precedent,
+keyword-safe, matches the all-lowercase builtin surface - as one
+breaking sweep before 0.9.0 freezes the names).
+
+next on the roadmap: 0.6.0 (modules - coro moves to std.coro, the
+first stdlib-shaped resident) and the 0.9.0 heavy passes (constant
+folding, general fusion, DCE-lite, jump threading, tailcalls) that own
+the remaining allocation-shaped class-path gap. tree-sitter catch-up
+still flagged (yield keyword joins the grammar list).
