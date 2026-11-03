@@ -1446,3 +1446,129 @@ Stage Summary:
 - open for veto: R17 (the prelude shadowing), R18 (fresh mic slots on
   copies + the parent-identity gate). tree-sitter catch-up still
   flagged (is/=== tokens, classes grammar).
+
+## session 31 — the lightweight perf pass (patch 36) + the coros draft
+
+Task ID: session-31. resumed from Q's "pushed to classes staging, now the
+lightweight pass" — the ruled PERF pass 1, then draft coros.
+
+Work Log:
+- synced to origin/classes-staging (Q's hand-applied a1411d1, "complete
+  classes"): one blank-line diff vs my patch stack, their branch is the
+  truth. baseline gates green: e2e 399x4, unit x3, embed x3. sandbox
+  toolchain rebuilt (wren from wren-cli, lua 5.4.7 from source, a real
+  hyperfine-shaped shim in scripts/hyperfine_shim.py — the sandbox has
+  no hyperfine/lua and no root; the shim produces the same json).
+- the honest baseline ran FIRST per the sequencing rule: 42 benches x
+  4 languages, RUNS=5 WARMUP=1, -O2, on pristine classes-staging.
+  (the background-run lesson: the sandbox recycles between messages and
+  kills nohup'd processes — benches must run foreground, chunked under
+  the 10-minute tool timeout. two silent bench deaths before that
+  clicked.)
+- patch 36, four pieces, one handler body:
+  1. threaded dispatch: computed gotos behind OK_THREADED_DISPATCH +
+     cmake GNU/Clang auto-detect + OK_PURE as the portability gate.
+     CASE(op)/DISPATCH() macros share the switch and threaded body; the
+     table is designated-initializer'd by enum value, sized by a new
+     OP__COUNT sentinel; the four pre-patch NAME ops alias NOP (the
+     switch silently skipped them too — freeze rewrites them before
+     execution). OK_PARANOID gains a table-null check. the transform
+     itself is scripts/thread_dispatch.py (block-stack scanner + the
+     mechanical CASE/DISPATCH conversion).
+  2. fused conditions: OP_JUMP_IF_CMP (2w; the 3 spare bits above Q
+     carry the comparator lane; eight comparators ==,!=,<,<=,>,>=,===,is).
+     a DIRECT comparison in an if/while/for condition compiles to one
+     instruction where the generic path spent two. the perform family is
+     reused verbatim through a hoisted perform_comparison helper; the
+     result lands in the lhs register which may be a LOCAL's register
+     (zero staging for `while i < n`), so the VM saves the operand and
+     restores it after the truthiness read — one store, zero semantic
+     drift, operators still dispatch. patch_jump_if re-ors the cmp bits.
+     compile_fused_condition_jump returns UNSUPPORTED having emitted
+     nothing for every non-direct shape; logical/negated/bare
+     conditions keep the generic path (the general fusion is pass 2).
+  3. poly-MIC: chunk->mic is now mic_cache = 3-way probe chain +
+     round-robin eviction hand; fills go first-empty-else-victim;
+     fresh generations start cold (R18 carried to the new shape).
+     the gc tracer walks every way. class-resident op caches unchanged.
+  4. interning (NAMES only): okintern.c/h, open-addressed set of
+     canonical object_strings, strong-rooted via a new gc watch, owned by
+     `ok`, threaded into compiler_specs/vm_specs. every compiler-made
+     NAME interns (member names, class names, canonical operator
+     spellings, function names, statics/fields ladder constants) and the
+     vm's startup names intern (so "init"/"operator +" canonicalize with
+     the compiler's). SM_PROBE_MATCHES, map_value_key_equals, and
+     perform_equal's string lanes grew pointer fast paths. LITERALS STAY
+     UNINTERNED — === is word identity and `"a" === "a"` must stay false
+     (identity.ok pins it); interning literals is R19, Q's call.
+- the bug worth the receipt: the transform's scanner classified breaks
+  by looking for loop/switch heads adjacent to `{` — `for (uint32_t w =
+  0; ...)` and `switch (cmp)` have conditions between keyword and brace
+  and were invisible. five loop-internal breaks became DISPATCH() (two
+  mic probe loops, three DEFINE_METHOD parent-chain walks). switch mode
+  compiled the wrong code CORRECTLY (DISPATCH = break exits the C loop)
+  and passed 399/399; threaded mode dispatched the VM from inside the C
+  loops: 13 failures — "expected error, got success" (chain walks
+  aborted, signature/init-super checks never fired), `o.v` evaluating to
+  its receiver, inheritance finding the parent's init. two debugging
+  sins compounded it first: a hex misread (0x357 vs 0x353, "the freeze
+  didn't bake" — it did) and a probe run whose "rc=0" belonged to
+  `head`, not the binary (SIGPIPE). the discipline that closed it:
+  probe from /tmp copies only, check the probe's own exit code, and run
+  the gates on BOTH dispatch modes — the switch suite passing is not
+  evidence for the threaded build. fixed by hand; build_ok.sh +
+  run_unit_tests.sh grew threaded-asan(-aggr) variants so the gate
+  matrix permanently includes threaded sanitizer lanes (5 variants).
+- one more, found by the embed gate: compiler_compile's between-runs
+  deinit+init rebuilt compiler_specs WITHOUT the interner — the second
+  ok_run on one ok crashed on a NULL intern (the cli never saw it, one
+  script per process). the reset carries the interner now.
+- gates on the final state: e2e 403x4 x BOTH dispatch modes (399 + 4
+  new: fused_conditions, fused_operator_conditions, poly_mic,
+  interned_names — the poly test needed three authoring fixes of my own
+  (c-style-for syntax is `for let mut i`, statics+instance one-name-one-
+  owner, fields are ring-private, bare f() is read-then-call) — each a
+  doctrine reminder). unit x5, embed x5.
+- the report card (full tables + raw json in the collab repo:
+  results/baseline-classes-staging, after-switch, after-threaded;
+  the writeup is docs/drafts/PERF-PASS-1.md): core FLIPPED ahead of
+  wren — loop_counter 1.17x, branch_toggle 1.18x, arithmetic_sum 1.24x,
+  array_index_sum 1.26x, local_pressure 1.29x ahead; numeric-for family
+  2.85x+, map iteration 4.68x hold. class paths narrowed: field 1.2 ->
+  1.14x, chain 1.4 -> 1.30x, method 1.3 -> 1.24x, poly 1.3 -> 1.23x,
+  operator 2.0 -> 1.88x, instantiate 2.1 -> 2.02x. the remainder is
+  allocation-shaped (instantiate's nested run_until construction lanes,
+  operator results allocating) — 0.9.0's heavy-pass lane, stated in the
+  doc so nobody asks for pass 1.5. known warts on record: the poly-MIC
+  probe costs ~2-4% on monomorphic sites in switch mode (threading pays
+  it back), map_lookup wobbles (literal keys uninterned by R19's
+  standing).
+- the coros draft: docs/drafts/COROS.md. the pitch: a coroutine is a
+  run_until level that parks instead of returning — the re-entrancy,
+  frame parking, and watermark machinery already exists (operator
+  dispatch, defer, catch paid for it). recommended surface: a Coro class
+  (patch 34's natives-as-classes door) + `yield` keyword; per-coro
+  execution_state swapped into vm->current_execution_state at resume;
+  OP_YIELD unwinds to the coro's depth and returns RUNTIME_SUSPENDED;
+  errors propagate to the resumer; ~350-450 lines. R20-R24 open
+  (surface, dead-resume, error-death defers, yield spelling, 0.6.0 vs
+  earlier landing). no symmetric transfer, no scheduler — standing veto.
+- delivered: patches/36-lightweight-perf.patch (3952 lines, 18 files) +
+  download/ mirror, docs/drafts/PERF-PASS-1.md (the report card + the
+  receipts), docs/drafts/COROS.md, patches/README entry 36, ROADMAP-v1
+  pass-1 marked LANDED, the three bench result sets, worklog (this
+  entry). collab repo committed; NOTE: no github credentials in this
+  sandbox session — the collab push needs Q's side or a re-issued PAT.
+  the oklang side is one commit on branch opt-lightweight (ahead of
+  origin/classes-staging), patchfile applies clean.
+
+Stage Summary:
+- PERF pass 1 is closed: measured, gated on both dispatch modes, core
+  ahead of wren, the classes gap narrowed to its allocation-shaped core.
+- next: Q rules R19 (intern literals?) + the COROS R20-R24; then 0.6.0
+  (modules, with Coro as a candidate first resident per R24) and the
+  0.9.0 heavy passes (constant folding, the general fusion, DCE-lite,
+  jump threading, tailcalls) which own the remaining class-path gap.
+- tree-sitter catch-up still flagged (is/=== tokens, classes grammar,
+  and now OP_JUMP_IF_CMP is invisible to nothing external — bytecode
+  only; no grammar change needed for it).

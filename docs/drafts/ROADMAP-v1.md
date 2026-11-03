@@ -190,26 +190,38 @@ era opens with the web framework as the first big consumer.
 optimization work splits into two passes.** a lightweight pass lands right
 after the classes theme closes; the heavy compiler passes stay later.
 
-*pass 1 — the lightweight round (post-0.5.0, before the next theme):*
+*pass 1 — the lightweight round: **LANDED (patch 36, session 31).** the
+report card is docs/drafts/PERF-PASS-1.md; the split below kept as the
+record of what was ruled.*
 - string interning: separate from hashing-on-construct (which landed with
   maps). interning changes key equality to pointer-eq — now scheduled here.
+  **landed NAMES-only: literals stay uninterned because === is word
+  identity (R19 open — interning literals would flip `"a" === "a"`).**
 - inline polymorphic cache: the per-site mic grows a 2-3 entry class probe
   chain, so `class_poly_dispatch` (two classes alternating at one site)
   stops thrashing. the class-resident operator cache (patch 32) already
-  covers the operator lanes.
+  covers the operator lanes. **landed: 3-way chain, round-robin hand.**
 - conditional materialization: conditions stop materializing booleans into
   registers — the compare+jump fusion's first half (this is Q's "branch no
   materialize", sized down to the condition lane; the full fusion stays in
-  pass 2). targets the branch_toggle gap.
+  pass 2). targets the branch_toggle gap. **landed: OP_JUMP_IF_CMP, all
+  eight comparators, operators still dispatch through the fused lane.**
 - threaded dispatch loop behind a compile-time switch: computed gotos
-  (labels-as-values), the classic register-VM dispatch win.
+  (labels-as-values), the classic register-VM dispatch win. **landed:
+  CASE/DISPATCH macros, one handler body for both modes, gates run on
+  BOTH modes (the switch suite passing is not evidence for the threaded
+  build — that exact asymmetry hid the transform bug, see the
+  PERF-PASS-1 receipts).**
 - pure mode + compiler auto-detection in cmake: the OK_PURE-style build mode
   and cmake detecting GNU extensions (gcc/clang) to enable them — the switch
   the threaded dispatch rides on, and the portability gate that keeps the
-  non-GNU builds honest.
+  non-GNU builds honest. **landed: OK_PURE option + GNU/Clang auto-detect.**
 - sequencing rule: the classes benchmarks (incl. the wren column) run BEFORE
   this pass lands and again after — the before/after numbers are the pass's
-  report card.
+  report card. **ran: baseline (classes-staging, -O2) vs after-switch vs
+  after-threaded — the core flipped ahead of wren (1.17-1.29x on the loop
+  family), the class paths narrowed to 1.14-2.02x, the remainder is
+  allocation-shaped (0.9.0's lane).**
 
 *pass 2 — the heavy compiler passes (0.9.0 as planned, standing lane):*
 - constant folding + propagation on statically resolved operands.

@@ -411,3 +411,33 @@ bare_builtin_shadow.ok pins a pre-existing finding - a bare call inside
 a method reaches the std-zero builtin before the class's own method of
 the same name (R17 in CITADEL-R4). gates: e2e 399 x4 + unit + embed.
 the full walkthrough is docs/drafts/CITADEL-R4.md.
+
+### 36 — the lightweight perf pass (interning, poly-MIC, fused conditions, threaded dispatch)
+
+four rulings from ROADMAP-v1's PERF pass 1, landed as one patch on top of
+classes-staging. (1) threaded dispatch: computed gotos behind
+OK_THREADED_DISPATCH, one handler body shared by both modes (CASE/DISPATCH
+macros; the switch build compiles identically to before), cmake GNU
+auto-detect + OK_PURE as the portability gate, OP__COUNT sizes the table,
+the four pre-patch NAME ops alias NOP to match the switch's silent skip.
+(2) fused conditions: OP_JUMP_IF_CMP (2w, 3-bit cmp lane) - a direct
+comparison in an if/while/for condition is one instruction instead of
+two, the perform family reused verbatim (operators still dispatch), the
+lhs operand saved/restored so a local's register can serve directly.
+(3) the poly-MIC: the per-site cache is a 3-way probe chain with
+round-robin eviction; class_poly_dispatch stops thrashing; fresh
+generations start cold (R18 carried). (4) interning: an open-addressed
+set canonicalizes compiler-made NAMES (member/class/method spellings +
+the vm's startup names) so probes hit a pointer fast path - literals stay
+uninterned because === is word identity and flipping `"a" === "a"` to
+true is a contract change (R19 open). four new e2e tests; gates: e2e
+403/403 on BOTH dispatch modes + unit/embed x5 (gcc, asan, asan-aggr,
+threaded-asan, threaded-asan-aggr - the threaded sanitizer lanes exist
+because the switch build passing is NOT evidence for the threaded build:
+the transform-scanner bug hid five wrong break->DISPATCH conversions
+behind a green switch suite). the before/after numbers and the receipts:
+docs/drafts/PERF-PASS-1.md. the classes gap narrowed (field 1.2->1.14x,
+chain 1.4->1.30x, poly 1.3->1.23x vs wren) and the core FLIPPED to ahead
+(loop_counter 1.17x, branch_toggle 1.18x, arithmetic_sum 1.24x,
+array_index 1.26x); what remains is allocation-shaped - 0.9.0's lane.
+also delivered: docs/drafts/COROS.md, the coroutine draft (R20-R24).

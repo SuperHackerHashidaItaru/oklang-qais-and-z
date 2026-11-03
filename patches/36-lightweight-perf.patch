@@ -1,0 +1,3952 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0f770ab..ebdd203 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -13,6 +13,7 @@ option(OK_ENABLE_SANITIZERS "Enable ASan" OFF)
+ option(OK_PARANOID "Enable additional logging" OFF)
+ option(OK_PEDANTIC "Enable additional failure checking" OFF)
+ option(OK_AGGRESSIVE_GC "Trigger garbage collection on every allocation" OFF)
++option(OK_PURE "Strictly portable C: no compiler extensions (switch dispatch, no threaded code)" OFF)
+ 
+ if(OK_BUILD_SHARED)
+   set(OK_LIBRARY_TYPE SHARED)
+@@ -36,6 +37,18 @@ if (OK_PEDANTIC)
+     target_compile_definitions(ok PUBLIC OK_PEDANTIC)
+ endif()
+ 
++# the perf switches ride on compiler extensions (labels-as-values for the
++# threaded dispatch loop). cmake auto-detects GNU/Clang and enables them
++# unless OK_PURE is set - the portability gate that keeps a strict-C build
++# (and msvc, and the wasm targets without the extension) on the classic
++# switch, one code path, two dispatch modes, the e2e suite runs on both.
++if (NOT OK_PURE AND (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID MATCHES "Clang"))
++    target_compile_definitions(ok PRIVATE OK_THREADED_DISPATCH)
++    message(STATUS "threaded dispatch: ON (GNU extensions detected; -DOK_PURE=ON to disable)")
++elseif (OK_PURE)
++    message(STATUS "threaded dispatch: OFF (OK_PURE: strictly portable C)")
++endif()
++
+ target_sources(ok PRIVATE
+   src/ok.c
+   src/okast.c
+@@ -57,6 +70,7 @@ target_sources(ok PRIVATE
+   src/okstring.c
+   src/okspecs.c
+   src/okgc.c
++  src/okintern.c
+ )
+ 
+ if(CMAKE_BUILD_TYPE STREQUAL "Coverage")
+diff --git a/src/ok.c b/src/ok.c
+index 6956371..fedbc34 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -17,6 +17,7 @@
+ struct ok {
+   object_store objects_store;
+   globals_store globals_store;
++  string_interner interner;
+   compiler compiler;
+   vm vm;
+   gc gc;
+@@ -419,12 +420,21 @@ ok* ok_create(ok_specs p_specs) {
+ 
+   globals_store_init(&okay->globals_store, &okay->alloc);
+   gc_watch_globals(&okay->gc, &okay->globals_store);
+-  compiler_specs compiler_specs = {
+-      .alloc = &okay->alloc, .objects_store = &okay->objects_store, .globals_store = &okay->globals_store};
++  // the interner precedes both consumers (compiler + vm): they only store
++  // the pointer, but the gc watch must be live before either interns.
++  string_interner_init(&okay->interner, &okay->alloc);
++  gc_watch_interner(&okay->gc, &okay->interner);
++  compiler_specs compiler_specs = {.alloc = &okay->alloc,
++                                   .objects_store = &okay->objects_store,
++                                   .globals_store = &okay->globals_store,
++                                   .interner = &okay->interner};
+   compiler_init(&okay->compiler, compiler_specs);
+   gc_watch_compiler(&okay->gc, &okay->compiler);
+-  vm_specs vm_specs = {
+-      .alloc = &okay->alloc, .globals_store = &okay->globals_store, .objects_store = &okay->objects_store, .ok = okay};
++  vm_specs vm_specs = {.alloc = &okay->alloc,
++                       .globals_store = &okay->globals_store,
++                       .objects_store = &okay->objects_store,
++                       .ok = okay,
++                       .interner = &okay->interner};
+   vm_init(&okay->vm, vm_specs);
+   gc_watch_vm(&okay->gc, &okay->vm);
+   // the singletons need mark_vm live before they exist: their only root is
+@@ -647,6 +657,7 @@ void ok_set_print(ok* p_ok, ok_print_fn p_cb, void* p_ctx) {
+ void ok_free(ok* p_ok) {
+   vm_deinit(&p_ok->vm);
+   compiler_deinit(&p_ok->compiler);
++  string_interner_deinit(&p_ok->interner);
+   globals_store_deinit(&p_ok->globals_store);
+   object_store_deinit(&p_ok->objects_store);
+   gc_deinit(&p_ok->gc);
+diff --git a/src/okchunk.c b/src/okchunk.c
+index ade55e4..b8ffb7c 100644
+--- a/src/okchunk.c
++++ b/src/okchunk.c
+@@ -9,7 +9,7 @@
+ 
+ ARRAY_DEFINE_DEFAULT(code, word, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(source_info, ok_line_info_repeated, ARRAY_DEFAULT_TYPE_DEINIT)
+-ARRAY_DEFINE_DEFAULT(mic_entries, mic_entry, ARRAY_DEFAULT_TYPE_DEINIT)
++ARRAY_DEFINE_DEFAULT(mic_caches, mic_cache, ARRAY_DEFAULT_TYPE_DEINIT)
+ #define IDENTIFIERS_DEINIT(x, a) string_deinit(x, a)
+ ARRAY_DEFINE(identifiers, string, uint32_t, UINT32_MAX, IDENTIFIERS_DEINIT)
+ 
+@@ -33,7 +33,7 @@ void chunk_init(chunk* p_chunk, allocators* p_alloc) {
+   identifiers_init(&p_chunk->identifiers, p_alloc);
+   value_array_init(&p_chunk->constants, p_alloc);
+   source_info_init(&p_chunk->source_info, p_alloc);
+-  mic_entries_init(&p_chunk->mic, p_alloc);
++  mic_caches_init(&p_chunk->mic, p_alloc);
+   p_chunk->source_id = VM_SOURCE_UNSTAMPED;
+ }
+ 
+@@ -42,7 +42,7 @@ void chunk_deinit(chunk* p_chunk) {
+   identifiers_deinit(&p_chunk->identifiers, p_chunk->alloc);
+   value_array_deinit(&p_chunk->constants, p_chunk->alloc);
+   source_info_deinit(&p_chunk->source_info, p_chunk->alloc);
+-  mic_entries_deinit(&p_chunk->mic, p_chunk->alloc);
++  mic_caches_deinit(&p_chunk->mic, p_chunk->alloc);
+ }
+ 
+ bool chunk_write_word(chunk* p_chunk, const word p_word, const ok_line_info p_line_info) {
+@@ -100,13 +100,18 @@ mic_slot chunk_add_mic(chunk* p_chunk, const ok_line_info p_line_info) {
+   if (p_chunk->mic.count >= INDEX_MAX) {
+     return (index_wrapper){0, 0, MIC_OVERFLOW};
+   }
+-  const mic_entry empty = {NULL_AS_VALUE(), NULL, 0, 0};
+-  if (!mic_entries_append(&p_chunk->mic, empty)) {
++  // every way empty, hand at zero: cold site
++  const mic_cache empty = {{{NULL_AS_VALUE(), NULL, 0, 0, 0}}, 0};
++  if (!mic_caches_append(&p_chunk->mic, empty)) {
+     return (index_wrapper){0, 0, MIC_OVERFLOW};
+   }
+   return (index_wrapper){p_chunk->mic.count - 1, 0, MIC_OK};
+ }
+ 
++bool comparison_is_valid(uint8_t p_cmp) {
++  return p_cmp <= (uint8_t)CMP_IS;
++}
++
+ ok_line_info_repeated* chunk_find_line_info(const chunk* p_chunk, const uint32_t p_instruction_index) {
+ #if !defined(NDEBUG)
+   // invariant guard: the RLE table must cover exactly [0, code.count)
+diff --git a/src/okchunk.h b/src/okchunk.h
+index a1e03dc..d4f2a8c 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -151,6 +151,19 @@ typedef struct {
+   uint8_t recv_is_class;
+ } mic_entry;
+ 
++// the site's storage: a small probe chain instead of a single entry, so a
++// polymorphic site (two receiver classes alternating at one call) stops
++// thrashing. probe order is declaration order; a miss fills the first empty
++// way, and a full set evicts round-robin via the hand. ways stay valid
++// forever under the freeze seal (entries are read-only snapshots of sealed
++// tables), so eviction is a performance decision, never a correctness one.
++#define OK_MIC_WAYS 3
++
++typedef struct {
++  mic_entry ways[OK_MIC_WAYS];
++  uint8_t hand;
++} mic_cache;
++
+ typedef index_wrapper mic_slot;
+ 
+ enum {
+@@ -160,7 +173,7 @@ enum {
+ 
+ #define IS_MIC_VALID(mw) ((mw).errors == MIC_OK)
+ 
+-ARRAY_DECLARE_DEFAULT(mic_entries, mic_entry)
++ARRAY_DECLARE_DEFAULT(mic_caches, mic_cache)
+ 
+ // clang-format off
+ typedef enum {
+@@ -378,8 +391,31 @@ typedef enum {
+                          //                          exact-class probe, classof+identity fused, no global involved.
+                          //                          the operand must be a class value
+   OP_IS_LONG,            // 2w:   (p, A, B, C, q) -> r[A] = classof(q then k[B] otherwise r[B]) === (p then k[C] otherwise r[C]); ip += w
++  OP_JUMP_IF_CMP,        // 2w:   (p, A, B, C, Q, cmp) -> jump += A when (p == 1) == truthy(r[B] CMP (Q then k[C] otherwise r[C])),
++                         //                          CMP selected by the 3-bit cmp lane. the compare+jump fusion's
++                         //                          condition half: the compiler emits it for a DIRECT comparison in
++                         //                          an if/while condition, the bool never materializes in a named
++                         //                          register (the perform lands it in the lhs temp, which the jump
++                         //                          consumes). polarity p matches OP_JUMP_IF.
++  OP__COUNT,             // sentinel: the number of opcodes; must remain LAST (the threaded
++                         // dispatch table is sized by it).
+ } opcode;
+ 
++// the fused compare+jump's comparator lane. ids are stable bytecode surface:
++// they ride the 3-bit cmp field of OP_JUMP_IF_CMP.
++typedef enum {
++  CMP_EQUALS = 0,
++  CMP_NOT_EQUAL,
++  CMP_LESS,
++  CMP_LESS_EQUAL,
++  CMP_GREATER,
++  CMP_GREATER_EQUAL,
++  CMP_STRICT_EQUAL,
++  CMP_IS,
++} comparison;
++
++bool comparison_is_valid(uint8_t p_cmp);
++
+ // clang-format on
+ 
+ ARRAY_DECLARE_DEFAULT(code, word)
+@@ -425,6 +461,7 @@ ARRAY_DECLARE_DEFAULT(identifiers, string)
+ #define B_MASK UINT64_C(0x000000ffff000000)  // 16 bit width
+ #define C_MASK UINT64_C(0x00ffff0000000000)  // 16 bit width
+ #define Q_MASK UINT64_C(0x0100000000000000)  // 1 bit width
++#define CMP_MASK UINT64_C(0x0e00000000000000) // 3 bit width (OP_JUMP_IF_CMP's comparator)
+ 
+ #define OP_LOFFSET 0u
+ #define P_LOFFSET (OP_LOFFSET + 7u)
+@@ -432,6 +469,7 @@ ARRAY_DECLARE_DEFAULT(identifiers, string)
+ #define B_LOFFSET (A_LOFFSET + 16u)
+ #define C_LOFFSET (B_LOFFSET + 16u)
+ #define Q_LOFFSET (C_LOFFSET + 16u)
++#define CMP_LOFFSET (Q_LOFFSET + 1u)
+ 
+ #define a_MAX UINT8_MAX
+ #define b_MAX a_MAX
+@@ -542,6 +580,16 @@ static inline uint16_t Q_of(const word2 p_word) {
+   return (p_word & Q_MASK) >> Q_LOFFSET;
+ }
+ 
++static inline uint8_t cmp_of(const word2 p_word) {
++  return (uint8_t)((p_word & CMP_MASK) >> CMP_LOFFSET);
++}
++
++static inline word2 encode_OPPABCQC(
++    const opcode p_OP, const bool p_P, const uint16_t p_A, const uint16_t p_B, const uint16_t p_C, const bool p_Q,
++    const uint8_t p_cmp) {
++  return encode_OPPABCQ(p_OP, p_P, p_A, p_B, p_C, p_Q) | (((word2)p_cmp << CMP_LOFFSET) & CMP_MASK);
++}
++
+ // chunks reference their source by index into the vm's source table.
+ // UINT32_MAX = unstamped: a chunk compiled outside ok_run.
+ // none today, but the guard keeps reports honest instead of accidentally reading entry 0.
+@@ -552,11 +600,12 @@ struct chunk {
+   identifiers identifiers;
+   value_array constants;
+   source_info source_info;
+-  // per-site monomorphic inline caches, addressed by the mic word of
+-  // OP_INVOKE / OP_GET_MEMBER. the klass values are gc-traced with the
+-  // chunk (the function tracer walks them); the raw method pointers
+-  // beneath them are sound because class tables freeze at definition end.
+-  mic_entries mic;
++  // per-site polymorphic inline caches (the probe chain), addressed by the
++  // mic word of OP_INVOKE / OP_GET_MEMBER. the klass values are gc-traced
++  // with the chunk (the function tracer walks every way); the raw method
++  // pointers beneath them are sound because class tables freeze at
++  // definition end.
++  mic_caches mic;
+   // index into the vm's source table (VM_SOURCE_UNSTAMPED until ok_run stamps the freshly compiled tree).
+   // runtime reports read the frame's chunk's entry
+   uint32_t source_id;
+@@ -641,6 +690,7 @@ static inline uint32_t opcode_word_count(opcode p_op) {
+   case OP_METHOD_NOT_ASSIGNABLE_LONG:
+   case OP_STRICT_EQUAL_LONG:
+   case OP_IS_LONG:
++  case OP_JUMP_IF_CMP:
+     return 2;
+   case OP_GET_MEMBER:
+   case OP_INVOKE:
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 98c2e09..419d499 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -346,7 +346,8 @@ begin_context(compiler* p_compiler, ok_string_view p_name, function_type p_type,
+   compile_context ctx;
+   allocators* alloc = p_compiler->alloc;
+   object_specs s = {alloc, p_compiler->objects_store};
+-  object_string* obj_str = create_object_string(p_name, &s);
++  // function names intern: same spelling, same object, forever
++  object_string* obj_str = string_interner_intern(p_compiler->interner, p_name, &s);
+   if (obj_str == NULL) {
+     report_oom(p_compiler, p_author);
+     return false;
+@@ -635,6 +636,7 @@ void compiler_init(compiler* p_compiler, compiler_specs p_specs) {
+   p_compiler->panic = false;
+   p_compiler->alloc = p_specs.alloc;
+   p_compiler->globals_store = p_specs.globals_store;
++  p_compiler->interner = p_specs.interner;
+   compile_contexts_init(&p_compiler->contexts, p_compiler->alloc);
+ }
+ 
+@@ -702,9 +704,13 @@ compile_result compiler_compile(compiler* p_compiler, compile_specs p_specs) {
+ #endif // defined (OK_DEBUG_DUMP_CODE)
+   }
+ ret: {
++  // the between-runs reset: same wiring, fresh state. the interner rides
++  // along (a NULL here survived the cli's one-script-per-process shape and
++  // died on the embed test's second ok_run - the gates earn their keep).
+   compiler_specs specs = {.alloc = p_compiler->alloc,
+                           .objects_store = p_compiler->objects_store,
+-                          .globals_store = p_compiler->globals_store};
++                          .globals_store = p_compiler->globals_store,
++                          .interner = p_compiler->interner};
+   compiler_deinit(p_compiler);
+   compiler_init(p_compiler, specs);
+   return result;
+@@ -1424,7 +1430,9 @@ static constant add_name_constant(compiler* p_compiler, token p_name, ast_node*
+ // carry a synthesized spelling ("operator +") that no single token spans.
+ static constant add_string_constant(compiler* p_compiler, ok_string_view p_name, ast_node* p_author) {
+   object_specs specs = {p_compiler->alloc, p_compiler->objects_store};
+-  object_string* name = create_object_string(p_name, &specs);
++  // interned: the canonical spelling for this content, so member probes hit
++  // the pointer fast path and repeated spellings share one object.
++  object_string* name = string_interner_intern(p_compiler->interner, p_name, &specs);
+   if (name == NULL) {
+     report_oom(p_compiler, p_author);
+     return (constant){0, 0, CONSTANT_ALLOCATION_FAILED};
+@@ -1542,7 +1550,7 @@ static bool compile_class_declaration(compiler* p_compiler, ast_class_declaratio
+       return false;
+     }
+   }
+-  object_string* name_str = create_object_string(name_view, &obj_specs);
++  object_string* name_str = string_interner_intern(p_compiler->interner, name_view, &obj_specs);
+   if (name_str == NULL) {
+     report_oom(p_compiler, author);
+     return false;
+@@ -1937,7 +1945,7 @@ static location resolve_variable(compiler* p_compiler, const ok_string_view p_id
+   // binding. globals lose to statics.
+   if (current_context(p_compiler)->sees_statics) {
+     object_specs specs = {p_compiler->alloc, p_compiler->objects_store};
+-    object_string* name = create_object_string(p_identifier, &specs);
++    object_string* name = string_interner_intern(p_compiler->interner, p_identifier, &specs);
+     if (name == NULL) {
+       report_oom(p_compiler, p_author);
+       return invalid;
+@@ -1956,7 +1964,7 @@ static location resolve_variable(compiler* p_compiler, const ok_string_view p_id
+   // the global). captured enclosing names won above; globals lose to fields.
+   if (current_context(p_compiler)->sees_fields) {
+     object_specs specs = {p_compiler->alloc, p_compiler->objects_store};
+-    object_string* name = create_object_string(p_identifier, &specs);
++    object_string* name = string_interner_intern(p_compiler->interner, p_identifier, &specs);
+     if (name == NULL) {
+       report_oom(p_compiler, p_author);
+       return invalid;
+@@ -2100,7 +2108,7 @@ static lvalue resolve_lvalue(compiler* p_compiler, ast_expression* p_lvalue_expr
+       if (self.error == LOCATION_OK && self.kind == LOCATION_KIND_REGISTER && self.index == 0) {
+         object_specs specs = {p_compiler->alloc, p_compiler->objects_store};
+         ok_string_view name_view = ast_access_expression_name(access);
+-        object_string* name = create_object_string(name_view, &specs);
++        object_string* name = string_interner_intern(p_compiler->interner, name_view, &specs);
+         if (name == NULL) {
+           report_oom(p_compiler, author);
+           return (lvalue){LVALUE_INVALID};
+@@ -2131,7 +2139,7 @@ static lvalue resolve_lvalue(compiler* p_compiler, ast_expression* p_lvalue_expr
+     }
+     object_specs specs = {p_compiler->alloc, p_compiler->objects_store};
+     ok_string_view name_view = ast_access_expression_name(access);
+-    object_string* name = create_object_string(name_view, &specs);
++    object_string* name = string_interner_intern(p_compiler->interner, name_view, &specs);
+     if (name == NULL) {
+       report_oom(p_compiler, author);
+       return (lvalue){LVALUE_INVALID};
+@@ -2524,6 +2532,108 @@ static bool emit_incomplete_jump_if_set(
+   return true;
+ }
+ 
++// the fused condition lane (the compare+jump fusion's condition half, the
++// "branch no materialize" sizing): a DIRECT comparison as an if/while/for
++// condition emits one instruction instead of the binop's bool + OP_JUMP_IF
++// pair. the operands keep their natural homes - a local's register is used
++// as-is (the vm saves and restores it around the result), a constant rhs
++// rides the k-operand - so the fused shape adds zero staging. every other
++// condition shape (logical operators, negation, plain values) returns
++// UNSUPPORTED having emitted nothing, and the caller runs the generic path.
++typedef enum {
++  FUSED_CONDITION_UNSUPPORTED,
++  FUSED_CONDITION_OK,
++  FUSED_CONDITION_ERROR,
++} fused_condition_result;
++
++static fused_condition_result compile_fused_condition_jump(
++    compiler* p_compiler, ast_expression* p_condition, bool p_truthy, uint32_t* p_out, ast_node* p_author) {
++  if (p_condition->node.node_type != AST_INFIX_BINARY_EXPRESSION) {
++    return FUSED_CONDITION_UNSUPPORTED;
++  }
++  ast_infix_binary_expression* binexpr = (ast_infix_binary_expression*)p_condition;
++  comparison cmp;
++  switch (binexpr->_operator) {
++  case OPERATOR_BIN_EQUALS:
++    cmp = CMP_EQUALS;
++    break;
++  case OPERATOR_BIN_BANG_EQUAL:
++    cmp = CMP_NOT_EQUAL;
++    break;
++  case OPERATOR_BIN_LESS:
++    cmp = CMP_LESS;
++    break;
++  case OPERATOR_BIN_LESS_EQUAL:
++    cmp = CMP_LESS_EQUAL;
++    break;
++  case OPERATOR_BIN_GREATER:
++    cmp = CMP_GREATER;
++    break;
++  case OPERATOR_BIN_GREATER_EQUAL:
++    cmp = CMP_GREATER_EQUAL;
++    break;
++  case OPERATOR_BIN_STRICT_EQUALS:
++    cmp = CMP_STRICT_EQUAL;
++    break;
++  case OPERATOR_BIN_IS:
++    cmp = CMP_IS;
++    break;
++  default:
++    return FUSED_CONDITION_UNSUPPORTED;
++  }
++  register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
++  // temps for the operands the compiler cannot address in place (constants
++  // never load, locals keep their registers, expressions stage here)
++  _register lhs_dest;
++  if (!register_allocator_allocate_temp(regalloc, &lhs_dest)) {
++    report_oom(p_compiler, p_author);
++    return FUSED_CONDITION_ERROR;
++  }
++  expression_result lhs;
++  if (!compile_expression(p_compiler, binexpr->left, lhs_dest, 1, &lhs)) {
++    return FUSED_CONDITION_ERROR;
++  }
++  _register rhs_dest;
++  if (!register_allocator_allocate_temp(regalloc, &rhs_dest)) {
++    report_oom(p_compiler, p_author);
++    return FUSED_CONDITION_ERROR;
++  }
++  expression_result rhs;
++  if (!compile_expression(p_compiler, binexpr->right, rhs_dest, 1, &rhs)) {
++    return FUSED_CONDITION_ERROR;
++  }
++  // the lhs lands in a register (its temp, or the local it already is); the
++  // rhs may stay a constant - the same operand policy the value binops use.
++  if (!materialize_into_if_not_register(p_compiler, &lhs.value, lhs_dest, p_author)) {
++    return FUSED_CONDITION_ERROR;
++  }
++  bool is_rhs_const = false;
++  if (!materialize_into_if_not_common(
++          p_compiler, &is_rhs_const, LOCATION_KIND_CONSTANT, &rhs.value, rhs_dest, p_author)) {
++    return FUSED_CONDITION_ERROR;
++  }
++  if (lhs.value.index > B_MAX || rhs.value.index > C_MAX) {
++    // the 2w form carries 16 bit operands; a compile window this wide keeps
++    // the generic path (whose LONG variants exist) rather than growing a
++    // fused LONG spelling nobody has benched yet.
++    return FUSED_CONDITION_UNSUPPORTED;
++  }
++  *p_out = current_chunk(p_compiler)->code.count;
++  if (!emit_word2(p_compiler,
++                  encode_OPPABCQC(OP_JUMP_IF_CMP,
++                                  p_truthy,
++                                  0,
++                                  lhs.value.index,
++                                  rhs.value.index,
++                                  is_rhs_const,
++                                  (uint8_t)cmp),
++                  p_author)) {
++    report_oom(p_compiler, p_author);
++    return FUSED_CONDITION_ERROR;
++  }
++  return FUSED_CONDITION_OK;
++}
++
+ // defaults ladder guard: jump forward when the argument for parameter position
+ // p_position was supplied (frame->argc > position). patched with patch_jump_if,
+ // which preserves B (the position) while rewriting A.
+@@ -2593,7 +2703,10 @@ static bool patch_jump_if(
+   const uint16_t B = B_of(joined);
+   const uint16_t C = C_of(joined);
+   const bool Q = Q_of(joined);
+-  word2 patched = encode_OPPABCQ(op, p, jmp, B, C, Q);
++  // the cmp lane rides along untouched: encode_OPPABCQ zeroes it, so the
++  // original bits are re-or'd. every other 2w jump keeps those bits zero and
++  // re-oring zeros is a no-op - one patcher, both shapes.
++  word2 patched = encode_OPPABCQ(op, p, jmp, B, C, Q) | (joined & CMP_MASK);
+   words[0] = (word)(patched & UINT64_C(0xffffffff));
+   words[1] = (word)(patched >> 32u);
+   return true;
+@@ -2631,25 +2744,32 @@ static bool patch_jump_if_set(compiler* p_compiler,
+ }
+ 
+ bool compile_if_statement(compiler* p_compiler, ast_if_statement* p_if) {
+-  expression_result condition;
+-  _register condition_register;
+-  if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &condition_register)) {
+-    report_oom(p_compiler, (ast_node*)p_if);
+-    return false;
+-  }
+-  if (!compile_expression(p_compiler, p_if->condition, condition_register, 1, &condition)) {
+-    return false;
+-  }
+-  if (!materialize_into_if_not_register(p_compiler, &condition.value, condition_register, (ast_node*)p_if)) {
++  uint32_t cons_jump;
++  const fused_condition_result fused =
++      compile_fused_condition_jump(p_compiler, p_if->condition, false, &cons_jump, (ast_node*)p_if);
++  if (fused == FUSED_CONDITION_ERROR) {
+     return false;
+   }
+-  condition_register.error = REGISTER_OK;
+-  condition_register.index = condition.value.index;
+-  condition_register.flags = REGISTER_FLAG_NONE; // for all that it matters this is a temp
++  if (fused == FUSED_CONDITION_UNSUPPORTED) {
++    expression_result condition;
++    _register condition_register;
++    if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &condition_register)) {
++      report_oom(p_compiler, (ast_node*)p_if);
++      return false;
++    }
++    if (!compile_expression(p_compiler, p_if->condition, condition_register, 1, &condition)) {
++      return false;
++    }
++    if (!materialize_into_if_not_register(p_compiler, &condition.value, condition_register, (ast_node*)p_if)) {
++      return false;
++    }
++    condition_register.error = REGISTER_OK;
++    condition_register.index = condition.value.index;
++    condition_register.flags = REGISTER_FLAG_NONE; // for all that it matters this is a temp
+ 
+-  uint32_t cons_jump;
+-  if (!emit_incomplete_jump_if(p_compiler, false, condition_register, &cons_jump, (ast_node*)p_if)) {
+-    return false;
++    if (!emit_incomplete_jump_if(p_compiler, false, condition_register, &cons_jump, (ast_node*)p_if)) {
++      return false;
++    }
+   }
+ 
+   if (!compile_statement(p_compiler, p_if->consequence)) {
+@@ -2708,26 +2828,33 @@ bool compile_while_statement(compiler* p_compiler, ast_while_statement* p_while)
+   CTX.handlers_at_entry = ctx->active_handlers;
+   chunk* chunk = current_chunk(p_compiler);
+   const uint32_t loop_start = chunk->code.count;
+-  expression_result condition;
+-  _register condition_reg;
+-  if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &condition_reg)) {
+-    report_oom(p_compiler, (ast_node*)p_while);
+-    return false;
+-  }
+-  if (!compile_expression(p_compiler, p_while->condition, condition_reg, 1, &condition)) {
+-    return false;
+-  }
+-  if (!materialize_into_if_not_register(p_compiler, &condition.value, condition_reg, (ast_node*)p_while)) {
++  uint32_t exit_jmp;
++  const fused_condition_result fused =
++      compile_fused_condition_jump(p_compiler, p_while->condition, false, &exit_jmp, (ast_node*)p_while);
++  if (fused == FUSED_CONDITION_ERROR) {
+     return false;
+   }
++  if (fused == FUSED_CONDITION_UNSUPPORTED) {
++    expression_result condition;
++    _register condition_reg;
++    if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &condition_reg)) {
++      report_oom(p_compiler, (ast_node*)p_while);
++      return false;
++    }
++    if (!compile_expression(p_compiler, p_while->condition, condition_reg, 1, &condition)) {
++      return false;
++    }
++    if (!materialize_into_if_not_register(p_compiler, &condition.value, condition_reg, (ast_node*)p_while)) {
++      return false;
++    }
+ 
+-  condition_reg.error = REGISTER_OK;
+-  condition_reg.index = condition.value.index;
+-  condition_reg.flags = REGISTER_FLAG_NONE;
++    condition_reg.error = REGISTER_OK;
++    condition_reg.index = condition.value.index;
++    condition_reg.flags = REGISTER_FLAG_NONE;
+ 
+-  uint32_t exit_jmp;
+-  if (!emit_incomplete_jump_if(p_compiler, false, condition_reg, &exit_jmp, (ast_node*)p_while)) {
+-    return false;
++    if (!emit_incomplete_jump_if(p_compiler, false, condition_reg, &exit_jmp, (ast_node*)p_while)) {
++      return false;
++    }
+   }
+ 
+   if (!compile_statement(p_compiler, p_while->body)) {
+@@ -2778,27 +2905,36 @@ bool compile_for_statement(compiler* p_compiler, ast_for_statement* p_for) {
+   uint32_t exit_jump;
+   const uint32_t loop_start = chunk->code.count;
+   if (p_for->condition != NULL) {
+-    expression_result condition;
+-    _register condition_reg;
+-    if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &condition_reg)) {
+-      report_oom(p_compiler, (ast_node*)p_for);
+-      return false;
+-    }
+-    if (!compile_expression(p_compiler, p_for->condition, condition_reg, 1, &condition)) {
+-      goto fail;
+-    }
+-    if (!materialize_into_if_not_register(p_compiler, &condition.value, condition_reg, (ast_node*)p_for)) {
++    const fused_condition_result fused =
++        compile_fused_condition_jump(p_compiler, p_for->condition, false, &exit_jump, (ast_node*)p_for->condition);
++    if (fused == FUSED_CONDITION_ERROR) {
+       goto fail;
+     }
++    if (fused == FUSED_CONDITION_OK) {
++      is_exit_set = true;
++    } else {
++      expression_result condition;
++      _register condition_reg;
++      if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &condition_reg)) {
++        report_oom(p_compiler, (ast_node*)p_for);
++        return false;
++      }
++      if (!compile_expression(p_compiler, p_for->condition, condition_reg, 1, &condition)) {
++        goto fail;
++      }
++      if (!materialize_into_if_not_register(p_compiler, &condition.value, condition_reg, (ast_node*)p_for)) {
++        goto fail;
++      }
+ 
+-    condition_reg.error = REGISTER_OK;
+-    condition_reg.index = condition.value.index;
+-    condition_reg.flags = REGISTER_FLAG_NONE;
++      condition_reg.error = REGISTER_OK;
++      condition_reg.index = condition.value.index;
++      condition_reg.flags = REGISTER_FLAG_NONE;
+ 
+-    if (!emit_incomplete_jump_if(p_compiler, false, condition_reg, &exit_jump, (ast_node*)p_for->condition)) {
+-      goto fail;
++      if (!emit_incomplete_jump_if(p_compiler, false, condition_reg, &exit_jump, (ast_node*)p_for->condition)) {
++        goto fail;
++      }
++      is_exit_set = true;
+     }
+-    is_exit_set = true;
+   }
+   if (p_for->update != NULL) {
+     CTX.continue_forward = true;
+@@ -3369,6 +3505,11 @@ static bool compile_string_expression(compiler* p_compiler,
+   }
+   allocators* alloc = p_compiler->alloc;
+   object_specs s = {alloc, p_compiler->objects_store};
++  // literals stay UN-interned: === is word identity (C11) and identical
++  // literals must remain distinct words. interning covers NAMES (member,
++  // class, method spellings) - the lookup lane - never values. (interning
++  // literals too would flip `"a" === "a"` to true: a contract change that
++  // needs Q's ruling, not a perf patch's side effect.)
+   object_string* object_str = create_object_string(parsed_str, &s);
+   if (object_str == NULL) {
+     report_oom(p_compiler, (ast_node*)p_string);
+diff --git a/src/okcompiler.h b/src/okcompiler.h
+index f558601..dd88fdf 100644
+--- a/src/okcompiler.h
++++ b/src/okcompiler.h
+@@ -7,6 +7,7 @@
+ #include "okfwd.h"
+ #include "okglobals_store.h"
+ #include "okindex.h"
++#include "okintern.h"
+ #include "okmap.h"
+ #include "okobject.h"
+ #include "okobject_store.h"
+@@ -249,6 +250,10 @@ struct compiler {
+   allocators* alloc;
+   object_store* objects_store;
+   globals_store* globals_store;
++  // the string interner: every compiler-made string constant goes through
++  // it, so member/class/method names canonicalize and runtime probes hit
++  // the pointer fast path. the table outlives the compiler (ok owns both).
++  string_interner* interner;
+   compile_contexts contexts;
+   bool had_error;
+   bool panic;
+@@ -270,6 +275,7 @@ typedef struct {
+   allocators* alloc;
+   object_store* objects_store;
+   globals_store* globals_store;
++  string_interner* interner;
+ } compiler_specs;
+ 
+ typedef struct {
+diff --git a/src/okdebug.c b/src/okdebug.c
+index db7d518..2543508 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -121,8 +121,21 @@ static const char* const OPCODE_NAMES[] = {
+     "STRICT_EQUAL_LONG",
+     "IS",
+     "IS_LONG",
++    "JUMP_IF_CMP",
++};
++typedef char opcode_names_in_sync[(sizeof(OPCODE_NAMES) / sizeof(OPCODE_NAMES[0]) == (size_t)OP__COUNT) ? 1 : -1];
++
++// the fused comparator lane's spellings, index-parallel to the comparison enum.
++static const char* const COMPARISON_NAMES[] = {
++    "==",
++    "!=",
++    "<",
++    "<=",
++    ">",
++    ">=",
++    "===",
++    "is",
+ };
+-typedef char opcode_names_in_sync[(sizeof(OPCODE_NAMES) / sizeof(OPCODE_NAMES[0]) == (size_t)OP_IS_LONG + 1) ? 1 : -1];
+ 
+ static const char* binop_symbol(const opcode p_op) {
+   switch (p_op) {
+@@ -336,6 +349,16 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+   case OP_JUMP_IF_SET:
+     printf("-> %04u when %s(r%u); r%u = r%u", p_offset + 2 + A, p ? "truthy" : "falsy", B, C, B);
+     break;
++  case OP_JUMP_IF_CMP: {
++    const uint8_t cmp = cmp_of(joined);
++    const char* spelling = cmp <= (uint8_t)CMP_IS ? COMPARISON_NAMES[cmp] : "<corrupt>";
++    if (q) {
++      printf("-> %04u when %s(r%u %s k%u)", p_offset + 2 + A, p ? "truthy" : "falsy", B, spelling, C);
++    } else {
++      printf("-> %04u when %s(r%u %s r%u)", p_offset + 2 + A, p ? "truthy" : "falsy", B, spelling, C);
++    }
++    break;
++  }
+   case OP_LOAD_NULL:
+     printf("null -> r%u x%u", A, B);
+     break;
+diff --git a/src/okgc.c b/src/okgc.c
+index 0365012..c664226 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -28,6 +28,7 @@ void gc_init(gc* p_gc, object_store* p_heap, allocators* p_alloc) {
+   p_gc->globals_store = NULL;
+   p_gc->object_store = p_heap;
+   p_gc->vm = NULL;
++  p_gc->interner = NULL;
+   p_gc->alloc = p_alloc;
+   p_gc->raw_alloc_wrapper = create_raw_allocators_wrapper(p_alloc->raw_allocators);
+   p_gc->allocated_bytes = 0;
+@@ -56,6 +57,7 @@ void gc_deinit(gc* p_gc) {
+   p_gc->globals_store = NULL;
+   p_gc->object_store = NULL;
+   p_gc->vm = NULL;
++  p_gc->interner = NULL;
+   p_gc->allocated_bytes = 0;
+   p_gc->next = 1024 * 1024; // 1mb
+   p_gc->is_paused = true;
+@@ -135,6 +137,10 @@ void gc_watch_globals(gc* p_gc, globals_store* p_globals) {
+   p_gc->globals_store = p_globals;
+ }
+ 
++void gc_watch_interner(gc* p_gc, string_interner* p_interner) {
++  p_gc->interner = p_interner;
++}
++
+ bool gc_collect(gc* p_gc, size_t p_predict, size_t p_old) {
+   p_gc->allocated_bytes += p_predict - p_old;
+ 
+@@ -254,6 +260,19 @@ static bool mark_globals_store(gc* p_gc) {
+   return true;
+ }
+ 
++static bool mark_interner(gc* p_gc) {
++  // strong roots: every canonical string is immortal by design (see the
++  // lifetime policy on the struct) - identical to the lifetimes they already
++  // hold as chunk constants or class-table keys.
++  for (uint32_t i = 0; i < p_gc->interner->capacity; ++i) {
++    object_string* entry = p_gc->interner->slots[i];
++    if (entry != NULL && !mark_value(p_gc, OBJECT_AS_VALUE(entry))) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ static bool mark(gc* p_gc) {
+   if (p_gc->vm != NULL && !mark_vm(p_gc)) {
+     return false;
+@@ -264,6 +283,9 @@ static bool mark(gc* p_gc) {
+   if (p_gc->globals_store != NULL && !mark_globals_store(p_gc)) {
+     return false;
+   }
++  if (p_gc->interner != NULL && !mark_interner(p_gc)) {
++    return false;
++  }
+   for (uint32_t i = 0; i < p_gc->guard_count; ++i) {
+     if (!mark_value(p_gc, p_gc->guarded[i])) {
+       return false;
+@@ -364,10 +386,13 @@ static bool trace_object(gc* p_gc, object* p_object) {
+     }
+     // the per-site inline caches hold class values (and through them, the
+     // frozen tables their raw entry pointers index): the chunk owns their
+-    // rooting, a class can outlive every register that named it.
++    // rooting, a class can outlive every register that named it. every way
++    // of the probe chain roots its own key.
+     for (uint32_t i = 0; i < fu->chunk.mic.count; ++i) {
+-      if (!mark_value(p_gc, fu->chunk.mic.data[i].klass)) {
+-        return false;
++      for (uint32_t w = 0; w < OK_MIC_WAYS; ++w) {
++        if (!mark_value(p_gc, fu->chunk.mic.data[i].ways[w].klass)) {
++          return false;
++        }
+       }
+     }
+     break;
+diff --git a/src/okgc.h b/src/okgc.h
+index c2416ae..97305ff 100644
+--- a/src/okgc.h
++++ b/src/okgc.h
+@@ -2,6 +2,7 @@
+ #define OK_GC_H
+ 
+ #include "okfwd.h"
++#include "okintern.h"
+ #include "okvalue.h"
+ 
+ #include <stdbool.h>
+@@ -19,6 +20,7 @@ struct gc {
+   compiler* compiler;
+   object_store* object_store;
+   globals_store* globals_store;
++  string_interner* interner;
+   grays grays;
+   // embedder-owned strong references (ok_root). unlike the guard stack these
+   // are long lived and unordered, so: growable (raw allocators), null-slot + freelist recycling.
+@@ -55,5 +57,6 @@ void gc_resume(gc* p_gc);
+ void gc_watch_vm(gc* p_gc, vm* p_vm);
+ void gc_watch_compiler(gc* p_gc, compiler* p_compiler);
+ void gc_watch_globals(gc* p_gc, globals_store* p_globals);
++void gc_watch_interner(gc* p_gc, string_interner* p_interner);
+ 
+ #endif // OK_GC_H
+diff --git a/src/okintern.c b/src/okintern.c
+new file mode 100644
+index 0000000..f3c3d43
+--- /dev/null
++++ b/src/okintern.c
+@@ -0,0 +1,147 @@
++#include <stddef.h>
++#include <string.h>
++
++#include "okintern.h"
++#include "okobject.h"
++
++// the set's load factor ceiling: grow at 2/3 full, same family as okmap.
++#define INTERN_MAX_LOAD_NUM 2
++#define INTERN_MAX_LOAD_DEN 3
++
++static uint32_t interner_capacity_for(uint32_t p_count) {
++  uint32_t capacity = 8;
++  while (capacity * INTERN_MAX_LOAD_NUM / INTERN_MAX_LOAD_DEN <= p_count) {
++    capacity <<= 1u;
++  }
++  return capacity;
++}
++
++void string_interner_init(string_interner* p_interner, allocators* p_alloc) {
++  p_interner->slots = NULL;
++  p_interner->hashes = NULL;
++  p_interner->count = 0;
++  p_interner->capacity = 0;
++  p_interner->alloc = p_alloc;
++}
++
++void string_interner_deinit(string_interner* p_interner) {
++  // entries themselves are object_store-owned; only the index dies here
++  if (p_interner->slots != NULL) {
++    p_interner->alloc->release(p_interner->alloc, p_interner->slots);
++    p_interner->slots = NULL;
++  }
++  if (p_interner->hashes != NULL) {
++    p_interner->alloc->release(p_interner->alloc, p_interner->hashes);
++    p_interner->hashes = NULL;
++  }
++  p_interner->count = 0;
++  p_interner->capacity = 0;
++}
++
++// probe for p_hash + p_view in a table of p_capacity slots. returns the slot
++// index: occupied + content-equal = hit; the first empty slot = miss target.
++static uint32_t interner_probe(object_string** p_slots,
++                               const hash_t* p_hashes,
++                               uint32_t p_capacity,
++                               hash_t p_hash,
++                               ok_string_view p_view) {
++  uint32_t i = (uint32_t)p_hash & (p_capacity - 1u);
++  for (;;) {
++    object_string* entry = p_slots[i];
++    if (entry == NULL) {
++      return i; // miss
++    }
++    if (p_hashes[i] == p_hash) {
++      const uint64_t length = ok_string_view_get_length(&p_view);
++      if (string_get_length(&entry->string) == length &&
++          memcmp(entry->string.chars, p_view.chars, length) == 0) {
++        return i; // hit
++      }
++    }
++    i = (i + 1u) & (p_capacity - 1u);
++  }
++}
++
++static bool interner_grow(string_interner* p_interner) {
++  const uint32_t new_capacity = interner_capacity_for(p_interner->count);
++  object_string** new_slots = (object_string**)p_interner->alloc->allocate(p_interner->alloc, new_capacity * sizeof(object_string*));
++  hash_t* new_hashes = (hash_t*)p_interner->alloc->allocate(p_interner->alloc, new_capacity * sizeof(hash_t));
++  if (new_slots == NULL || new_hashes == NULL) {
++    if (new_slots != NULL) {
++      p_interner->alloc->release(p_interner->alloc, new_slots);
++    }
++    if (new_hashes != NULL) {
++      p_interner->alloc->release(p_interner->alloc, new_hashes);
++    }
++    return false;
++  }
++  for (uint32_t i = 0; i < new_capacity; ++i) {
++    new_slots[i] = NULL;
++  }
++  // re-insert from the cached hashes: stored strings are never re-hashed
++  for (uint32_t i = 0; i < p_interner->capacity; ++i) {
++    const object_string* entry = p_interner->slots[i];
++    if (entry == NULL) {
++      continue;
++    }
++    const uint32_t j = (uint32_t)p_interner->hashes[i] & (new_capacity - 1u);
++    // the new table is fresh: the first probe miss is the insert point
++    uint32_t k = j;
++    while (new_slots[k] != NULL) {
++      k = (k + 1u) & (new_capacity - 1u);
++    }
++    new_slots[k] = (object_string*)entry;
++    new_hashes[k] = p_interner->hashes[i];
++  }
++  if (p_interner->slots != NULL) {
++    p_interner->alloc->release(p_interner->alloc, p_interner->slots);
++  }
++  if (p_interner->hashes != NULL) {
++    p_interner->alloc->release(p_interner->alloc, p_interner->hashes);
++  }
++  p_interner->slots = new_slots;
++  p_interner->hashes = new_hashes;
++  p_interner->capacity = new_capacity;
++  return true;
++}
++
++object_string* string_interner_find(const string_interner* p_interner, ok_string_view p_view) {
++  if (p_interner->capacity == 0) {
++    return NULL;
++  }
++  const hash_t hash = default_hash_str(p_view);
++  const uint32_t i = interner_probe(p_interner->slots,
++                                    p_interner->hashes,
++                                    p_interner->capacity,
++                                    hash,
++                                    p_view);
++  return p_interner->slots[i];
++}
++
++object_string* string_interner_intern(string_interner* p_interner, ok_string_view p_view, object_specs* p_specs) {
++  // growth first when needed, so the insert below never grows mid-flight
++  if (p_interner->capacity == 0 ||
++      (p_interner->count + 1u) * INTERN_MAX_LOAD_DEN > p_interner->capacity * INTERN_MAX_LOAD_NUM) {
++    if (!interner_grow(p_interner)) {
++      return NULL;
++    }
++  }
++  const hash_t hash = default_hash_str(p_view);
++  uint32_t i = interner_probe(p_interner->slots, p_interner->hashes, p_interner->capacity, hash, p_view);
++  if (p_interner->slots[i] != NULL) {
++    return p_interner->slots[i];
++  }
++  // miss: create the canonical object, then insert. the creation may collect
++  // (aggressive mode); the new string is unrooted until the slot assignment
++  // below, and the assignment itself cannot allocate.
++  object_string* fresh = create_object_string(p_view, p_specs);
++  if (fresh == NULL) {
++    return NULL;
++  }
++  // the probe index is stale-proof: nothing inserted between probe and here
++  // (the only allocation was the string itself, and inserts are ours alone)
++  p_interner->slots[i] = fresh;
++  p_interner->hashes[i] = hash;
++  p_interner->count += 1u;
++  return fresh;
++}
+diff --git a/src/okintern.h b/src/okintern.h
+new file mode 100644
+index 0000000..6b11148
+--- /dev/null
++++ b/src/okintern.h
+@@ -0,0 +1,54 @@
++#ifndef OK_INTERN_H
++#define OK_INTERN_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "okobject.h"
++#include "okutils.h"
++
++// the string interner: canonicalizes compiler-made strings (identifiers,
++// literals, member names, the vm's startup names) so name lookups can hit
++// pointer equality before falling back to content comparison. RUNTIME-built
++// strings (concatenation, number formatting, host-created values) are never
++// interned: their population is unbounded and equality stays content-based,
++// which the probe fast paths handle by falling through on pointer mismatch.
++//
++// lifetime policy: the table holds STRONG references and the gc roots it
++// (gc_watch_interner / mark_interner). interned strings are therefore
++// immortal - identical to the lifetime they already have as chunk constants
++// or class-table keys, so this changes no observable lifetime. when the
++// pipeline-isolation spec lands, interning moves to its commit phase and the
++// table becomes the module registry's canonical-name source.
++
++typedef struct {
++  // open-addressed set of canonical object_string*: parallel slots + cached
++  // hashes, linear probing, power-of-two capacity, no tombstones (eviction
++  // never happens - the table only grows).
++  object_string** slots;
++  hash_t* hashes; // cached; garbage in empty slots, read after the pointer check
++  uint32_t count;
++  uint32_t capacity; // always a power of two (or zero pre-first-insert)
++  allocators* alloc;
++} string_interner;
++
++void string_interner_init(string_interner* p_interner, allocators* p_alloc);
++void string_interner_deinit(string_interner* p_interner);
++
++// the canonical string for p_view: an existing entry when the content is
++// already interned, otherwise a freshly created one (created + inserted
++// through p_specs). the returned string is rooted by the interner itself.
++//
++// gc discipline: the insert may grow the table, whose allocation can collect;
++// the fresh string is created BEFORE inserting and is NOT yet reachable, so
++// callers that create-then-intern through a cold path must guard across this
++// call. (the compiler sites follow the existing add_string_constant shape and
++// already do; the vm's singleton sites assign into rooted slots immediately.)
++object_string* string_interner_intern(string_interner* p_interner, ok_string_view p_view, object_specs* p_specs);
++
++// probe only: the canonical string when one exists, NULL otherwise. no
++// allocation, no side effects - the freeze pass and diagnostics use this to
++// reuse spellings without creating.
++object_string* string_interner_find(const string_interner* p_interner, ok_string_view p_view);
++
++#endif // OK_INTERN_H
+diff --git a/src/okobject.c b/src/okobject.c
+index 5992572..d68e5e4 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -61,6 +61,11 @@ bool map_value_key_equals(value p_probe, value p_key) {
+     if (!IS_VALUE_STRING(p_key)) {
+       return false;
+     }
++    // interned strings (literals, and everything else the compiler made)
++    // settle here; runtime-built strings fall through to the content compare
++    if (p_probe == p_key) {
++      return true;
++    }
+     // the cached-hash fast reject already ran in find_slot (hashes[i] == hash)
+     const object_string* left = VALUE_AS_STRING(p_probe);
+     const object_string* right = VALUE_AS_STRING(p_key);
+@@ -386,9 +391,12 @@ object_map* create_object_map(object_specs* p_specs) {
+ #define SM_KEY_IS_EMPTY(k) ((k) == NULL)
+ #define SM_KEY_SET_EMPTY(k) (*(k) = NULL)
+ #define SM_PROBE_HASH(p) ((p)->hash)
++// interned keys (everything the compiler or the vm startup made) settle on
++// the pointer compare; runtime-built probes fall through to content.
+ #define SM_PROBE_MATCHES(p, k)                                                                                \
+-  (string_get_length(&(p)->string) == string_get_length(&(k)->string) &&                                     \
+-   memcmp((p)->string.chars, (k)->string.chars, string_get_length(&(p)->string)) == 0)
++  ((p) == (k) ||                                                                                              \
++   (string_get_length(&(p)->string) == string_get_length(&(k)->string) &&                                     \
++    memcmp((p)->string.chars, (k)->string.chars, string_get_length(&(p)->string)) == 0))
+ #define SM_KEY_CLONE(p, a) (p)
+ #define SM_NO_DEINIT(k, a) ((void)0)
+ 
+diff --git a/src/okvm.c b/src/okvm.c
+index 7646daf..476de59 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -110,6 +110,7 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->alloc = p_specs.alloc;
+   p_vm->objects_store = p_specs.objects_store;
+   p_vm->globals_store = p_specs.globals_store;
++  p_vm->interner = p_specs.interner;
+   vm_sources_init(&p_vm->sources, p_vm->alloc);
+   p_vm->retain_source = false;
+   p_vm->ok = p_specs.ok;
+@@ -192,11 +193,18 @@ void vm_deinit(vm* p_vm) {
+ // OK_AGGRESSIVE_GC by conversion_private_error.ok; guard pushes are checked
+ // now, and the cached names below need no guard at all (their assignment is
+ // the rooting - nothing allocates between the two).
++// the canonical spelling for a c-literal name, interned: matches the
++// compiler's constants by pointer (the probe fast paths hit on ==).
++static object_string* intern_vm_string(vm* p_vm, const char* p_chars) {
++  object_specs specs = {p_vm->alloc, p_vm->objects_store};
++  return string_interner_intern(
++      p_vm->interner, ok_create_string_view(p_chars, OK_STRING_VIEW_CALCULATE_LENGTH, true), &specs);
++}
++
+ bool vm_init_singletons(vm* p_vm) {
+   object_specs specs = {p_vm->alloc, p_vm->objects_store};
+   gc* gc = p_vm->alloc->gc;
+-  object_string* object_name =
+-      create_object_string(ok_create_string_view("Object", OK_STRING_VIEW_CALCULATE_LENGTH, true), &specs);
++  object_string* object_name = intern_vm_string(p_vm, "Object");
+   if (object_name == NULL) {
+     return false;
+   }
+@@ -210,8 +218,7 @@ bool vm_init_singletons(vm* p_vm) {
+   }
+   // the root is born complete: no fields, no methods, frozen empty.
+   object_class_freeze(p_vm->object_singleton);
+-  object_string* class_name =
+-      create_object_string(ok_create_string_view("Class", OK_STRING_VIEW_CALCULATE_LENGTH, true), &specs);
++  object_string* class_name = intern_vm_string(p_vm, "Class");
+   if (class_name == NULL) {
+     return false;
+   }
+@@ -227,10 +234,8 @@ bool vm_init_singletons(vm* p_vm) {
+   // the cached lookup names: no guard window exists for any of them - the
+   // assignment into the vm IS the rooting (mark_vm scans these slots, and
+   // nothing allocates between assignment and the next possible collect).
+-  p_vm->static_call_name =
+-      create_object_string(ok_create_string_view("operator ()", OK_STRING_VIEW_CALCULATE_LENGTH, true), &specs);
+-  p_vm->init_method_name =
+-      create_object_string(ok_create_string_view("init", OK_STRING_VIEW_CALCULATE_LENGTH, true), &specs);
++  p_vm->static_call_name = intern_vm_string(p_vm, "operator ()");
++  p_vm->init_method_name = intern_vm_string(p_vm, "init");
+   // the operator probe names: one per class_operator, from the canonical
+   // spelling table. [CALL] aliases static_call_name (same spelling), so it is
+   // skipped here and patched in after the loop.
+@@ -241,11 +246,7 @@ bool vm_init_singletons(vm* p_vm) {
+     if (p_vm->static_call_name == NULL || p_vm->init_method_name == NULL) {
+       break;
+     }
+-    p_vm->op_names[i] =
+-        create_object_string(ok_create_string_view(class_operator_spelling((class_operator)i),
+-                                                   OK_STRING_VIEW_CALCULATE_LENGTH,
+-                                                   true),
+-                             &specs);
++    p_vm->op_names[i] = intern_vm_string(p_vm, class_operator_spelling((class_operator)i));
+   }
+   p_vm->op_names[CLASS_OP_CALL] = p_vm->static_call_name;
+   // the seven builtin singletons (C10): under Object, created UNFROZEN here -
+@@ -254,11 +255,7 @@ bool vm_init_singletons(vm* p_vm) {
+   // the name rides the guard stack only across the class creation that
+   // adopts it.
+   for (uint32_t i = 0; i < OK_BUILTIN_COUNT; ++i) {
+-    object_string* builtin_name =
+-        create_object_string(ok_create_string_view(builtin_class_name((builtin_class_id)i),
+-                                                   OK_STRING_VIEW_CALCULATE_LENGTH,
+-                                                   true),
+-                             &specs);
++    object_string* builtin_name = intern_vm_string(p_vm, builtin_class_name((builtin_class_id)i));
+     if (builtin_name == NULL) {
+       break;
+     }
+@@ -904,8 +901,13 @@ perform_equal(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_de
+   }
+   switch (VALUE_TAG(lhs)) {
+   case TAG_OBJECT_MASK: {
+-    // value equality for strings: equal content, not common prefix.
++    // value equality for strings: equal content, not common prefix. interned
++    // operands (literals, compiler names) settle on the pointer compare first.
+     if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(p_rhs)) {
++      if (lhs == p_rhs) {
++        p_reg->array.data[base + p_dest] = BOOL_AS_VALUE(true);
++        return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
++      }
+       const object_string* left = VALUE_AS_STRING(lhs);
+       const object_string* right = VALUE_AS_STRING(p_rhs);
+       const uint64_t left_length = string_get_length(&left->string);
+@@ -944,8 +946,12 @@ perform_not_equal(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t
+   }
+   switch (VALUE_TAG(lhs)) {
+   case TAG_OBJECT_MASK: {
+-    // value equality for strings, negated - same length+memcmp shape.
++    // value equality for strings, negated - same pointer/content shape.
+     if (IS_VALUE_STRING(lhs) && IS_VALUE_STRING(p_rhs)) {
++      if (lhs == p_rhs) {
++        p_reg->array.data[base + p_dest] = BOOL_AS_VALUE(false);
++        return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
++      }
+       const object_string* left = VALUE_AS_STRING(lhs);
+       const object_string* right = VALUE_AS_STRING(p_rhs);
+       const uint64_t left_length = string_get_length(&left->string);
+@@ -2403,9 +2409,11 @@ static bool copy_proto_fill(vm* p_vm, object_function* p_dest, object_function*
+   if (!upvalue_descriptor_array_append_n(&p_dest->upvalues, p_src->upvalues.data, p_src->upvalues.count)) {
+     return false;
+   }
+-  const mic_entry empty_mic = {NULL_AS_VALUE(), NULL, 0, 0};
++  // fresh mic slots for every site: each generation's caches start cold
++  // (R18). every way empty, hand rewound.
++  const mic_cache empty_cache = {{{NULL_AS_VALUE(), NULL, 0, 0, 0}}, 0};
+   for (uint32_t i = 0; i < src->mic.count; ++i) {
+-    if (!mic_entries_append(&dest->mic, empty_mic)) {
++    if (!mic_caches_append(&dest->mic, empty_cache)) {
+       return false;
+     }
+   }
+@@ -2726,6 +2734,73 @@ static interpret_result error_interpret_result(void) {
+   return result;
+ }
+ 
++// fill one way of a site's probe chain: the first empty way, else the
++// round-robin victim. callers arrive here only on a probe miss, so the key
++// is absent by construction. eviction is sound forever: entries are
++// read-only snapshots of frozen tables.
++static void mic_fill(mic_cache* p_cache, const mic_entry* p_entry) {
++  for (uint32_t w = 0; w < OK_MIC_WAYS; ++w) {
++    if (p_cache->ways[w].klass == NULL_AS_VALUE()) {
++      p_cache->ways[w] = *p_entry;
++      return;
++    }
++  }
++  p_cache->ways[p_cache->hand % OK_MIC_WAYS] = *p_entry;
++  p_cache->hand = (uint8_t)((p_cache->hand + 1u) % OK_MIC_WAYS);
++}
++
++// the fused compare's comparator lane: dispatches to the SAME perform the
++// value binops use, by comparator id. lives outside the dispatch loop so its
++// switch cannot be mistaken for dispatch control flow by transform tooling
++// (and reads better): every arm returns directly.
++static interpret_result perform_comparison(
++    vm* p_vm, register_file* p_reg, call_frame* p_frame, uint8_t p_cmp, uint16_t p_dest, value p_lhs, value p_rhs) {
++  switch (p_cmp) {
++  case CMP_EQUALS:
++    return perform_equal(p_vm, p_reg, p_frame, p_dest, p_lhs, p_rhs);
++  case CMP_NOT_EQUAL:
++    return perform_not_equal(p_vm, p_reg, p_frame, p_dest, p_lhs, p_rhs);
++  case CMP_LESS:
++    return perform_less(p_vm, p_reg, p_frame, p_dest, p_lhs, p_rhs);
++  case CMP_LESS_EQUAL:
++    return perform_less_equal(p_vm, p_reg, p_frame, p_dest, p_lhs, p_rhs);
++  case CMP_GREATER:
++    return perform_greater(p_vm, p_reg, p_frame, p_dest, p_lhs, p_rhs);
++  case CMP_GREATER_EQUAL:
++    return perform_greater_equal(p_vm, p_reg, p_frame, p_dest, p_lhs, p_rhs);
++  case CMP_STRICT_EQUAL:
++    return perform_strict_equal(p_vm, p_reg, p_frame, p_dest, p_lhs, p_rhs);
++  case CMP_IS:
++  default:
++    return perform_is(p_vm, p_reg, p_frame, p_dest, p_lhs, p_rhs);
++  }
++}
++
++// threaded dispatch (the labels-as-values GNU extension): each handler ends
++// in its own indirect jump through the opcode table, so the cpu's branch
++// predictor learns per-site targets instead of fighting over one shared
++// switch branch. enabled by OK_THREADED_DISPATCH - cmake's GNU auto-detect
++// sets it unless OK_PURE is on, and any -D hand-build can too. the trace
++// build keeps the canonical switch loop (OK_TRACE_EXECUTION wants the loop
++// top on every instruction, and perf is not its concern); anything without
++// the extension compiles the switch exactly as before. the two modes share
++// one handler body: CASE() spells the label, DISPATCH() leaves the handler.
++#if defined(OK_THREADED_DISPATCH) && defined(__GNUC__) && !defined(OK_TRACE_EXECUTION)
++#define OK_DISPATCH_THREADED 1
++#endif
++
++#ifdef OK_DISPATCH_THREADED
++#define CASE(op) L_##op
++#define DISPATCH()                                                                                                       \
++  do {                                                                                                                   \
++    instruction = READ_WORD();                                                                                           \
++    goto *ok_dispatch_table[op_of(instruction)];                                                                         \
++  } while (0)
++#else
++#define CASE(op) case op
++#define DISPATCH() break
++#endif
++
+ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+   execution_state* exe = p_vm->current_execution_state;
+   call_frame* frame = &exe->call_stack.data[exe->call_stack.count - 1];
+@@ -2776,6 +2851,141 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+     frame->ip = ip;                                                                                                     \
+   } while (0)
+ 
++#ifdef OK_DISPATCH_THREADED
++// one label per opcode, designated by enum value so the mapping cannot rot
++// with the enum's order (a hole stays NULL and fails loudly on first dispatch;
++// OK_PARANOID checks the whole table up front).
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wpedantic" // &&label is the extension being opted into
++static void* ok_dispatch_table[OP__COUNT] = {
++  [OP_NOP] = &&L_OP_NOP,
++  [OP_MOVE] = &&L_OP_MOVE,
++  [OP_MOVE_LONG] = &&L_OP_MOVE_LONG,
++  [OP_LOAD_CONSTANT] = &&L_OP_LOAD_CONSTANT,
++  [OP_LOAD_CONSTANT_LONG] = &&L_OP_LOAD_CONSTANT_LONG,
++  [OP_JUMP] = &&L_OP_JUMP,
++  [OP_LOOP] = &&L_OP_LOOP,
++  [OP_JUMP_IF] = &&L_OP_JUMP_IF,
++  [OP_JUMP_IF_SET] = &&L_OP_JUMP_IF_SET,
++  [OP_LOAD_NULL] = &&L_OP_LOAD_NULL,
++  [OP_LOAD_FALSE] = &&L_OP_LOAD_FALSE,
++  [OP_LOAD_TRUE] = &&L_OP_LOAD_TRUE,
++  [OP_LOAD_GLOBAL] = &&L_OP_LOAD_GLOBAL,
++  [OP_LOAD_GLOBAL_LONG] = &&L_OP_LOAD_GLOBAL_LONG,
++  [OP_STORE_GLOBAL] = &&L_OP_STORE_GLOBAL,
++  [OP_STORE_GLOBAL_LONG] = &&L_OP_STORE_GLOBAL_LONG,
++  [OP_LOAD_UPVALUE] = &&L_OP_LOAD_UPVALUE,
++  [OP_LOAD_UPVALUE_LONG] = &&L_OP_LOAD_UPVALUE_LONG,
++  [OP_STORE_UPVALUE] = &&L_OP_STORE_UPVALUE,
++  [OP_STORE_UPVALUE_LONG] = &&L_OP_STORE_UPVALUE_LONG,
++  [OP_CLOSE_UPVALUES] = &&L_OP_CLOSE_UPVALUES,
++  [OP_CALL] = &&L_OP_CALL,
++  [OP_CALL_LONG] = &&L_OP_CALL_LONG,
++  [OP_RETURN] = &&L_OP_RETURN,
++  [OP_RETURN_LONG] = &&L_OP_RETURN_LONG,
++  [OP_RETURN_1] = &&L_OP_RETURN_1,
++  [OP_CLOSURE] = &&L_OP_CLOSURE,
++  [OP_CLOSURE_LONG] = &&L_OP_CLOSURE_LONG,
++  [OP_NOT] = &&L_OP_NOT,
++  [OP_NOT_LONG] = &&L_OP_NOT_LONG,
++  [OP_NEGATE] = &&L_OP_NEGATE,
++  [OP_NEGATE_LONG] = &&L_OP_NEGATE_LONG,
++  [OP_ADD] = &&L_OP_ADD,
++  [OP_ADD_LONG] = &&L_OP_ADD_LONG,
++  [OP_SUBTRACT] = &&L_OP_SUBTRACT,
++  [OP_SUBTRACT_LONG] = &&L_OP_SUBTRACT_LONG,
++  [OP_MULTIPLY] = &&L_OP_MULTIPLY,
++  [OP_MULTIPLY_LONG] = &&L_OP_MULTIPLY_LONG,
++  [OP_DIVIDE] = &&L_OP_DIVIDE,
++  [OP_DIVIDE_LONG] = &&L_OP_DIVIDE_LONG,
++  [OP_MODULUS] = &&L_OP_MODULUS,
++  [OP_AS] = &&L_OP_AS,
++  [OP_AS_LONG] = &&L_OP_AS_LONG,
++  [OP_MODULUS_LONG] = &&L_OP_MODULUS_LONG,
++  [OP_EQUALS] = &&L_OP_EQUALS,
++  [OP_EQUALS_LONG] = &&L_OP_EQUALS_LONG,
++  [OP_NOT_EQUAL] = &&L_OP_NOT_EQUAL,
++  [OP_NOT_EQUAL_LONG] = &&L_OP_NOT_EQUAL_LONG,
++  [OP_GREATER] = &&L_OP_GREATER,
++  [OP_GREATER_LONG] = &&L_OP_GREATER_LONG,
++  [OP_LESS] = &&L_OP_LESS,
++  [OP_LESS_LONG] = &&L_OP_LESS_LONG,
++  [OP_GREATER_EQUAL] = &&L_OP_GREATER_EQUAL,
++  [OP_GREATER_EQUAL_LONG] = &&L_OP_GREATER_EQUAL_LONG,
++  [OP_LESS_EQUAL] = &&L_OP_LESS_EQUAL,
++  [OP_LESS_EQUAL_LONG] = &&L_OP_LESS_EQUAL_LONG,
++  [OP_PRINT] = &&L_OP_PRINT,
++  [OP_ARRAY_NEW] = &&L_OP_ARRAY_NEW,
++  [OP_ARRAY_NEW_LONG] = &&L_OP_ARRAY_NEW_LONG,
++  [OP_MAP_NEW] = &&L_OP_MAP_NEW,
++  [OP_MAP_NEW_LONG] = &&L_OP_MAP_NEW_LONG,
++  [OP_INDEX_GET] = &&L_OP_INDEX_GET,
++  [OP_INDEX_GET_LONG] = &&L_OP_INDEX_GET_LONG,
++  [OP_INDEX_SET] = &&L_OP_INDEX_SET,
++  [OP_INDEX_SET_LONG] = &&L_OP_INDEX_SET_LONG,
++  [OP_JUMP_IF_ARGC] = &&L_OP_JUMP_IF_ARGC,
++  [OP_FOR_PREP] = &&L_OP_FOR_PREP,
++  [OP_FOR_LOOP] = &&L_OP_FOR_LOOP,
++  [OP_ITER_PREP] = &&L_OP_ITER_PREP,
++  [OP_ITER_GET] = &&L_OP_ITER_GET,
++  [OP_ITER_LOOP] = &&L_OP_ITER_LOOP,
++  [OP_VA_PACK] = &&L_OP_VA_PACK,
++  [OP_CALL_SPREAD] = &&L_OP_CALL_SPREAD,
++  [OP_CALL_SPREAD_LONG] = &&L_OP_CALL_SPREAD_LONG,
++  [OP_TRY_ENTER] = &&L_OP_TRY_ENTER,
++  [OP_TRY_EXIT] = &&L_OP_TRY_EXIT,
++  [OP_THROW] = &&L_OP_THROW,
++  [OP_DEFER_MARK] = &&L_OP_DEFER_MARK,
++  [OP_DEFER_RUN] = &&L_OP_DEFER_RUN,
++  [OP_CLASS] = &&L_OP_CLASS,
++  [OP_DEFINE_FIELD] = &&L_OP_DEFINE_FIELD,
++  [OP_DEFINE_METHOD] = &&L_OP_DEFINE_METHOD,
++  [OP_CLASS_END] = &&L_OP_CLASS_END,
++  [OP_GET_FIELD] = &&L_OP_GET_FIELD,
++  [OP_GET_FIELD_LONG] = &&L_OP_GET_FIELD_LONG,
++  [OP_STORE_FIELD] = &&L_OP_STORE_FIELD,
++  [OP_STORE_FIELD_LONG] = &&L_OP_STORE_FIELD_LONG,
++  [OP_STORE_FIELD_G] = &&L_OP_STORE_FIELD_G,
++  [OP_STORE_FIELD_G_NAME] = &&L_OP_STORE_FIELD_G_NAME,
++  [OP_FIELD_IMMUTABLE] = &&L_OP_FIELD_IMMUTABLE,
++  [OP_FIELD_IMMUTABLE_G] = &&L_OP_FIELD_IMMUTABLE_G,
++  [OP_GET_MEMBER] = &&L_OP_GET_MEMBER,
++  [OP_INVOKE] = &&L_OP_INVOKE,
++  [OP_SUPER_INVOKE] = &&L_OP_SUPER_INVOKE,
++  [OP_CLASS_END_LONG] = &&L_OP_CLASS_END_LONG,
++  [OP_DEFINE_STATIC_METHOD] = &&L_OP_DEFINE_STATIC_METHOD,
++  [OP_DEFINE_STATIC_FIELD] = &&L_OP_DEFINE_STATIC_FIELD,
++  [OP_GET_STATIC_NAME] = &&L_OP_GET_STATIC_NAME,
++  [OP_STORE_STATIC_NAME] = &&L_OP_STORE_STATIC_NAME,
++  [OP_GET_METHOD] = &&L_OP_GET_METHOD,
++  [OP_GET_METHOD_LONG] = &&L_OP_GET_METHOD_LONG,
++  [OP_METHOD_NOT_ASSIGNABLE] = &&L_OP_METHOD_NOT_ASSIGNABLE,
++  [OP_METHOD_NOT_ASSIGNABLE_LONG] = &&L_OP_METHOD_NOT_ASSIGNABLE_LONG,
++  [OP_STRICT_EQUAL] = &&L_OP_STRICT_EQUAL,
++  [OP_STRICT_EQUAL_LONG] = &&L_OP_STRICT_EQUAL_LONG,
++  [OP_IS] = &&L_OP_IS,
++  [OP_IS_LONG] = &&L_OP_IS_LONG,
++  [OP_JUMP_IF_CMP] = &&L_OP_JUMP_IF_CMP,
++  // the four pre-patch NAME forms never dispatch: the freeze pass rewrites
++  // every one before member code can run. the switch build silently skips an
++  // un-rewritten stray (no case label, no default); aliasing them to NOP
++  // keeps the two dispatch modes byte-identical in that (impossible) case.
++  [OP_GET_FIELD_NAME] = &&L_OP_NOP,
++  [OP_GET_FIELD_NAME_LONG] = &&L_OP_NOP,
++  [OP_STORE_FIELD_NAME] = &&L_OP_NOP,
++  [OP_STORE_FIELD_NAME_LONG] = &&L_OP_NOP,
++};
++#ifdef OK_PARANOID
++  for (int ok_di = 0; ok_di < (int)OP__COUNT; ++ok_di) {
++    if (ok_dispatch_table[ok_di] == NULL) {
++      fprintf(stderr, "ok: dispatch table hole at opcode %d\n", ok_di);
++      exit(70);
++    }
++  }
++#endif
++#pragma GCC diagnostic pop
++#endif
++
+   for (;;) {
+ #if defined(OK_TRACE_EXECUTION)
+     disassembler disassembler;
+@@ -2793,54 +3003,58 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+ #endif // defined(OK_TRACE_EXECUTION)
+ 
+     word instruction = READ_WORD();
++#if defined(OK_DISPATCH_THREADED)
++    goto *ok_dispatch_table[op_of(instruction)];
++#else
+     switch (op_of(instruction)) {
+-    case OP_NOP: {
+-      break;
++#endif
++    CASE(OP_NOP): {
++      DISPATCH();
+     }
+-    case OP_MOVE: {
++    CASE(OP_MOVE): {
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+       REG_AT(ap) = REG_AT(bp);
+-      break;
++      DISPATCH();
+     }
+-    case OP_MOVE_LONG: {
++    CASE(OP_MOVE_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       REG_AT(A) = REG_AT(B);
+-      break;
++      DISPATCH();
+     }
+-    case OP_LOAD_CONSTANT: {
++    CASE(OP_LOAD_CONSTANT): {
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+       REG_AT(ap) = frame->closure->function->chunk.constants.data[bp];
+-      break;
++      DISPATCH();
+     }
+-    case OP_LOAD_CONSTANT_LONG: {
++    CASE(OP_LOAD_CONSTANT_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       REG_AT(A) = frame->closure->function->chunk.constants.data[B];
+-      break;
++      DISPATCH();
+     }
+-    case OP_JUMP: {
++    CASE(OP_JUMP): {
+       ip += Alarge_of(instruction);
+-      break;
++      DISPATCH();
+     }
+-    case OP_LOOP: {
++    CASE(OP_LOOP): {
+       ip -= Alarge_of(instruction);
+-      break;
++      DISPATCH();
+     }
+-    case OP_JUMP_IF: {
++    CASE(OP_JUMP_IF): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const bool p = p_of(words);
+       const bool jump = p ^ is_falsy(REG_AT(B));
+       ip += jump * A;
+-      break;
++      DISPATCH();
+     }
+-    case OP_JUMP_IF_SET: {
++    CASE(OP_JUMP_IF_SET): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -2851,9 +3065,49 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         ip += A;
+         REG_AT(C) = REG_AT(B);
+       }
+-      break;
++      DISPATCH();
++    }
++    CASE(OP_JUMP_IF_CMP): {
++      // the fused condition: one instruction where the generic path spends
++      // two (the binop's bool materialization + OP_JUMP_IF's re-read). the
++      // comparison runs through the SAME perform the binop uses (the helper
++      // above), landing its result in the lhs register - which the compiler
++      // may point straight at a local (the `while i < n` shape fuses with
++      // zero staging), so the operand is saved and restored around the
++      // result read. operators keep dispatching, the ordered four keep their
++      // shared shape, and the truthiness test consumes the result exactly as
++      // OP_JUMP_IF would.
++      const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      const uint16_t C = C_of(words);
++      const uint8_t cmp = cmp_of(words);
++      if (!comparison_is_valid(cmp)) {
++        runtime_error(p_vm, OK_EK_INTERNAL, "corrupt fused comparison id.");
++        FAIL_PATH();
++        DISPATCH();
++      }
++      const value lhs = REG_AT(B);
++      const value rhs = Q_of(words) ? frame->closure->function->chunk.constants.data[C] : REG_AT(C);
++      const interpret_result res = perform_comparison(p_vm, reg, frame, cmp, B, lhs, rhs);
++      if (res.status != RUNTIME_OK) {
++        // the error paths never wrote the destination (performs write their
++        // result only on success), so the operand needs no restore here.
++        FAIL_PATH();
++        DISPATCH();
++      }
++      // a dispatched operator method may have grown the register file / call
++      // stack: re-cache before the result read.
++      REFRESH_AFTER_NESTED();
++      const bool jump = p ^ is_falsy(REG_AT(B));
++      REG_AT(B) = lhs; // the operand's register survives the fused compare
++      if (jump) {
++        ip += A;
++      }
++      DISPATCH();
+     }
+-    case OP_LOAD_NULL: {
++    CASE(OP_LOAD_NULL): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -2867,28 +3121,28 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+               (uint32_t)A + B,
+               frame->closure->function->name ? frame->closure->function->name->string.chars : "?");
+ #endif
+-      break;
++      DISPATCH();
+     }
+-    case OP_LOAD_FALSE: {
++    CASE(OP_LOAD_FALSE): {
+       const uint16_t A = Alarge_of(instruction);
+       REG_AT(A) = BOOL_AS_VALUE(false);
+-      break;
++      DISPATCH();
+     }
+-    case OP_LOAD_TRUE: {
++    CASE(OP_LOAD_TRUE): {
+       const uint16_t A = Alarge_of(instruction);
+       REG_AT(A) = BOOL_AS_VALUE(true);
+-      break;
++      DISPATCH();
+     }
+-    case OP_LOAD_GLOBAL: {
++    CASE(OP_LOAD_GLOBAL): {
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+       REG_AT(ap) = p_vm->globals_store->global_values.data[bp];
+ #ifdef OK_TRACE_GLOBALS
+       fprintf(stderr, "[tg] L  g[%u] -> r[%u]  bits=0x%016llx\n", bp, ap, (unsigned long long)REG_AT(ap));
+ #endif
+-      break;
++      DISPATCH();
+     }
+-    case OP_LOAD_GLOBAL_LONG: {
++    CASE(OP_LOAD_GLOBAL_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -2896,9 +3150,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+ #ifdef OK_TRACE_GLOBALS
+       fprintf(stderr, "[tg] L  g[%u] -> r[%u] (long)  bits=0x%016llx\n", B, A, (unsigned long long)REG_AT(A));
+ #endif
+-      break;
++      DISPATCH();
+     }
+-    case OP_STORE_GLOBAL: {
++    CASE(OP_STORE_GLOBAL): {
+       const bool p = p_of(instruction);
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+@@ -2911,9 +3165,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+               bp,
+               (unsigned long long)p_vm->globals_store->global_values.data[ap]);
+ #endif
+-      break;
++      DISPATCH();
+     }
+-    case OP_STORE_GLOBAL_LONG: {
++    CASE(OP_STORE_GLOBAL_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+@@ -2927,47 +3181,47 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+               B,
+               (unsigned long long)p_vm->globals_store->global_values.data[A]);
+ #endif
+-      break;
++      DISPATCH();
+     }
+-    case OP_LOAD_UPVALUE: {
++    CASE(OP_LOAD_UPVALUE): {
+       uint16_t ap = aprime_of(instruction);
+       uint16_t bp = bprime_of(instruction);
+       REG_AT(ap) = *object_upvalue_get_value(
+           frame->closure->upvalues.data[bp],
+           reg->array.data); // upvalue locations are absolute in the register file, they are not frame relative
+-      break;
++      DISPATCH();
+     }
+-    case OP_LOAD_UPVALUE_LONG: {
++    CASE(OP_LOAD_UPVALUE_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       REG_AT(A) = *object_upvalue_get_value(
+           frame->closure->upvalues.data[B],
+           reg->array.data); // upvalue locations are absolute in the register file, they are not frame relative
+-      break;
++      DISPATCH();
+     }
+-    case OP_STORE_UPVALUE: {
++    CASE(OP_STORE_UPVALUE): {
+       const bool p = p_of(instruction);
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+       *object_upvalue_get_value(frame->closure->upvalues.data[ap], reg->array.data) =
+           resolve_operand(frame, reg, bp, p);
+-      break;
++      DISPATCH();
+     }
+-    case OP_STORE_UPVALUE_LONG: {
++    CASE(OP_STORE_UPVALUE_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       *object_upvalue_get_value(frame->closure->upvalues.data[A], reg->array.data) = resolve_operand(frame, reg, B, p);
+-      break;
++      DISPATCH();
+     }
+-    case OP_CLOSE_UPVALUES: {
++    CASE(OP_CLOSE_UPVALUES): {
+       const uint16_t A = Alarge_of(instruction);
+       close_upvalues(exe, frame->registers_base + A);
+-      break;
++      DISPATCH();
+     }
+-    case OP_CALL: {
++    CASE(OP_CALL): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -2987,9 +3241,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
+-      break;
++      DISPATCH();
+     }
+-    case OP_CALL_LONG: {
++    CASE(OP_CALL_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+@@ -3010,9 +3264,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
+-      break;
++      DISPATCH();
+     }
+-    case OP_RETURN: {
++    CASE(OP_RETURN): {
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+       const uint16_t returned = return_from_frame(exe, reg, frame, ap, bp);
+@@ -3021,9 +3275,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       }
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
+-      break;
++      DISPATCH();
+     }
+-    case OP_RETURN_LONG: {
++    CASE(OP_RETURN_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -3033,9 +3287,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       }
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
+-      break;
++      DISPATCH();
+     }
+-    case OP_RETURN_1: {
++    CASE(OP_RETURN_1): {
+       const uint16_t A = Alarge_of(instruction);
+       const uint8_t e = elarge_of(instruction);
+       const uint16_t returned = return_1_from_frame(p_vm, exe, frame, A, e);
+@@ -3044,18 +3298,18 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       }
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
+-      break;
++      DISPATCH();
+     }
+-    case OP_CLOSURE: {
++    CASE(OP_CLOSURE): {
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+       interpret_result result = create_closure(p_vm, exe, reg, frame, ap, bp);
+       if (result.status != RUNTIME_OK) {
+         FAIL_PATH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_CLOSURE_LONG: {
++    CASE(OP_CLOSURE_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -3063,9 +3317,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (result.status != RUNTIME_OK) {
+         FAIL_PATH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_NOT: {
++    CASE(OP_NOT): {
+       const bool p = p_of(instruction);
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+@@ -3073,9 +3327,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (res.status != RUNTIME_OK) {
+         FAIL_PATH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_NOT_LONG: {
++    CASE(OP_NOT_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+@@ -3084,9 +3338,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (res.status != RUNTIME_OK) {
+         FAIL_PATH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_NEGATE: {
++    CASE(OP_NEGATE): {
+       const bool p = p_of(instruction);
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+@@ -3095,9 +3349,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_NEGATE_LONG: {
++    CASE(OP_NEGATE_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const uint16_t A = A_of(words);
+@@ -3107,9 +3361,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_ADD: {
++    CASE(OP_ADD): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3119,9 +3373,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_ADD_LONG: {
++    CASE(OP_ADD_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3134,9 +3388,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_SUBTRACT: {
++    CASE(OP_SUBTRACT): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3146,9 +3400,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_SUBTRACT_LONG: {
++    CASE(OP_SUBTRACT_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3161,9 +3415,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_MULTIPLY: {
++    CASE(OP_MULTIPLY): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3173,9 +3427,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_MULTIPLY_LONG: {
++    CASE(OP_MULTIPLY_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3188,9 +3442,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_DIVIDE: {
++    CASE(OP_DIVIDE): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3200,9 +3454,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_DIVIDE_LONG: {
++    CASE(OP_DIVIDE_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3215,9 +3469,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_MODULUS: {
++    CASE(OP_MODULUS): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3227,9 +3481,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_MODULUS_LONG: {
++    CASE(OP_MODULUS_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3242,9 +3496,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_EQUALS: {
++    CASE(OP_EQUALS): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3254,9 +3508,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_EQUALS_LONG: {
++    CASE(OP_EQUALS_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3269,9 +3523,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_NOT_EQUAL: {
++    CASE(OP_NOT_EQUAL): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3281,9 +3535,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_STRICT_EQUAL: {
++    CASE(OP_STRICT_EQUAL): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3294,9 +3548,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (res.status != RUNTIME_OK) {
+         FAIL_PATH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_STRICT_EQUAL_LONG: {
++    CASE(OP_STRICT_EQUAL_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3308,9 +3562,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (res.status != RUNTIME_OK) {
+         FAIL_PATH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_IS: {
++    CASE(OP_IS): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3320,9 +3574,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (res.status != RUNTIME_OK) {
+         FAIL_PATH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_IS_LONG: {
++    CASE(OP_IS_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3334,9 +3588,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (res.status != RUNTIME_OK) {
+         FAIL_PATH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_NOT_EQUAL_LONG: {
++    CASE(OP_NOT_EQUAL_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3349,9 +3603,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_GREATER: {
++    CASE(OP_GREATER): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3361,9 +3615,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_GREATER_LONG: {
++    CASE(OP_GREATER_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3376,9 +3630,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_LESS: {
++    CASE(OP_LESS): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3388,9 +3642,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_LESS_LONG: {
++    CASE(OP_LESS_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3403,9 +3657,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_GREATER_EQUAL: {
++    CASE(OP_GREATER_EQUAL): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3415,9 +3669,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_GREATER_EQUAL_LONG: {
++    CASE(OP_GREATER_EQUAL_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3430,9 +3684,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_LESS_EQUAL: {
++    CASE(OP_LESS_EQUAL): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3442,9 +3696,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_LESS_EQUAL_LONG: {
++    CASE(OP_LESS_EQUAL_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3457,9 +3711,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_AS: {
++    CASE(OP_AS): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3471,9 +3725,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+-    case OP_AS_LONG: {
++    CASE(OP_AS_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(instruction);
+       const bool q = Q_of(words);
+@@ -3486,10 +3740,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REFRESH_AFTER_NESTED();
+-      break;
++      DISPATCH();
+     }
+ 
+-    case OP_ARRAY_NEW: {
++    CASE(OP_ARRAY_NEW): {
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+@@ -3510,12 +3764,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         goto oom_new;
+       }
+       REG_AT(a) = OBJECT_AS_VALUE(arr);
+-      break;
++      DISPATCH();
+     oom_new:
+       runtime_oom(p_vm, "out of memory: failed to allocate array.");
+       FAIL_PATH();
+     }
+-    case OP_ARRAY_NEW_LONG: {
++    CASE(OP_ARRAY_NEW_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -3532,12 +3786,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         goto oom_new_long;
+       }
+       REG_AT(A) = OBJECT_AS_VALUE(arr);
+-      break;
++      DISPATCH();
+     oom_new_long:
+       runtime_oom(p_vm, "out of memory: failed to allocate array.");
+       FAIL_PATH();
+     }
+-    case OP_MAP_NEW: {
++    CASE(OP_MAP_NEW): {
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+@@ -3561,12 +3815,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH(); // map_write already reported
+       }
+       REG_AT(a) = OBJECT_AS_VALUE(map);
+-      break;
++      DISPATCH();
+     oom_map_new:
+       runtime_oom(p_vm, "out of memory: failed to allocate map.");
+       FAIL_PATH();
+     }
+-    case OP_MAP_NEW_LONG: {
++    CASE(OP_MAP_NEW_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -3586,12 +3840,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH(); // map_write already reported
+       }
+       REG_AT(A) = OBJECT_AS_VALUE(map);
+-      break;
++      DISPATCH();
+     oom_map_new_long:
+       runtime_oom(p_vm, "out of memory: failed to allocate map.");
+       FAIL_PATH();
+     }
+-    case OP_INDEX_GET: {
++    CASE(OP_INDEX_GET): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3604,7 +3858,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           FAIL_PATH();
+         }
+         REG_AT(a) = read;
+-        break;
++        DISPATCH();
+       }
+       // the instance arm: operator [] on the left operand's class.
+       if (IS_VALUE_INSTANCE(base)) {
+@@ -3614,7 +3868,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+             FAIL_PATH();
+           }
+           REFRESH_AFTER_NESTED();
+-          break;
++          DISPATCH();
+         }
+       }
+       const object_array* arr = resolve_array_base(p_vm, base);
+@@ -3623,9 +3877,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REG_AT(a) = arr->values.data[index];
+-      break;
++      DISPATCH();
+     }
+-    case OP_INDEX_GET_LONG: {
++    CASE(OP_INDEX_GET_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(words);
+       const uint16_t A = A_of(words);
+@@ -3639,7 +3893,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           FAIL_PATH();
+         }
+         REG_AT(A) = read;
+-        break;
++        DISPATCH();
+       }
+       // the instance arm: operator [] on the left operand's class.
+       if (IS_VALUE_INSTANCE(base)) {
+@@ -3649,7 +3903,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+             FAIL_PATH();
+           }
+           REFRESH_AFTER_NESTED();
+-          break;
++          DISPATCH();
+         }
+       }
+       const object_array* arr = resolve_array_base(p_vm, base);
+@@ -3658,9 +3912,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REG_AT(A) = arr->values.data[index];
+-      break;
++      DISPATCH();
+     }
+-    case OP_INDEX_SET: {
++    CASE(OP_INDEX_SET): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+@@ -3673,7 +3927,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         if (!map_write(p_vm, base, key, REG_AT(c))) {
+           FAIL_PATH();
+         }
+-        break;
++        DISPATCH();
+       }
+       // the instance arm: operator []= (index, value); the operator runs for
+       // effect - the assignment expression's value is the stored value, same
+@@ -3686,7 +3940,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+             FAIL_PATH();
+           }
+           REFRESH_AFTER_NESTED();
+-          break;
++          DISPATCH();
+         }
+       }
+       const object_array* arr = resolve_array_base(p_vm, base);
+@@ -3695,9 +3949,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       ((object_array*)arr)->values.data[index] = REG_AT(c);
+-      break;
++      DISPATCH();
+     }
+-    case OP_INDEX_SET_LONG: {
++    CASE(OP_INDEX_SET_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(words);
+       const bool q = Q_of(words);
+@@ -3710,7 +3964,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         if (!map_write(p_vm, base, key, resolve_operand(frame, reg, C, q))) {
+           FAIL_PATH();
+         }
+-        break;
++        DISPATCH();
+       }
+       // the instance arm: operator []= (index, value), long form.
+       if (IS_VALUE_INSTANCE(base)) {
+@@ -3721,7 +3975,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+             FAIL_PATH();
+           }
+           REFRESH_AFTER_NESTED();
+-          break;
++          DISPATCH();
+         }
+       }
+       const object_array* arr = resolve_array_base(p_vm, base);
+@@ -3730,18 +3984,18 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       ((object_array*)arr)->values.data[index] = resolve_operand(frame, reg, C, q);
+-      break;
++      DISPATCH();
+     }
+-    case OP_JUMP_IF_ARGC: {
++    CASE(OP_JUMP_IF_ARGC): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+       const bool p = p_of(words);
+       const bool jump = (p ? 1u : 0u) == (frame->argc > B ? 1u : 0u);
+       ip += jump * A;
+-      break;
++      DISPATCH();
+     }
+-    case OP_FOR_PREP: {
++    CASE(OP_FOR_PREP): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words); // forward offset to the loop exit
+       const uint16_t B = B_of(words); // counter. limit at B + 1, step at B + 2
+@@ -3763,9 +4017,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (!in_range) {
+         ip += A;
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_FOR_LOOP: {
++    CASE(OP_FOR_LOOP): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words); // backward offset to the body top
+       const uint16_t B = B_of(words); // counter. limit at B + 1, step at B + 2
+@@ -3785,9 +4039,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (in_range) {
+         ip -= A;
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_ITER_PREP: {
++    CASE(OP_ITER_PREP): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool p = p_of(words);     // p == 1: the (k, v) two-binding form
+       const uint16_t A = A_of(words); // forward offset to the loop exit
+@@ -3806,7 +4060,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         if (count == 0) {
+           ip += A;
+         }
+-        break;
++        DISPATCH();
+       }
+       if (value_is_object_type(iterable, OBJ_MAP)) {
+         // snapshot the version for the back edge's size-change check, then
+@@ -3821,12 +4075,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         if (slot >= map->entries.capacity) {
+           ip += A;
+         }
+-        break;
++        DISPATCH();
+       }
+       runtime_error(p_vm, OK_EK_TYPE, "can only iterate over arrays and maps.");
+       FAIL_PATH();
+     }
+-    case OP_ITER_GET: {
++    CASE(OP_ITER_GET): {
+       const bool p = p_of(instruction); // p == 1: also write the value register
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t B = B_of(words); // state base
+@@ -3844,9 +4098,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           REG_AT(C + 1) = map->entries.values[cursor];
+         }
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_ITER_LOOP: {
++    CASE(OP_ITER_LOOP): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words); // backward offset to the body top
+       const uint16_t B = B_of(words); // state base
+@@ -3859,7 +4113,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         if (cursor < VALUE_AS_NUMBER(REG_AT(B + 2))) {
+           ip -= A;
+         }
+-        break;
++        DISPATCH();
+       }
+       // a map: PREP validated the type. a size change since the snapshot is a
+       // hard error (the slot walk would mis-walk: backward shifts move entries
+@@ -3877,9 +4131,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (slot < map->entries.capacity) {
+         ip -= A;
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_VA_PACK: {
++    CASE(OP_VA_PACK): {
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+       // the trailing-argument window: [bp, argc] (bp is the varargs parameter's
+@@ -3903,9 +4157,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         FAIL_PATH();
+       }
+       REG_AT(ap) = OBJECT_AS_VALUE(arr);
+-      break;
++      DISPATCH();
+     }
+-    case OP_CALL_SPREAD: {
++    CASE(OP_CALL_SPREAD): {
+       const uint8_t a = a_of(instruction);
+       const uint8_t b = b_of(instruction);
+       const uint8_t c = c_of(instruction);
+@@ -3917,9 +4171,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
+-      break;
++      DISPATCH();
+     }
+-    case OP_CALL_SPREAD_LONG: {
++    CASE(OP_CALL_SPREAD_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -3932,9 +4186,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
+-      break;
++      DISPATCH();
+     }
+-    case OP_PRINT: {
++    CASE(OP_PRINT): {
+       const bool p = p_of(instruction);
+       const value printed = resolve_operand(frame, reg, Alarge_of(instruction), p);
+       if (p_vm->print_cb != NULL) {
+@@ -3943,9 +4197,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         value_debug_print(printed);
+         puts("");
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_TRY_ENTER: {
++    CASE(OP_TRY_ENTER): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -3959,16 +4213,16 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         runtime_oom(p_vm, "out of memory: failed to grow the handler stack.");
+         FAIL_PATH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_TRY_EXIT: {
++    CASE(OP_TRY_EXIT): {
+       // leaving the protected region. the top record belongs to this frame
+       // by construction (the compiler pairs every ENTER it emits).
+       ASSERT(exe->handlers.count > 0 && exe->handlers.data[exe->handlers.count - 1].frame == exe->call_stack.count - 1);
+       exe->handlers.count--;
+-      break;
++      DISPATCH();
+     }
+-    case OP_THROW: {
++    CASE(OP_THROW): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       exe->error_pending = true;
+@@ -3980,20 +4234,20 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       exe->error_kind = OK_EK_INTERNAL;
+       exe->has_error = true;
+       FAIL_PATH();
+-      break;
++      DISPATCH();
+     }
+-    case OP_DEFER_MARK: {
++    CASE(OP_DEFER_MARK): {
+       const uint16_t A = Alarge_of(instruction);
+       value* slot = &reg->array.data[frame->registers_base + A];
+       if (!IS_VALUE_STRICTLY_OBJECT(*slot) || object_get_type(VALUE_AS_OBJECT(*slot)) != OBJ_CLOSURE) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "internal: defer mark on a non-closure.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       *slot = DEFER_AS_VALUE((object_closure*)VALUE_AS_OBJECT(*slot));
+-      break;
++      DISPATCH();
+     }
+-    case OP_DEFER_RUN: {
++    CASE(OP_DEFER_RUN): {
+       const uint16_t A = Alarge_of(instruction);
+       value* slot = &reg->array.data[frame->registers_base + A];
+       if (IS_VALUE_STRICTLY_DEFER(*slot)) {
+@@ -4002,7 +4256,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         frame->ip = ip;
+         if (!stage_defer_thunk(p_vm, exe, reg, thunk)) {
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         // the OP_CALL refresh: the thunk's frame returned into this one, or
+         // an unwind resumed us elsewhere entirely
+@@ -4013,9 +4267,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       }
+       // a null slot is the no-op: the defer statement never executed on
+       // this path (conditional defer, a loop iteration that skipped it)
+-      break;
++      DISPATCH();
+     }
+-    case OP_CLASS: {
++    CASE(OP_CLASS): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -4027,7 +4281,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       } else if (!IS_VALUE_STRICTLY_NULL(parent_value)) {
+         runtime_error(p_vm, OK_EK_TYPE, "the parent of a class must be a class.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       if (parent == NULL) {
+         parent = p_vm->object_singleton;
+@@ -4035,12 +4289,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (parent == NULL) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "class Object is missing.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       if (!IS_VALUE_STRING(frame->closure->function->chunk.constants.data[B])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "class name constant is not a string.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_specs specs = {p_vm->alloc, p_vm->objects_store};
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[B]);
+@@ -4050,12 +4304,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (klass == NULL) {
+         runtime_oom(p_vm, "out of memory: failed to allocate class.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       REG_AT(A) = OBJECT_AS_VALUE(klass);
+-      break;
++      DISPATCH();
+     }
+-    case OP_DEFINE_FIELD: {
++    CASE(OP_DEFINE_FIELD): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool has_no_init = p_of(instruction);
+       const uint16_t A = A_of(words);
+@@ -4065,7 +4319,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (!IS_VALUE_CLASS(REG_AT(A)) || !IS_VALUE_STRING(frame->closure->function->chunk.constants.data[C])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt class field definition.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_class* klass = VALUE_AS_CLASS(REG_AT(A));
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[C]);
+@@ -4074,7 +4328,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         if (!IS_VALUE_CLOSURE(REG_AT(B))) {
+           runtime_error(p_vm, OK_EK_INTERNAL, "corrupt class field initializer.");
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         thunk = VALUE_AS_CLOSURE(REG_AT(B));
+         thunk->owner = klass;
+@@ -4091,11 +4345,11 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           runtime_oom(p_vm, "out of memory: failed to add field.");
+         }
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_DEFINE_METHOD: {
++    CASE(OP_DEFINE_METHOD): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool is_pub = p_of(instruction);
+       const uint16_t A = A_of(words);
+@@ -4105,7 +4359,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           !IS_VALUE_STRING(frame->closure->function->chunk.constants.data[C])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt class method definition.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_class* klass = VALUE_AS_CLASS(REG_AT(A));
+       object_closure* closure = VALUE_AS_CLOSURE(REG_AT(B));
+@@ -4113,7 +4367,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (klass->frozen) {
+         runtime_error(p_vm, OK_EK_TYPE, "class %s is sealed; methods cannot be added.", klass->name->string.chars);
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       closure->owner = klass;
+       // pub survives overrides: an override of a pub ancestor is pub, and a
+@@ -4124,7 +4378,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         for (const object_class* c = klass->parent; c != NULL; c = c->parent) {
+           inherited = method_map_get(&c->methods, name);
+           if (inherited != NULL) {
+-            break;
++            break; // leave the chain walk (a C break, never a dispatch)
+           }
+         }
+         if (inherited != NULL) {
+@@ -4134,7 +4388,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           "method '%s' overrides a pub method and must be pub.",
+                           name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+           if (inherited->pub) {
+             pub = true;
+@@ -4155,7 +4409,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           "method '%s' overrides a method with a different signature.",
+                           name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+         }
+       }
+@@ -4173,11 +4427,11 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                             klass->name->string.chars);
+               FAIL_PATH();
+             }
+-            break;
++            break; // the ancestor's init was found (a C break, never a dispatch)
+           }
+         }
+         if (p_vm->current_execution_state->error_pending) {
+-          break;
++          DISPATCH();
+         }
+       }
+       method_entry entry;
+@@ -4198,45 +4452,45 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                       name->string.chars,
+                       klass->name->string.chars);
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       if (!method_map_set(&klass->methods, name, entry)) {
+         runtime_oom(p_vm, "out of memory: failed to add method.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_CLASS_END: {
++    CASE(OP_CLASS_END): {
+       const uint16_t ap = aprime_of(instruction);
+       if (!IS_VALUE_CLASS(REG_AT(ap))) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt class definition end.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_class* klass = VALUE_AS_CLASS(REG_AT(ap));
+       if (!class_freeze(p_vm, klass)) {
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_CLASS_END_LONG: {
++    CASE(OP_CLASS_END_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       if (!IS_VALUE_CLASS(REG_AT(A))) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt class definition end.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_class* klass = VALUE_AS_CLASS(REG_AT(A));
+       if (!class_freeze(p_vm, klass)) {
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_DEFINE_STATIC_METHOD: {
++    CASE(OP_DEFINE_STATIC_METHOD): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool is_pub = p_of(instruction);
+       const uint16_t A = A_of(words);
+@@ -4246,7 +4500,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           !IS_VALUE_STRING(frame->closure->function->chunk.constants.data[C])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt static method definition.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_class* klass = VALUE_AS_CLASS(REG_AT(A));
+       object_closure* closure = VALUE_AS_CLOSURE(REG_AT(B));
+@@ -4254,7 +4508,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (klass->frozen) {
+         runtime_error(p_vm, OK_EK_TYPE, "class %s is sealed; statics cannot be added.", klass->name->string.chars);
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       closure->owner = klass;
+       // pub survival and the signature contract, against the parent's STATICS
+@@ -4265,7 +4519,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         for (const object_class* c = klass->parent; c != NULL; c = c->parent) {
+           inherited = method_map_get(&c->statics, name);
+           if (inherited != NULL) {
+-            break;
++            break; // leave the chain walk (a C break, never a dispatch)
+           }
+         }
+         if (inherited != NULL) {
+@@ -4275,7 +4529,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           "static method '%s' overrides a pub static and must be pub.",
+                           name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+           if (inherited->pub) {
+             pub = true;
+@@ -4288,7 +4542,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           "static method '%s' overrides a static with a different signature.",
+                           name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+         }
+       }
+@@ -4303,11 +4557,11 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (!method_map_set(&klass->statics, name, entry)) {
+         runtime_oom(p_vm, "out of memory: failed to add static method.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_DEFINE_STATIC_FIELD: {
++    CASE(OP_DEFINE_STATIC_FIELD): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -4316,7 +4570,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (!IS_VALUE_CLASS(REG_AT(A)) || !IS_VALUE_STRING(frame->closure->function->chunk.constants.data[C])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt static field definition.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_class* klass = VALUE_AS_CLASS(REG_AT(A));
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[C]);
+@@ -4332,11 +4586,11 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           runtime_oom(p_vm, "out of memory: failed to add static field.");
+         }
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+-      break;
++      DISPATCH();
+     }
+-    case OP_GET_STATIC_NAME: {
++    CASE(OP_GET_STATIC_NAME): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -4346,7 +4600,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           !IS_VALUE_STRING(frame->closure->function->chunk.constants.data[C])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt static field read.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_class* klass = VALUE_AS_CLASS(klass_value);
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[C]);
+@@ -4366,7 +4620,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           name->string.chars,
+                           klass->name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+           gc_guard_up(p_vm->alloc->gc, klass_value);
+           object_specs specs = {p_vm->alloc, p_vm->objects_store};
+@@ -4375,10 +4629,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           if (bound == NULL) {
+             runtime_oom(p_vm, "out of memory: failed to allocate a bound method.");
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+           REG_AT(A) = OBJECT_AS_VALUE(bound);
+-          break;
++          DISPATCH();
+         }
+         // the global lane: bare globals are reachable from static contexts
+         // (the instance lane's freeze fallback, mirrored at runtime - the
+@@ -4389,7 +4643,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                                                                          false));
+         if (IS_GLOBAL_VALID(glob)) {
+           REG_AT(A) = p_vm->globals_store->global_values.data[glob.index];
+-          break;
++          DISPATCH();
+         }
+         runtime_error(p_vm,
+                       OK_EK_TYPE,
+@@ -4397,12 +4651,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                       name->string.chars,
+                       klass->name->string.chars);
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       REG_AT(A) = owner->static_values.data[entry->slot];
+-      break;
++      DISPATCH();
+     }
+-    case OP_STORE_STATIC_NAME: {
++    CASE(OP_STORE_STATIC_NAME): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool value_is_constant = p_of(instruction);
+       const uint16_t A = A_of(words);
+@@ -4413,7 +4667,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           !IS_VALUE_STRING(frame->closure->function->chunk.constants.data[C])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt static field store.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_class* klass = VALUE_AS_CLASS(klass_value);
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[C]);
+@@ -4427,7 +4681,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                         "cannot assign to static method '%s': methods are not assignable.",
+                         name->string.chars);
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         // the global lane, mirroring the read's fallback.
+         const global glob = globals_store_get(p_vm->globals_store, ok_create_string_view(
+@@ -4442,13 +4696,13 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           "cannot assign to global '%s': declared without 'mut'.",
+                           name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+           p_vm->globals_store->global_values.data[glob.index] = value_is_constant
+                                                                     ? frame->closure->function->chunk.constants
+                                                                           .data[A]
+                                                                     : REG_AT(A);
+-          break;
++          DISPATCH();
+         }
+         runtime_error(p_vm,
+                       OK_EK_TYPE,
+@@ -4456,7 +4710,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                       name->string.chars,
+                       klass->name->string.chars);
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       if (!entry->mut) {
+         runtime_error(p_vm,
+@@ -4464,14 +4718,14 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                       "cannot assign to static '%s': declared without 'mut'.",
+                       name->string.chars);
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       owner->static_values.data[entry->slot] = value_is_constant
+                                                     ? frame->closure->function->chunk.constants.data[A]
+                                                     : REG_AT(A);
+-      break;
++      DISPATCH();
+     }
+-    case OP_GET_METHOD: {
++    CASE(OP_GET_METHOD): {
+       // the baked method lane (R1): a bare method name inside a member body,
+       // proved at freeze time, resolved here against the running method's
+       // DEFINING class (the body was compiled in its context) and bound to
+@@ -4483,14 +4737,14 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           !IS_VALUE_STRING(frame->closure->function->chunk.constants.data[bp])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt method read.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[bp]);
+       object_class* owner = frame->closure->owner;
+       if (owner == NULL) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "method read outside a class member.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       const method_entry* entry = object_class_find_method(owner, name);
+       if (entry == NULL) {
+@@ -4498,7 +4752,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         // unless the bytecode was hand-forged.
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt method read: entry vanished from a frozen table.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       if (!entry_visible_from(entry, frame)) {
+         runtime_error(p_vm,
+@@ -4507,7 +4761,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                       name->string.chars,
+                       entry->owner->name->string.chars);
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       gc_guard_up(p_vm->alloc->gc, self);
+       object_specs specs = {p_vm->alloc, p_vm->objects_store};
+@@ -4516,12 +4770,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (bound == NULL) {
+         runtime_oom(p_vm, "out of memory: failed to allocate a bound method.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       REG_AT(ap) = OBJECT_AS_VALUE(bound);
+-      break;
++      DISPATCH();
+     }
+-    case OP_GET_METHOD_LONG: {
++    CASE(OP_GET_METHOD_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -4530,20 +4784,20 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           !IS_VALUE_STRING(frame->closure->function->chunk.constants.data[B])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt method read.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[B]);
+       object_class* owner = frame->closure->owner;
+       if (owner == NULL) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "method read outside a class member.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       const method_entry* entry = object_class_find_method(owner, name);
+       if (entry == NULL) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt method read: entry vanished from a frozen table.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       if (!entry_visible_from(entry, frame)) {
+         runtime_error(p_vm,
+@@ -4552,7 +4806,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                       name->string.chars,
+                       entry->owner->name->string.chars);
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       gc_guard_up(p_vm->alloc->gc, self);
+       object_specs specs = {p_vm->alloc, p_vm->objects_store};
+@@ -4561,12 +4815,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (bound == NULL) {
+         runtime_oom(p_vm, "out of memory: failed to allocate a bound method.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       REG_AT(A) = OBJECT_AS_VALUE(bound);
+-      break;
++      DISPATCH();
+     }
+-    case OP_METHOD_NOT_ASSIGNABLE: {
++    CASE(OP_METHOD_NOT_ASSIGNABLE): {
+       const uint16_t bp = bprime_of(instruction);
+       const object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[bp]);
+       runtime_error(p_vm,
+@@ -4574,9 +4828,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                     "cannot assign to method '%s': methods are not assignable.",
+                     name != NULL ? name->string.chars : "?");
+       FAIL_PATH();
+-      break;
++      DISPATCH();
+     }
+-    case OP_METHOD_NOT_ASSIGNABLE_LONG: {
++    CASE(OP_METHOD_NOT_ASSIGNABLE_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[A]);
+@@ -4585,21 +4839,21 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                     "cannot assign to method '%s': methods are not assignable.",
+                     name != NULL ? name->string.chars : "?");
+       FAIL_PATH();
+-      break;
++      DISPATCH();
+     }
+-    case OP_GET_FIELD: {
++    CASE(OP_GET_FIELD): {
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+       value self = REG_AT(0);
+       if (!IS_VALUE_INSTANCE(self)) {
+         runtime_error(p_vm, OK_EK_TYPE, "field access outside a method receiver.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       REG_AT(ap) = VALUE_AS_INSTANCE(self)->fields[bp];
+-      break;
++      DISPATCH();
+     }
+-    case OP_GET_FIELD_LONG: {
++    CASE(OP_GET_FIELD_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -4607,12 +4861,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (!IS_VALUE_INSTANCE(self)) {
+         runtime_error(p_vm, OK_EK_TYPE, "field access outside a method receiver.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       REG_AT(A) = VALUE_AS_INSTANCE(self)->fields[B];
+-      break;
++      DISPATCH();
+     }
+-    case OP_STORE_FIELD: {
++    CASE(OP_STORE_FIELD): {
+       const bool value_is_constant = p_of(instruction);
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+@@ -4620,14 +4874,14 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (!IS_VALUE_INSTANCE(self)) {
+         runtime_error(p_vm, OK_EK_TYPE, "field access outside a method receiver.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       VALUE_AS_INSTANCE(self)->fields[bp] = value_is_constant
+                                                 ? frame->closure->function->chunk.constants.data[ap]
+                                                 : REG_AT(ap);
+-      break;
++      DISPATCH();
+     }
+-    case OP_STORE_FIELD_LONG: {
++    CASE(OP_STORE_FIELD_LONG): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool value_is_constant = p_of(instruction);
+       const uint16_t A = A_of(words);
+@@ -4636,14 +4890,14 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (!IS_VALUE_INSTANCE(self)) {
+         runtime_error(p_vm, OK_EK_TYPE, "field access outside a method receiver.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       VALUE_AS_INSTANCE(self)->fields[B] = value_is_constant
+                                                ? frame->closure->function->chunk.constants.data[A]
+                                                : REG_AT(A);
+-      break;
++      DISPATCH();
+     }
+-    case OP_FIELD_IMMUTABLE: {
++    CASE(OP_FIELD_IMMUTABLE): {
+       const uint16_t bp = bprime_of(instruction);
+       const object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[bp]);
+       runtime_error(p_vm,
+@@ -4651,9 +4905,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                     "cannot assign to field '%s': declared without 'mut'.",
+                     name->string.chars);
+       FAIL_PATH();
+-      break;
++      DISPATCH();
+     }
+-    case OP_STORE_FIELD_G: {
++    CASE(OP_STORE_FIELD_G): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t A = A_of(words);
+       const uint16_t B = B_of(words);
+@@ -4662,7 +4916,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (!IS_VALUE_INSTANCE(recv)) {
+         runtime_error(p_vm, OK_EK_TYPE, "only instances have fields.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_instance* inst = VALUE_AS_INSTANCE(recv);
+       const object_class* recv_seg = field_defining_segment(inst->klass, C);
+@@ -4675,12 +4929,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                       "class '%s' does not share this field with the enclosing hierarchy.",
+                       inst->klass->name->string.chars);
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       inst->fields[C] = REG_AT(B);
+-      break;
++      DISPATCH();
+     }
+-    case OP_STORE_FIELD_G_NAME: {
++    CASE(OP_STORE_FIELD_G_NAME): {
+       // the un-baked member store: the receiver is an expression, so it may
+       // be an instance (a field the freeze could not bake - or chose not to)
+       // or a class value (a static). name-keyed, resolved here, both lanes
+@@ -4693,7 +4947,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (!IS_VALUE_STRING(frame->closure->function->chunk.constants.data[C])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt member store.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[C]);
+       if (IS_VALUE_INSTANCE(recv)) {
+@@ -4706,7 +4960,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                         inst->klass->name->string.chars,
+                         name->string.chars);
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         const object_class* seg = field_defining_segment(inst->klass, field->slot);
+         const object_class* caller = frame->closure->owner;
+@@ -4717,7 +4971,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                         name->string.chars,
+                         inst->klass->name->string.chars);
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         if (!field->mut) {
+           runtime_error(p_vm,
+@@ -4725,10 +4979,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                         "cannot assign to field '%s': declared without 'mut'.",
+                         name->string.chars);
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         inst->fields[field->slot] = REG_AT(B);
+-        break;
++        DISPATCH();
+       }
+       if (IS_VALUE_CLASS(recv)) {
+         object_class* klass = VALUE_AS_CLASS(recv);
+@@ -4741,7 +4995,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                         klass->name->string.chars,
+                         name->string.chars);
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         const object_class* caller = frame->closure->owner;
+         if (caller == NULL || !object_class_is_a(caller, owner)) {
+@@ -4751,7 +5005,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                         name->string.chars,
+                         owner->name->string.chars);
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         if (!statik->mut) {
+           runtime_error(p_vm,
+@@ -4759,16 +5013,16 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                         "cannot assign to static '%s': declared without 'mut'.",
+                         name->string.chars);
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         owner->static_values.data[statik->slot] = REG_AT(B);
+-        break;
++        DISPATCH();
+       }
+       runtime_error(p_vm, OK_EK_TYPE, "only instances and classes have assignable members.");
+       FAIL_PATH();
+-      break;
++      DISPATCH();
+     }
+-    case OP_FIELD_IMMUTABLE_G: {
++    CASE(OP_FIELD_IMMUTABLE_G): {
+       const word2 words = JOIN_WORD(instruction);
+       const uint16_t C = C_of(words);
+       const object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[C]);
+@@ -4777,9 +5031,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                     "cannot assign to field '%s': declared without 'mut'.",
+                     name->string.chars);
+       FAIL_PATH();
+-      break;
++      DISPATCH();
+     }
+-    case OP_GET_MEMBER: {
++    CASE(OP_GET_MEMBER): {
+       const word2 words = JOIN_WORD(instruction);
+       const word mic_word = READ_WORD();
+       const uint16_t A = A_of(words);
+@@ -4804,37 +5058,45 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (mic_at >= chunk->mic.count) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "member cache index out of range.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
++      }
++      mic_cache* cache = &chunk->mic.data[mic_at];
++      mic_entry* hit = NULL;
++      for (uint32_t w = 0; w < OK_MIC_WAYS; ++w) {
++        if (cache->ways[w].klass == OBJECT_AS_VALUE(klass) &&
++            cache->ways[w].recv_is_class == (recv_is_class ? 1u : 0u)) {
++          hit = &cache->ways[w];
++          break; // leave the probe loop (a C break, never a dispatch)
++        }
+       }
+-      mic_entry* cache = &chunk->mic.data[mic_at];
+-      if (cache->klass == OBJECT_AS_VALUE(klass) && cache->recv_is_class == (recv_is_class ? 1u : 0u)) {
+-        if (cache->is_field) {
+-          if (cache->recv_is_class) {
++      if (hit != NULL) {
++        if (hit->is_field) {
++          if (hit->recv_is_class) {
+             // static fields never cache: a stale lane flip means corruption.
+             runtime_error(p_vm, OK_EK_INTERNAL, "corrupt member cache lane.");
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+-          REG_AT(A) = inst->fields[cache->field_slot];
+-          break;
++          REG_AT(A) = inst->fields[hit->field_slot];
++          DISPATCH();
+         }
+         // a cached method entry: the bind
+         gc_guard_up(p_vm->alloc->gc, recv);
+         object_specs specs = {p_vm->alloc, p_vm->objects_store};
+-        object_bound_method* bound = create_object_bound_method(recv, cache->method, &specs);
++        object_bound_method* bound = create_object_bound_method(recv, hit->method, &specs);
+         gc_guard_down(p_vm->alloc->gc);
+         if (bound == NULL) {
+           runtime_oom(p_vm, "out of memory: failed to allocate a bound method.");
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         REG_AT(A) = OBJECT_AS_VALUE(bound);
+-        break;
++        DISPATCH();
+       }
+       if (!IS_VALUE_STRING(chunk->constants.data[C])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "member name constant is not a string.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_string* name = VALUE_AS_STRING(chunk->constants.data[C]);
+       if (recv_is_class) {
+@@ -4854,10 +5116,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           name->string.chars,
+                           owner->name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+           REG_AT(A) = owner->static_values.data[sf->slot];
+-          break;
++          DISPATCH();
+         }
+         const method_entry* entry = object_class_find_static_method(klass, name);
+         if (entry != NULL) {
+@@ -4868,13 +5130,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           name->string.chars,
+                           klass->name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+-          cache->klass = recv;
+-          cache->method = entry;
+-          cache->field_slot = 0;
+-          cache->is_field = 0;
+-          cache->recv_is_class = 1;
++          const mic_entry filled = {recv, entry, 0, 0, 1};
++          mic_fill(cache, &filled);
+           gc_guard_up(p_vm->alloc->gc, recv);
+           object_specs specs = {p_vm->alloc, p_vm->objects_store};
+           object_bound_method* bound = create_object_bound_method(recv, entry, &specs);
+@@ -4882,10 +5141,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+           if (bound == NULL) {
+             runtime_oom(p_vm, "out of memory: failed to allocate a bound method.");
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+           REG_AT(A) = OBJECT_AS_VALUE(bound);
+-          break;
++          DISPATCH();
+         }
+         runtime_error(p_vm,
+                       OK_EK_TYPE,
+@@ -4893,7 +5152,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                       klass->name->string.chars,
+                       name->string.chars);
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       const field_entry* field = object_class_find_field(klass, name);
+       if (field != NULL) {
+@@ -4908,15 +5167,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                         name->string.chars,
+                         klass->name->string.chars);
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+-        cache->klass = OBJECT_AS_VALUE(klass);
+-        cache->method = NULL;
+-        cache->field_slot = field->slot;
+-        cache->is_field = 1;
+-        cache->recv_is_class = 0;
++        const mic_entry filled = {OBJECT_AS_VALUE(klass), NULL, field->slot, 1, 0};
++        mic_fill(cache, &filled);
+         REG_AT(A) = inst->fields[field->slot];
+-        break;
++        DISPATCH();
+       }
+       const method_entry* entry = object_class_find_method(klass, name);
+       if (entry != NULL) {
+@@ -4927,13 +5183,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                         name->string.chars,
+                         klass->name->string.chars);
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+-        cache->klass = OBJECT_AS_VALUE(klass);
+-        cache->method = entry;
+-        cache->field_slot = 0;
+-        cache->is_field = 0;
+-        cache->recv_is_class = 0;
++        const mic_entry filled = {OBJECT_AS_VALUE(klass), entry, 0, 0, 0};
++        mic_fill(cache, &filled);
+         gc_guard_up(p_vm->alloc->gc, recv);
+         object_specs specs = {p_vm->alloc, p_vm->objects_store};
+         object_bound_method* bound = create_object_bound_method(recv, entry, &specs);
+@@ -4941,10 +5194,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         if (bound == NULL) {
+           runtime_oom(p_vm, "out of memory: failed to allocate a bound method.");
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         REG_AT(A) = OBJECT_AS_VALUE(bound);
+-        break;
++        DISPATCH();
+       }
+       runtime_error(p_vm,
+                     OK_EK_TYPE,
+@@ -4952,9 +5205,9 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                     klass->name->string.chars,
+                     name->string.chars);
+       FAIL_PATH();
+-      break;
++      DISPATCH();
+     }
+-    case OP_INVOKE: {
++    CASE(OP_INVOKE): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool takes_one = p_of(instruction);
+       const word mic_word = READ_WORD();
+@@ -4985,47 +5238,55 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (mic_at >= chunk->mic.count) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "invoke cache index out of range.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
++      }
++      mic_cache* cache = &chunk->mic.data[mic_at];
++      mic_entry* hit = NULL;
++      for (uint32_t w = 0; w < OK_MIC_WAYS; ++w) {
++        if (cache->ways[w].klass == OBJECT_AS_VALUE(klass) &&
++            cache->ways[w].recv_is_class == (recv_is_class ? 1u : 0u)) {
++          hit = &cache->ways[w];
++          break; // leave the probe loop (a C break, never a dispatch)
++        }
+       }
+-      mic_entry* cache = &chunk->mic.data[mic_at];
+-      if (cache->klass == OBJECT_AS_VALUE(klass) && cache->recv_is_class == (recv_is_class ? 1u : 0u)) {
+-        if (cache->is_field) {
+-          if (cache->recv_is_class) {
++      if (hit != NULL) {
++        if (hit->is_field) {
++          if (hit->recv_is_class) {
+             runtime_error(p_vm, OK_EK_INTERNAL, "corrupt invoke cache lane.");
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+           // a cached field slot holding a callable: the other thing
+           // obj.name(args) can mean. re-read and re-check every time - the
+           // value in a mut field can change between calls.
+           entry = NULL;
+-          value callable = inst->fields[cache->field_slot];
++          value callable = inst->fields[hit->field_slot];
+           if (IS_VALUE_CLOSURE(callable)) {
+             REG_AT(A) = callable;
+             frame->ip = ip;
+             if (!call(p_vm, exe, reg, VALUE_AS_CLOSURE(callable), frame->registers_base + A, B,
+                       takes_one ? 1u : 0u)) {
+               FAIL_PATH();
+-              break;
++              DISPATCH();
+             }
+             exe = p_vm->current_execution_state;
+             reg = &exe->registers;
+             frame = &exe->call_stack.data[exe->call_stack.count - 1];
+             ip = frame->ip;
+-            break;
++            DISPATCH();
+           }
+           runtime_error(p_vm,
+                         OK_EK_TYPE,
+                         "field holds a value that is not callable in this position.");
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+-        entry = cache->method;
++        entry = hit->method;
+       } else {
+         if (!IS_VALUE_STRING(chunk->constants.data[C])) {
+           runtime_error(p_vm, OK_EK_INTERNAL, "method name constant is not a string.");
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         object_string* name = VALUE_AS_STRING(chunk->constants.data[C]);
+         if (recv_is_class) {
+@@ -5040,13 +5301,13 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+               frame->ip = ip;
+               if (!construct_instance(p_vm, klass, frame->registers_base + A, B)) {
+                 FAIL_PATH();
+-                break;
++                DISPATCH();
+               }
+               exe = p_vm->current_execution_state;
+               reg = &exe->registers;
+               frame = &exe->call_stack.data[exe->call_stack.count - 1];
+               ip = frame->ip;
+-              break;
++              DISPATCH();
+             }
+             runtime_error(p_vm,
+                           OK_EK_TYPE,
+@@ -5054,7 +5315,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           klass->name->string.chars,
+                           name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+           if (!entry_visible_from(entry, frame)) {
+             runtime_error(p_vm,
+@@ -5063,13 +5324,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           name->string.chars,
+                           klass->name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+-          cache->klass = recv;
+-          cache->method = entry;
+-          cache->field_slot = 0;
+-          cache->is_field = 0;
+-          cache->recv_is_class = 1;
++          const mic_entry filled = {recv, entry, 0, 0, 1};
++          mic_fill(cache, &filled);
+         } else {
+           entry = object_class_find_method(klass, name);
+           if (entry == NULL) {
+@@ -5082,23 +5340,20 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+             if (field != NULL && seg != NULL && caller != NULL && object_class_is_a(caller, seg)) {
+               value callable = inst->fields[field->slot];
+               if (IS_VALUE_CLOSURE(callable)) {
+-                cache->klass = OBJECT_AS_VALUE(klass);
+-                cache->method = NULL;
+-                cache->field_slot = field->slot;
+-                cache->is_field = 1;
+-                cache->recv_is_class = 0;
++                const mic_entry filled = {OBJECT_AS_VALUE(klass), NULL, field->slot, 1, 0};
++                mic_fill(cache, &filled);
+                 REG_AT(A) = callable;
+                 frame->ip = ip;
+                 if (!call(p_vm, exe, reg, VALUE_AS_CLOSURE(callable), frame->registers_base + A, B,
+                           takes_one ? 1u : 0u)) {
+                   FAIL_PATH();
+-                  break;
++                  DISPATCH();
+                 }
+                 exe = p_vm->current_execution_state;
+                 reg = &exe->registers;
+                 frame = &exe->call_stack.data[exe->call_stack.count - 1];
+                 ip = frame->ip;
+-                break;
++                DISPATCH();
+               }
+               runtime_error(p_vm,
+                             OK_EK_TYPE,
+@@ -5106,7 +5361,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                             name->string.chars,
+                             klass->name->string.chars);
+               FAIL_PATH();
+-              break;
++              DISPATCH();
+             }
+             runtime_error(p_vm,
+                           OK_EK_TYPE,
+@@ -5114,7 +5369,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           klass->name->string.chars,
+                           name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+           if (!entry_visible_from(entry, frame)) {
+             runtime_error(p_vm,
+@@ -5123,13 +5378,10 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                           name->string.chars,
+                           klass->name->string.chars);
+             FAIL_PATH();
+-            break;
++            DISPATCH();
+           }
+-          cache->klass = OBJECT_AS_VALUE(klass);
+-          cache->method = entry;
+-          cache->field_slot = 0;
+-          cache->is_field = 0;
+-          cache->recv_is_class = 0;
++          const mic_entry filled = {OBJECT_AS_VALUE(klass), entry, 0, 0, 0};
++          mic_fill(cache, &filled);
+         }
+       }
+       if (entry->is_native) {
+@@ -5140,26 +5392,26 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         frame->ip = ip;
+         if (!call_native_method(p_vm, exe, reg, entry, frame->registers_base + A, B)) {
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         exe = p_vm->current_execution_state;
+         reg = &exe->registers;
+         frame = &exe->call_stack.data[exe->call_stack.count - 1];
+         ip = frame->ip;
+-        break;
++        DISPATCH();
+       }
+       frame->ip = ip;
+       if (!call(p_vm, exe, reg, entry->closure, frame->registers_base + A, B, takes_one ? 1u : 0u)) {
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       exe = p_vm->current_execution_state;
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
+-      break;
++      DISPATCH();
+     }
+-    case OP_SUPER_INVOKE: {
++    CASE(OP_SUPER_INVOKE): {
+       const word2 words = JOIN_WORD(instruction);
+       const bool takes_one = p_of(instruction);
+       const uint16_t A = A_of(words);
+@@ -5169,12 +5421,12 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       if (owner == NULL || owner->parent == NULL) {
+         runtime_error(p_vm, OK_EK_TYPE, "'super' outside a class hierarchy.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       if (!IS_VALUE_STRING(frame->closure->function->chunk.constants.data[C])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "method name constant is not a string.");
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[C]);
+       // the receiver at register 0 picks the lane: an instance walks the
+@@ -5191,7 +5443,7 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+                       name->string.chars,
+                       owner->name->string.chars);
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       if (entry->is_native) {
+         // same window shape as the closure lane: receiver (register 0)
+@@ -5200,13 +5452,13 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+         frame->ip = ip;
+         if (!call_native_method(p_vm, exe, reg, entry, frame->registers_base + A, B)) {
+           FAIL_PATH();
+-          break;
++          DISPATCH();
+         }
+         exe = p_vm->current_execution_state;
+         reg = &exe->registers;
+         frame = &exe->call_stack.data[exe->call_stack.count - 1];
+         ip = frame->ip;
+-        break;
++        DISPATCH();
+       }
+       // stage the receiver (register 0) as the call window base, then the
+       // ordinary call machinery owns the rest
+@@ -5214,21 +5466,25 @@ interpret_result run_until(vm* p_vm, uint32_t p_call_depth) {
+       frame->ip = ip;
+       if (!call(p_vm, exe, reg, entry->closure, frame->registers_base + A, B, takes_one ? 1u : 0u)) {
+         FAIL_PATH();
+-        break;
++        DISPATCH();
+       }
+       exe = p_vm->current_execution_state;
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
+-      break;
+-    }
++      DISPATCH();
+     }
++#if !defined(OK_DISPATCH_THREADED)
++    } // switch
++#endif
+   next_instruction:; // FAIL_PATH resumes here: the catch's first instruction is next
+   }
+ #undef READ_BYTE
+ #undef READ_CONSTANT
+ #undef BIN_OP
+ #undef FAIL_PATH
++#undef CASE
++#undef DISPATCH
+ }
+ 
+ // raise (catchable): stash kind + message into the error lane. no printing,
+diff --git a/src/okvm.h b/src/okvm.h
+index 560ec35..12c1e8e 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -4,6 +4,7 @@
+ #include "okarray.h"
+ #include "okchunk.h"
+ #include "okfwd.h"
++#include "okintern.h"
+ #include "okobject.h"
+ 
+ ARRAY_DECLARE_DEFAULT(register_array, value)
+@@ -127,6 +128,10 @@ typedef struct {
+ 
+ struct vm {
+   execution_state* current_execution_state;
++  // the string interner: canonical compiler-made names. rooted via the gc's
++  // interner watch; the vm interns its startup spellings here so they
++  // pointer-match the compiler's constants (member probes hit on ==).
++  string_interner* interner;
+   // the two singletons every hierarchy funnels into: Object (the root, the
+   // default parent) and Class (the class of every class value - there is
+   // exactly one metaclass, no tower). created at vm_init, traced via mark_vm.
+@@ -177,6 +182,7 @@ typedef struct {
+   globals_store* globals_store;
+   allocators* alloc;
+   ok* ok;
++  string_interner* interner;
+ } vm_specs;
+ 
+ typedef struct {
+diff --git a/tests/e2e/tests/classes/fused_operator_conditions.ok b/tests/e2e/tests/classes/fused_operator_conditions.ok
+new file mode 100644
+index 0000000..6dcd3fc
+--- /dev/null
++++ b/tests/e2e/tests/classes/fused_operator_conditions.ok
+@@ -0,0 +1,40 @@
++// the fused comparison's operator dispatch: `if (a == b)` where the left
++// operand's class defines operator == must dispatch exactly like the value
++// binop would. same for the ordered comparisons inside conditions.
++class Version {
++  let major = 0;
++  let minor = 0;
++  fu init(major, minor) { this.major = major; this.minor = minor; }
++  pub fu operator ==(o) { return major == o.major and minor == o.minor; }
++  pub fu operator <(o) { return major < o.major or (major == o.major and minor < o.minor); }
++  pub fu key() { return major + minor; }
++}
++let v1 = Version(1, 0);
++let v2 = Version(1, 0);
++let v3 = Version(2, 1);
++
++// == dispatches through the fused if
++if v1 == v2 { print "eq-dispatch"; } // expect: eq-dispatch
++if v1 == v3 { print "eq-bad"; }
++
++// the negated form of a dispatched ==
++if v1 == v3 { print "neq-bad"; } else { print "neq-else"; } // expect: neq-else
++
++// < dispatches through the fused while bound
++let mut count = 0;
++let mut cur = Version(0, 3);
++while cur < v3 {
++  count = count + 1;
++  cur = Version(count, 3);
++}
++print count; // expect: 2
++
++// the same operators through the value lane (non-fused) agree
++print(v1 == v2); // expect: true
++print(v1 < v3); // expect: true
++print(v3 < v1); // expect: false
++
++// dispatch errors surface from the fused lane with the right message
++class NoCompare { pub fu tag() { return 1; } }
++let x = NoCompare();
++if x < 5 { print "unreachable"; } // expect error: invalid operands for binary '<'
+diff --git a/tests/e2e/tests/classes/interned_names.ok b/tests/e2e/tests/classes/interned_names.ok
+new file mode 100644
+index 0000000..e320e65
+--- /dev/null
++++ b/tests/e2e/tests/classes/interned_names.ok
+@@ -0,0 +1,53 @@
++// the string interner: compiler-made names canonicalize so member probes hit
++// the pointer fast path. this pins the OBSERVABLE contracts that must not
++// change when interning is on: identical spellings resolve to one method,
++// distinct-but-equal runtime strings still compare by content, and ===
++// stays word identity (literals are NOT interned - two occurrences of the
++// same literal are distinct words).
++class Names {
++  pub fu len() { return 42; } // a method spelled like a builtin
++  pub fu get() { return 1; }
++}
++let ns = Names();
++print(ns.len()); // expect: 42
++print len(ns); // expect error: invalid argument: 'len' expects an array or a map.
++
++// the same method name on many classes: every lookup finds its own
++class One { pub fu who() { return 1; } }
++class Two { pub fu who() { return 2; } }
++class Three : One { pub fu who2() { return who() + 30; } }
++print One().who(); // expect: 1
++print Two().who(); // expect: 2
++print Three().who2(); // expect: 31
++
++// canonical operator spellings: definition and dispatch sites agree across
++// whitespace spellings (the parser normalizes, the interner canonicalizes)
++class Spaced {
++  let v = 0;
++  fu init(v) { this.v = v; }
++  pub fu operator +(o) { return Spaced(v + o.v); }
++  pub fu operator  <  (o) { return v < o.v; }
++  pub fu get() { return v; }
++}
++print (Spaced(1) + Spaced(2)).get(); // expect: 3
++print Spaced(1) < Spaced(2); // expect: true
++
++// runtime-built strings compare by CONTENT against literals and each other
++let lit = "abc";
++let built = "ab" + "c";
++print(lit == built); // expect: true
++print(built == "abc"); // expect: true
++print(built != "xyz"); // expect: true
++
++// map keys: a literal key and a runtime-built equal key address one entry
++let m = { "k": 1 };
++m["b" + "uilt"] = 2;
++print(m["k"]); // expect: 1
++print(m["built"]); // expect: 2
++print(m["b" + "uilt"]); // expect: 2
++
++// === stays word identity: two literal occurrences are distinct words even
++// when the content matches (interning covers NAMES, never literal values)
++print("same" === "same"); // expect: false
++let s = "same";
++print(s === s); // expect: true
+diff --git a/tests/e2e/tests/classes/poly_mic.ok b/tests/e2e/tests/classes/poly_mic.ok
+new file mode 100644
+index 0000000..5d2245d
+--- /dev/null
++++ b/tests/e2e/tests/classes/poly_mic.ok
+@@ -0,0 +1,70 @@
++// the polymorphic inline cache: one call site, several receiver classes
++// alternating. the 3-way probe chain must keep every lane hitting (the old
++// single-entry mic thrashed on exactly this shape). five classes so the
++// chain also exercises round-robin eviction - and correctness never depends
++// on which entry won the slot.
++class A { pub fu tag() { return 1; } }
++class B { pub fu tag() { return 2; } }
++class C { pub fu tag() { return 3; } }
++class D { pub fu tag() { return 4; } }
++class E { pub fu tag() { return 5; } }
++
++let objs = [A(), B(), C(), D(), E()];
++let mut sum = 0;
++let mut round = 0;
++while round < 3 {
++  let mut idx = 0;
++  while idx < 5 {
++    sum = sum + objs[idx].tag();
++    idx = idx + 1;
++  }
++  round = round + 1;
++}
++print sum; // expect: 45
++
++// mixed lanes at one site: instance receivers, class receivers (statics),
++// and a builtin receiver (the native lane) - the cache keys them apart.
++class Meta {
++  pub static fu who() { return 10; }
++  pub fu mine() { return 20; }
++}
++let m = Meta();
++let mut acc = 0;
++let mut q = 0;
++while q < 2 {
++  acc = acc + m.mine();
++  acc = acc + Meta.who();
++  acc = acc + [1, 2, 3, 4].len();
++  q = q + 1;
++}
++print acc; // expect: 68
++
++// fields at a polymorphic site: three classes with the same field name at
++// different slots (inheritance shifts the layout) - the cache carries the
++// per-class slot.
++class Base { let x = 0; fu init(x) { this.x = x; } pub fu getx() { return x; } }
++class Mid : Base {}
++class Leaf : Mid { let y = 0; fu init(x, y) { super(x); this.y = y; } pub fu sum() { return getx() + y; } }
++let shapes = [Base(1), Mid(2), Leaf(3, 4)];
++let mut fields = 0;
++let mut w = 0;
++while w < 3 {
++  fields = fields + shapes[w].getx(); // the method, not the private field
++  w = w + 1;
++}
++print fields; // expect: 6
++print Leaf(3, 4).sum(); // expect: 7
++
++// a field-then-method flip at one site (the shadow shape): reads are
++// field-first, call sites are method-first. the probe runs from inside the
++// ring (fields are hierarchy-internal, the C++ ring).
++class Shadow {
++  let mut f = 0;
++  pub fu f() { return 99; }
++  fu init() { f = 5; }
++  pub fu probe() { return f; }        // the field (read lane)
++  pub fu probe_call() { return this.f(); } // the method (explicit call lane)
++}
++let sh = Shadow();
++print sh.probe(); // expect: 5
++print sh.probe_call(); // expect: 99
+diff --git a/tests/e2e/tests/loops/fused_conditions.ok b/tests/e2e/tests/loops/fused_conditions.ok
+new file mode 100644
+index 0000000..9c8d36a
+--- /dev/null
++++ b/tests/e2e/tests/loops/fused_conditions.ok
+@@ -0,0 +1,69 @@
++// the fused condition lane: a direct comparison in an if/while/for condition
++// compiles to one instruction (OP_JUMP_IF_CMP) instead of the binop's bool +
++// OP_JUMP_IF pair. this file pins the semantics of every fusable comparator
++// through all three statement forms, with both operands in every home (local
++// register, constant, expression temp) - the fusion must be invisible.
++let a = 3;
++let b = 7;
++let n = 4;
++
++// if with every comparator, constant and register rhs
++if a < b { print "lt-reg"; } // expect: lt-reg
++if a < 10 { print "lt-k"; } // expect: lt-k
++if a <= 3 { print "le-reg"; } // expect: le-reg
++if a <= 2 { print "le-bad"; }
++if b > a { print "gt-reg"; } // expect: gt-reg
++if b > 99 { print "gt-bad"; }
++if b >= 7 { print "ge-reg"; } // expect: ge-reg
++if a == 3 { print "eq-k"; } // expect: eq-k
++if a == b { print "eq-bad"; }
++if a != b { print "neq-reg"; } // expect: neq-reg
++if a != 3 { print "neq-bad"; }
++if "x" === "x" { print "seq-same"; } // distinct literal words: never taken
++if 1 === 1.0 { print "seq-num"; } // expect: seq-num
++if 1 === 2 { print "seq-bad"; }
++
++// else arm through the fused jump
++if a > b { print "bad-then"; } else { print "good-else"; } // expect: good-else
++
++// while with a fused bound: the loop runs and exits
++let mut i = 0;
++while i < n { i = i + 1; }
++print i; // expect: 4
++
++// while whose fused condition is false from the start
++let mut j = 0;
++while j < 0 { j = 9; }
++print j; // expect: 0
++
++// while with register bound and a non-constant step
++let mut k = 0;
++let limit = 3;
++while k < limit { k = k + 2; }
++print k; // expect: 4
++
++// c-style for with a fused condition
++let mut total = 0;
++for let mut f = 0; f < 5; f = f + 1 { total = total + f; }
++print total; // expect: 10
++
++// the comparison operands can be expressions staging in temps
++if a + 1 < b * 2 { print "expr-temps"; } // expect: expr-temps
++
++// strings compare by content through the fused lane too
++let s = "hello";
++if s == "hello" { print "str-eq"; } // expect: str-eq
++if s != "world" { print "str-neq"; } // expect: str-neq
++
++// the local on the left survives the fused compare (the vm restores it)
++let mut counter = 0;
++while counter < 3 { counter = counter + 1; }
++print counter; // expect: 3
++
++// conditions that do NOT fuse keep working: logical operators, negation,
++// bare truthiness
++let flag = true;
++if flag { print "bare"; } // expect: bare
++if !(a > b) { print "negated"; } // expect: negated
++if a < b and b < 10 { print "and-lane"; } // expect: and-lane
++if a > b or b > a { print "or-lane"; } // expect: or-lane
