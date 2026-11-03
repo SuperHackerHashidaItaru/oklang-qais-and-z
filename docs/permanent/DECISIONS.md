@@ -328,3 +328,42 @@ D13's "interning stays OFF". the cost: one hash+probe per creation
 churned content returns; bounded memory proven (300k churned strings
 under a 64mb cap). gates: 427/427 x5 (plain, threaded, asan,
 aggressive-gc, asan+aggressive).
+
+## D21 — the coro C API: embedders drive coros, natives park callers [LOCKED 2026-11-03, patch 42]
+the "vm_tick" investigation closed: no ready-queue pump exists or should
+(scheduler = stdlib = casio, standing veto) - what was missing was the
+primitive set the future pump is built from. ok.h grows ok_coro_new /
+ok_coro_resume / ok_coro_status / ok_coro_current (thin honest wrappers
+over coro_drive with ok_call's C boundary discipline: errors land in
+ok_last_error at the host boundary, fail the enclosing call inside a
+native; a dead coro answers null per R21) plus ok_value_is_coro and the
+OK_CORO_* status enum. the one real piece of machinery is
+ok_native_suspend: a native requests suspension AT ITS RETURN BOUNDARY -
+a flag on the execution state, checked by the six native call-completion
+arms (OP_CALL x4, INVOKE, SUPER_INVOKE), parks the coro exactly like
+OP_YIELD would: the native's result goes out to the resumer, the next
+resume's argument lands in the call's result register. the yield barrier
+doctrine guards it identically (no suspend on main, under an operator /
+constructor / unwind defer, or across another native call - request-time
+refusals, so the flag never outlives its flight). this is the surface
+OR-3's ok_api vtable wraps from day one (D19's ABI argument), and asio's
+sleep/await are now writable. gates: e2e 427/427 x5 + unit/embed/capi x5
+(tests/capi/ is new: pure C99, 140 checks, doubles as OR-3's
+memory-backed-loader bed); delta blue flat (the six flag checks cost
+nothing measurable). caught en route: patch 40's rename broke the embed
+test's one `Object` - the gates had been quoting e2e only; fixed, and
+the unit runner lane is back in the receipts.
+
+same session, Q's review round on the modules draft (recorded here
+because D19 is the locked parent): the manifest is **project.ok** (not
+okproject.ok - "the file ext gives it"); **coro stays a core native**
+like str/num/bool/map/array/type, NOT gated in std - R24's std.coro home
+is overruled, OR-2 shrinks to the flat stdlib's std/ re-home; platform
+independence by construction (OK_API export macro, dlopen/dlsym behind
+the compile-time wrapper); and the host provides dynamic loading
+malloc-style (ok_dylib hooks, platform default, hard off-switch) - the
+language runs on platforms with no loader at all, and the off-switch is
+the structural sandbox denial. v0.7.0 is named **"Epigone"**. OPEN for
+Q, Z recommending IN: the ok_api read side, type/class identity
+(classof/is_instance/class_name), native->script calls, and the
+single-integer OK_NATIVE_ABI versioning stance (MODULES.md section 11a).

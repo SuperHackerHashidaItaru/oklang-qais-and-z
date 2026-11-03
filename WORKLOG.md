@@ -1782,3 +1782,76 @@ still flagged (yield keyword joins the grammar list).
 - next: Q rules on patch 42's shape (the coro C API + the tests/capi/
   harness), then OR-1 opens the 0.8.0 lane. delta blue stays the 0.9.0
   meter.
+## session 35 (2026-11-03): patch 42 lands (D21, the coro C API) + Epigone + the modules amendments
+
+- context: session 34's deliverables (interning 41, the vm_tick report,
+  MODULES.md final) came back from Q: "i agree about the draft, with
+  some tiny adjustments" + the api questions + "proceed with the current
+  task, then stop at the task that pends on these questions" + "Epigone
+  is super cool and fitting, recording that".
+- patch 42, D21 - the coro C API. the current task, landed on
+  modules-staging (c93995d + 474a0df, clean on top of 41/tidy):
+  ok_coro_new / ok_coro_resume / ok_coro_status / ok_coro_current +
+  ok_value_is_coro + OK_CORO_* in ok.h (implemented in okvm.c beside
+  the coro natives, where coro_drive lives), and ok_native_suspend -
+  the native parks its caller at its own return boundary. the park: a
+  flag on the execution state, request-time validated (coro owner /
+  depth 1 / no barrier - refusals in the yield error family, spelled
+  "suspend"), consumed by the six native call-completion arms (OP_CALL
+  x4, OP_INVOKE, OP_SUPER_INVOKE). the native's result goes out to the
+  resumer; the next resume's argument lands in the call's result
+  register. ok_coro_resume keeps ok_call's exact error discipline
+  (ok_last_error at depth 0, pending lane inside a native) and
+  gc-guards the coro across the drive.
+- tests/capi/ - the new harness, pure C99 (the public header's
+  C-cleanliness is now pinned by a build): 140 checks over the
+  two-way channel, R21/R22 from C (the death sweep's defers seen
+  through the print hook), the park at plain/spread/method/defer
+  shapes (the method lane through a C-defined class), a suspended
+  inner coro ESCAPING its dead creator into the host's hands,
+  self-resume refusal, the three barrier refusals. two test-authored
+  corrections en route: native_park serves both arities (function +
+  method), and the barrier refusals must run INSIDE a coro (at top
+  level "outside a coroutine" fires first). doubles as OR-3's
+  memory-backed-loader bed per the spec.
+- caught en route, fixed in the same patch: the embed test still said
+  `Object` - patch 40's rename missed its one script use, and the last
+  two sessions' receipts quoted e2e only so it rotted silently (the
+  threaded-asan build dirs still held pre-rename objects, which is how
+  it slipped past a spot check). fixed; run_unit_tests.sh gains the
+  capi lane; the full runner matrix is back in the receipts.
+- gates: e2e 427/427 x5 (plain, threaded, asan, aggressive,
+  asan+aggressive) + unit x3 / embed / capi x5 (gcc, asan, asan-aggr,
+  threaded-asan, threaded-asan-aggr). delta blue: 14065400 correct,
+  flat - baseline-plain 617.8ms vs current-plain 614.4ms median (the
+  six flag checks cost nothing); 251.5ms at -O2 matches session-33's
+  "249.7ms", which was an -O2 build all along - the scary first read
+  of 621 vs 249 was -O0 vs -O2, not a regression.
+- Epigone recorded: v0.7.0's name, in ROADMAP (third update bracket)
+  and D21's tail. the 0.7.0 lane is one apply away from closing.
+- MODULES.md amended per Q's review round (the RULED items folded in,
+  the questions answered and marked OPEN in new section 11a):
+  project.ok (the ext gives it); coro stays a core native like
+  str/num/bool/map/array/type - "since it is inside the api, it
+  shouldn't be gated in std", R24's std.coro home overruled, OR-2
+  shrunk to the flat stdlib re-home; OK_API + the compile-time
+  dlopen/dlsym wrapper (two real implementations: LoadLibrary, dlopen
+  family - macos included, "what others are" answered in section 7);
+  and Q's host-provided dynamic loading (ok_dylib hooks, malloc-style,
+  platform default, hard off-switch) designed in as section 7's
+  loader floor - it is also the structural sandbox denial. the vtable
+  grows the READ side (value_type/as_*/array_*/map_*), type + class
+  identity (classof/is_instance/class_name - Q's question,
+  recommendation YES), and call - all marked OPEN for Q with the
+  single-integer OK_NATIVE_ABI versioning stance (bump the number, no
+  semver, append-only entries as the one kept discipline). stopped
+  here per Q's instruction: OR-1 does not start until the OPEN items
+  are ruled.
+- delivered: patches/42-coroc-api.patch (+ README entry), MODULES.md
+  amended, DECISIONS D21 (+ the review-round rulings in its tail),
+  ROADMAP third update, this entry. language side: two commits on
+  modules-staging (c93995d, 474a0df), clean on top of 764e26d (=
+  tidy + 41) when Q wants them.
+- next: Q rules the four OPEN items (read side, type/class identity,
+  call, versioning) -> OR-3's vtable is final -> OR-1 opens the
+  0.8.0 lane. delta blue stays the 0.9.0 meter.

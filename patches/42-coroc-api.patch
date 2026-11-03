@@ -1,0 +1,824 @@
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index 07a679b..ba68e26 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -52,6 +52,7 @@ bool ok_value_is_bool(ok_value p_value);
+ bool ok_value_is_number(ok_value p_value);
+ bool ok_value_is_object(ok_value p_value);
+ bool ok_value_is_string(ok_value p_value);
++bool ok_value_is_coro(ok_value p_value);
+ 
+ bool ok_value_as_bool(ok_value p_value);
+ double ok_value_as_number(ok_value p_value);
+@@ -191,6 +192,58 @@ bool ok_class_define_native_method(ok* p_ok,
+ // after this, definitions are refused forever.
+ bool ok_class_freeze(ok* p_ok, ok_value p_class);
+ 
++/* coroutines (embedder side) */
++
++// the lifecycle ok_coro_status reports. a dead coro answers null on resume
++// (R21); errors kill the coro and fail the resume call (R22).
++enum {
++  OK_CORO_READY = 0,
++  OK_CORO_SUSPENDED = 1,
++  OK_CORO_RUNNING = 2,
++  OK_CORO_DEAD = 3,
++};
++
++// coro(fu) from C. p_body must be a script closure (a fu or lambda value);
++// a bound method, a native, or anything else is refused with a null return,
++// as is allocation failure. the body does NOT run until the first resume.
++// the result is not rooted: ok_root it like an ok_array_new result.
++ok_value ok_coro_new(ok* p_ok, ok_value p_body);
++
++// the game-loop primitive: while (running) { ok_coro_resume(...); render(); }
++// drives one suspension segment of the coro. true + *p_out = the yielded
++// value, or the body's final value when it completes. false = the body died
++// by error: at the host boundary the lane lands in ok_last_error (nothing
++// prints), inside a native the enclosing call fails instead - exactly
++// ok_call's discipline. a dead coro answers true + null; a running one
++// errors. p_arg lands in the body's parameter (first resume) or the parked
++// yield/suspend expression's result slot (later resumes); pass p_has_arg =
++// false to send null. the coro is guarded for the duration of the call;
++// *p_out follows the same rooting contract as an ok_call result.
++bool ok_coro_resume(ok* p_ok, ok_value p_coro, ok_value p_arg, bool p_has_arg, ok_value* p_out);
++
++// OK_CORO_READY / _SUSPENDED / _RUNNING / _DEAD. UINT32_MAX for any value
++// that is not a coro (check ok_value_is_coro first if the provenance is in
++// doubt).
++uint32_t ok_coro_status(ok* p_ok, ok_value p_coro);
++
++// the coro currently running, as a value. meaningful inside a native (or a
++// print callback) invoked from a coro's body; null on the main state, which
++// is also what the host sees between runs. root it if you keep it past your
++// next allocation.
++ok_value ok_coro_current(ok* p_ok);
++
++// a native parks its caller: request suspension at the native's own return
++// boundary. only valid inside a native callback whose caller chain down to
++// the coro's frame is pure bytecode - the same boundaries OP_YIELD enforces
++// (not on the main state, not under an operator method / constructor /
++// error-unwind defer, not across another native call). a granted request
++// parks the coro when the native returns: the native's result goes out to
++// the resumer (the resume's *p_out), and the next resume's argument lands in
++// the call's result register - the yield contract, one boundary later.
++// false = refused (the error lane explains, the call fails into script
++// catch), or the call site is not a native at all.
++bool ok_native_suspend(ok* p_ok);
++
+ /* output */
+ 
+ // print statements route through p_cb when set. the default (NULL) keeps the
+diff --git a/src/ok.c b/src/ok.c
+index 4be7c5a..6f38ff6 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -716,6 +716,10 @@ bool ok_value_is_string(ok_value p_value) {
+   return IS_VALUE_STRING(p_value);
+ }
+ 
++bool ok_value_is_coro(ok_value p_value) {
++  return IS_VALUE_CORO(p_value);
++}
++
+ bool ok_value_as_bool(ok_value p_value) {
+   return VALUE_AS_BOOL(p_value);
+ }
+diff --git a/src/okvm.c b/src/okvm.c
+index 30e66a4..bcbab79 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -6,6 +6,7 @@
+ #include <string.h>
+ 
+ #include "okvm.h"
++#include "ok/ok.h"
+ #if defined(OK_PARANOID)
+ #define OK_TRACE_EXECUTION
+ #endif // defined(OK_PARANOID)
+@@ -141,6 +142,7 @@ void vm_init(vm* p_vm, vm_specs p_specs) {
+   p_vm->current_execution_state->has_error = false;
+   p_vm->current_execution_state->error_what[0] = '\0';
+   p_vm->current_execution_state->native_call_depth = 0;
++  p_vm->current_execution_state->native_suspend_pending = false;
+   p_vm->current_execution_state->owner_coro = NULL; // the vm's own state: no coro owns it
+   p_vm->current_execution_state->yield_barrier = 0;
+   p_vm->current_execution_state->yield_barrier_kind = 0;
+@@ -637,6 +639,7 @@ static execution_state* coro_state_create(vm* p_vm, object_coro* p_coro) {
+   state->has_error = false;
+   state->error_what[0] = '\0';
+   state->native_call_depth = 0;
++  state->native_suspend_pending = false;
+   state->owner_coro = p_coro;
+   state->yield_barrier = 0;
+   state->yield_barrier_kind = 0;
+@@ -870,6 +873,137 @@ bool vm_define_coro_surface(vm* p_vm) {
+       object_class_define_native_method(klass, ok_create_string_view("status", 6, true), 1, native_coro_status, true, &specs);
+   return status;
+ }
++
++// =========================== the coro C API (patch 42) ===========================
++//
++// ok.h's embedder surface over the same engine the natives drive: create,
++// drive, inspect, and the one piece of machinery a script cannot express -
++// a native parking its caller. the wrappers keep ok_call's C boundary
++// discipline: errors land in the boundary's lane (ok_last_error at depth
++// 0, the enclosing call's failure inside a native), values cross as plain
++// words, rooting past each call is the host's job.
++
++// the ok.h status enum and the internal coro_status must stay index-parallel
++// (ok_coro_status returns the internal word unchecked).
++typedef char ok_coro_status_is_index_parallel[(OK_CORO_READY == (int)CORO_READY &&
++                                                OK_CORO_SUSPENDED == (int)CORO_SUSPENDED &&
++                                                OK_CORO_RUNNING == (int)CORO_RUNNING &&
++                                                OK_CORO_DEAD == (int)CORO_DEAD)
++                                                   ? 1
++                                                   : -1];
++
++// the park half of ok_native_suspend, shared by every call-completion arm
++// that can finish a suspend-requesting native (OP_CALL x4, OP_INVOKE,
++// OP_SUPER_INVOKE - the operator / constructor / unwind lanes are refused
++// at request time by the barrier, so they never reach a park). the native's
++// result already sits in the window at p_result (a frame-relative register
++// index); it goes OUT to the resumer, the coro parks in place, and the next
++// resume's argument lands in that same register - the yield contract, one
++// boundary later.
++static interpret_result native_suspend_park(execution_state* p_exe,
++                                             register_file* p_reg,
++                                             call_frame* p_frame,
++                                             uint16_t p_result) {
++  p_exe->native_suspend_pending = false;
++  object_coro* coro = p_exe->owner_coro;
++  coro->resume_target = p_result;
++  coro->status = CORO_SUSPENDED;
++  return (interpret_result){.status = RUNTIME_SUSPENDED,
++                            .top_level_return = p_reg->array.data[p_frame->registers_base + p_result]};
++}
++
++ok_value ok_coro_new(ok* p_ok, ok_value p_body) {
++  vm* p_vm = ok_vm(p_ok);
++  if (!IS_VALUE_CLOSURE(p_body)) {
++    return NULL_AS_VALUE();
++  }
++  object_specs specs = {p_vm->alloc, p_vm->objects_store};
++  gc_guard_up(p_vm->alloc->gc, p_body); // the coro rides the guard until the caller roots it
++  object_coro* coro = create_object_coro(VALUE_AS_CLOSURE(p_body), &specs);
++  gc_guard_down(p_vm->alloc->gc);
++  if (coro == NULL) {
++    return NULL_AS_VALUE();
++  }
++  return OBJECT_AS_VALUE(coro);
++}
++
++bool ok_coro_resume(ok* p_ok, ok_value p_coro, ok_value p_arg, bool p_has_arg, ok_value* p_out) {
++  vm* p_vm = ok_vm(p_ok);
++  if (!IS_VALUE_CORO(p_coro)) {
++    *p_out = NULL_AS_VALUE();
++    return false;
++  }
++  // the coro may be unrooted host state for the whole drive: the guard
++  // covers exactly the window in which the host holds no reference the
++  // collector can see (the drive itself swaps the states, the parked
++  // resumer's registers keep the script-lane receiver alive the same way).
++  gc_guard_up(p_vm->alloc->gc, p_coro);
++  value out;
++  const bool drove = coro_drive(p_vm, VALUE_AS_CORO(p_coro), p_has_arg, p_arg, &out);
++  gc_guard_down(p_vm->alloc->gc);
++  if (!drove) {
++    // the lane (transplanted to this boundary's state) carries the error:
++    // consumed here at depth 0 for ok_last_error, left pending inside a
++    // native so the enclosing call fails - vm_call's exact discipline.
++    if (p_vm->current_execution_state->native_call_depth == 0) {
++      vm_error(p_vm, false);
++    }
++    *p_out = NULL_AS_VALUE();
++    return false;
++  }
++  *p_out = out;
++  return true;
++}
++
++uint32_t ok_coro_status(ok* p_ok, ok_value p_coro) {
++  (void)p_ok;
++  if (!IS_VALUE_CORO(p_coro)) {
++    return UINT32_MAX;
++  }
++  return VALUE_AS_CORO(p_coro)->status;
++}
++
++ok_value ok_coro_current(ok* p_ok) {
++  vm* p_vm = ok_vm(p_ok);
++  object_coro* coro = p_vm->current_execution_state->owner_coro;
++  if (coro == NULL) {
++    return NULL_AS_VALUE();
++  }
++  return OBJECT_AS_VALUE(coro);
++}
++
++bool ok_native_suspend(ok* p_ok) {
++  vm* p_vm = ok_vm(p_ok);
++  execution_state* exe = p_vm->current_execution_state;
++  if (exe->native_call_depth == 0) {
++    return false; // not inside a native: there is no return boundary to park at
++  }
++  if (exe->owner_coro == NULL) {
++    runtime_error(p_vm, OK_EK_VALUE, "cannot suspend outside a coroutine.");
++    return false;
++  }
++  if (exe->native_call_depth > 1) {
++    runtime_error(p_vm, OK_EK_VALUE, "cannot suspend across a native call.");
++    return false;
++  }
++  if (exe->yield_barrier > 0) {
++    switch ((yield_barrier_kind)exe->yield_barrier_kind) {
++    case YIELD_BARRIER_CONSTRUCTOR:
++      runtime_error(p_vm, OK_EK_VALUE, "cannot suspend from inside a constructor.");
++      break;
++    case YIELD_BARRIER_OPERATOR:
++      runtime_error(p_vm, OK_EK_VALUE, "cannot suspend from inside an operator method.");
++      break;
++    case YIELD_BARRIER_DEFER:
++    default:
++      runtime_error(p_vm, OK_EK_VALUE, "cannot suspend from inside a defer.");
++      break;
++    }
++    return false;
++  }
++  exe->native_suspend_pending = true;
++  return true;
++}
+ static bool entry_visible_from(const method_entry* p_entry, const call_frame* p_frame);
+ static interpret_result error_interpret_result(void);
+ static interpret_result dispatch_operator_method(vm* p_vm,
+@@ -3634,6 +3768,9 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
++      if (exe->native_suspend_pending) {
++        return native_suspend_park(exe, reg, frame, a);
++      }
+       DISPATCH();
+     }
+     CASE(OP_CALL_LONG): {
+@@ -3657,6 +3794,9 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
++      if (exe->native_suspend_pending) {
++        return native_suspend_park(exe, reg, frame, A);
++      }
+       DISPATCH();
+     }
+     CASE(OP_RETURN): {
+@@ -4647,6 +4787,9 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
++      if (exe->native_suspend_pending) {
++        return native_suspend_park(exe, reg, frame, a);
++      }
+       DISPATCH();
+     }
+     CASE(OP_CALL_SPREAD_LONG): {
+@@ -4662,6 +4805,9 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       reg = &exe->registers;
+       frame = &exe->call_stack.data[exe->call_stack.count - 1];
+       ip = frame->ip;
++      if (exe->native_suspend_pending) {
++        return native_suspend_park(exe, reg, frame, A);
++      }
+       DISPATCH();
+     }
+     CASE(OP_PRINT): {
+@@ -5874,6 +6020,9 @@ static void* ok_dispatch_table[OP__COUNT] = {
+         reg = &exe->registers;
+         frame = &exe->call_stack.data[exe->call_stack.count - 1];
+         ip = frame->ip;
++        if (exe->native_suspend_pending) {
++          return native_suspend_park(exe, reg, frame, A);
++        }
+         DISPATCH();
+       }
+       frame->ip = ip;
+@@ -5934,6 +6083,9 @@ static void* ok_dispatch_table[OP__COUNT] = {
+         reg = &exe->registers;
+         frame = &exe->call_stack.data[exe->call_stack.count - 1];
+         ip = frame->ip;
++        if (exe->native_suspend_pending) {
++          return native_suspend_park(exe, reg, frame, A);
++        }
+         DISPATCH();
+       }
+       // stage the receiver (register 0) as the call window base, then the
+diff --git a/src/okvm.h b/src/okvm.h
+index a47ac40..6abcc77 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -106,6 +106,16 @@ typedef struct execution_state {
+   uint8_t yield_barrier;
+   uint8_t yield_barrier_kind;
+ 
++  // set by ok_native_suspend inside a native, consumed by the dispatch
++  // loop's native call-completion arms (OP_CALL / OP_CALL_SPREAD /
++  // OP_INVOKE / OP_SUPER_INVOKE): the requesting native's result goes out
++  // to the resumer, the coro parks exactly like OP_YIELD would, and the
++  // next resume's argument lands in the call's result register. the
++  // request-time validation (coro owner, yield barrier, native depth)
++  // guarantees no completion arm outside those four can ever see it set,
++  // so the flag never outlives the native flight that raised it.
++  bool native_suspend_pending;
++
+   // the parked-resumer chain head, see vm.resume_parked below.
+   struct execution_state* next_parked;
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index d34f510..82e7ff0 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1,3 +1,4 @@
+ add_subdirectory(unit/)
+ add_subdirectory(e2e/)
++add_subdirectory(capi/)
+ add_subdirectory(integration/)
+diff --git a/tests/capi/CMakeLists.txt b/tests/capi/CMakeLists.txt
+new file mode 100644
+index 0000000..4196731
+--- /dev/null
++++ b/tests/capi/CMakeLists.txt
+@@ -0,0 +1,15 @@
++project (oktest_capi LANGUAGES C)
++
++# the coro C API harness (patch 42): drives ok_coro_* + ok_native_suspend
++# through real scripts from pure C99. doubles as OR-3's embedder-loader test
++# bed when the module loader lands.
++
++add_executable(${PROJECT_NAME}
++  src/main.c
++)
++
++target_link_libraries(${PROJECT_NAME}
++  PRIVATE
++  ok
++  ok_sanitizers
++)
+diff --git a/tests/capi/src/main.c b/tests/capi/src/main.c
+new file mode 100644
+index 0000000..819d823
+--- /dev/null
++++ b/tests/capi/src/main.c
+@@ -0,0 +1,442 @@
++// tests/capi/src/main.c - the coro C API harness (patch 42).
++//
++// drives ok_coro_new / ok_coro_resume / ok_coro_status / ok_coro_current
++// and ok_native_suspend through real scripts: the two-way resume channel,
++// error death (the R22 defer sweep from the C lane), the native park at
++// every call shape (plain call, spread, method, defer exit), nested resume
++// from inside a native, and the barrier refusals.
++//
++// pure C99 on purpose: the public header must stay C-clean. the aggressive
++// gc build runs this binary too - every host-held value that crosses an
++// allocation is rooted or consumed first, that discipline is part of what
++// is under test.
++
++#include <ok/ok.h>
++
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++static int g_checks = 0;
++
++#define CHECK(p_cond)                                                                                                 \
++  do {                                                                                                                \
++    ++g_checks;                                                                                                       \
++    if (!(p_cond)) {                                                                                                  \
++      fprintf(stderr, "FAILED: %s (%s:%d)\n", #p_cond, __FILE__, __LINE__);                                           \
++      return 1;                                                                                                       \
++    }                                                                                                                 \
++  } while (0)
++
++// the print hook captures script output so defer/sweep lanes are observable
++// without stdout comparison.
++static char g_log[4096];
++static size_t g_log_len = 0;
++
++static void log_reset(void) {
++  g_log[0] = '\0';
++  g_log_len = 0;
++}
++
++static bool log_has(const char* p_needle) {
++  return strstr(g_log, p_needle) != NULL;
++}
++
++static void log_print(void* p_ctx, ok_value p_value) {
++  (void)p_ctx;
++  if (!ok_value_is_string(p_value)) {
++    return;
++  }
++  ok_cstring_view s = ok_value_as_string(p_value);
++  if (s.chars != NULL && g_log_len + 1 < sizeof(g_log)) {
++    const size_t n = strlen(s.chars);
++    const size_t room = sizeof(g_log) - g_log_len - 1;
++    memcpy(g_log + g_log_len, s.chars, n < room ? n : room);
++    g_log_len += n < room ? n : room;
++    g_log[g_log_len++] = '\n';
++    g_log[g_log_len] = '\0';
++  }
++  ok_cstring_view_deinit(&s);
++}
++
++// the suspend-requesting native: parks its caller at the return boundary,
++// answers its argument doubled. serves both spellings - the plain function
++// park(x) (argc 1) and the Cap method tick (argc 2, receiver first) - so
++// every call shape rides one suspension path. also records the running
++// coro as seen from inside a native, and whether the current boundary
++// allowed the request.
++static ok_value g_seen_current;
++static bool g_last_suspend_granted;
++
++static ok_value native_park(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  CHECK(p_argc == 1 || p_argc == 2);
++  const ok_value payload = p_argv[p_argc - 1];
++  CHECK(ok_value_is_number(payload));
++  g_seen_current = ok_coro_current(p_ok);
++  g_last_suspend_granted = ok_native_suspend(p_ok);
++  if (!g_last_suspend_granted) {
++    return ok_value_null(); // the error lane carries the refusal
++  }
++  return ok_value_number(ok_value_as_number(payload) * 2.0);
++}
++
++// a native that drives another coro from C (the parked-resumer chain from
++// the host lane): one resume per call. captures the coro it runs ON, so a
++// test can prove the native executed inside the caller's state.
++static ok_value native_drive(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  CHECK(p_argc == 1);
++  CHECK(ok_value_is_coro(p_argv[0]));
++  g_seen_current = ok_coro_current(p_ok);
++  ok_value out = ok_value_null();
++  CHECK(ok_coro_resume(p_ok, p_argv[0], ok_value_null(), false, &out));
++  return out;
++}
++
++// a native that tries to resume the RUNNING coro (itself): must fail and
++// fail its own call through the pending error lane.
++static ok_value native_self_resume(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  (void)p_argv;
++  ok_value self = ok_coro_current(p_ok);
++  CHECK(ok_value_is_coro(self));
++  ok_value out = ok_value_null();
++  CHECK(!ok_coro_resume(p_ok, self, ok_value_null(), false, &out));
++  return ok_value_null(); // never reached by the script: the lane is pending
++}
++
++static ok_string_view sv(const char* p_chars) {
++  return ok_create_string_view(p_chars, OK_STRING_VIEW_CALCULATE_LENGTH, true);
++}
++
++// reads :what: out of a materialized {:kind:, :what:} error map.
++static bool error_what_contains(ok* p_ok, const char* p_needle) {
++  ok_value error = ok_last_error(p_ok);
++  if (!ok_value_is_map(error)) {
++    return false;
++  }
++  ok_value key = ok_value_string(p_ok, sv("what"));
++  ok_value what = ok_value_null();
++  if (!ok_map_get(error, key, &what)) {
++    return false;
++  }
++  if (!ok_value_is_string(what)) {
++    return false;
++  }
++  ok_cstring_view text = ok_value_as_string(what);
++  const bool found = text.chars != NULL && strstr(text.chars, p_needle) != NULL;
++  ok_cstring_view_deinit(&text);
++  return found;
++}
++
++static bool run(ok* p_ok, const char* p_code) {
++  log_reset();
++  ok_source source = {p_code, "capi.ok"};
++  return ok_run(p_ok, source) == OK;
++}
++
++int main(void) {
++  ok_specs specs = {};
++  ok* p_ok = ok_create(specs);
++  CHECK(p_ok != NULL);
++
++  ok_set_print(p_ok, log_print, NULL);
++
++  CHECK(ok_global_define_native_function(p_ok, sv("park"), 1, native_park));
++  CHECK(ok_global_define_native_function(p_ok, sv("drive"), 1, native_drive));
++  CHECK(ok_global_define_native_function(p_ok, sv("self_resume"), 0, native_self_resume));
++
++  // a C-defined class with a native method: the OP_INVOKE park lane.
++  ok_value cap = ok_class_new(p_ok, sv("Cap"), ok_value_null());
++  CHECK(ok_value_is_class(cap));
++  CHECK(ok_class_define_native_method(p_ok, cap, sv("tick"), 2, native_park, true));
++  CHECK(ok_class_freeze(p_ok, cap));
++  CHECK(ok_global_define(p_ok, sv("Cap"), cap, false));
++
++  // ---------- 1. construct, drive, the two-way channel ----------
++  CHECK(run(p_ok,
++            "glob fu worker(n) {\n"
++            "  print(\"start \" + n as str);\n"
++            "  let got = yield n;\n"
++            "  print(\"got \" + got as str);\n"
++            "  return \"done \" + got as str;\n"
++            "}\n"));
++
++  ok_value body = ok_value_null();
++  CHECK(ok_global_get(p_ok, sv("worker"), &body));
++  CHECK(!ok_value_is_coro(body));
++
++  // a non-closure body is refused with null
++  CHECK(ok_value_is_null(ok_coro_new(p_ok, ok_value_number(1))));
++
++  ok_value coro = ok_coro_new(p_ok, body);
++  CHECK(ok_value_is_coro(coro));
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_READY);
++
++  // on the main state, between runs: no running coro
++  CHECK(ok_value_is_null(ok_coro_current(p_ok)));
++
++  const uint32_t root = ok_root(p_ok, coro);
++  CHECK(root != OK_ROOT_INVALID);
++
++  ok_value out = ok_value_null();
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_number(7), true, &out));
++  CHECK(ok_value_is_number(out) && ok_value_as_number(out) == 7.0); // yield n
++  CHECK(log_has("start 7"));
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_SUSPENDED);
++
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_string(p_ok, sv("hi")), true, &out));
++  CHECK(ok_value_is_string(out));
++  ok_cstring_view done = ok_value_as_string(out);
++  CHECK(done.chars != NULL && strcmp(done.chars, "done hi") == 0);
++  ok_cstring_view_deinit(&done);
++  CHECK(log_has("got hi"));
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_DEAD);
++
++  // R21 from the C lane: a dead coro answers null, not an error
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_null(), false, &out));
++  CHECK(ok_value_is_null(out));
++
++  CHECK(ok_unroot(p_ok, root));
++
++  // ---------- 2. error death: the lane, the sweep, the status ----------
++  CHECK(run(p_ok,
++            "fu close(tag) {\n"
++            "  print(\"closing \" + tag);\n"
++            "  return true;\n"
++            "}\n"
++            "glob fu dying() {\n"
++            "  defer close(\"a\");\n"
++            "  defer close(\"b\");\n"
++            "  yield 1;\n"
++            "  let boom = 1 + \"x\";\n"
++            "  return 0;\n"
++            "}\n"));
++
++  CHECK(ok_global_get(p_ok, sv("dying"), &body));
++  coro = ok_coro_new(p_ok, body);
++  CHECK(ok_value_is_coro(coro));
++  const uint32_t root2 = ok_root(p_ok, coro);
++
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_null(), false, &out));
++  CHECK(ok_value_is_number(out) && ok_value_as_number(out) == 1.0);
++
++  ok_clear_error(p_ok);
++  CHECK(!ok_coro_resume(p_ok, coro, ok_value_null(), false, &out));
++  CHECK(ok_value_is_null(out));
++  CHECK(error_what_contains(p_ok, "invalid operands")); // the transplanted lane
++  CHECK(log_has("closing b") && log_has("closing a"));  // the R22 death sweep ran, lifo
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_DEAD);
++  ok_clear_error(p_ok);
++
++  CHECK(ok_unroot(p_ok, root2));
++
++  // ---------- 3. the native park, plain call shape ----------
++  CHECK(run(p_ok,
++            "glob fu plain_worker() {\n"
++            "  let got = park(21);\n"
++            "  print(\"plain woke \" + got as str);\n"
++            "  return got;\n"
++            "}\n"));
++
++  CHECK(ok_global_get(p_ok, sv("plain_worker"), &body));
++  coro = ok_coro_new(p_ok, body);
++  const uint32_t root3 = ok_root(p_ok, coro);
++
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_null(), false, &out));
++  CHECK(g_last_suspend_granted);
++  CHECK(ok_value_is_number(out) && ok_value_as_number(out) == 42.0); // the native's result goes out
++  CHECK(g_seen_current == coro);                                     // word identity: the running coro
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_SUSPENDED);
++
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_string(p_ok, sv("late")), true, &out));
++  CHECK(ok_value_is_string(out));
++  ok_cstring_view woke = ok_value_as_string(out);
++  CHECK(woke.chars != NULL && strcmp(woke.chars, "late") == 0); // the wake value landed in `got`
++  ok_cstring_view_deinit(&woke);
++  CHECK(log_has("plain woke late"));
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_DEAD);
++  CHECK(ok_unroot(p_ok, root3));
++
++  // ---------- 4. the native park, spread shape ----------
++  CHECK(run(p_ok,
++            "glob fu spread_worker() {\n"
++            "  let args = [4];\n"
++            "  let got = park(args...);\n"
++            "  print(\"spread woke \" + got as str);\n"
++            "  return got;\n"
++            "}\n"));
++
++  CHECK(ok_global_get(p_ok, sv("spread_worker"), &body));
++  coro = ok_coro_new(p_ok, body);
++  const uint32_t root4 = ok_root(p_ok, coro);
++
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_null(), false, &out));
++  CHECK(g_last_suspend_granted);
++  CHECK(ok_value_is_number(out) && ok_value_as_number(out) == 8.0);
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_SUSPENDED);
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_number(9), true, &out));
++  CHECK(ok_value_is_number(out) && ok_value_as_number(out) == 9.0);
++  CHECK(log_has("spread woke 9"));
++  CHECK(ok_unroot(p_ok, root4));
++
++  // ---------- 5. the native park, method shape (OP_INVOKE) ----------
++  CHECK(run(p_ok,
++            "glob fu method_worker() {\n"
++            "  let c = Cap();\n"
++            "  let got = c.tick(5);\n"
++            "  print(\"method woke \" + got as str);\n"
++            "  return \"fin\";\n"
++            "}\n"));
++
++  CHECK(ok_global_get(p_ok, sv("method_worker"), &body));
++  coro = ok_coro_new(p_ok, body);
++  const uint32_t root5 = ok_root(p_ok, coro);
++
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_null(), false, &out));
++  CHECK(g_last_suspend_granted);
++  CHECK(ok_value_is_number(out) && ok_value_as_number(out) == 10.0);
++  CHECK(g_seen_current == coro);
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_SUSPENDED);
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_string(p_ok, sv("go")), true, &out));
++  CHECK(ok_value_is_string(out));
++  ok_cstring_view fin = ok_value_as_string(out);
++  CHECK(fin.chars != NULL && strcmp(fin.chars, "fin") == 0);
++  ok_cstring_view_deinit(&fin);
++  CHECK(log_has("method woke go"));
++  CHECK(ok_unroot(p_ok, root5));
++
++  // ---------- 6. the native park on the normal defer exit ----------
++  CHECK(run(p_ok,
++            "glob fu defer_worker() {\n"
++            "  defer park(3);\n"
++            "  print(\"before\");\n"
++            "  return 2;\n"
++            "}\n"));
++
++  CHECK(ok_global_get(p_ok, sv("defer_worker"), &body));
++  coro = ok_coro_new(p_ok, body);
++  const uint32_t root6 = ok_root(p_ok, coro);
++
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_null(), false, &out));
++  CHECK(g_last_suspend_granted);
++  CHECK(ok_value_is_number(out) && ok_value_as_number(out) == 6.0); // parked mid-cleanup
++  CHECK(log_has("before"));
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_SUSPENDED);
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_number(5), true, &out));
++  CHECK(ok_value_is_number(out) && ok_value_as_number(out) == 2.0); // the body's return, after the chain
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_DEAD);
++  CHECK(ok_unroot(p_ok, root6));
++
++  // ---------- 7. nested resume from inside a native ----------
++  // drive() resumes the inner coro once from C: inner suspends (the outer
++  // state parks on the resume chain while it runs), the native answers the
++  // yielded value, and the outer body keeps going - the suspension does NOT
++  // propagate through the native. the outer body then hands the still-
++  // suspended inner coro OUT as its return value; the host drives it the
++  // rest of the way after its creator is dead.
++  CHECK(run(p_ok,
++            "glob fu outer() {\n"
++            "  let inner = coro(fu() { yield \"inner-out\"; return \"inner-done\"; });\n"
++            "  let got = drive(inner);\n"
++            "  print(\"inner gave \" + got as str);\n"
++            "  return inner;\n"
++            "}\n"));
++
++  CHECK(ok_global_get(p_ok, sv("outer"), &body));
++  coro = ok_coro_new(p_ok, body);
++  const uint32_t root7 = ok_root(p_ok, coro);
++
++  CHECK(ok_coro_resume(p_ok, coro, ok_value_null(), false, &out));
++  CHECK(g_seen_current == coro); // the native ran on the outer coro's state
++  CHECK(log_has("inner gave inner-out"));
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_DEAD);
++  CHECK(ok_unroot(p_ok, root7));
++
++  // the escaped inner coro: still suspended, resumable from C
++  CHECK(ok_value_is_coro(out));
++  const uint32_t root7b = ok_root(p_ok, out);
++  CHECK(ok_coro_status(p_ok, out) == OK_CORO_SUSPENDED);
++  ok_value inner_final = ok_value_null();
++  CHECK(ok_coro_resume(p_ok, out, ok_value_null(), false, &inner_final));
++  CHECK(ok_value_is_string(inner_final));
++  ok_cstring_view inner2 = ok_value_as_string(inner_final);
++  CHECK(inner2.chars != NULL && strcmp(inner2.chars, "inner-done") == 0);
++  ok_cstring_view_deinit(&inner2);
++  CHECK(ok_coro_status(p_ok, out) == OK_CORO_DEAD);
++  CHECK(ok_unroot(p_ok, root7b));
++
++  // ---------- 8. resume of a running coro, from inside a native ----------
++  CHECK(run(p_ok,
++            "glob fu selfish() {\n"
++            "  let got = self_resume();\n"
++            "  return got;\n"
++            "}\n"));
++
++  CHECK(ok_global_get(p_ok, sv("selfish"), &body));
++  coro = ok_coro_new(p_ok, body);
++  const uint32_t root8 = ok_root(p_ok, coro);
++
++  ok_clear_error(p_ok);
++  CHECK(!ok_coro_resume(p_ok, coro, ok_value_null(), false, &out));
++  CHECK(error_what_contains(p_ok, "resume of a running coroutine"));
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_DEAD);
++  ok_clear_error(p_ok);
++  CHECK(ok_unroot(p_ok, root8));
++
++  // ---------- 9. the refusals (the yield barrier doctrine) ----------
++  ok_clear_error(p_ok);
++  CHECK(!run(p_ok, "park(1);\n"));
++  CHECK(error_what_contains(p_ok, "cannot suspend outside a coroutine"));
++  ok_clear_error(p_ok);
++
++  // the barrier lanes need a coro around them (otherwise "outside a
++  // coroutine" fires first): the operator and constructor refusals
++  CHECK(run(p_ok,
++            "glob fu op_worker() {\n"
++            "  class Box {\n"
++            "    pub fu operator +(other) {\n"
++            "      return park(1);\n"
++            "    }\n"
++            "  }\n"
++            "  let b = Box() + Box();\n"
++            "  return 0;\n"
++            "}\n"));
++  CHECK(ok_global_get(p_ok, sv("op_worker"), &body));
++  coro = ok_coro_new(p_ok, body);
++  const uint32_t root9a = ok_root(p_ok, coro);
++  ok_clear_error(p_ok);
++  CHECK(!ok_coro_resume(p_ok, coro, ok_value_null(), false, &out));
++  CHECK(error_what_contains(p_ok, "cannot suspend from inside an operator method"));
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_DEAD);
++  ok_clear_error(p_ok);
++  CHECK(ok_unroot(p_ok, root9a));
++
++  CHECK(run(p_ok,
++            "glob fu init_worker() {\n"
++            "  class Bot {\n"
++            "    fu init() {\n"
++            "      park(1);\n"
++            "    }\n"
++            "  }\n"
++            "  let b = Bot();\n"
++            "  return 0;\n"
++            "}\n"));
++  CHECK(ok_global_get(p_ok, sv("init_worker"), &body));
++  coro = ok_coro_new(p_ok, body);
++  const uint32_t root9b = ok_root(p_ok, coro);
++  ok_clear_error(p_ok);
++  CHECK(!ok_coro_resume(p_ok, coro, ok_value_null(), false, &out));
++  CHECK(error_what_contains(p_ok, "cannot suspend from inside a constructor"));
++  CHECK(ok_coro_status(p_ok, coro) == OK_CORO_DEAD);
++  ok_clear_error(p_ok);
++  CHECK(ok_unroot(p_ok, root9b));
++
++  // ---------- 10. status of a non-coro, teardown ----------
++  CHECK(ok_coro_status(p_ok, ok_value_number(1)) == UINT32_MAX);
++  CHECK(!ok_value_is_coro(ok_value_string(p_ok, sv("x"))));
++
++  ok_free(p_ok);
++
++  printf("capi: %d checks OK\n", g_checks);
++  return 0;
++}
+diff --git a/tests/integration/embedding/src/main.cpp b/tests/integration/embedding/src/main.cpp
+index d474909..9de4503 100644
+--- a/tests/integration/embedding/src/main.cpp
++++ b/tests/integration/embedding/src/main.cpp
+@@ -487,7 +487,7 @@ int main() {
+     if m.square(7) != 49 { print "bad: square"; }
+     if m.add(1, 2) != 3 { print "bad: add"; }
+     if not (m is Math) { print "bad: is"; }
+-    if not isinstance(m, Object) { print "bad: root"; }
++    if not isinstance(m, object) { print "bad: root"; }
+     // the bound native method carries its receiver
+     let sq = m.square;
+     if sq(6) != 36 { print "bad: bound"; }

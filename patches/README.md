@@ -572,3 +572,32 @@ strings/interning_churn.ok (churn + rebirth + map round trip), and the
 two old-doctrine expectations flipped (classes/identity.ok,
 loops/fused_conditions.ok seq-same). 300k churned strings in 0.55s
 under a 64mb cap: the table pins nothing. gates: 427/427 x5.
+
+### 42 — the coro C API + ok_native_suspend (D21)
+
+the vm_tick report's answer, landed: ok.h grows the embedder coro
+surface (ok_coro_new / ok_coro_resume / ok_coro_status / ok_coro_current
++ ok_value_is_coro + the OK_CORO_* enum), wrappers over coro_drive with
+ok_call's exact C boundary discipline (errors -> ok_last_error at the
+host boundary, pending lane inside a native; R21 dead-answers-null; the
+coro gc-guarded across the drive so an unrooted host value survives it).
+the one real piece: ok_native_suspend - a native parks its caller at its
+own return boundary. a flag on the execution state, set at request time
+(validated: coro owner, no barrier, depth 1 - refusals use the yield
+error family spelled "suspend"), consumed by the six native
+call-completion arms (OP_CALL, OP_CALL_LONG, OP_CALL_SPREAD,
+OP_CALL_SPREAD_LONG, OP_INVOKE, OP_SUPER_INVOKE): the native's result
+goes out to the resumer, the coro parks exactly like OP_YIELD, the next
+resume's argument lands in the call's result register. request-time
+validation makes the flag unable to outlive its flight. tests/capi/ is
+new - a pure C99 harness (140 checks: the two-way channel, R21/R22 from
+C, the park at plain/spread/method/defer shapes, a suspended coro
+escaping its dead creator, self-resume refusal, the three barrier
+refusals); doubles as OR-3's memory-backed-loader test bed. ALSO in this
+patch: the embed test's one `Object` -> `object` (patch 40's rename
+missed it; the gates had been quoting e2e only, so it rotted silently -
+the unit runner lane is back in the receipts). gates: e2e 427/427 x5
+(plain, threaded, asan, aggressive, asan+aggressive) + unit x3 / embed /
+capi x5 (gcc, asan, asan-aggr, threaded-asan, threaded-asan-aggr);
+delta blue 14065400 correct, flat (617.8 -> 614.4ms median -O0, 251.5ms
+-O2 vs session-33's 249.7 which was -O2 all along).

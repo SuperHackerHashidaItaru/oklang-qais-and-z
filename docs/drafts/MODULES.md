@@ -1,19 +1,39 @@
 # MODULES — the 0.8.0 wave, codename "O Resolution" (final)
 
-status: FINAL. the M1-M14 rulings came back (2026-11-03, recorded verbatim
-in section 11), the sandboxing gap Q caught is designed in (section 6), the
-patch series is re-densed per Q's "the plan was too sparse" (4 patches, was
-8 - section 10). the pre-modules work Q ordered landed first: string
-interning is patch 41 (D20, 427/427 x5) and the coro C API is specced as
-patch 42 (appendix A) so ok_module.h's vtable inherits it instead of
-breaking later. OR-1 can start.
+status: FINAL, amended once. the M1-M14 rulings came back (2026-11-03,
+recorded verbatim in section 11), the sandboxing gap Q caught is designed
+in (section 6), the patch series is re-densed per Q's "the plan was too
+sparse" (4 patches, was 8 - section 10). the pre-modules work Q ordered
+landed first: string interning is patch 41 (D20, 427/427 x5) and the coro
+C API is patch 42 (D21, LANDED - appendix A), so ok_module.h's vtable
+inherits it instead of breaking later.
+
+amendments (2026-11-03, Q's review round on this draft - the two RULED
+ones are folded in below, the api-surface items are answered and marked
+OPEN for Q at section 11's end):
+- RULED: the manifest is **project.ok** (was okproject.ok) - "no need for
+  the ok prefix, as the file ext gives it".
+- RULED: **coro stays a core native** like str/num/bool/map/array/type -
+  "since it is inside the api, it shouldn't be gated in std". the std.coro
+  re-home (R24's lean) is OFF; OR-2 shrinks to the std/ re-home of the
+  flat stdlib.
+- RULED: platform independence by construction - the **OK_API** export
+  macro (msvc dllexport/dllimport) and **dlopen/dlsym hidden behind a
+  compile-time wrapper** (windows LoadLibrary, everything posix-ish
+  dlopen - section 7).
+- Q-proposed, Z-endorsed (design in section 7): the host provides
+  **dlopen/dlsym like malloc** with the platform wrapper as fallback, and
+  can turn dynamic loading off entirely - unsupported platforms run the
+  language, and the off-switch doubles as the structural sandbox denial.
+- OPEN for Q: the ok_api vtable's read side + type/class identity entries
+  (section 7) and the versioning stance (single bumped integer, no semver).
 
 renumbering note: this wave was drafted as 0.6.0; Q's tidy lane (classes
 fix + defer continuation + the rename + interning + the coro C API) is
-v0.7.0 now, so modules is **0.8.0**. one stale in-tree reference (okvm.h's
-"the 0.7.0 registry" comment) is OR-1 scope. the codename is Q's pick: "O
-Resolution" (wilderun, veil of imagination - we are, after all, resolving
-paths).
+v0.7.0 now - **named "Epigone"** (Q's pick, recorded) - so modules is
+**0.8.0**. one stale in-tree reference (okvm.h's "the 0.7.0 registry"
+comment) is OR-1 scope. the codename is Q's pick: "O Resolution"
+(wilderun, veil of imagination - we are, after all, resolving paths).
 
 ## context restore (read this first in a fresh session)
 
@@ -30,10 +50,10 @@ paths).
 - doc index: docs/permanent/{ROADMAP,DECISIONS,PROJECT_STATE}.md are the
   living truth; docs/drafts/ holds the feature drafts (CLASSES, COROS,
   MODULES=this); WORKLOG.md is the session log, newest at the bottom.
-- the 0.7.0 lane (Q's tidy branch): defer continuation (D17, patch 39),
-  the type/object rename (D18, patch 40), universal string interning
-  (D20, patch 41), and the coro C API (appendix A, patch 42 proposal).
-  this wave stacks on top of all of it.
+- the 0.7.0 lane (Q's tidy branch, "Epigone"): defer continuation (D17,
+  patch 39), the type/object rename (D18, patch 40), universal string
+  interning (D20, patch 41), and the coro C API (D21, patch 42 - LANDED
+  on modules-staging, appendix A). this wave stacks on top of all of it.
 - delta blue (session 33) is the 0.9.0 meter: ok at 1.93x of wren on the
   allocation-shaped gap. modules first, then the heavy passes.
 
@@ -169,7 +189,8 @@ import "a/c";                         // merges: the same root binding `a`
   deliberate side-effect door). a module MAY glob-inject globals; std is
   still protected (M8). no new semantics invented here.
 
-## 4. okproject.ok - the project shape (M10, Q's ruling)
+## 4. project.ok - the project shape (M10, Q's ruling; renamed per Q's
+review round: "no need for the ok prefix, as the file ext gives it")
 
 a file at the project root, **strictly in ok** (it runs through the real
 parser + VM - no second config format to maintain), mirroring pyproject.toml
@@ -181,7 +202,7 @@ the door for more is section 6's open question). it may not import (it is
 a script, not a module, in v1). the CLI reads one global:
 
 ```ok
-// okproject.ok
+// project.ok
 glob let project = {
   "name": "myapp",
   "version": "0.1.0",
@@ -215,16 +236,16 @@ glob let project = {
 
 rules:
 - discovery walks UP from the ENTRY FILE (never cwd - the last implicit
-  working-dir dependence dies here) to the nearest okproject.ok; that
+  working-dir dependence dies here) to the nearest project.ok; that
   root governs. a raw ok file with no project above it is a standalone
   script: file-relative imports only (plus std, plus OKPATH).
-- a dep that is itself an okproject recurses: its own roots/deps/natives
+- a dep that is itself a project recurses: its own roots/deps/natives
   apply. dep names must be unique (M13: collision = error naming both
   paths).
 - **no pip, and Q is leaning "not just v1 - maybe forever"** (M11: mixed
   feelings about package managers, vendor-via-git preferred). a module is
   something reachable on disk; the day a registry is ever wanted,
-  okproject grows a "source" field and nothing here precludes it. the
+  project.ok grows a "source" field and nothing here precludes it. the
   doctrine is: `git clone` is the dependency manager.
 - manifest evaluation errors are hard failures with the manifest's own
   path:line:col. the manifest instance's capabilities: host caps minus
@@ -244,7 +265,7 @@ can be resolved per usual resolution walk can be imported"):
    should be able to load it without an active project").
 2. P starts with `std/`: the standard library (re-homed by OR-2). never
    found through steps 3-5: user code cannot shadow std (M8).
-3. walk up from F to the nearest okproject.ok root R: search R's module
+3. walk up from F to the nearest project.ok root R: search R's module
    roots (["src"] default) with the same ladder (incl. native
    candidates), then R's declared native targets (build if stale and
    allowed - sections 4/6/8), then R's deps by name (recursing into each
@@ -340,7 +361,8 @@ void ok_caps_drop(ok* p_ok, uint32_t p_caps); // RATCHET: drop only, never grant
   process (the compiler story), HOST is data-plane leakage (fs/env/
   network later). they compose as a bitmask; presets are sugar.
 
-## 7. the loader - one door, three backs (M3, M14)
+## 7. the loader - one door, three backs (M3, M14; platform independence
+per Q's review round)
 
 the VM and the compiler NEVER touch the filesystem for imports. all
 loading goes through a vtable the host installs:
@@ -348,6 +370,20 @@ loading goes through a vtable the host installs:
 ```c
 // include/ok/ok_module.h (new, OR-3)
 #define OK_NATIVE_ABI 1
+
+// platform-independent export/import: the one symbol a native shared
+// object exposes. msvc needs dllexport/dllimport; everywhere else the
+// default visibility is fine (and -fvisibility=hidden builds export only
+// this). the wrapper is compile-time - no runtime dispatch.
+#if defined(_WIN32)
+#  if defined(OK_MODULE_BUILDING)
+#    define OK_API __declspec(dllexport)
+#  else
+#    define OK_API __declspec(dllimport)
+#  endif
+#else
+#  define OK_API __attribute__((visibility("default")))
+#endif
 
 typedef struct ok_native_fn_def {
   const char* name;
@@ -358,7 +394,7 @@ typedef struct ok_native_fn_def {
 typedef struct ok_native_module {
   uint32_t abi;               // must equal OK_NATIVE_ABI, checked at load
   const char* name;           // self-declared; must match the import stem for graph loads
-  const char* version;
+  const char* version;        // the MODULE's own version string (display only)
   uint32_t fn_count;
   const ok_native_fn_def* fns;
   // optional class surface: built at load via the patch-34 door.
@@ -372,22 +408,54 @@ typedef struct ok_native_module {
 // the ONE symbol the shared object must export:
 // OK_API const ok_native_module* ok_native_export(const ok_api* p_api);
 
+// the type tag every value answers - the read side's discriminator.
+typedef enum {
+  OK_TYPE_NIL, OK_TYPE_BOOL, OK_TYPE_NUM, OK_TYPE_STR,
+  OK_TYPE_ARRAY, OK_TYPE_MAP, OK_TYPE_FN, OK_TYPE_CLASS,
+  OK_TYPE_INSTANCE, OK_TYPE_CORO, OK_TYPE_NATIVE,
+} ok_type_tag;
+
 // the api vtable (M14: "the vm only cares about its vtable"): a dlopen'd
 // module NEVER links against oklang symbols (no -rdynamic, no symbol
 // collisions, several vms can coexist). it calls through this table,
 // which the loader fills with the host's implementations - the same
 // functions ok.h exposes for static embedders, plus the coro primitives
-// (appendix A) from day one: adding vtable entries later is an ABI break,
-// and future asio-style natives cannot be written without them.
+// (appendix A, patch 42, LANDED) from day one: adding vtable entries
+// later is an ABI break, and future asio-style natives cannot be written
+// without them.
+//
+// [amended per Q's review round - the read side and the type/class
+// identity entries are NEW here, marked below; OPEN for Q at section 11]
 typedef struct ok_api {
   uint32_t abi;               // OK_NATIVE_ABI
-  // values
+  // values: the write side (construct)
   ok_value (*value_string)(ok*, ok_string_view);
   ok_value (*value_number)(double);
   ok_value (*value_bool)(bool);
   ok_value (*array_new)(ok*, const ok_value*, uint32_t);
   ok_value (*map_new)(ok*, const ok_value*, uint32_t);
   bool (*map_set)(ok*, ok_value, ok_value, ok_value);
+  // values: the read side (inspect + unwrap) - NEW, the draft's gap:
+  // a native that cannot read its arguments can only build values for
+  // nobody. mirrors ok.h's as/is families one to one.
+  ok_type_tag (*value_type)(ok_value);            // the one-call discriminator
+  double (*value_as_number)(ok_value);
+  bool (*value_as_bool)(ok_value);
+  ok_cstring_view (*value_as_string)(ok_value);   // owned by the value, never freed by the native
+  uint32_t (*array_len)(ok_value);
+  ok_value (*array_get)(ok_value, uint32_t);      // out of bounds: null
+  uint32_t (*map_len)(ok_value);
+  bool (*map_get)(ok_value, ok_value, ok_value*); // false: absent/illegal/not-a-map
+  // type + class identity - NEW, Q's question answered yes (section 11):
+  // a native type-checks its arguments constantly, and a native class
+  // must recognize instances of itself (and of user subclasses).
+  // identity itself stays word equality (===): free, no entry needed.
+  ok_value (*classof)(ok*, ok_value);             // the class value; `type` for classes themselves
+  bool (*is_instance)(ok*, ok_value, ok_value p_class);
+  ok_cstring_view (*class_name)(ok*, ok_value p_class);
+  // calls - NEW: a native invoking a script callback (sort comparators,
+  // event hooks; the same shape ok_call gives static embedders)
+  bool (*call)(ok*, ok_value p_callee, uint8_t p_argc, const ok_value* p_argv, ok_value* p_out);
   // classes (the patch-34 door)
   ok_value (*class_new)(ok*, ok_string_view, ok_value p_parent);
   bool (*class_define_native_method)(ok*, ok_value, ok_string_view, uint16_t, ok_native_fn, bool p_pub);
@@ -397,13 +465,35 @@ typedef struct ok_api {
   bool (*native_throw)(ok*, ok_value);
   uint32_t (*root)(ok*, ok_value);
   bool (*unroot)(ok*, uint32_t);
-  // coro primitives (appendix A) - asio's future door
+  // coro primitives (appendix A, patch 42, LANDED in ok.h) - asio's door
   ok_value (*coro_new)(ok*, ok_value p_body);
-  bool (*coro_resume)(ok*, ok_value p_coro, ok_value p_arg, ok_value* p_out);
+  bool (*coro_resume)(ok*, ok_value p_coro, ok_value p_arg, bool p_has_arg, ok_value* p_out);
   uint32_t (*coro_status)(ok*, ok_value p_coro);
   ok_value (*coro_current)(ok*);
-  // (grown carefully; every addition bumps OK_NATIVE_ABI)
+  // (grown carefully; every addition bumps OK_NATIVE_ABI - see the
+  // versioning note below)
 } ok_api;
+
+// the dynamic-library hooks - Q's proposal, endorsed: the host provides
+// dlopen/dlsym like it provides malloc, the platform wrapper is the
+// DEFAULT, and NULL (or the OK_CAP_NATIVE_LOAD drop) turns dynamic
+// loading off entirely. this is how the language runs on platforms with
+// no loader at all (consoles, some embedded, wasm-without-dlopen): the
+// host either supplies the hooks from its own packaging or accepts
+// static natives only - and it is the structural sandbox denial from
+// section 6.3, made concrete: an embedder that wants an audited,
+// whitelisted, or memory-backed loader installs one here.
+typedef struct ok_dylib {
+  // each returns NULL/void* with a message in p_err on failure
+  void* (*open)(void* p_ctx, const char* p_path, char* p_err, size_t p_err_capacity);
+  void* (*sym)(void* p_ctx, void* p_handle, const char* p_name, char* p_err, size_t p_err_capacity);
+  void (*close)(void* p_ctx, void* p_handle);
+  void* p_ctx;
+} ok_dylib;
+// ok_specs grows `const ok_dylib* dylib;` - NULL means the platform
+// default (the compile-time wrapper). the host turns loading OFF by
+// dropping OK_CAP_NATIVE_LOAD (the capability gate checks first) or by
+// installing a dylib table whose open always fails with its own message.
 
 // the loader vtable (host installs; the CLI installs the fs default)
 typedef struct ok_loader {
@@ -414,12 +504,34 @@ typedef struct ok_loader {
 void ok_set_loader(ok* p_ok, ok_loader* p_loader);
 ```
 
+platform wrapper (compile-time, one translation unit, no runtime
+dispatch - the answer to "what others are, i am only familiar with
+linux's"): linux, the bsds, solaris/illumos, aix, haiku, and macos all
+speak the **dlopen family** (dlfcn.h - mach-o on mac uses the same api),
+windows is **LoadLibrary/GetProcAddress/FreeLibrary** with GetLastError
+for the error string, and everything else (consoles, bare newlib, wasi
+without a dynamic linker) has NOTHING - which is exactly the case the
+host-provided ok_dylib hooks exist for. two real implementations, one
+ifdef.
+
+**versioning** (Q: "is it just a number that we bump? no sem ver and
+compatibility stuff??") - proposal, OPEN for Q: yes, exactly that.
+`OK_NATIVE_ABI` is a single integer in ok_module.h; any change to the
+vtable, the descriptor layouts, or the tag enum bumps it; every module
+carries the number it was built against and the loader checks BOTH
+directions at load; mismatch refuses with the rebuild message. no semver,
+no compat matrix, no deprecation cycle - pre-1.0 nobody exists to be
+compatible with, and the honest stance is "rebuild your natives". the
+one cheap discipline we keep anyway: vtable entries are APPEND-ONLY
+(never repurposed, never reordered), so a generous "host newer than
+module" policy is a later option, not a redesign.
+
 why a vtable and not "just read files":
 - **the embedding working-dir problem, killed by construction** (Q: "when
   embedding, and want to import, we dont know what the embedders working
   dir is"). paths resolve against EXPLICIT roots (the loader's), never
   an implicit cwd. the CLI's default loader resolves the entry file's
-  dir + okproject discovery + OKPATH; an embedder installs its own:
+  dir + project.ok discovery + OKPATH; an embedder installs its own:
   memory-backed sources, packaged assets, wasm fetches. the language
   never guesses.
 - **emscripten/wasm is a backend, not a redesign**: load_native there is
@@ -428,8 +540,10 @@ why a vtable and not "just read files":
 - testability: the e2e matrix gets a memory-backed loader test in C
   (OR-3), which is also the embedder documentation by example.
 
-loading discipline for natives: dlopen(path, RTLD_NOW | RTLD_LOCAL) - a
-module's symbols never leak into another's namespace. dlsym
+loading discipline for natives: open with the "local, resolve-now"
+mode (RTLD_NOW | RTLD_LOCAL on the dlopen family, LoadLibrary on
+windows - via the ok_dylib hooks, never called directly), a module's
+symbols never leak into another's namespace. resolve
 ("ok_native_export"), abi check first (both directions: the module may
 refuse US), name check second (the path's stem and the declared name
 must agree for graph imports; --native force-loads register under the
@@ -504,24 +618,28 @@ reads this section + WORKLOG and resumes - that is the whole point.
   the multi-file e2e runner extension. acceptance: multi-file e2e
   (import chains, cycle errors, init order, pub/privacy, root merging,
   alias/from forms, cross-file traces), the whole old matrix green.
-- **OR-2 - std re-home** (was P3, the compatibility-sensitive one):
-  the std/ directory (io, math, str, array, map, coro - **coro becomes
-  std.coro per R24**, its always-loaded ruling relaxed to "std module,
-  preloaded by default for now"); natives re-registered as module
-  members; **flat globals stay as deprecated aliases - removal is the
-  NEXT stdlib version's call, not 0.7.0's** (Q's sub-ruling: "flat ones
-  keep it for now, we work on this in stdlib next version"). the
-  print-statement deprecation plan (and the %g default's replacement by
-  std.io's formatting) is written down here as that version's scope.
-  acceptance: old scripts unchanged (aliases), new-style scripts pass,
-  the std module table documented.
+- **OR-2 - std re-home** (was P3, the compatibility-sensitive one;
+  SHRUNK by Q's review-round ruling - coro stays a core native, it does
+  NOT move): the std/ directory (io, math, str, array, map) with the
+  natives re-registered as module members; **coro is NOT part of this**
+  anymore - it is native like str/num/bool/map/array/type, it lives in
+  the api, and it is not gated in std (R24's std.coro home is overruled
+  by the ruling that the api carries it). **flat globals stay as
+  deprecated aliases - removal is the NEXT stdlib version's call, not
+  this wave's** (Q's sub-ruling: "flat ones keep it for now, we work on
+  this in stdlib next version"). the print-statement deprecation plan
+  (and the %g default's replacement by std.io's formatting) is written
+  down here as that version's scope. acceptance: old scripts unchanged
+  (aliases), new-style scripts pass, the std module table documented.
 - **OR-3 - sandbox + natives + the embedder loader** (was P4+P7 + the
   new sandbox section; loading is born gated): the capability system
   FIRST (ok_specs caps, the ratchet, ok_caps_get/drop, CLI --restrict/
   --sandbox/--allow/--deny, gating the host-touching surface); then
-  ok_module.h (the descriptor + the ok_api vtable incl. the coro
-  primitives of appendix A); the loader's load_native (RTLD_NOW |
-  RTLD_LOCAL, abi + name checks, the error messages); registration
+  ok_module.h (the OK_API export macro, the descriptor, the ok_api
+  vtable incl. the coro primitives of appendix A and - pending Q's nod
+  on the OPEN items - the read side + type/class identity + call, the
+  ok_dylib host hooks, the single-integer ABI); the loader's load_native
+  (via the dylib hooks, abi + name checks, the error messages); registration
   under the module namespace; class mounting through the patch-34 door;
   lifecycle hooks; `ok run --native`; a hello-native sample module (one
   function + one class) + e2e with a declared gcc build; the
@@ -530,7 +648,7 @@ reads this section + WORKLOG and resumes - that is the whole point.
   bad-symbol errors are the documented messages; --restrict refuses
   with the capability error; e2e runs an import graph fully from
   memory with zero fs calls.
-- **OR-4 - okproject.ok + the build pipeline** (was P5+P6): manifest
+- **OR-4 - project.ok + the build pipeline** (was P5+P6): manifest
   discovery (walk up from the ENTRY file), the evaluator (full-stdlib
   no-natives instance, reads the `project` global), module roots, path
   deps (project/raw/native, recursive), native targets with declared
@@ -568,10 +686,11 @@ policy over mechanics that all exist by then.
 - **M8** std is protected (root name reserved, unshadowable); NO
   wildcard imports. ✓
 - **M9** `pub` is the export rule; no new syntax. ✓
-- **M10** okproject.ok is a single ok file evaluated in a sandboxed ok
-  instance - not limited (full stdlib), but it cannot load native. the
-  natives-in-manifest question stays open with a one-bit door (section
-  7). ✓
+- **M10** project.ok (renamed from okproject.ok per Q's review round:
+  "no need for the ok prefix, as the file ext gives it") is a single ok
+  file evaluated in a sandboxed ok instance - not limited (full stdlib),
+  but it cannot load native. the natives-in-manifest question stays open
+  with a one-bit door (section 7). ✓
 - **M11** no package manager - maybe not just v1, maybe forever;
   vendor via git. ✓
 - **M12** native targets declare a BUILD COMMAND - whatever build
@@ -585,12 +704,58 @@ policy over mechanics that all exist by then.
 - sub-rulings: coro's home is **std.coro** (OR-2); the flat stdlib
   globals **stay for now** - the flattening work is the NEXT stdlib
   version's. ✓
+  [AMENDED 2026-11-03, Q's review round on this draft: the coro half is
+  OVERRULED - **coro stays a core native**, like str/num/bool/map/array/
+  type: "since it is inside the api, it shouldn't be gated in std". it
+  remains always-loaded, the eighth builtin class, and the ok_api vtable
+  carries its primitives (appendix A, patch 42, LANDED). the flat-alias
+  half stands unchanged.]
 
-## appendix A - the coro C API ("vm_tick"), specced for patch 42
+## 11a. this round's new rulings + the OPEN items (2026-11-03, Q's review)
+
+RULED (folded into the draft above):
+- **project.ok** - the manifest filename; the .ok extension already
+  says it.
+- **coro is core, not std** - see the sub-ruling amendment above.
+- **platform independence by construction** - OK_API for dynamic
+  export/import (msvc), dlopen/dlsym hidden behind the compile-time
+  wrapper (windows LoadLibrary, dlopen family everywhere else).
+- **host-provided dynamic loading** (Q's proposal, Z-endorsed): the
+  ok_dylib hooks in ok_specs, malloc-style - host-provided with the
+  platform wrapper as default fallback, plus the ability to turn the
+  feature off entirely. unsupported platforms run the language; the
+  off-switch is the structural sandbox denial.
+
+OPEN for Q (Z's recommendations, awaiting the nod before OR-3 finalizes
+the vtable):
+- **the vtable read side** (value_type / as_number / as_bool / as_string
+  / array_len / array_get / map_len / map_get): the draft shipped
+  write-only, which is not enough - a native that cannot read its
+  arguments can only build values for nobody. recommendation: IN.
+- **type + class identity** (classof / is_instance / class_name): Q
+  asked "should they be in the api?" - recommendation: YES. every
+  nontrivial native type-checks its arguments, and a native class must
+  recognize its own instances (and user subclasses) - the raylib door
+  does not work without it. identity itself stays word equality (===),
+  no entry needed. what stays OUT of v1: method enumeration, dynamic
+  member get/set, subclass creation from native - each is a later ABI
+  bump if a real need shows up.
+- **calls** (call, ok_call's shape): natives invoking script callbacks -
+  sort comparators, event hooks, the future asio. recommendation: IN.
+- **versioning**: a single OK_NATIVE_ABI integer, bumped on any layout
+  change, checked both directions at load, no semver and no compat
+  promises pre-1.0 ("rebuild your natives" is the honest stance); the
+  append-only discipline on vtable entries keeps a softer policy a
+  later option, not a redesign.
+
+## appendix A - the coro C API ("vm_tick") - LANDED as patch 42 (D21)
 
 Q's ask: "there is some missing api that comes with coros, which is
 vm_tick or something - figure it out and report." the investigation,
-recorded here because ok_module.h's vtable depends on it:
+recorded here because ok_module.h's vtable depends on it. status: LANDED
+on modules-staging (c93995d), ok.h + okvm.c + tests/capi/. the shape
+survived contact with one test-authored correction and one discovery
+about the draft's own test plan (both in the deltas below).
 
 **what exists**: the whole engine is there - coro_drive (the resume
 driver: state swap, parked-resumer chain, R22 death sweep, error
@@ -638,11 +803,36 @@ bool      ok_native_suspend(ok* p_ok);                      // the deep one - se
   cannot be written without them. landing the C API first also gives
   the 0.7.0 lane its embedder story: the game loop drives coros
   directly, no trampolines.
-- tests: the e2e matrix is script-only today; the coro C API needs a
-  tiny C harness (tests/capi/, one main.c driving ok_coro_* through a
-  real script with yields + error death + suspend-request lanes) run
-  by the build flavors. that harness then doubles as OR-3's
-  memory-backed-loader test bed. (proposal - Q rules on the shape.)
+- **implementation deltas from this spec** (LANDED):
+  - the park sites are the six native call-completion arms - OP_CALL,
+    OP_CALL_LONG, OP_CALL_SPREAD, OP_CALL_SPREAD_LONG, OP_INVOKE,
+    OP_SUPER_INVOKE - one flag check each on the hot path, after the
+    existing post-call refresh. delta blue measured flat (baseline
+    617.8ms vs 614.4ms median at -O0, 251.5ms at -O2 - within noise;
+    the session-33 "249.7ms" was an -O2 build all along).
+  - request-time validation (owner coro, native depth > 1, yield
+    barrier) guarantees the flag never outlives the native flight that
+    set it - no completion arm outside the six can ever see it, so
+    there is no stale-flag lane to clean.
+  - the barrier refusals spell "suspend" ("cannot suspend from inside
+    an operator method.") - same kind (VALUE), same lanes as the yield
+    errors, but the operation is named in the message.
+  - the harness is tests/capi/src/main.c, PURE C99 (the public header
+    stays C-clean - that is now pinned by a build, not a claim), 140
+    checks: construct/drive/two-way channel, R21 + R22 from the C lane
+    (the death sweep's defers observable through the print hook), the
+    park at every call shape (plain, spread, method via a C-defined
+    class, normal-exit defer), nested resume from inside a native with
+    the suspended inner coro ESCAPING its dead creator to the host,
+    self-resume refusal, and the three barrier refusals. it doubles as
+    OR-3's memory-backed-loader test bed when the loader lands.
+  - caught en route: the embed test still said `Object` - patch 40's
+    rename missed it, and the last two sessions' gates quoted e2e only
+    so it rotted silently. fixed; the unit runner lane (which builds
+    the embed test) is part of the receipts again.
+  - gates: e2e 427/427 x5 (plain, threaded, asan, aggressive-gc,
+    asan+aggressive) + unit x3 / embed / capi x5 (gcc, asan, asan-aggr,
+    threaded-asan, threaded-asan-aggr) + delta blue correct at 14065400.
 
 ## 12. the future doors this opens (recorded, not scheduled)
 

@@ -82,6 +82,16 @@ coro C API) is v0.7.0. M1-M14 are ruled and closed, the capability
 sandbox is designed in, and the patch series is re-densed to four
 (OR-1..OR-4). the living draft is docs/drafts/MODULES.md, codename
 "O Resolution".]
+[third update, same day: **v0.7.0 is named "Epigone"** (Q's pick, for the
+tidy cleanup lane). its content is now concrete: defer continuation (D17),
+type/object (D18), universal interning (D20), and the coro C API (D21,
+patch 42 LANDED on modules-staging — the 0.7.0 lane is one apply away
+from closing). Q's review round on the modules draft also ruled:
+project.ok (not okproject.ok), coro stays a core native (std.coro home
+cancelled, OR-2 shrunk), OK_API + the compile-time dlopen/dlsym wrapper,
+and host-provided dynamic loading with an off-switch. the OPEN items
+(vtable read side, type/class identity, versioning) are in MODULES.md
+section 11a.]
 
 **v0.0.10 — maps v2** (oct24 spec stands: open addressing, linear probing,
 parallel key/value arrays, backward-shift delete, no tombstones, splitmix64 +
