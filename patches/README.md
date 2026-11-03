@@ -601,3 +601,81 @@ the unit runner lane is back in the receipts). gates: e2e 427/427 x5
 capi x5 (gcc, asan, asan-aggr, threaded-asan, threaded-asan-aggr);
 delta blue 14065400 correct, flat (617.8 -> 614.4ms median -O0, 251.5ms
 -O2 vs session-33's 249.7 which was -O2 all along).
+
+### 43 — modules: the compile-time spine (OR-1, "O Resolution")
+
+vs coro a8c4a99 (interning + Q's coro C API landing). MODULES.md
+section 10's OR-1, whole: the three import forms (import "p";
+import "p" as a; from "p" import x, y as z;) - quoted paths only
+(M1, bare identifiers get the teaching error), module top level only,
+pub is the export rule (M9: pub let/fu/class + pub span lets; glob
+cannot be pub). the module system (src/okmodules.c/h, new): the
+loader vtable (read_source today - the CLI's fs default is installed
+at ok_create; load_native arrives with OR-3), the resolution ladder
+(exact / +.ok / /index.ok, native candidates detected and refused
+with the OR-3 error), file-relative + OKPATH lanes, realpath'd
+canonical registry keys (D20-interns the class names), depth-first
+loading with the 128-deep chain guard, cycles and path conflicts as
+hard errors with teaching notes (the cycle walks its chain), the 404
+that lists every location and form tried. the module value: a sealed
+namespace instance (module_namespace classes - public reads, refused
+writes, prints <module /path>), one immutable field per pub export,
+harvested from hidden globals (" module:<canon>:<name>") the export
+epilogue stores after the module's top level ran (the globals trick
+one level up; an early top-level return is refused so the epilogue
+always runs). binding (M5): import "a/b" binds the root a with the
+module at a.b, same-root imports merge, a single-segment path binds
+the module itself, as binds the module value, from-imports bind
+exported symbols (probed against the frozen namespace, pub only).
+std is reserved in module-world TUs (M8); a standalone script keeps
+every name. per-module source registration keeps multi-file traces
+honest (the stale okvm.h 0.7.0-registry comment finally told the
+truth and was rewritten). the VM's OP_INVOKE namespace lane routes
+non-closure callables through call_value: mod.Class(args) is
+construction, and OR-3's natives will ride the same lane. struct ok
+moved to okstate.h (internal visibility for the driver). the e2e
+runner extension: a directory holding main.ok is ONE test case
+(fixtures skipped), a // okpath: directive prepends OKPATH - both
+runners (C++ and the sandbox gate). tests: 44 new cases across
+tests/e2e/tests/modules/ (chains, diamond dedup, a 20-deep chain,
+init order, root merging + conflicts, cycles incl. self, alias/from,
+privacy, missing exports, immutability, span exports, captured
+upvalues, pub classes, glob injection, cross-file traces, module
+parse/top-level failures, early return, okpath, the native hint,
+std reservation x3, and every syntax refusal). 427 -> 471. gates:
+471/471 x5 (plain, threaded, asan, aggressive, asan+aggressive; the
+aggressive lane earned its keep - it caught gc_init not nulling the
+new modules watch pointer, the module system initializing after
+vm_init's allocations, and the compiled module function riding
+unrooted across vm_begin_source; also fixed en route: a guard-stack
+leak in the namespace builders, imports binding through the
+uninitialized-local state, and directories passing the readability
+probe). asan leak-clean (the registry owns its canonical paths now).
+delta blue unchanged (1.4e7 in 0.62s).
+
+### 44 — tree-sitter: imports, pub, and the spans catch-up
+
+vs tree-sitter-oklang master 72b061f WITH patch 29 applied (apply 29
+first, then this). the import grammar catches up to OR-1: import_decl
+reshaped (no declmods - an import is its own statement kind now;
+glob import is a hard error in the language, the old corpus test
+rewritten), from_import_decl + import_specifier new, pub added to the
+top-level let/fu/class declmods, import_decl dropped from the
+top-level conflicts list (nothing shares its prefix anymore). AND the
+spans catch-up that OR-1 made load-bearing: span_bindings (let (a,
+mut b) = call(); - the destructuring let, trailing comma legal, the
+value must be a call) and the multi-value return (return a, b;) -
+both landed in the language at v0.3.0 and the grammar never knew; the
+pub span-let export form parses them together now. queries: "from"
+joins "import" @include, import_specifier aliases highlight like
+import aliases. corpus: modules.txt + spans.txt (6 tests). generated
+files regenerated with tree-sitter-cli 0.27.1 (same version as 29 -
+parser.c churns wholesale, the semantic delta is grammar + queries +
+corpus). verification: corpus 138/138; every valid module e2e fixture
+parses with zero ERROR nodes (the four intentional invalid-syntax
+tests - star imports, unquoted paths - correctly error); full e2e
+tree sweep goes from 175 error files on the base to 104 (the span
+family fixed). the remaining 104 are pre-existing debt the grammar is
+versions behind on: varargs, two-binding for-in, classes
+operators/statics/details, coros, is/conversions. a full catch-up is
+its own session - Q rules on when.

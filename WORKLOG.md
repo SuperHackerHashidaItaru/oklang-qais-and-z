@@ -1855,3 +1855,75 @@ still flagged (yield keyword joins the grammar list).
 - next: Q rules the four OPEN items (read side, type/class identity,
   call, versioning) -> OR-3's vtable is final -> OR-1 opens the
   0.8.0 lane. delta blue stays the 0.9.0 meter.
+
+## session 36 (2026-11-03): OR-1 lands - the compile-time spine (patches 43 + 44)
+
+- context: the session before died ~20 minutes into OR-1 (the sandbox
+  held the uncommitted driver: okmodules.c/h, okstate.h, ~840 lines
+  across the tree). resumed per the recovery protocol: repo resync
+  (picking up session 35's patch-42 landing + the MODULES amendments
+  on the way), Z-GUIDE, worklog tail, the amended MODULES.md reread -
+  and per Q's word, the gate was not rebuilt, it never moved. Q's
+  greenlight ("start the modules plan as intended") opened OR-1 over
+  the OPEN-items stop; the vtable questions gate OR-3, not the spine.
+  coro carries Q's own patch-42 application (63cb498) - built on,
+  not redone.
+- patch 43 - OR-1, the whole spine per MODULES.md section 10: the
+  three import forms, quoted paths (M1), one surface for future
+  natives (M2), the loader vtable with the fs default (M14 - the
+  language never guesses a filesystem; load_native is OR-3's door and
+  native candidates say so), the realpath-keyed registry (D20 keys),
+  depth-first init, cycles/conflicts as hard errors with teaching
+  notes, M5's root binding with merging (single-segment paths bind the
+  module itself - the draft's own example finally true), pub exports
+  harvested from hidden globals into sealed namespace instances
+  (public reads, refused writes, <module /path>), the std reservation
+  with the standalone-script exemption, per-module source
+  registration (the okvm.h 0.7.0-registry comment rewritten after six
+  sessions), and the runner extension (main.ok dirs + the okpath
+  directive, both runners).
+- the matrix earned its keep this round - six real bugs found and
+  fixed before delivery, all in the new code, none in the old 427:
+  the namespace builders leaked a gc guard slot per call (16-slot
+  stack, 20-module graphs would have died), import bindings rode the
+  uninitialized-local state (resolution skips them - define_local was
+  the missing word), single-segment imports materialized empty
+  namespaces instead of the module, pub span-lets lost every binding
+  after the first, directories passed the readability probe (fopen
+  opens them on linux - stat + S_ISREG now), and the aggressive lane
+  caught three rooting sins in one afternoon: gc_init not nulling the
+  new watch pointer, the module system initializing after vm_init's
+  allocations, and the compiled module function unrooted across
+  vm_begin_source (asan drew the exact freed-byte picture). plus one
+  honest leak fix (the registry's canonical paths) for a clean asan
+  exit.
+- receipts: 44 new module tests (import chains, a diamond, a 20-deep
+  chain, init order, merging + conflicts, cycles incl. self-import,
+  alias/from, privacy, missing exports, immutability, span exports,
+  captured upvalues, pub classes, glob injection, cross-file traces,
+  every parse refusal, okpath, the native hint, std x3), 427 -> 471;
+  gates 471/471 x5 (plain, threaded, asan, aggressive, asan+aggr);
+  embedding integration OK; delta blue unchanged (1.4e7 in 0.62s).
+  the vm change is one lane: OP_INVOKE's namespace fields route
+  non-closure callables through call_value, so mod.Class(args) is
+  construction and OR-3's natives ride the same road.
+- patch 44 - tree-sitter catch-up, stacked on 29 (apply order
+  matters): import/from/as + pub declmods + the spans grammar (the
+  destructuring let and multi-value return - v0.3.0 features the
+  grammar never learned; OR-1's pub span-let surface made them
+  load-bearing). corpus 138/138, every valid module fixture parses
+  clean. discovered debt, reported not fixed: the grammar is versions
+  behind on varargs, two-binding for-in, classes details, and coros -
+  104 e2e files parse with ERROR nodes on master+29, 71 fewer with 44
+  applied. a full catch-up is its own session, Q rules on when.
+- delivered: patches/43-modules-compile-time-spine.patch (applies
+  clean on coro; the sandbox commit is modules-staging c629e33),
+  patches/44-tree-sitter-imports-pub-spans.patch (vs master 72b061f +
+  29), README entries for 42/43/44, this entry. fixtures generator
+  kept sandbox-side (scripts/gen_modules_fixtures.py).
+- next: OR-2, shrunk per the amendments to the flat stdlib re-home
+  (coro stays a core native like str/num - R24's std.coro home
+  overruled; the manifest is project.ok). then OR-3 (sandbox +
+  natives + the loader - loading is born gated, and its vtable waits
+  on the four OPEN items) and OR-4 (project.ok + build). delta blue
+  stays the 0.9.0 meter.

@@ -1,0 +1,3925 @@
+diff --git a/.gitignore b/.gitignore
+index 648029d..0d4b94b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,5 @@
+ build/
+ .cache/
+ build*/
++out.log
++err.log
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ebdd203..280036f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -59,6 +59,7 @@ target_sources(ok PRIVATE
+   src/okglobals_store.c
+   src/oklexer.c
+   src/okmm.c
++  src/okmodules.c
+   src/okobject.c
+   src/okobject_store.c
+   src/okoperator.c
+diff --git a/src/ok.c b/src/ok.c
+index 6f38ff6..8b63b66 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -6,30 +6,18 @@
+ #include "okcompiler.h"
+ #include "okdebug.h"
+ #include "okgc.h"
++#include "okmodules.h"
+ #include "okobject.h"
+ #include "okobject_store.h"
+ #include "okparser.h"
+ #include "okspecs.h"
++#include "okstate.h"
+ #include "okutils.h"
+ #include "okvalue.h"
+ #include "okvm.h"
+ 
+-struct ok {
+-  object_store objects_store;
+-  globals_store globals_store;
+-  string_interner interner;
+-  compiler compiler;
+-  vm vm;
+-  gc gc;
+-  ok_source source;
+-  allocators alloc;
+-  ok_allocators raw_alloc;
+-  bool dump_bytecode;
+-  bool dump_skip_run;
+-};
+-
+ // the vm's natives receive the ok* per the native ABI and reach the vm through
+-// here (the struct above is this file's own business)
++// here (struct ok lives in okstate.h since OR-1 - the module driver shares it)
+ vm* ok_vm(ok* p_ok) {
+   return &p_ok->vm;
+ }
+@@ -360,7 +348,7 @@ static const seed_entry top_level_seeds[] = {
+     {"type", SEED_CLASS, OK_BUILTIN_COUNT},
+ };
+ 
+-static top_level_declarations ok_get_top_level_declarations(ok* p_ok, bool* p_error) {
++top_level_declarations ok_get_top_level_declarations(ok* p_ok, bool* p_error) {
+   top_level_declarations decls;
+   top_level_declarations_init(&decls, &p_ok->alloc);
+   for (uint32_t i = 0; i < sizeof(top_level_seeds) / sizeof(top_level_seeds[0]); ++i) {
+@@ -374,7 +362,7 @@ static top_level_declarations ok_get_top_level_declarations(ok* p_ok, bool* p_er
+   return decls;
+ }
+ 
+-static value_array ok_get_top_level_values(ok* p_ok, bool* p_error) {
++value_array ok_get_top_level_values(ok* p_ok, bool* p_error) {
+   value_array vals;
+   value_array_init(&vals, &p_ok->alloc);
+ 
+@@ -441,6 +429,13 @@ ok* ok_create(ok_specs p_specs) {
+                                    .interner = &okay->interner};
+   compiler_init(&okay->compiler, compiler_specs);
+   gc_watch_compiler(&okay->gc, &okay->compiler);
++  // OR-1: the module system - registry, loader (the fs default), and the
++  // gc watch that roots loaded modules' namespaces and the pending roots.
++  // initialized before the vm: vm_init allocates, and under aggressive gc
++  // a collection there must mark a VALID (empty) module system - the
++  // singleton failures' ok_free paths see one too.
++  ok_modules_init(&okay->modules, okay, &okay->alloc);
++  gc_watch_modules(&okay->gc, &okay->modules);
+   vm_specs vm_specs = {.alloc = &okay->alloc,
+                        .globals_store = &okay->globals_store,
+                        .objects_store = &okay->objects_store,
+@@ -464,18 +459,18 @@ ok* ok_create(ok_specs p_specs) {
+   return okay;
+ }
+ 
+-static ok_result ok_run_inner(ok* p_ok, uint32_t p_source_id);
++static ok_result ok_run_inner(ok* p_ok, uint32_t p_source_id, parse_result* p_parsed, ok_import_bindings p_imports);
+ 
+ // stamp the freshly compiled tree with its source id: the main function and
+ // every nested proto (function protos live in the constants arrays).
+ // proto trees grow downward only (a proto's constants are built before it is finished),
+ // so the walk terminates. shared protos stamp idempotently.
+-static void stamp_source_ids(object_function* p_function, uint32_t p_source_id) {
++void ok_stamp_source_ids(object_function* p_function, uint32_t p_source_id) {
+   p_function->chunk.source_id = p_source_id;
+   for (uint32_t i = 0; i < p_function->chunk.constants.count; ++i) {
+     const value v = p_function->chunk.constants.data[i];
+     if (IS_VALUE_FUNCTION(v)) {
+-      stamp_source_ids(VALUE_AS_FUNCTION(v), p_source_id);
++      ok_stamp_source_ids(VALUE_AS_FUNCTION(v), p_source_id);
+     }
+   }
+ }
+@@ -489,7 +484,52 @@ ok_result ok_run(ok* p_ok, ok_source p_source) {
+     return OK_INIT_ERROR;
+   }
+   p_ok->source = p_source;
+-  const ok_result result = ok_run_inner(p_ok, source_id);
++
++  // OR-1: the module graph phase. the TU parses once here (ok_run_inner
++  // reuses the tree); if it has imports, the module system resolves and
++  // initializes the whole graph before the compile - the bindings arrive
++  // as constants, and the compiler resolves nothing at run time.
++  parser parser;
++  parser_specs parser_specs = {.alloc = &p_ok->alloc, .source = &p_ok->source};
++  parser_init(&parser, parser_specs);
++  parse_result parsed = parser_parse(&parser);
++  ok_result result = OK;
++  ok_import_binding_array bindings;
++  ok_import_binding_array_init(&bindings, &p_ok->alloc);
++  if (parsed.status != PARSE_OK) {
++    result = OK_PARSE_ERROR;
++  } else {
++#if defined(OK_TRACE_AST)
++    gc_pause(&p_ok->gc);
++    printf("--- ast ---\n");
++    ast_dispatch_print((ast_node*)parsed.root);
++    printf("--- ast ---");
++    fflush(stdout);
++    gc_resume(&p_ok->gc);
++#endif // defined(OK_TRACE_AST)
++    bool has_imports = false;
++    for (uint32_t i = 0; i < parsed.root->statements.count; ++i) {
++      if (parsed.root->statements.data[i]->node.node_type == AST_IMPORT_STATEMENT) {
++        has_imports = true;
++        break;
++      }
++    }
++    if (has_imports) {
++      // the per-run windows reset: the previous run's roots and names are
++      // adopted by its compiled constants, and its bindings are spent.
++      p_ok->modules.pending_roots.count = 0;
++      for (uint32_t i = 0; i < p_ok->modules.name_arena_count; ++i) {
++        free(p_ok->modules.name_arena[i]);
++      }
++      p_ok->modules.name_arena_count = 0;
++      result = ok_modules_prepare(&p_ok->modules, parsed.root, &p_ok->source, &bindings);
++    }
++  }
++  if (result == OK) {
++    result = ok_run_inner(p_ok, source_id, &parsed, (ok_import_bindings){bindings.data, bindings.count});
++  }
++  ok_import_binding_array_deinit(&bindings, &p_ok->alloc);
++  parse_result_deinit(&parsed);
+   vm_end_source(&p_ok->vm, source_id);
+   return result;
+ }
+@@ -583,42 +623,30 @@ void ok_clear_error(ok* p_ok) {
+   vm_clear_error(&p_ok->vm);
+ }
+ 
+-static ok_result ok_run_inner(ok* p_ok, uint32_t p_source_id) {
+-  parser parser;
+-  parser_specs specs = {.alloc = &p_ok->alloc, .source = &p_ok->source};
+-  parser_init(&parser, specs);
+-  parse_result parse_result = parser_parse(&parser);
+-  if (parse_result.status != PARSE_OK) {
+-    parse_result_deinit(&parse_result);
+-    return OK_PARSE_ERROR;
+-  }
+-
+-#if defined(OK_TRACE_AST)
+-  gc_pause(&p_ok->gc);
+-  printf("--- ast ---\n");
+-  ast_dispatch_print((ast_node*)parse_result.root);
+-  printf("--- ast ---");
+-  fflush(stdout);
+-  gc_resume(&p_ok->gc);
+-#endif // defined(OK_TRACE_AST)
+-
++static ok_result ok_run_inner(ok* p_ok, uint32_t p_source_id, parse_result* p_parsed, ok_import_bindings p_imports) {
++  // the entry compile: a plain TU (module mode is the loader's lane). the
++  // parse came in from ok_run's graph phase - one parse per run, ever.
+   compile_specs compile_specs;
+-  compile_specs.root = parse_result.root;
++  compile_specs.root = p_parsed->root;
+   compile_specs.source = &p_ok->source;
+   bool err = false;
+   compile_specs.top_level_declarations = ok_get_top_level_declarations(p_ok, &err);
+   if (err) {
+     return OK_INIT_ERROR;
+   }
++  compile_specs.imports = p_imports;
++  compile_specs.is_module = false;
++  compile_specs.module_path = ok_create_string_view(NULL, 0, false);
+   compile_result compile_result = compiler_compile(&p_ok->compiler, compile_specs);
+   top_level_declarations_deinit(&compile_specs.top_level_declarations, &p_ok->alloc);
+-  parse_result_deinit(&parse_result);
+   if (compile_result.status != COMPILE_OK) {
++    module_exports_deinit(&compile_result.exports, &p_ok->alloc);
+     return OK_COMPILE_ERROR;
+   }
++  module_exports_deinit(&compile_result.exports, &p_ok->alloc); // the entry exports nothing
+   // the freshly compiled tree remembers its source:
+   // main + every nested proto. runtime reports read it back per frame
+-  stamp_source_ids(compile_result.function, p_source_id);
++  ok_stamp_source_ids(compile_result.function, p_source_id);
+   if (p_ok->dump_bytecode) {
+     gc_pause(&p_ok->gc);
+     disassembler disassembler;
+@@ -666,6 +694,7 @@ void ok_set_print(ok* p_ok, ok_print_fn p_cb, void* p_ctx) {
+ }
+ 
+ void ok_free(ok* p_ok) {
++  ok_modules_deinit(&p_ok->modules);
+   vm_deinit(&p_ok->vm);
+   compiler_deinit(&p_ok->compiler);
+   string_interner_deinit(&p_ok->interner);
+diff --git a/src/okast.c b/src/okast.c
+index 7428466..0c46a4c 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -50,6 +50,7 @@
+   X(AST_THROW_STATEMENT, ast_throw_statement)                                                                          \
+   X(AST_TRY_STATEMENT, ast_try_statement)                                                                              \
+   X(AST_DEFER_STATEMENT, ast_defer_statement)                                                                          \
++  X(AST_IMPORT_STATEMENT, ast_import_statement)                                                                        \
+   X(AST_EOF_STATEMENT, ast_eof_statement)                                                                              \
+   X(AST_LET_DECLARATION, ast_let_declaration)                                                                          \
+   X(AST_FUNCTION_DECLARATION, ast_function_declaration)                                                                \
+@@ -1674,6 +1675,65 @@ string ast_defer_statement_asprint(const ast_defer_statement* p_defer) {
+   return res;
+ }
+ 
++ARRAY_DEFINE_DEFAULT(ast_import_specifier_list, ast_import_specifier, ARRAY_DEFAULT_TYPE_DEINIT)
++
++void ast_import_statement_init(ast_import_statement* p_import,
++                               token p_token,
++                               token p_path,
++                               ast_import_specifier_list p_symbols,
++                               bool p_has_alias,
++                               token p_alias,
++                               ast_specs* p_specs) {
++  ast_statement_init(&p_import->statement, AST_IMPORT_STATEMENT, p_token, p_specs);
++  p_import->path = p_path;
++  p_import->has_alias = p_has_alias;
++  p_import->alias = p_alias;
++  p_import->symbols = p_symbols;
++}
++
++void ast_import_statement_deinit(ast_import_statement* p_import) {
++  allocators* alloc = p_import->statement.node.alloc;
++  ast_import_specifier_list_deinit(&p_import->symbols, alloc);
++  ast_statement_deinit(&p_import->statement);
++}
++
++bool ast_import_statement_print(const ast_import_statement* p_import) {
++  return printf("import") > 0;
++}
++
++string ast_import_statement_asprint(const ast_import_statement* p_import) {
++  allocators* alloc = p_import->statement.node.alloc;
++  const ok_string_view path = ast_import_statement_path(p_import);
++  string res = asprint(alloc, "import \"%.*s\"", ok_string_view_get_length(&path), path.chars);
++  if (res.chars == NULL) {
++    return res;
++  }
++  if (p_import->has_alias) {
++    string joined = asprint(alloc, "%s as %.*s", res.chars, p_import->alias.length, p_import->alias.start);
++    string_deinit(&res, alloc);
++    res = joined;
++  }
++  for (uint32_t i = 0; i < p_import->symbols.count && res.chars != NULL; ++i) {
++    const ast_import_specifier* spec = &p_import->symbols.data[i];
++    const bool has_alias = spec->alias.type == TOKEN_IDENTIFIER;
++    string part = asprint(alloc,
++                          "%s %.*s%s%.*s",
++                          res.chars,
++                          spec->name.length,
++                          spec->name.start,
++                          has_alias ? " as " : "",
++                          has_alias ? spec->alias.length : 0,
++                          has_alias ? spec->alias.start : "");
++    string_deinit(&res, alloc);
++    res = part;
++  }
++  return res;
++}
++
++ok_string_view ast_import_statement_path(const ast_import_statement* p_import) {
++  return ok_create_string_view(p_import->path.start + 1, p_import->path.length - 2, false);
++}
++
+ void ast_let_declaration_init(ast_let_declaration* p_let,
+                               ast_binding* p_binding,
+                               ast_expression* p_value,
+diff --git a/src/okast.h b/src/okast.h
+index 24648cc..5486066 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -68,6 +68,7 @@ typedef enum {
+   AST_THROW_STATEMENT,
+   AST_TRY_STATEMENT,
+   AST_DEFER_STATEMENT,
++  AST_IMPORT_STATEMENT,
+   AST_EOF_STATEMENT,
+   AST_RANGE_PURE_STATEMENT_END = AST_EOF_STATEMENT,
+ 
+@@ -704,6 +705,42 @@ void ast_defer_statement_deinit(ast_defer_statement* p_defer);
+ bool ast_defer_statement_print(const ast_defer_statement* p_defer);
+ string ast_defer_statement_asprint(const ast_defer_statement* p_defer);
+ 
++// one imported symbol of a `from "p" import a, b as c;` - the name as spelled
++// in the importing module, plus the local alias when `as` renames it.
++typedef struct {
++  token name;  // the exported symbol's identifier
++  token alias; // alias.type == TOKEN_IDENTIFIER when present, else TOKEN_ERROR
++} ast_import_specifier;
++
++ARRAY_DECLARE_DEFAULT(ast_import_specifier_list, ast_import_specifier)
++
++// `import "a/b";` / `import "a/b" as c;` / `from "a/b" import x, y as z;`
++// (OR-1, M1/M2/M5). the path is the raw STRING token - the view strips the
++// quotes exactly like a string literal. the statement is only created at
++// module top level (parse_root); anywhere else the parser refuses it. the
++// compiler never resolves it: the module system resolved the whole graph
++// before this TU compiled, and hands the bindings over via compile_specs.
++typedef struct {
++  ast_statement statement;
++  token path;                          // the quoted path (quotes included, like string tokens)
++  bool has_alias;                     // `import "p" as name;`
++  token alias;                        // the alias identifier when has_alias
++  ast_import_specifier_list symbols;  // `from` form only; empty for path imports
++} ast_import_statement;
++
++void ast_import_statement_init(ast_import_statement* p_import,
++                               token p_token,
++                               token p_path,
++                               ast_import_specifier_list p_symbols,
++                               bool p_has_alias,
++                               token p_alias,
++                               ast_specs* p_specs);
++void ast_import_statement_deinit(ast_import_statement* p_import);
++bool ast_import_statement_print(const ast_import_statement* p_import);
++string ast_import_statement_asprint(const ast_import_statement* p_import);
++// the path literal's contents (no quotes), same convention as string expressions.
++ok_string_view ast_import_statement_path(const ast_import_statement* p_import);
++
+ typedef struct {
+   ast_declaration declaration;
+   ast_binding* binding; // the single-binder form (`let x = v;`), NULL in the span form
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 486daf2..1eedb84 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -186,6 +186,9 @@ ARRAY_DEFINE_DEFAULT(scopes, scope, scope_deinit)
+ ARRAY_DEFINE_DEFAULT(compile_contexts, compile_context, compile_context_deinit)
+ ARRAY_DEFINE_DEFAULT(uint16_array, uint16_t, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(loop_stack, loop_context, loop_context_deinit)
++// OR-1: the module export table (the type lives in okcompiler.h, the
++// compiler is its one producer)
++ARRAY_DEFINE_DEFAULT(module_exports, module_export, ARRAY_DEFAULT_TYPE_DEINIT)
+ 
+ static void error_at_noted_located(compiler* p_compiler,
+                                    const ast_node* p_author,
+@@ -499,6 +502,7 @@ add_local(compiler* p_compiler, const variable_declaration p_declration, bool p_
+ 
+ static bool compile_root(compiler* p_compiler, ast_root* p_root);
+ static bool compile_statement(compiler* p_compiler, ast_statement* p_statement);
++static bool compile_import_statement(compiler* p_compiler, ast_import_statement* p_import);
+ static bool compile_expression(compiler* p_compiler,
+                                ast_expression* p_expression,
+                                _register p_dest,
+@@ -527,6 +531,15 @@ static bool compile_access_expression(compiler* p_compiler,
+ 
+ static bool compile_expression_statement(compiler* p_compiler, ast_expression_statement* p_expression_statement);
+ static bool compile_eof_statement(compiler* p_compiler, ast_eof_statement* p_eof);
++// OR-1: the helpers the import/export paths share with the declaration
++// compilers (defined further down, declared here so compile_root's neighbors
++// can use them in the file's layout order).
++static bool materialize_value(compiler* p_compiler, _register p_dest, location p_value, ast_node* p_author);
++static bool write_global(compiler* p_compiler, global_id p_global, expression_result p_value, ast_node* p_author);
++static location declare_variable(compiler* p_compiler, const variable_declaration p_declration, ast_node* p_node);
++static bool register_for_location(compiler* p_compiler, location p_location, _register* p_dest);
++static bool emit_module_exports(compiler* p_compiler, ast_node* p_author);
++static bool define_local(compiler* p_compiler, location p_local, expression_result p_value, ast_node* p_author);
+ static bool compile_print_statement(compiler* p_compiler, ast_print_statement* p_print);
+ static bool compile_compound_statement(compiler* p_compiler, ast_compound_statement* p_compound);
+ static bool compile_if_statement(compiler* p_compiler, ast_if_statement* p_if);
+@@ -642,6 +655,11 @@ void compiler_init(compiler* p_compiler, compiler_specs p_specs) {
+   p_compiler->alloc = p_specs.alloc;
+   p_compiler->globals_store = p_specs.globals_store;
+   p_compiler->interner = p_specs.interner;
++  p_compiler->imports = (ok_import_bindings){NULL, 0};
++  p_compiler->imports_next = 0;
++  p_compiler->is_module = false;
++  p_compiler->module_path = ok_create_string_view(NULL, 0, false);
++  module_exports_init(&p_compiler->exports, p_compiler->alloc);
+   compile_contexts_init(&p_compiler->contexts, p_compiler->alloc);
+ }
+ 
+@@ -651,6 +669,11 @@ void compiler_deinit(compiler* p_compiler) {
+   p_compiler->globals_store = NULL;
+   p_compiler->had_error = false;
+   p_compiler->panic = false;
++  p_compiler->imports = (ok_import_bindings){NULL, 0};
++  p_compiler->imports_next = 0;
++  p_compiler->is_module = false;
++  p_compiler->module_path = ok_create_string_view(NULL, 0, false);
++  module_exports_deinit(&p_compiler->exports, p_compiler->alloc);
+   compile_contexts_deinit(&p_compiler->contexts, p_compiler->alloc);
+ }
+ 
+@@ -658,7 +681,12 @@ compile_result compiler_compile(compiler* p_compiler, compile_specs p_specs) {
+   compile_result result;
+   result.function = NULL;
+   result.status = COMPILE_ERROR;
++  module_exports_init(&result.exports, p_compiler->alloc);
+   p_compiler->source = p_specs.source;
++  p_compiler->imports = p_specs.imports;
++  p_compiler->imports_next = 0;
++  p_compiler->is_module = p_specs.is_module;
++  p_compiler->module_path = p_specs.module_path;
+   variable_declaration decl = {.identifier = "", .flags = VARIABLE_DECLRATION_FLAGS_NONE};
+   if (!begin_context(p_compiler,
+                      ok_create_string_view("<main>", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+@@ -694,6 +722,15 @@ compile_result compiler_compile(compiler* p_compiler, compile_specs p_specs) {
+   // its defers (and its upvalue closes) are live code. ending it after the return would make
+   // the whole epilogue dead bytes. a top-level `defer` would never run.
+   res &= end_scope(p_compiler, (ast_node*)p_specs.root); // user top-level scope
++  // OR-1 (M9): the module epilogue - after the user's top level ran (its
++  // defers included), every pub export's register is stored to its hidden
++  // global for the loader to harvest. the registers persist past the scope
++  // end (locals are compile-time; the frame's slots survive until the
++  // return), and an early top-level return is refused in module mode, so
++  // every export is live here.
++  if (p_compiler->is_module) {
++    res &= emit_module_exports(p_compiler, (ast_node*)p_specs.root);
++  }
+   res &= emit_default_return(p_compiler, (ast_node*)p_specs.root);
+   res &= end_scope(p_compiler, (ast_node*)p_specs.root); // hidden scope
+   res &= end_scope(p_compiler, (ast_node*)p_specs.root);
+@@ -708,6 +745,10 @@ compile_result compiler_compile(compiler* p_compiler, compile_specs p_specs) {
+     disassembler_deinit(&disassembler);
+ #endif // defined (OK_DEBUG_DUMP_CODE)
+   }
++  // move the exports table into the result before the between-runs reset
++  // deinits the compiler's copy (the driver reads it after the run).
++  result.exports = p_compiler->exports;
++  module_exports_init(&p_compiler->exports, p_compiler->alloc);
+ ret: {
+   // the between-runs reset: same wiring, fresh state. the interner rides
+   // along (a NULL here survived the cli's one-script-per-process shape and
+@@ -762,6 +803,172 @@ static bool compile_root(compiler* p_compiler, ast_root* p_root) {
+   return res;
+ }
+ 
++// OR-1: is the compiler walking the user top level of <main>? the three
++// scopes there are [outer, hidden-seeds, user]; class bodies and methods add
++// contexts, blocks and loops add scopes. this is where pub means "export".
++static bool at_module_top_level(compiler* p_compiler) {
++  return p_compiler->contexts.count == 1 && current_context(p_compiler)->scopes.count == 3;
++}
++
++// OR-1 (M8): the reserved root. a top-level binding named `std` would shadow
++// the standard library's namespace; the reservation has teeth only in TUs
++// that participate in the module world (a module, or any file with imports)
++// - a standalone script keeps every name.
++static bool name_is_reserved_root(compiler* p_compiler, const ok_string_view p_name) {
++  if (p_name.chars == NULL || ok_string_view_get_length(&p_name) != 3 || memcmp(p_name.chars, "std", 3) != 0) {
++    return false;
++  }
++  return p_compiler->is_module || p_compiler->imports.count > 0;
++}
++
++// OR-1 (M9): a pub top-level declaration in a module becomes an export: the
++// name and its register land in the exports table; compiler_compile's
++// epilogue stores them to the hidden globals the loader harvests. this is
++// also the choke point for pub-in-the-wrong-place, the vestigial `export`
++// keyword (pub is the rule), and the std reservation.
++static bool record_module_export_if_pub(compiler* p_compiler,
++                                        const ok_string_view p_name,
++                                        location p_variable,
++                                        ast_node* p_author,
++                                        ast_declaration_modifiers_t p_modifiers) {
++  if (!at_module_top_level(p_compiler)) {
++    if ((p_modifiers & (DECLARATION_PUB | DECLARATION_EXPORT)) != 0) {
++      error_at(p_compiler,
++               p_author,
++               ok_create_string_view("'pub' is a module top-level modifier.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      return false;
++    }
++    return true;
++  }
++  if ((p_modifiers & DECLARATION_EXPORT) != 0) {
++    error_at(p_compiler,
++             p_author,
++             ok_create_string_view("the export rule is 'pub' (M9), not 'export'.",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    return false;
++  }
++  if (name_is_reserved_root(p_compiler, p_name)) {
++    error_at(p_compiler,
++             p_author,
++             ok_create_string_view("the name 'std' is reserved for the standard library's namespace.",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    return false;
++  }
++  if ((p_modifiers & DECLARATION_PUB) == 0 || !p_compiler->is_module) {
++    return true; // pub in the entry file is legal and meaningless there - or no pub at all
++  }
++  if (p_variable.kind != LOCATION_KIND_REGISTER) {
++    return true; // unreachable: pub+glob is a parse error
++  }
++  module_export entry;
++  entry.name = p_name;
++  entry.local = (uint16_t)p_variable.index;
++  entry.hidden = (global_id){0, GLOBAL_FLAG_NONE, GLOBAL_OK};
++  if (!module_exports_append(&p_compiler->exports, entry)) {
++    report_oom(p_compiler, p_author);
++    return false;
++  }
++  return true;
++}
++
++// OR-1 (M9): the module export epilogue. emitted after the user top-level
++// scope ends and before the fall-off return: for every recorded pub export,
++// allocate the hidden global " module:<canon>:<name>" (leading space =
++// invisible to script, the seed natives' convention) and store the local's
++// register into it. the loader reads these back after the module's main ran
++// and fills the namespace object - the globals trick one level up.
++static bool emit_module_exports(compiler* p_compiler, ast_node* p_author) {
++  for (uint32_t i = 0; i < p_compiler->exports.count; ++i) {
++    module_export* entry = &p_compiler->exports.data[i];
++    string mangled = asprint(p_compiler->alloc,
++                             " module:%.*s:%.*s",
++                             ok_string_view_get_length(&p_compiler->module_path),
++                             p_compiler->module_path.chars,
++                             ok_string_view_get_length(&entry->name),
++                             entry->name.chars);
++    if (mangled.chars == NULL) {
++      report_oom(p_compiler, p_author);
++      return false;
++    }
++    const global_id glob = globals_store_add(
++        p_compiler->globals_store,
++        ok_create_string_view(mangled.chars, (uint32_t)string_get_length(&mangled), false),
++        GLOBAL_FLAG_NONE);
++    string_deinit(&mangled, p_compiler->alloc);
++    if (!IS_GLOBAL_VALID(glob)) {
++      report_oom(p_compiler, p_author);
++      return false;
++    }
++    entry->hidden = glob;
++    expression_result value;
++    value.type = EXPRESSION_VALUE;
++    value.value = (location){entry->local, LOCATION_KIND_REGISTER, LOCATION_OK};
++    value.lvalue = (lvalue){0};
++    value.count = 1;
++    if (!write_global(p_compiler, glob, value, p_author)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// OR-1: bind one import value as a local (the root/alias/symbol name) with a
++// constant load. the value is a live object (a namespace instance, a class,
++// a closure) riding the constant pool; it is rooted elsewhere (the module
++// registry or the pending-roots window), so the push needs no guard across
++// the constants array's growth. define_local (not a bare materialize) so the
++// binding leaves the uninitialized state - resolution skips uninitialized
++// locals, the `let x; { let x = x; }` rule.
++static bool bind_import_value(compiler* p_compiler, ok_string_view p_name, value p_value, ast_node* p_author) {
++  variable_declaration vardecl = {.identifier = p_name, .flags = VARIABLE_DECLRATION_FLAGS_NONE};
++  location variable = declare_variable(p_compiler, vardecl, p_author);
++  if (variable.error != LOCATION_OK) {
++    return false; // the usual duplicate-binding error, naming the import site
++  }
++  constant con = add_constant(p_compiler, p_value, p_author);
++  if (!IS_CONSTANT_VALID(con)) {
++    return false;
++  }
++  expression_result value;
++  value.type = EXPRESSION_VALUE;
++  value.value = (location){CONSTANT_RAW_INDEX(con), LOCATION_KIND_CONSTANT, LOCATION_OK};
++  value.lvalue = (lvalue){0};
++  value.count = 1;
++  return define_local(p_compiler, variable, value, p_author);
++}
++
++// OR-1 (M2/M4/M5): the import statement. the module system resolved the
++// whole graph before this TU compiled; this only consumes the prepared
++// binding table in statement order. a path import is one binding (its root,
++// or the aliased module value); a from-import is one binding per symbol. a
++// merge binding (the root is already bound - M5's root merging) emits
++// nothing: the root namespace object already carries the new stem.
++static bool compile_import_statement(compiler* p_compiler, ast_import_statement* p_import) {
++  ast_node* author = (ast_node*)p_import;
++  const uint32_t bindings_needed = p_import->symbols.count == 0 ? 1 : p_import->symbols.count;
++  if (p_compiler->imports_next + bindings_needed > p_compiler->imports.count) {
++    // cannot happen: the driver prepared the table from this very parse tree
++    error_at(p_compiler,
++             author,
++             ok_create_string_view("internal error: the import binding table is out of sync.",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    return false;
++  }
++  for (uint32_t i = 0; i < bindings_needed; ++i) {
++    const ok_import_binding* binding = &p_compiler->imports.data[p_compiler->imports_next++];
++    if (binding->merge) {
++      continue;
++    }
++    if (!bind_import_value(p_compiler, binding->name, binding->value, author)) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ static bool compile_statement(compiler* p_compiler, ast_statement* p_statement) {
+   ASSERT_MSG(p_statement->node.node_type >= AST_RANGE_STATEMENT_BEGIN &&
+                  p_statement->node.node_type <= AST_RANGE_STATEMENT_END,
+@@ -815,6 +1022,9 @@ static bool compile_statement(compiler* p_compiler, ast_statement* p_statement)
+   case AST_DEFER_STATEMENT:
+     result = compile_defer_statement(p_compiler, (ast_defer_statement*)p_statement);
+     break;
++  case AST_IMPORT_STATEMENT:
++    result = compile_import_statement(p_compiler, (ast_import_statement*)p_statement);
++    break;
+   case AST_LET_DECLARATION:
+     result = compile_let_declration(p_compiler, (ast_let_declaration*)p_statement);
+     break;
+@@ -1349,6 +1559,9 @@ static bool compile_let_declration(compiler* p_compiler, ast_let_declaration* p_
+   if (variable.error != LOCATION_OK) {
+     return false;
+   }
++  if (!record_module_export_if_pub(p_compiler, name, variable, (ast_node*)p_let, p_let->declaration.modifiers)) {
++    return false;
++  }
+   expression_result value;
+   _register dest;
+   if (!register_for_location(p_compiler, variable, &dest)) {
+@@ -1386,6 +1599,14 @@ static bool compile_let_declaration_span(compiler* p_compiler, ast_let_declarati
+   if (!IS_REGISTER_VALID(window)) {
+     return false;
+   }
++  // OR-1 (M9): each span binding is an export candidate like any top-level let.
++  if (!record_module_export_if_pub(p_compiler,
++                                   decl0.identifier,
++                                   (location){window.index, LOCATION_KIND_REGISTER, LOCATION_OK},
++                                   (ast_node*)p_let->span_bindings.data[0],
++                                   p_let->declaration.modifiers)) {
++    return false;
++  }
+   // the call, requesting exactly n results.
+   // (call() compares against the callee's inferred span. strictness check lives there).
+   expression_result value;
+@@ -1404,6 +1625,13 @@ static bool compile_let_declaration_span(compiler* p_compiler, ast_let_declarati
+       return false;
+     }
+     ASSERT_MSG(slot.index == window.index + i, "span binding left the result window.");
++    if (!record_module_export_if_pub(p_compiler,
++                                     decl.identifier,
++                                     (location){slot.index, LOCATION_KIND_REGISTER, LOCATION_OK},
++                                     (ast_node*)p_let->span_bindings.data[i],
++                                     p_let->declaration.modifiers)) {
++      return false;
++    }
+   }
+   return true;
+ }
+@@ -1417,6 +1645,9 @@ static bool compile_function_declaration(compiler* p_compiler, ast_function_decl
+   if (variable.error != LOCATION_OK) {
+     return false;
+   }
++  if (!record_module_export_if_pub(p_compiler, name, variable, (ast_node*)p_fu, p_fu->declaration.modifiers)) {
++    return false;
++  }
+   expression_result value;
+   _register dest;
+   if (!register_for_location(p_compiler, variable, &dest)) {
+@@ -1532,6 +1763,9 @@ static bool compile_class_declaration(compiler* p_compiler, ast_class_declaratio
+   if (varloc.error != LOCATION_OK) {
+     return false;
+   }
++  if (!record_module_export_if_pub(p_compiler, name_view, varloc, author, p_class->declaration.modifiers)) {
++    return false;
++  }
+   _register klass_reg;
+   if (!register_for_location(p_compiler, varloc, &klass_reg)) {
+     report_oom(p_compiler, author);
+@@ -3369,6 +3603,19 @@ static bool record_return_span(compiler* p_compiler, ast_return_statement* p_ret
+ }
+ 
+ static bool compile_return_statement(compiler* p_compiler, ast_return_statement* p_return) {
++  // OR-1: a module's top level cannot return early - the export epilogue
++  // that compiler_compile emits at the scope's end would be skipped and the
++  // module would silently export nulls. the entry file keeps the classic
++  // script freedom; lambdas and methods inside a module are unaffected
++  // (they compile in their own contexts).
++  if (p_compiler->is_module && p_compiler->contexts.count == 1) {
++    error_at(p_compiler,
++             (ast_node*)p_return,
++             ok_create_string_view("a module top level cannot return: its exports are its pub declarations.",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    return false;
++  }
+   const uint32_t count = p_return->returned.count;
+   if (!record_return_span(p_compiler, p_return, count == 0 ? 1 : count)) {
+     return false;
+diff --git a/src/okcompiler.h b/src/okcompiler.h
+index dd88fdf..223ac48 100644
+--- a/src/okcompiler.h
++++ b/src/okcompiler.h
+@@ -245,6 +245,37 @@ typedef struct {
+ } compile_context;
+ 
+ ARRAY_DECLARE_DEFAULT(compile_contexts, compile_context)
++
++// OR-1 modules: one pub top-level export of the TU being compiled. the
++// compiler records name + the local's register; the epilogue it emits stores
++// the register to the hidden global " module:<canon>:<name>" after the user's
++// top level ran, and the loader reads it back to fill the namespace object.
++typedef struct {
++  ok_string_view name;   // the export's display name (the namespace field name)
++  uint16_t local;        // the top-level local's register index
++  global_id hidden;      // the mangled hidden global (allocated at the epilogue)
++} module_export;
++
++ARRAY_DECLARE_DEFAULT(module_exports, module_export)
++
++// one resolved import binding, prepared by the module system (okmodules.c)
++// BEFORE the importing TU compiles - the compiler never resolves anything,
++// it only binds what the table hands it, in statement order (M4: the whole
++// graph is compile-time; by the time this TU compiles every imported module
++// is initialized and its exports are live values). the values are borrowed:
++// the module registry (or the pending-roots window) roots them.
++typedef struct {
++  ok_string_view name;  // the local binding: the root (or alias), or the symbol
++  value value;          // the root namespace / module value / export value
++  bool merge;           // a path import whose root is already bound in this scope
++                        // (M5 root merging): no redeclaration, no code
++} ok_import_binding;
++
++typedef struct {
++  const ok_import_binding* data;
++  uint32_t count;
++} ok_import_bindings;
++
+ struct compiler {
+   ok_source* source;
+   allocators* alloc;
+@@ -257,6 +288,15 @@ struct compiler {
+   compile_contexts contexts;
+   bool had_error;
+   bool panic;
++  // OR-1 modules: the resolved import bindings for the TU being compiled
++  // (borrowed from compile_specs; consumed in statement order).
++  ok_import_bindings imports;
++  uint32_t imports_next;
++  // OR-1: this TU is a module - pub top-level declarations become exports,
++  // and an early top-level return is refused (the epilogue must run).
++  bool is_module;
++  ok_string_view module_path;
++  module_exports exports;
+ };
+ 
+ typedef enum {
+@@ -267,6 +307,11 @@ typedef enum {
+ typedef struct {
+   compile_status status;
+   object_function* function;
++  // OR-1 modules: valid when the specs said is_module; the driver reads the
++  // hidden globals after the run and builds the namespace object from it.
++  // the array is the caller's to deinit (module_exports_deinit) -
++  // compiler_compile always leaves it initialized.
++  module_exports exports;
+ } compile_result;
+ 
+ ARRAY_DECLARE_DEFAULT(top_level_declarations, variable_declaration);
+@@ -282,6 +327,15 @@ typedef struct {
+   ok_source* source;
+   ast_root* root;
+   top_level_declarations top_level_declarations;
++  // OR-1: the import bindings, in statement order (may be empty/NULL for a
++  // TU with no imports - the common single-file case pays nothing).
++  ok_import_bindings imports;
++  // OR-1: module mode - this TU is an imported module (pub exports + the
++  // epilogue + the no-early-return rule). the entry file is not one.
++  bool is_module;
++  // the module's canonical path (module mode only): the hidden-global
++  // mangling prefix " module:<canon>:<name>".
++  ok_string_view module_path;
+ } compile_specs;
+ 
+ void compiler_init(compiler* compiler, compiler_specs p_specs);
+diff --git a/src/okfwd.h b/src/okfwd.h
+index 03fa9c2..cb33e7c 100644
+--- a/src/okfwd.h
++++ b/src/okfwd.h
+@@ -11,5 +11,6 @@ typedef struct object_store object_store;
+ typedef struct vm vm;
+ typedef struct compiler compiler;
+ typedef struct globals_store globals_store;
++typedef struct module_system module_system;
+ 
+ #endif // OK_SRC_FWD_H
+diff --git a/src/okgc.c b/src/okgc.c
+index 38e768e..d552bc0 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -5,6 +5,7 @@
+ 
+ #include "okcompiler.h"
+ #include "okglobals_store.h"
++#include "okmodules.h"
+ #include "okobject_store.h"
+ #include "okvalue.h"
+ #include "okvm.h"
+@@ -29,6 +30,7 @@ void gc_init(gc* p_gc, object_store* p_heap, allocators* p_alloc) {
+   p_gc->object_store = p_heap;
+   p_gc->vm = NULL;
+   p_gc->interner = NULL;
++  p_gc->modules = NULL;
+   p_gc->alloc = p_alloc;
+   p_gc->raw_alloc_wrapper = create_raw_allocators_wrapper(p_alloc->raw_allocators);
+   p_gc->allocated_bytes = 0;
+@@ -141,6 +143,10 @@ void gc_watch_interner(gc* p_gc, string_interner* p_interner) {
+   p_gc->interner = p_interner;
+ }
+ 
++void gc_watch_modules(gc* p_gc, module_system* p_modules) {
++  p_gc->modules = p_modules;
++}
++
+ bool gc_collect(gc* p_gc, size_t p_predict, size_t p_old) {
+   p_gc->allocated_bytes += p_predict - p_old;
+ 
+@@ -276,6 +282,28 @@ static bool mark_globals_store(gc* p_gc) {
+   return true;
+ }
+ 
++static bool mark_value_array(gc* p_gc, value_array* p_array) {
++  for (uint32_t i = 0; i < p_array->count; ++i) {
++    if (!mark_value(p_gc, p_array->data[i])) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// OR-1: the module registry's namespaces and the pending-roots window (the
++// roots a TU built but its constants have not adopted yet). the canonical
++// path strings and the namespace classes ride through the instances.
++static bool mark_modules(gc* p_gc) {
++  module_system* modules = p_gc->modules;
++  for (uint32_t i = 0; i < modules->loaded.count; ++i) {
++    if (!mark_value(p_gc, modules->loaded.data[i].namespace)) {
++      return false;
++    }
++  }
++  return mark_value_array(p_gc, &modules->pending_roots);
++}
++
+ static bool mark(gc* p_gc) {
+   if (p_gc->vm != NULL && !mark_vm(p_gc)) {
+     return false;
+@@ -286,6 +314,9 @@ static bool mark(gc* p_gc) {
+   if (p_gc->globals_store != NULL && !mark_globals_store(p_gc)) {
+     return false;
+   }
++  if (p_gc->modules != NULL && !mark_modules(p_gc)) {
++    return false;
++  }
+   // the interner is deliberately NOT marked: it is a weak set (D20). its
+   // dead entries are removed by sweep's pre-pass instead, and its live
+   // entries stay alive through whatever else references them (chunk
+@@ -304,15 +335,6 @@ static bool mark(gc* p_gc) {
+   return true;
+ }
+ 
+-static bool mark_value_array(gc* p_gc, value_array* p_array) {
+-  for (uint32_t i = 0; i < p_array->count; ++i) {
+-    if (!mark_value(p_gc, p_array->data[i])) {
+-      return false;
+-    }
+-  }
+-  return true;
+-}
+-
+ // the interner's dead-entry pass (D20): the table is a WEAK set - mark
+ // never walks it - so its unmarked entries must leave BEFORE the object walk
+ // frees them (a freed canonical string would dangle in a probe chain).
+diff --git a/src/okgc.h b/src/okgc.h
+index 97305ff..621ea3d 100644
+--- a/src/okgc.h
++++ b/src/okgc.h
+@@ -21,6 +21,7 @@ struct gc {
+   object_store* object_store;
+   globals_store* globals_store;
+   string_interner* interner;
++  module_system* modules;
+   grays grays;
+   // embedder-owned strong references (ok_root). unlike the guard stack these
+   // are long lived and unordered, so: growable (raw allocators), null-slot + freelist recycling.
+@@ -58,5 +59,6 @@ void gc_watch_vm(gc* p_gc, vm* p_vm);
+ void gc_watch_compiler(gc* p_gc, compiler* p_compiler);
+ void gc_watch_globals(gc* p_gc, globals_store* p_globals);
+ void gc_watch_interner(gc* p_gc, string_interner* p_interner);
++void gc_watch_modules(gc* p_gc, module_system* p_modules);
+ 
+ #endif // OK_GC_H
+diff --git a/src/oklexer.c b/src/oklexer.c
+index aa241d5..12ea17e 100644
+--- a/src/oklexer.c
++++ b/src/oklexer.c
+@@ -197,6 +197,8 @@ static token_type lookup_identifier(lexer* p_lexer) {
+         return check_keyword(p_lexer, 2, 3, "lse", TOKEN_FALSE);
+       case 'o':
+         return check_keyword(p_lexer, 2, 1, "r", TOKEN_FOR);
++      case 'r':
++        return check_keyword(p_lexer, 2, 2, "om", TOKEN_FROM);
+       }
+     }
+     break;
+diff --git a/src/okmodules.c b/src/okmodules.c
+new file mode 100644
+index 0000000..fa0a202
+--- /dev/null
++++ b/src/okmodules.c
+@@ -0,0 +1,1186 @@
++// OR-1 "O Resolution" - the compile-time module spine, driver side.
++//
++// the shape (MODULES.md section 3): ok_modules_prepare walks one TU's import
++// statements; each import resolves through the ladder (file-relative, then
++// OKPATH - the std/ root lands with OR-2), then loads depth-first: read,
++// parse, prepare ITS imports (recursion - the active chain catches cycles),
++// compile in module mode (pub top-levels recorded), run the main (top-level
++// code runs once, on first import, before the importer's), harvest the
++// exports from the hidden globals into a sealed namespace instance, register.
++// by the time the importer compiles, every binding is a live value riding
++// its constant pool - the compiler resolves nothing at run time, ever.
++//
++// diagnostics use the import site's own file:line:col through okdiag, so a
++// module-world error reads exactly like every other oklang error.
++
++#define _XOPEN_SOURCE 700 // strdup + realpath (XSI; the c99 build is strict)
++
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#include "okmodules.h"
++
++#include "okdiag.h"
++#include "okparser.h"
++#include "okstate.h"
++#include "okutils.h"
++#include "okvm.h"
++
++// the arrays okmodules.h declares (this file is their one definition site).
++// a registry record owns its canonical path (raw strdup); the deinit hook is
++// the array macro's per-element call.
++static void ok_module_record_deinit(ok_module_record* p_record, allocators* p_alloc) {
++  (void)p_alloc;
++  free(p_record->canonical);
++  p_record->canonical = NULL;
++}
++
++ARRAY_DEFINE_DEFAULT(ok_module_records, ok_module_record, ok_module_record_deinit)
++ARRAY_DEFINE_DEFAULT(ok_import_binding_array, ok_import_binding, ARRAY_DEFAULT_TYPE_DEINIT)
++
++// ---------------------------------------------------------------- the fs loader
++
++// the CLI default. an embedder replaces it through ok_modules_set_loader
++// (OR-3 exposes that door publicly); the language never guesses a filesystem.
++static bool fs_read_source(void* p_ctx, const char* p_path, ok_source* p_out) {
++  (void)p_ctx;
++  FILE* file = fopen(p_path, "rb");
++  if (file == NULL) {
++    return false;
++  }
++  if (fseek(file, 0L, SEEK_END) != 0) {
++    fclose(file);
++    return false;
++  }
++  const long size = ftell(file);
++  rewind(file);
++  if (size < 0) {
++    fclose(file);
++    return false;
++  }
++  char* buff = (char*)malloc((size_t)size + 1);
++  if (buff == NULL) {
++    fclose(file);
++    return false;
++  }
++  const size_t read = fread(buff, sizeof(char), (size_t)size, file);
++  fclose(file);
++  if (read != (size_t)size) {
++    free(buff);
++    return false;
++  }
++  buff[read] = '\0';
++  p_out->code = buff;
++  p_out->path = p_path;
++  return true;
++}
++
++// ---------------------------------------------------------------- diagnostics
++
++// one driver-side error at an import site: the same header + snippet contract
++// every parse/compile error uses. first-wins does not apply here - the driver
++// aborts on the first failure, so one report per failure path.
++static void module_report(const ok_source* p_source, const token* p_site, const char* p_message) {
++  bool panic = false;
++  bool had_error = false;
++  const ok_span span = ok_span_of_token(p_site);
++  okdiag_report(&panic,
++                &had_error,
++                p_source->path,
++                p_source->code,
++                &span,
++                p_site->type == TOKEN_EOF,
++                REPORT_SEVERITY_ERROR,
++                ok_create_string_view(p_message, OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                NULL);
++}
++
++// a located note line, the renderer's exact format: continuation context
++// under the error (the 404's tried-locations trace, the cycle's chain).
++static void module_note(const ok_source* p_source, const token* p_site, const char* p_text) {
++  const ok_span span = ok_span_of_token(p_site);
++  fprintf(stderr, "%s:%u:%u: note: %s\n", p_source->path, span.line, span.column, p_text);
++}
++
++// ---------------------------------------------------------------- path plumbing
++
++// a growable list of malloc'd strings (the 404's trace). raw malloc: these
++// live only inside one resolve call.
++typedef struct {
++  char** items;
++  uint32_t count;
++  uint32_t capacity;
++} str_list;
++
++static void str_list_init(str_list* p_list) {
++  p_list->items = NULL;
++  p_list->count = 0;
++  p_list->capacity = 0;
++}
++
++static void str_list_deinit(str_list* p_list) {
++  for (uint32_t i = 0; i < p_list->count; ++i) {
++    free(p_list->items[i]);
++  }
++  free(p_list->items);
++  p_list->items = NULL;
++  p_list->count = 0;
++  p_list->capacity = 0;
++}
++
++static bool str_list_append(str_list* p_list, const char* p_text) {
++  if (p_list->count == p_list->capacity) {
++    const uint32_t grown = p_list->capacity == 0 ? 8 : p_list->capacity * 2;
++    char** items = (char**)realloc(p_list->items, sizeof(char*) * grown);
++    if (items == NULL) {
++      return false;
++    }
++    p_list->items = items;
++    p_list->capacity = grown;
++  }
++  char* copy = strdup(p_text);
++  if (copy == NULL) {
++    return false;
++  }
++  p_list->items[p_list->count++] = copy;
++  return true;
++}
++
++// a module source is a regular file: fopen alone happily "opens" a directory,
++// which would let the ladder bind a directory as a module and die at the read.
++static bool file_readable(const char* p_path) {
++  struct stat info;
++  if (stat(p_path, &info) != 0) {
++    return false;
++  }
++  if (!S_ISREG(info.st_mode)) {
++    return false;
++  }
++  FILE* file = fopen(p_path, "rb");
++  if (file == NULL) {
++    return false;
++  }
++  fclose(file);
++  return true;
++}
++
++// lexical join + normalize: dir's segments, then rel's, with '.' skipped and
++// '..' popping. rel never starts with '/' (the parser rejects absolute
++// paths). the result is malloc'd; NULL = OOM.
++static char* join_normalize(const char* p_dir, const ok_string_view p_rel) {
++  const size_t dir_length = strlen(p_dir);
++  const uint64_t rel_length = ok_string_view_get_length(&p_rel);
++  char* out = (char*)malloc(dir_length + rel_length + 4);
++  if (out == NULL) {
++    return NULL;
++  }
++  size_t olen = 0;
++  // the dir goes in as-is (its trailing '/' is handled below)
++  memcpy(out, p_dir, dir_length);
++  olen = dir_length;
++  // walk rel's segments
++  uint64_t i = 0;
++  while (i < rel_length) {
++    uint64_t j = i;
++    while (j < rel_length && p_rel.chars[j] != '/') {
++      ++j;
++    }
++    const uint64_t seg_length = j - i;
++    const bool is_dot = seg_length == 1 && p_rel.chars[i] == '.';
++    const bool is_dotdot = seg_length == 2 && p_rel.chars[i] == '.' && p_rel.chars[i + 1] == '.';
++    if (is_dotdot) {
++      // pop the last segment (keep the leading '/', stop at the root)
++      while (olen > 0 && out[olen - 1] != '/') {
++        --olen;
++      }
++      if (olen > 0) {
++        --olen; // the '/' itself
++      }
++    } else if (!is_dot && seg_length > 0) {
++      if (olen > 0 && out[olen - 1] != '/') {
++        out[olen++] = '/';
++      } else if (olen == 0) {
++        out[olen++] = '/'; // a relative dir with no segments yet (".")
++      }
++      memcpy(out + olen, p_rel.chars + i, seg_length);
++      olen += seg_length;
++    }
++    i = j + 1;
++  }
++  if (olen == 0) {
++    out[olen++] = '.';
++  }
++  out[olen] = '\0';
++  return out;
++}
++
++// the resolution ladder at one candidate location (M3/M6): the exact file,
++// then + ".ok", then + "/index.ok". a native candidate (.so today - the
++// platform table widens with OR-3) is detected but not loaded: natives land
++// with OR-3's sandboxed loader, and the error says so.
++static char* ladder_at(const char* p_base, str_list* p_tried, bool* p_native_found) {
++  static const char* const forms[] = {"", ".ok", "/index.ok"};
++  for (uint32_t f = 0; f < 3; ++f) {
++    const size_t base_length = strlen(p_base);
++    char* candidate = (char*)malloc(base_length + strlen(forms[f]) + 1);
++    if (candidate == NULL) {
++      return NULL;
++    }
++    memcpy(candidate, p_base, base_length);
++    strcpy(candidate + base_length, forms[f]);
++    if (file_readable(candidate)) {
++      return candidate;
++    }
++    str_list_append(p_tried, candidate); // best effort: the trace wants it
++    free(candidate);
++  }
++  const size_t base_length = strlen(p_base);
++  char* native_candidate = (char*)malloc(base_length + 4);
++  if (native_candidate != NULL) {
++    memcpy(native_candidate, p_base, base_length);
++    strcpy(native_candidate + base_length, ".so");
++    if (file_readable(native_candidate)) {
++      *p_native_found = true;
++    }
++    free(native_candidate);
++  }
++  return NULL;
++}
++
++// the importing file's directory ("" -> "."). returns a malloc'd copy.
++static char* directory_of(const char* p_path) {
++  const char* last = strrchr(p_path, '/');
++  if (last == NULL) {
++    return strdup(".");
++  }
++  if (last == p_path) {
++    return strdup("/");
++  }
++  const size_t length = (size_t)(last - p_path);
++  char* dir = (char*)malloc(length + 1);
++  if (dir == NULL) {
++    return NULL;
++  }
++  memcpy(dir, p_path, length);
++  dir[length] = '\0';
++  return dir;
++}
++
++// does the view start with the given prefix?
++static bool view_starts_with(const ok_string_view p_view, const char* p_prefix) {
++  const size_t prefix_length = strlen(p_prefix);
++  return ok_string_view_get_length(&p_view) >= prefix_length &&
++         memcmp(p_view.chars, p_prefix, prefix_length) == 0;
++}
++
++static bool view_equals(const ok_string_view p_view, const char* p_text) {
++  const size_t length = strlen(p_text);
++  return ok_string_view_get_length(&p_view) == length && memcmp(p_view.chars, p_text, length) == 0;
++}
++
++// ---------------------------------------------------------------- the registry
++
++// the per-run name arena (root names the binding table views). raw malloc,
++// freed at the next ok_run's reset (ok.c) and at deinit.
++static char* arena_strdup(module_system* p_modules, const char* p_text) {
++  if (p_modules->name_arena_count == p_modules->name_arena_capacity) {
++    const uint32_t grown = p_modules->name_arena_capacity == 0 ? 16 : p_modules->name_arena_capacity * 2;
++    char** arena = (char**)realloc(p_modules->name_arena, sizeof(char*) * grown);
++    if (arena == NULL) {
++      return NULL;
++    }
++    p_modules->name_arena = arena;
++    p_modules->name_arena_capacity = grown;
++  }
++  char* copy = strdup(p_text);
++  if (copy == NULL) {
++    return NULL;
++  }
++  p_modules->name_arena[p_modules->name_arena_count++] = copy;
++  return copy;
++}
++
++static ok_module_record* registry_find(module_system* p_modules, const char* p_canonical) {
++  for (uint32_t i = 0; i < p_modules->loaded.count; ++i) {
++    if (strcmp(p_modules->loaded.data[i].canonical, p_canonical) == 0) {
++      return &p_modules->loaded.data[i];
++    }
++  }
++  return NULL;
++}
++
++// ---------------------------------------------------------------- namespaces
++
++// build one module namespace: a fresh class (module_namespace = true, so
++// field reads are public and writes refused), one immutable field per export
++// in declaration order, frozen, instantiated, filled from the hidden globals
++// the module's epilogue stored. the class's name is the canonical path -
++// `print m` reads `<module /abs/path>`; identity is the class, not the name.
++static bool build_namespace(module_system* p_modules,
++                            const char* p_canonical,
++                            const module_exports* p_exports,
++                            value* p_out) {
++  ok* okay = p_modules->ok;
++  object_specs specs = {&okay->alloc, &okay->objects_store};
++  gc* collector = okay->alloc.gc;
++
++  object_string* name = string_interner_intern(
++      &okay->interner, ok_create_string_view(p_canonical, (uint32_t)strlen(p_canonical), true), &specs);
++  if (name == NULL) {
++    return false;
++  }
++  if (!gc_guard_up(collector, OBJECT_AS_VALUE(name))) {
++    return false;
++  }
++  object_class* klass = create_object_class(name, okay->vm.object_singleton, &specs);
++  gc_guard_down(collector); // the class roots its name from here
++  if (klass == NULL) {
++    return false;
++  }
++  klass->module_namespace = true;
++  if (!gc_guard_up(collector, OBJECT_AS_VALUE(klass))) {
++    return false;
++  }
++  for (uint32_t i = 0; i < p_exports->count; ++i) {
++    object_string* field_name = string_interner_intern(&okay->interner, p_exports->data[i].name, &specs);
++    if (field_name == NULL) {
++      gc_guard_down(collector);
++      return false;
++    }
++    if (!gc_guard_up(collector, OBJECT_AS_VALUE(field_name))) {
++      gc_guard_down(collector);
++      return false;
++    }
++    const object_string* previous_owner = NULL;
++    const bool added =
++        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */, &previous_owner);
++    gc_guard_down(collector); // the class owns the name now
++    if (!added) {
++      gc_guard_down(collector);
++      return false;
++    }
++  }
++  if (!object_class_freeze(klass)) {
++    gc_guard_down(collector);
++    return false;
++  }
++  object_instance* inst = create_object_instance(klass, &specs);
++  gc_guard_down(collector); // the instance roots the class
++  if (inst == NULL) {
++    return false;
++  }
++  // the harvest needs no guard: nothing between the instance's creation and
++  // the caller's gc_guard_up allocates - the values ride straight from the
++  // hidden globals into the export slots.
++  for (uint32_t i = 0; i < p_exports->count; ++i) {
++    const module_export* entry = &p_exports->data[i];
++    inst->fields[i] = okay->globals_store.global_values.data[entry->hidden.index];
++  }
++  *p_out = OBJECT_AS_VALUE(inst);
++  return true;
++}
++
++// ---------------------------------------------------------------- the pending root tree
++
++// a TU's root namespaces, pre-materialization. one node per path segment
++// between the root and a module leaf; M5's merging is multiple leaves under
++// one root, and a node that is both a leaf and a branch is the M13-style
++// conflict (a path cannot bind a module and a namespace at once).
++// nodes OWN their names (strdup) - the segment buffers they came from die
++// with each import statement, the tree lives until materialization.
++typedef struct pending_ns {
++  char* name;               // the segment, owned
++  value module_leaf;        // set when a module lands exactly here
++  bool has_leaf;
++  struct pending_ns* children;
++  uint32_t children_count;
++  uint32_t children_capacity;
++} pending_ns;
++
++static void pending_ns_init(pending_ns* p_node, const char* p_name) {
++  p_node->name = strdup(p_name);
++  p_node->module_leaf = NULL_AS_VALUE();
++  p_node->has_leaf = false;
++  p_node->children = NULL;
++  p_node->children_count = 0;
++  p_node->children_capacity = 0;
++}
++
++static void pending_ns_deinit(pending_ns* p_node) {
++  for (uint32_t i = 0; i < p_node->children_count; ++i) {
++    pending_ns_deinit(&p_node->children[i]);
++  }
++  free(p_node->children);
++  free(p_node->name);
++  p_node->name = NULL;
++  p_node->children = NULL;
++  p_node->children_count = 0;
++  p_node->children_capacity = 0;
++}
++
++static pending_ns* pending_ns_child(pending_ns* p_node, const char* p_name) {
++  for (uint32_t i = 0; i < p_node->children_count; ++i) {
++    if (strcmp(p_node->children[i].name, p_name) == 0) {
++      return &p_node->children[i];
++    }
++  }
++  if (p_node->children_count == p_node->children_capacity) {
++    const uint32_t grown = p_node->children_capacity == 0 ? 4 : p_node->children_capacity * 2;
++    pending_ns* children = (pending_ns*)realloc(p_node->children, sizeof(pending_ns) * grown);
++    if (children == NULL) {
++      return NULL;
++    }
++    p_node->children = children;
++    p_node->children_capacity = grown;
++  }
++  pending_ns* child = &p_node->children[p_node->children_count++];
++  pending_ns_init(child, p_name);
++  return child;
++}
++
++// materialize a pending node into a live namespace instance: class (one
++// field per child), freeze, instance, recurse into children, fill slots.
++// slot i is child i - a fresh class assigns fields in declaration order.
++static bool materialize_ns(module_system* p_modules, pending_ns* p_node, value* p_out) {
++  ok* okay = p_modules->ok;
++  object_specs specs = {&okay->alloc, &okay->objects_store};
++  gc* collector = okay->alloc.gc;
++
++  object_string* name = string_interner_intern(
++      &okay->interner, ok_create_string_view(p_node->name, (uint32_t)strlen(p_node->name), true), &specs);
++  if (name == NULL) {
++    return false;
++  }
++  if (!gc_guard_up(collector, OBJECT_AS_VALUE(name))) {
++    return false;
++  }
++  object_class* klass = create_object_class(name, okay->vm.object_singleton, &specs);
++  gc_guard_down(collector); // the class roots its name from here
++  if (klass == NULL) {
++    return false;
++  }
++  klass->module_namespace = true;
++  if (!gc_guard_up(collector, OBJECT_AS_VALUE(klass))) {
++    return false;
++  }
++  for (uint32_t i = 0; i < p_node->children_count; ++i) {
++    object_string* field_name = string_interner_intern(
++        &okay->interner,
++        ok_create_string_view(p_node->children[i].name, (uint32_t)strlen(p_node->children[i].name), true),
++        &specs);
++    if (field_name == NULL) {
++      gc_guard_down(collector);
++      return false;
++    }
++    if (!gc_guard_up(collector, OBJECT_AS_VALUE(field_name))) {
++      gc_guard_down(collector);
++      return false;
++    }
++    const object_string* previous_owner = NULL;
++    const bool added =
++        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */, &previous_owner);
++    gc_guard_down(collector); // the class owns the name now
++    if (!added) {
++      gc_guard_down(collector);
++      return false;
++    }
++  }
++  if (!object_class_freeze(klass)) {
++    gc_guard_down(collector);
++    return false;
++  }
++  object_instance* inst = create_object_instance(klass, &specs);
++  gc_guard_down(collector); // the instance roots the class
++  if (inst == NULL) {
++    return false;
++  }
++  if (!gc_guard_up(collector, OBJECT_AS_VALUE(inst))) {
++    return false;
++  }
++  for (uint32_t i = 0; i < p_node->children_count; ++i) {
++    pending_ns* child = &p_node->children[i];
++    value child_value;
++    if (child->children_count == 0) {
++      // a leaf: a module value (registry-rooted) or an alias-style direct value
++      child_value = child->module_leaf;
++    } else if (!materialize_ns(p_modules, child, &child_value)) {
++      gc_guard_down(collector);
++      return false;
++    }
++    // the assignment roots the child value; a leaf came pre-rooted, a
++    // materialized branch was guarded only until this store
++    inst->fields[i] = child_value;
++  }
++  *p_out = OBJECT_AS_VALUE(inst);
++  gc_guard_down(collector);
++  return true;
++}
++
++// ---------------------------------------------------------------- module loading
++
++// load (or find) one module by canonical path, depth-first. the site + the
++// importing source position every diagnostic this can raise.
++static ok_result load_module(module_system* p_modules,
++                            const char* p_canonical,
++                            const ok_source* p_from_source,
++                            const token* p_site) {
++  ok* okay = p_modules->ok;
++
++  // loaded already? one TU per module, ever (the registry is the cache).
++  ok_module_record* found = registry_find(p_modules, p_canonical);
++  if (found != NULL) {
++    return OK;
++  }
++  // in the active chain? a cycle (M13): the design is in the importer's
++  // graph, and the error walks the chain so the fix is obvious.
++  for (uint32_t i = 0; i < p_modules->chain_depth; ++i) {
++    if (strcmp(p_modules->chain[i], p_canonical) == 0) {
++      string chain = asprint(&okay->alloc, "the import chain is:");
++      for (uint32_t j = i; j < p_modules->chain_depth; ++j) {
++        string part = asprint(&okay->alloc, "%s %s ->", chain.chars, p_modules->chain[j]);
++        string_deinit(&chain, &okay->alloc);
++        chain = part;
++      }
++      string part = asprint(&okay->alloc, "%s %s (back to the start)", chain.chars, p_canonical);
++      string_deinit(&chain, &okay->alloc);
++      chain = part;
++      module_report(p_from_source, p_site, "circular import: this module is already being loaded.");
++      module_note(p_from_source, p_site, chain.chars);
++      string_deinit(&chain, &okay->alloc);
++      return OK_COMPILE_ERROR;
++    }
++  }
++  if (p_modules->chain_depth >= OK_MODULES_MAX_DEPTH) {
++    module_report(p_from_source,
++                  p_site,
++                  "import chain too deep: the limit is 128 - a module graph this deep is a design smell.");
++    return OK_COMPILE_ERROR;
++  }
++
++  // read + parse
++  ok_source source;
++  source.code = NULL;
++  source.path = p_canonical;
++  if (p_modules->loader.read_source == NULL || !p_modules->loader.read_source(p_modules->loader.p_ctx, p_canonical, &source)) {
++    module_report(p_from_source, p_site, "module source is unreadable (the resolver found it, the read failed).");
++    module_note(p_from_source, p_site, p_canonical);
++    return OK_COMPILE_ERROR;
++  }
++  parser parser;
++  parser_specs parser_specs = {.alloc = &okay->alloc, .source = &source};
++  parser_init(&parser, parser_specs);
++  parse_result parsed = parser_parse(&parser);
++  if (parsed.status != PARSE_OK) {
++    parser_deinit(&parser);
++    parse_result_deinit(&parsed);
++    free((void*)source.code);
++    return OK_PARSE_ERROR;
++  }
++
++  // the module's own imports, depth-first (the chain guards the recursion)
++  p_modules->chain[p_modules->chain_depth++] = p_canonical;
++  ok_import_binding_array bindings;
++  ok_import_binding_array_init(&bindings, &okay->alloc);
++  const ok_result prepared = ok_modules_prepare(p_modules, parsed.root, &source, &bindings);
++  p_modules->chain_depth--;
++  if (prepared != OK) {
++    parser_deinit(&parser);
++    parse_result_deinit(&parsed);
++    ok_import_binding_array_deinit(&bindings, &okay->alloc);
++    free((void*)source.code);
++    return prepared;
++  }
++
++  // compile in module mode: pub top-levels recorded, the export epilogue
++  // emitted, an early top-level return refused.
++  compile_specs compile_specs;
++  compile_specs.source = &source;
++  compile_specs.root = parsed.root;
++  bool err = false;
++  compile_specs.top_level_declarations = ok_get_top_level_declarations(okay, &err);
++  if (err) {
++    parser_deinit(&parser);
++    parse_result_deinit(&parsed);
++    ok_import_binding_array_deinit(&bindings, &okay->alloc);
++    free((void*)source.code);
++    return OK_INIT_ERROR;
++  }
++  compile_specs.imports = (ok_import_bindings){bindings.data, bindings.count};
++  compile_specs.is_module = true;
++  compile_specs.module_path = ok_create_string_view(p_canonical, (uint32_t)strlen(p_canonical), true);
++  compile_result compiled = compiler_compile(&okay->compiler, compile_specs);
++  top_level_declarations_deinit(&compile_specs.top_level_declarations, &okay->alloc);
++  ok_import_binding_array_deinit(&bindings, &okay->alloc);
++  parser_deinit(&parser);
++  if (compiled.status != COMPILE_OK) {
++    parse_result_deinit(&parsed);
++    module_exports_deinit(&compiled.exports, &okay->alloc);
++    free((void*)source.code);
++    return OK_COMPILE_ERROR;
++  }
++
++  // the compiled module function rides unrooted from compiler_compile until
++  // this guard: vm_begin_source below allocates, and under aggressive gc that
++  // collection must not sweep the tree ok_stamp_source_ids is about to walk.
++  if (!gc_guard_up(&okay->gc, OBJECT_AS_VALUE(compiled.function))) {
++    parse_result_deinit(&parsed);
++    module_exports_deinit(&compiled.exports, &okay->alloc);
++    free((void*)source.code);
++    module_report(p_from_source, p_site, "out of memory while running the module's top level.");
++    return OK_INIT_ERROR;
++  }
++  // run: one source registration per module (stack traces stay honest in
++  // multi-file runs), seeds staged like any <main>.
++  const uint32_t source_id = vm_begin_source(&okay->vm, source.code, source.path);
++  if (source_id == VM_SOURCE_UNSTAMPED) {
++    gc_guard_down(&okay->gc);
++    parse_result_deinit(&parsed);
++    module_exports_deinit(&compiled.exports, &okay->alloc);
++    free((void*)source.code);
++    return OK_INIT_ERROR;
++  }
++  ok_stamp_source_ids(compiled.function, source_id);
++  err = false;
++  interpret_specs interpret_specs;
++  interpret_specs.function = compiled.function;
++  interpret_specs.source_id = source_id;
++  interpret_specs.top_level_values = ok_get_top_level_values(okay, &err);
++  const interpret_result ran = err ? (interpret_result){0} : vm_interpret(&okay->vm, interpret_specs);
++  gc_guard_down(&okay->gc);
++  value_array_deinit(&interpret_specs.top_level_values, &okay->alloc);
++  vm_end_source(&okay->vm, source_id);
++  if (err || ran.status != RUNTIME_OK) {
++    parse_result_deinit(&parsed);
++    module_exports_deinit(&compiled.exports, &okay->alloc);
++    free((void*)source.code);
++    // the runtime error already printed with the module's own path and
++    // trace; this note ties it to the import that pulled it in.
++    module_note(p_from_source, p_site, "while loading this module (its top level failed).");
++    return OK_RUNTIME_ERROR;
++  }
++
++  // harvest: hidden globals -> the sealed namespace instance -> the registry
++  value namespace = NULL_AS_VALUE();
++  if (!build_namespace(p_modules, p_canonical, &compiled.exports, &namespace)) {
++    parse_result_deinit(&parsed);
++    module_exports_deinit(&compiled.exports, &okay->alloc);
++    free((void*)source.code);
++    module_report(p_from_source, p_site, "out of memory while building the module's namespace.");
++    return OK_INIT_ERROR;
++  }
++  ok_module_record record;
++  record.canonical = strdup(p_canonical);
++  record.name = VALUE_AS_INSTANCE(namespace)->klass->name;
++  record.namespace_class = VALUE_AS_INSTANCE(namespace)->klass;
++  record.namespace = namespace;
++  if (!gc_guard_up(&okay->gc, namespace)) {
++    free(record.canonical);
++    parse_result_deinit(&parsed);
++    module_exports_deinit(&compiled.exports, &okay->alloc);
++    free((void*)source.code);
++    module_report(p_from_source, p_site, "out of memory while registering the module.");
++    return OK_INIT_ERROR;
++  }
++  const bool registered = record.canonical != NULL && ok_module_records_append(&p_modules->loaded, record);
++  gc_guard_down(&okay->gc);
++  parse_result_deinit(&parsed);
++  module_exports_deinit(&compiled.exports, &okay->alloc);
++  free((void*)source.code);
++  if (!registered) {
++    free(record.canonical);
++    module_report(p_from_source, p_site, "out of memory while registering the module.");
++    return OK_INIT_ERROR;
++  }
++  return OK;
++}
++
++// ---------------------------------------------------------------- resolution
++
++// resolve one import path from one importing file. produces the canonical
++// (realpath'd, malloc'd) path, or prints the teaching 404 with the full
++// trace of locations and forms tried (and returns false).
++static bool resolve_import(module_system* p_modules,
++                           const ok_string_view p_path,
++                           const char* p_from_dir,
++                           const ok_source* p_source,
++                           const token* p_site,
++                           char** p_out_canonical) {
++  str_list tried;
++  str_list_init(&tried);
++  char* found = NULL;
++  bool native_found = false;
++
++  if (view_starts_with(p_path, "./") || view_starts_with(p_path, "../")) {
++    // the file-relative lane (M3): raw ok files, no project needed.
++    char* joined = join_normalize(p_from_dir, p_path);
++    if (joined != NULL) {
++      found = ladder_at(joined, &tried, &native_found);
++      free(joined);
++    }
++  } else if (view_starts_with(p_path, "std/")) {
++    // the std root is reserved (M8: unshadowable) and re-homes with OR-2 -
++    // until then it is honestly absent rather than OKPATH-shadowable.
++    module_report(p_source,
++                  p_site,
++                  "the standard library is not module-shaped yet: the std re-home is OR-2. file-relative "
++                  "(\"./x\") and OKPATH imports work today.");
++    str_list_deinit(&tried);
++    return false;
++  } else {
++    // the OKPATH lane: colon-separated roots, the same ladder at each.
++    const char* okpath = getenv("OKPATH");
++    if (okpath != NULL && *okpath != '\0') {
++      char* roots = strdup(okpath);
++      if (roots != NULL) {
++        char* cursor = roots;
++        while (cursor != NULL && *cursor != '\0' && found == NULL) {
++          char* colon = strchr(cursor, ':');
++          if (colon != NULL) {
++            *colon = '\0';
++          }
++          if (*cursor != '\0') {
++            char* joined = join_normalize(cursor, p_path);
++            if (joined != NULL) {
++              found = ladder_at(joined, &tried, &native_found);
++              free(joined);
++            }
++          }
++          cursor = colon != NULL ? colon + 1 : NULL;
++        }
++        free(roots);
++      }
++    }
++  }
++
++  if (found == NULL) {
++    if (native_found) {
++      module_report(p_source,
++                    p_site,
++                    "native module found, but native loading lands with OR-3 (the sandbox + the loader) - "
++                    "not yet.");
++      str_list_deinit(&tried);
++      return false;
++    }
++    // the 404 must teach (M3): every location and form tried, plus the hint.
++    module_report(p_source, p_site, "module not found.");
++    for (uint32_t i = 0; i < tried.count; ++i) {
++      module_note(p_source, p_site, tried.items[i]);
++    }
++    if (tried.count == 0) {
++      module_note(p_source, p_site, "no locations were searched: file-relative paths need './' or '../', "
++                                    "bare names search OKPATH (unset).");
++    } else {
++      module_note(p_source, p_site, "add the module's directory to OKPATH, or fix the path.");
++    }
++    str_list_deinit(&tried);
++    return false;
++  }
++
++  // canonicalize (symlinks resolved): the registry key, the class name, and
++  // the stack-trace path all use this one spelling.
++  char* canonical = realpath(found, NULL);
++  if (canonical == NULL) {
++    canonical = found; // realpath refused (exotic fs): the found path is the key
++  } else {
++    free(found);
++  }
++  *p_out_canonical = canonical;
++  str_list_deinit(&tried);
++  if (canonical == NULL) {
++    module_report(p_source, p_site, "out of memory while resolving the module path.");
++    return false;
++  }
++  return true;
++}
++
++// the binding segments (M5): the import literal's own segments, '.' skipped,
++// '..' popped where possible and dropped at the front (they climb toward the
++// importer's directory - the NAME is the remainder), a trailing '.ok'
++// stripped. "a/b" -> [a, b]; "./util.ok" -> [util]; "../lib/h" -> [lib, h].
++static bool binding_segments(const ok_string_view p_path, char*** p_out, uint32_t* p_out_count) {
++  const uint64_t length = ok_string_view_get_length(&p_path);
++  char** segments = NULL;
++  uint32_t count = 0;
++  uint32_t capacity = 0;
++  uint64_t i = 0;
++  while (i < length) {
++    uint64_t j = i;
++    while (j < length && p_path.chars[j] != '/') {
++      ++j;
++    }
++    const uint64_t seg_length = j - i;
++    const bool is_dot = seg_length == 1 && p_path.chars[i] == '.';
++    const bool is_dotdot = seg_length == 2 && p_path.chars[i] == '.' && p_path.chars[i + 1] == '.';
++    if (is_dotdot && count > 0) {
++      free(segments[--count]);
++    } else if (!is_dot && !is_dotdot && seg_length > 0) {
++      if (count == capacity) {
++        const uint32_t grown = capacity == 0 ? 4 : capacity * 2;
++        char** grown_segments = (char**)realloc(segments, sizeof(char*) * grown);
++        if (grown_segments == NULL) {
++          goto oom;
++        }
++        segments = grown_segments;
++        capacity = grown;
++      }
++      uint64_t name_length = seg_length;
++      if (name_length > 3 && memcmp(p_path.chars + i + name_length - 3, ".ok", 3) == 0) {
++        name_length -= 3;
++      }
++      if (name_length == 0) {
++        i = j + 1;
++        continue;
++      }
++      char* segment = (char*)malloc(name_length + 1);
++      if (segment == NULL) {
++        goto oom;
++      }
++      memcpy(segment, p_path.chars + i, name_length);
++      segment[name_length] = '\0';
++      segments[count++] = segment;
++    }
++    i = j + 1;
++  }
++  if (count == 0) {
++    goto oom; // a path of only dots has nothing to bind
++  }
++  *p_out = segments;
++  *p_out_count = count;
++  return true;
++oom:
++  for (uint32_t k = 0; k < count; ++k) {
++    free(segments[k]);
++  }
++  free(segments);
++  return false;
++}
++
++static void free_segments(char** p_segments, uint32_t p_count) {
++  for (uint32_t i = 0; i < p_count; ++i) {
++    free(p_segments[i]);
++  }
++  free(p_segments);
++}
++
++// ---------------------------------------------------------------- prepare (the graph phase)
++
++ok_result ok_modules_prepare(module_system* p_modules,
++                             ast_root* p_root,
++                             const ok_source* p_source,
++                             ok_import_binding_array* p_bindings) {
++  ok* okay = p_modules->ok;
++  char* from_dir = directory_of(p_source->path);
++  if (from_dir == NULL) {
++    return OK_INIT_ERROR;
++  }
++  ok_result result = OK;
++
++  // the TU's root forest + the deferred bindings awaiting their roots
++  pending_ns forest;
++  pending_ns_init(&forest, "");
++  uint32_t* deferred = NULL;      // binding indices (raw malloc)
++  char** deferred_roots = NULL; // parallel: the arena'd root name each lands under
++  uint32_t deferred_count = 0;
++  uint32_t deferred_capacity = 0;
++  ok_string_view* bound_roots = NULL; // root names already declared in this TU (M5 merging)
++  uint32_t bound_count = 0;
++  uint32_t bound_capacity = 0;
++
++  for (uint32_t s = 0; s < p_root->statements.count && result == OK; ++s) {
++    ast_statement* statement = p_root->statements.data[s];
++    if (statement->node.node_type != AST_IMPORT_STATEMENT) {
++      continue;
++    }
++    ast_import_statement* import = (ast_import_statement*)statement;
++    const ok_string_view path = ast_import_statement_path(import);
++    const token* site = &import->statement.node.token;
++
++    char* canonical = NULL;
++    if (!resolve_import(p_modules, path, from_dir, p_source, site, &canonical)) {
++      result = OK_COMPILE_ERROR;
++      break;
++    }
++    const ok_result loaded = load_module(p_modules, canonical, p_source, site);
++    if (loaded != OK) {
++      free(canonical);
++      result = loaded;
++      break;
++    }
++    ok_module_record* record = registry_find(p_modules, canonical);
++    // cannot be NULL: load_module just registered it (or it was there)
++    free(canonical);
++    canonical = NULL;
++    if (record == NULL) {
++      module_report(p_source, site, "internal error: the loaded module did not register.");
++      result = OK_INIT_ERROR;
++      break;
++    }
++
++    if (import->symbols.count == 0) {
++      // the path form: `import "a/b";` binds the root; `import "a/b" as c;`
++      // binds the module itself.
++      if (import->has_alias) {
++        const ok_import_binding binding = {
++            .name = ok_create_string_view(import->alias.start, import->alias.length, false),
++            .value = record->namespace,
++            .merge = false,
++        };
++        if (!ok_import_binding_array_append(p_bindings, binding)) {
++          result = OK_INIT_ERROR;
++          break;
++        }
++        continue;
++      }
++      char** segments = NULL;
++      uint32_t segment_count = 0;
++      if (!binding_segments(path, &segments, &segment_count)) {
++        module_report(p_source, site, "the import path has no name to bind.");
++        result = OK_COMPILE_ERROR;
++        break;
++      }
++      // the root name goes to the per-run arena: the binding table and the
++      // bound-roots check view it past this statement (the segment buffer
++      // dies at the end of it).
++      char* root_owned = arena_strdup(p_modules, segments[0]);
++      if (root_owned == NULL) {
++        free_segments(segments, segment_count);
++        result = OK_INIT_ERROR;
++        break;
++      }
++      const ok_string_view root_name =
++          ok_create_string_view(root_owned, (uint32_t)strlen(root_owned), true);
++      // the reserved root (M8): only the std/ lane may bind `std`.
++      if (view_equals(root_name, "std")) {
++        module_report(p_source,
++                      site,
++                      "the name 'std' is reserved for the standard library's namespace: import it as "
++                      "\"std/...\" when OR-2 lands it.");
++        free_segments(segments, segment_count);
++        result = OK_COMPILE_ERROR;
++        break;
++      }
++      // already bound in this TU? the merge lane (M5): no redeclaration, no
++      // code - the root namespace gains the new stem below.
++      bool already_bound = false;
++      for (uint32_t b = 0; b < bound_count; ++b) {
++        if (ok_string_view_get_length(&bound_roots[b]) == ok_string_view_get_length(&root_name) &&
++            memcmp(bound_roots[b].chars, root_name.chars, ok_string_view_get_length(&root_name)) == 0) {
++          already_bound = true;
++          break;
++        }
++      }
++      if (!already_bound) {
++        if (bound_count == bound_capacity) {
++          const uint32_t grown = bound_capacity == 0 ? 4 : bound_capacity * 2;
++          ok_string_view* grown_roots = (ok_string_view*)realloc(bound_roots, sizeof(ok_string_view) * grown);
++          if (grown_roots == NULL) {
++            free_segments(segments, segment_count);
++            result = OK_INIT_ERROR;
++            break;
++          }
++          bound_roots = grown_roots;
++          bound_capacity = grown;
++        }
++        bound_roots[bound_count++] = root_name;
++      }
++      // walk/create the node chain, leaf = the module value. the nodes own
++      // their names, so the segment buffer can die with the statement.
++      pending_ns* node = &forest;
++      bool conflict = false;
++      for (uint32_t i = 0; i < segment_count; ++i) {
++        pending_ns* child = pending_ns_child(node, segments[i]);
++        if (child == NULL) {
++          free_segments(segments, segment_count);
++          result = OK_INIT_ERROR;
++          break;
++        }
++        node = child;
++        if (node->has_leaf && i + 1 < segment_count) {
++          // a path cannot bind a module and a namespace at once (M13 doctrine)
++          module_report(p_source,
++                        site,
++                        "import path conflict: this path binds a namespace under a path that is already a "
++                        "module.");
++          conflict = true;
++          break;
++        }
++        if (node->children_count > 0 && i + 1 == segment_count) {
++          module_report(p_source,
++                        site,
++                        "import path conflict: this path binds a module where a namespace already lives.");
++          conflict = true;
++          break;
++        }
++      }
++      if (result != OK || conflict) {
++        if (conflict) {
++          result = OK_COMPILE_ERROR;
++        }
++        free_segments(segments, segment_count);
++        break;
++      }
++      node->module_leaf = record->namespace;
++      node->has_leaf = true;
++      free_segments(segments, segment_count);
++
++      const ok_import_binding binding = {
++          .name = root_name,
++          .value = NULL_AS_VALUE(), // filled when the roots materialize
++          .merge = already_bound,
++      };
++      if (!ok_import_binding_array_append(p_bindings, binding)) {
++        result = OK_INIT_ERROR;
++        break;
++      }
++      if (!already_bound) {
++        // defer: after the walk, this binding gets the materialized root
++        // (matched by name - the tree's arrays move as they grow)
++        if (deferred_count == deferred_capacity) {
++          const uint32_t grown = deferred_capacity == 0 ? 4 : deferred_capacity * 2;
++          uint32_t* grown_deferred = (uint32_t*)realloc(deferred, sizeof(uint32_t) * grown);
++          char** grown_roots = (char**)realloc(deferred_roots, sizeof(char*) * grown);
++          if (grown_deferred == NULL || grown_roots == NULL) {
++            free(grown_deferred != NULL ? grown_deferred : deferred);
++            if (grown_roots != NULL) {
++              deferred_roots = grown_roots; // keep the bigger one; freed below
++            }
++            result = OK_INIT_ERROR;
++            break;
++          }
++          deferred = grown_deferred;
++          deferred_roots = grown_roots;
++          deferred_capacity = grown;
++        }
++        deferred[deferred_count] = p_bindings->count - 1;
++        deferred_roots[deferred_count] = root_owned;
++        deferred_count++;
++      }
++      continue;
++    }
++
++    // the from form: bind exported symbols directly (M9: pub only).
++    for (uint32_t i = 0; i < import->symbols.count && result == OK; ++i) {
++      const ast_import_specifier* spec = &import->symbols.data[i];
++      const token* name_site = spec->alias.type == TOKEN_IDENTIFIER ? &spec->alias : &spec->name;
++      const ok_string_view symbol =
++          ok_create_string_view(spec->name.start, spec->name.length, false);
++      if (spec->alias.type == TOKEN_IDENTIFIER
++              ? view_equals(ok_create_string_view(spec->alias.start, spec->alias.length, false), "std")
++              : view_equals(symbol, "std")) {
++        module_report(p_source, name_site, "the name 'std' is reserved for the standard library's namespace.");
++        result = OK_COMPILE_ERROR;
++        break;
++      }
++      // the export probe: the frozen namespace's field map, by interned name
++      object_specs obj_specs = {&okay->alloc, &okay->objects_store};
++      object_string* probe = string_interner_intern(&okay->interner, symbol, &obj_specs);
++      if (probe == NULL) {
++        result = OK_INIT_ERROR;
++        break;
++      }
++      const field_entry* field = object_class_find_field(record->namespace_class, probe);
++      if (field == NULL) {
++        string message = asprint(&okay->alloc,
++                                 "module '%s' has no pub export '%.*s'.",
++                                 record->canonical,
++                                 (int)ok_string_view_get_length(&symbol),
++                                 symbol.chars);
++        module_report(p_source, name_site, message.chars != NULL ? message.chars : "no such export.");
++        string_deinit(&message, &okay->alloc);
++        result = OK_COMPILE_ERROR;
++        break;
++      }
++      const ok_import_binding binding = {
++          .name = spec->alias.type == TOKEN_IDENTIFIER
++                      ? ok_create_string_view(spec->alias.start, spec->alias.length, false)
++                      : symbol,
++          .value = VALUE_AS_INSTANCE(record->namespace)->fields[field->slot],
++          .merge = false,
++      };
++      if (!ok_import_binding_array_append(p_bindings, binding)) {
++        result = OK_INIT_ERROR;
++        break;
++      }
++    }
++  }
++
++  // materialize the roots and fill the deferred bindings
++  if (result == OK) {
++    for (uint32_t i = 0; i < forest.children_count && result == OK; ++i) {
++      pending_ns* root_node = &forest.children[i];
++      value root_value;
++      if (root_node->children_count == 0) {
++        // a single-segment path binds the module itself (M5: the module lands
++        // AT the root); the registry roots the value already
++        root_value = root_node->module_leaf;
++      } else if (!materialize_ns(p_modules, root_node, &root_value)) {
++        module_report(p_source, &p_root->statements.data[0]->node.token, "out of memory while building the root namespace.");
++        result = OK_INIT_ERROR;
++        break;
++      }
++      // the pending-roots window: marked until the importer's constants adopt
++      if (!gc_guard_up(&okay->gc, root_value)) {
++        module_report(p_source, &p_root->statements.data[0]->node.token, "out of memory while building the root namespace.");
++        result = OK_INIT_ERROR;
++        break;
++      }
++      const bool pushed = value_array_append(&p_modules->pending_roots, root_value);
++      gc_guard_down(&okay->gc);
++      if (!pushed) {
++        result = OK_INIT_ERROR;
++        break;
++      }
++      for (uint32_t d = 0; d < deferred_count; ++d) {
++        if (deferred_roots[d] != NULL && strcmp(deferred_roots[d], root_node->name) == 0) {
++          p_bindings->data[deferred[d]].value = root_value;
++        }
++      }
++    }
++  }
++
++  pending_ns_deinit(&forest);
++  free(deferred);
++  free(deferred_roots);
++  free(bound_roots);
++  free(from_dir);
++  return result;
++}
++
++// ---------------------------------------------------------------- lifecycle
++
++void ok_modules_init(module_system* p_modules, ok* p_ok, allocators* p_alloc) {
++  p_modules->ok = p_ok;
++  ok_module_records_init(&p_modules->loaded, p_alloc);
++  p_modules->chain_depth = 0;
++  for (uint32_t i = 0; i < OK_MODULES_MAX_DEPTH; ++i) {
++    p_modules->chain[i] = NULL;
++  }
++  value_array_init(&p_modules->pending_roots, p_alloc);
++  p_modules->name_arena = NULL;
++  p_modules->name_arena_count = 0;
++  p_modules->name_arena_capacity = 0;
++  ok_loader loader;
++  loader.read_source = fs_read_source;
++  loader.p_ctx = NULL;
++  p_modules->loader = loader;
++}
++
++void ok_modules_deinit(module_system* p_modules) {
++  ok_module_records_deinit(&p_modules->loaded, p_modules->loaded.alloc);
++  value_array_deinit(&p_modules->pending_roots, p_modules->pending_roots.alloc);
++  for (uint32_t i = 0; i < p_modules->name_arena_count; ++i) {
++    free(p_modules->name_arena[i]);
++  }
++  free(p_modules->name_arena);
++  p_modules->name_arena = NULL;
++  p_modules->name_arena_count = 0;
++  p_modules->name_arena_capacity = 0;
++  p_modules->ok = NULL;
++}
++
++void ok_modules_set_loader(module_system* p_modules, ok_loader p_loader) {
++  p_modules->loader = p_loader;
++}
+diff --git a/src/okmodules.h b/src/okmodules.h
+new file mode 100644
+index 0000000..7569ad1
+--- /dev/null
++++ b/src/okmodules.h
+@@ -0,0 +1,105 @@
++#ifndef OK_MODULES_H
++#define OK_MODULES_H
++
++// OR-1 "O Resolution" - the compile-time module spine (M1-M14).
++//
++// the VM and the compiler never touch the filesystem for imports: all loading
++// goes through the loader vtable the host installs (M14: "the vm only cares
++// about its vtable"). the CLI installs the fs default; an embedder can mount
++// memory-backed sources (the OR-3 test will do exactly that). load_native is
++// OR-3's half - a native candidate found by the ladder today produces the
++// teaching "lands with OR-3" error instead of a load.
++//
++// semantics (the MODULES draft, section 3): the compiler resolves the import
++// graph depth-first; each module is one TU compiled once, keyed by resolved
++// canonical path; top-level code runs once, on first import, before the
++// importer's top level; a cycle is a hard compile error (M13); the module
++// value is a sealed namespace instance (frozen class, public fields).
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "ok/ok_fwd.h"
++#include "ok/ok.h"
++#include "ok/ok_source.h"
++#include "ok/ok_string.h"
++
++#include "okarray.h"
++#include "okast.h"
++#include "okcompiler.h"
++#include "okobject.h"
++#include "okvalue.h"
++
++// the import chain depth cap: the load recursion shares the C stack with the
++// parser and the compiler, so a pathological graph errors instead of
++// blowing it (the draft's depth guard - there was no existing one to share).
++#define OK_MODULES_MAX_DEPTH 128
++
++typedef struct ok_loader {
++  // reads the source at an absolute path into *p_out (code: a malloc'd,
++  // NUL-terminated buffer the CALLER frees; path: the canonical path).
++  // false = unreadable (the driver turns it into the 404's IO note).
++  bool (*read_source)(void* p_ctx, const char* p_path, ok_source* p_out);
++  // load_native arrives with OR-3 (sandbox + the ok_api vtable). NULL today.
++  void* p_ctx;
++} ok_loader;
++
++// one loaded module. the registry is a plain array probed by strcmp on the
++// canonical path - module counts are tens, not thousands, and the load path
++// is not hot; the okmap upgrade can come when a profile asks for it.
++typedef struct {
++  char* canonical;             // the resolved absolute path (owned)
++  object_string* name;         // the canonical, interned (the namespace class's name)
++  object_class* namespace_class;
++  value namespace;             // the sealed namespace instance
++} ok_module_record;
++
++ARRAY_DECLARE_DEFAULT(ok_module_records, ok_module_record)
++ARRAY_DECLARE_DEFAULT(ok_import_binding_array, ok_import_binding)
++
++typedef struct module_system {
++  ok* ok;                      // the owning instance
++  ok_module_records loaded;    // every initialized module, load order
++  const char* chain[OK_MODULES_MAX_DEPTH]; // the active load chain's canonical paths (borrowed
++                               // from the loaders' buffers - alive through the recursion)
++  uint32_t chain_depth;
++  // per-run root namespaces: built by prepare(), adopted by the importer's
++  // chunk constants when it compiles. marked from here in between (a TU with
++  // more roots than the guard stack's 16 slots must not dangle mid-compile).
++  // reset at each ok_run entry - the previous run's constants root theirs.
++  value_array pending_roots;
++  // per-run name arena: the root names the binding table views (they outlive
++  // prepare's segment buffers - until the importer's compile consumed them).
++  // same reset discipline as pending_roots.
++  char** name_arena;
++  uint32_t name_arena_count;
++  uint32_t name_arena_capacity;
++  ok_loader loader;            // the host's loader (init installs the fs default)
++} module_system;
++
++void ok_modules_init(module_system* p_modules, ok* p_ok, allocators* p_alloc);
++void ok_modules_deinit(module_system* p_modules);
++
++// OR-3's door (the public ok_module.h will expose it embedder-side); the CLI
++// never calls it - init already installed the fs default.
++void ok_modules_set_loader(module_system* p_modules, ok_loader p_loader);
++
++// the graph phase for one TU (the entry, or a module being loaded): walks the
++// parsed root's import statements in order, resolves+initializes every module
++// depth-first (404s, cycles, reserved names and path conflicts are hard
++// errors printed with the import site's own file:line:col), builds the TU's
++// root namespaces (M5: `import "a/b"` binds `a`, the module lands at `a.b`,
++// same-root imports merge), and fills the ordered binding table the compiler
++// consumes. p_bindings is caller-initialized and caller-deinitialized; the
++// values inside are borrowed (the registry and pending_roots root them).
++ok_result ok_modules_prepare(module_system* p_modules,
++                             ast_root* p_root,
++                             const ok_source* p_source,
++                             ok_import_binding_array* p_bindings);
++
++// the gc's walk (called from okgc.c's mark): the registry's namespaces and
++// the pending-roots window. canonical/name/class strings ride the class
++// (reachable through the namespace instance), so only the values need walks.
++bool ok_modules_mark(gc* p_gc, module_system* p_modules);
++
++#endif // OK_MODULES_H
+diff --git a/src/okobject.c b/src/okobject.c
+index c634673..9dbe83c 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -468,6 +468,7 @@ static void object_class_init(object_class* p_class,
+     p_class->op_cache[i] = NULL;
+   }
+   p_class->frozen = false;
++  p_class->module_namespace = false;
+ }
+ 
+ static void object_class_deinit(object_class* p_class, object_specs* p_specs) {
+@@ -977,7 +978,8 @@ void object_debug_print(object* p_object) {
+     break;
+   }
+   case OBJ_INSTANCE: {
+-    printf("<instance %s>", ((object_instance*)p_object)->klass->name->string.chars);
++    printf(((object_instance*)p_object)->klass->module_namespace ? "<module %s>" : "<instance %s>",
++           ((object_instance*)p_object)->klass->name->string.chars);
+     break;
+   }
+   case OBJ_BOUND_METHOD: {
+diff --git a/src/okobject.h b/src/okobject.h
+index cc3ff72..4820744 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -356,6 +356,13 @@ struct object_class {
+   // costs no instruction words.
+   const struct method_entry* op_cache[CLASS_OP_COUNT];
+   bool frozen;
++  // OR-1 modules: this class describes a module namespace (or a root
++  // namespace). its instances are the module values: field reads are PUBLIC
++  // (the visibility ring does not apply - the exports are the surface), and
++  // field writes from script are refused (namespaces are immutable once
++  // sealed; the loader fills the slots from C before anyone sees the value).
++  // set only by the module system (okmodules.c) on freshly created classes.
++  bool module_namespace;
+ };
+ 
+ object_class* create_object_class(object_string* p_name, object_class* p_parent, object_specs* p_specs);
+diff --git a/src/okparser.c b/src/okparser.c
+index 9ac507a..06c4e23 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -35,6 +35,12 @@ static ast_return_statement* parse_return_statement(parser* p_parser);
+ static ast_throw_statement* parse_throw_statement(parser* p_parser);
+ static ast_try_statement* parse_try_statement(parser* p_parser);
+ static ast_defer_statement* parse_defer_statement(parser* p_parser, bool p_is_err);
++static ast_import_statement* parse_import_statement(parser* p_parser);
++static ast_import_statement* parse_from_import_statement(parser* p_parser);
++// OR-1 (M1): the import path's syntax, checked at the parse site so the error
++// points at the literal. forward slashes only, no absolute paths, no empty
++// segments. './' and '../' prefixes are the file-relative lane.
++static bool import_path_is_wellformed(const ok_string_view p_path, const char** p_reason);
+ 
+ static ast_bindings_list parse_bindings_list(parser* p_parser,
+                                              ast_binding_modifiers_t p_allowed_binds,
+@@ -290,7 +296,17 @@ ast_root* parse_root(parser* p_parser) {
+   ast_specs s = {alloc};
+   ast_root_init(root, trigger, &s);
+   while (advance(p_parser) && p_parser->previous.type != TOKEN_EOF) {
+-    ast_statement* statement = try_parse_declaration(p_parser);
++    ast_statement* statement = NULL;
++    // imports are module-top-level-only (OR-1): parse_root is the one place
++    // they are born. every other route (blocks, class bodies, for-inits)
++    // refuses them in parse_statement with the teaching error.
++    if (p_parser->previous.type == TOKEN_IMPORT) {
++      statement = (ast_statement*)parse_import_statement(p_parser);
++    } else if (p_parser->previous.type == TOKEN_FROM) {
++      statement = (ast_statement*)parse_from_import_statement(p_parser);
++    } else {
++      statement = try_parse_declaration(p_parser);
++    }
+     if (statement != NULL && statement->node.node_type != AST_EMPTY_STATEMENT) {
+       ast_statements_list_append(&root->statements, statement);
+     } else if (statement != NULL && statement->node.node_type == AST_EMPTY_STATEMENT) {
+@@ -991,6 +1007,12 @@ ast_statement* parse_statement(parser* p_parser) {
+     return (ast_statement*)parse_defer_statement(p_parser, false);
+   case TOKEN_DEFERR:
+     return (ast_statement*)parse_defer_statement(p_parser, true);
++  case TOKEN_IMPORT:
++  case TOKEN_FROM:
++    error_at(p_parser,
++             p_parser->previous,
++             ok_create_string_view("imports are only legal at module top level.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL;
+   case TOKEN_CATCH:
+     error_at(p_parser,
+              p_parser->previous,
+@@ -1137,9 +1159,11 @@ ast_let_declaration* parse_let_declaration(parser* p_parser,
+   allocators* alloc = p_parser->alloc;
+   const token let_tok = p_parser->previous;
+   // static is a class-member modifier: fields only exist in class bodies.
+-  // pub is never allowed on a let - fields are not the surface, methods are.
++  // pub (OR-1, M9) is the module-export modifier: top level only - inside a
++  // class body fields are still not the surface, methods are.
+   const ast_declaration_modifiers_t let_allowed_decl_mods =
+-      DECLARATION_GLOB | DECLARATION_EXPORT | (p_in_class_body ? DECLARATION_STATIC : 0);
++      DECLARATION_GLOB | DECLARATION_EXPORT |
++      (p_in_class_body ? DECLARATION_STATIC : DECLARATION_PUB);
+   if ((p_declaration_modifiers & ~let_allowed_decl_mods) != 0) {
+     string mods_str = ast_declaration_modifiers_asprint(p_declaration_modifiers, alloc);
+     string message = asprint(alloc,
+@@ -1155,6 +1179,17 @@ ast_let_declaration* parse_let_declaration(parser* p_parser,
+     string_deinit(&allowed_str, alloc);
+     return NULL;
+   }
++  // OR-1 (M9): pub marks a module's exports. it never combines with glob -
++  // a glob binding is process-global, the export surface is the module's own.
++  if ((p_declaration_modifiers & (DECLARATION_PUB | DECLARATION_GLOB)) == (DECLARATION_PUB | DECLARATION_GLOB)) {
++    error_at(p_parser,
++             let_tok,
++             ok_create_string_view("a glob declaration cannot be pub: 'glob' bindings are process-global, the export "
++                                   "surface is the module's.",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    return NULL;
++  }
+   const ast_binding_modifiers_t binding_mods = parse_binding_modifiers(p_parser, BINDING_MUT);
+   if (binding_mods == BINDING_ERROR) {
+     return NULL;
+@@ -1256,7 +1291,9 @@ ast_let_declaration* parse_let_declaration_span(parser* p_parser,
+                                                 ast_binding_modifiers_t p_binding_mods) {
+   allocators* alloc = p_parser->alloc;
+   const token let_tok = p_parser->previous;
+-  if (p_declaration_modifiers != DECLARATION_NONE) {
++  // OR-1 (M9): pub marks every binding of the span as a module export; the
++  // other declaration modifiers stay illegal on a destructuring let.
++  if ((p_declaration_modifiers & ~DECLARATION_PUB) != 0) {
+     string mods_str = ast_declaration_modifiers_asprint(p_declaration_modifiers, alloc);
+     string message = asprint(alloc, "illegal declaration modifier(s): [%s] on a destructuring let.", mods_str.chars);
+     error_at_noted(p_parser,
+@@ -1469,7 +1506,8 @@ ast_function_declaration* parse_function_declaration(parser* p_parser,
+   allocators* alloc = p_parser->alloc;
+   token fu_tok = p_parser->previous;
+   const ast_declaration_modifiers_t fu_allowed_decl_mods =
+-      DECLARATION_GLOB | DECLARATION_EXPORT | (p_in_class_body ? (DECLARATION_PUB | DECLARATION_STATIC) : 0);
++      DECLARATION_GLOB | DECLARATION_EXPORT |
++      (p_in_class_body ? (DECLARATION_PUB | DECLARATION_STATIC) : DECLARATION_PUB);
+   if ((p_declaration_modifiers & ~fu_allowed_decl_mods) != 0) {
+     string mods_str = ast_declaration_modifiers_asprint(p_declaration_modifiers, alloc);
+     string message = asprint(alloc,
+@@ -1666,7 +1704,7 @@ ast_expression* parse_super(parser* p_parser, token p_trigger) {
+ ast_class_declaration* parse_class_declaration(parser* p_parser, ast_declaration_modifiers_t p_modifiers) {
+   allocators* alloc = p_parser->alloc;
+   token class_tok = p_parser->previous;
+-  const ast_declaration_modifiers_t class_allowed_decl_mods = DECLARATION_GLOB | DECLARATION_EXPORT;
++  const ast_declaration_modifiers_t class_allowed_decl_mods = DECLARATION_GLOB | DECLARATION_EXPORT | DECLARATION_PUB;
+   if ((p_modifiers & ~class_allowed_decl_mods) != 0) {
+     string mods_str = ast_declaration_modifiers_asprint(p_modifiers, alloc);
+     string message = asprint(alloc, "illegal declaration modifier(s): [%s] in class declaration.", mods_str.chars);
+@@ -2882,6 +2920,234 @@ fail_expression:
+   return NULL;
+ }
+ 
++// OR-1 (M1): the path literal's shape. the reasons are full sentences so the
++// parse error reads as a lesson, not a code. returns false with *p_reason set.
++static bool import_path_is_wellformed(const ok_string_view p_path, const char** p_reason) {
++  const uint64_t length = ok_string_view_get_length(&p_path);
++  if (length == 0) {
++    *p_reason = "the import path is empty.";
++    return false;
++  }
++  if (p_path.chars[0] == '/') {
++    *p_reason = "absolute filesystem paths are not import paths: resolve against the importing file, OKPATH, or the "
++                "embedder's roots.";
++    return false;
++  }
++  if (p_path.chars[length - 1] == '/') {
++    *p_reason = "the import path ends with '/'.";
++    return false;
++  }
++  for (uint64_t i = 0; i < length; ++i) {
++    if (p_path.chars[i] == '\\') {
++      *p_reason = "import paths use forward slashes only (windows included).";
++      return false;
++    }
++    if (p_path.chars[i] == '/' && i + 1 < length && p_path.chars[i + 1] == '/') {
++      *p_reason = "the import path has an empty segment ('//').";
++      return false;
++    }
++  }
++  return true;
++}
++
++// `import "a/b";` / `import "a/b" as c;` (OR-1, M1/M2/M5). previous = 'import'.
++// the quoted path is the whole surface - the python-plain form is not the
++// language, and the error for it teaches the quoting.
++static ast_import_statement* parse_import_statement(parser* p_parser) {
++  allocators* alloc = p_parser->alloc;
++  const token import_tok = p_parser->previous;
++  if (p_parser->current.type == TOKEN_ASTERISK) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("star imports are rejected: name what you import.",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    return NULL;
++  }
++  if (p_parser->current.type != TOKEN_STRING) {
++    if (p_parser->current.type == TOKEN_IDENTIFIER) {
++      error_at_noted(p_parser,
++                     p_parser->current,
++                     ok_create_string_view("expected a quoted import path.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                     ok_create_string_view("spell it import \"a/b\"; - the python-plain form is not the language.",
++                                           OK_STRING_VIEW_CALCULATE_LENGTH,
++                                           true));
++    } else {
++      error_at(p_parser,
++               p_parser->current,
++               ok_create_string_view("expected a quoted import path after 'import'.",
++                                     OK_STRING_VIEW_CALCULATE_LENGTH,
++                                     true));
++    }
++    return NULL;
++  }
++  advance(p_parser); // the path literal into previous
++  const token path_tok = p_parser->previous;
++  const ok_string_view path = ok_create_string_view(path_tok.start + 1, path_tok.length - 2, false);
++  const char* reason = NULL;
++  if (!import_path_is_wellformed(path, &reason)) {
++    error_at(p_parser, path_tok, ok_create_string_view(reason, OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL;
++  }
++  bool has_alias = false;
++  token alias_tok;
++  alias_tok.type = TOKEN_ERROR;
++  alias_tok.start = "";
++  alias_tok.length = 0;
++  alias_tok.line_info = path_tok.line_info;
++  if (p_parser->current.type == TOKEN_AS) {
++    advance(p_parser); // 'as'
++    if (p_parser->current.type != TOKEN_IDENTIFIER) {
++      error_at(p_parser,
++               p_parser->current,
++               ok_create_string_view("expected an identifier after 'as'.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      return NULL;
++    }
++    advance(p_parser);
++    alias_tok = p_parser->previous;
++    has_alias = true;
++  }
++  if (p_parser->current.type != TOKEN_SEMICOLON) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("expected ';' after import statement.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL;
++  }
++  advance(p_parser);
++  ast_import_statement* node = (ast_import_statement*)alloc->allocate(alloc, sizeof(ast_import_statement));
++  if (node == NULL) {
++    error_at(p_parser,
++             import_tok,
++             ok_create_string_view("failed to allocate memory for import node.",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    return NULL;
++  }
++  ast_import_specifier_list empty;
++  ast_import_specifier_list_init(&empty, alloc);
++  ast_specs s = {alloc};
++  ast_import_statement_init(node, import_tok, path_tok, empty, has_alias, alias_tok, &s);
++  return node;
++}
++
++// `from "a/b" import x, y as z;` (OR-1, M2/M8/M9). previous = 'from'.
++static ast_import_statement* parse_from_import_statement(parser* p_parser) {
++  allocators* alloc = p_parser->alloc;
++  const token from_tok = p_parser->previous;
++  if (p_parser->current.type != TOKEN_STRING) {
++    if (p_parser->current.type == TOKEN_IDENTIFIER) {
++      error_at_noted(p_parser,
++                     p_parser->current,
++                     ok_create_string_view("expected a quoted import path after 'from'.",
++                                           OK_STRING_VIEW_CALCULATE_LENGTH,
++                                           true),
++                     ok_create_string_view("spell it from \"a/b\" import x; - the python-plain form is not the language.",
++                                           OK_STRING_VIEW_CALCULATE_LENGTH,
++                                           true));
++    } else {
++      error_at(p_parser,
++               p_parser->current,
++               ok_create_string_view("expected a quoted import path after 'from'.",
++                                     OK_STRING_VIEW_CALCULATE_LENGTH,
++                                     true));
++    }
++    return NULL;
++  }
++  advance(p_parser); // the path literal into previous
++  const token path_tok = p_parser->previous;
++  const ok_string_view path = ok_create_string_view(path_tok.start + 1, path_tok.length - 2, false);
++  const char* reason = NULL;
++  if (!import_path_is_wellformed(path, &reason)) {
++    error_at(p_parser, path_tok, ok_create_string_view(reason, OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL;
++  }
++  if (p_parser->current.type != TOKEN_IMPORT) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("expected 'import' after the from path.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL;
++  }
++  advance(p_parser); // 'import'
++  ast_import_specifier_list symbols;
++  ast_import_specifier_list_init(&symbols, alloc);
++  if (p_parser->current.type == TOKEN_ASTERISK) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("star imports are rejected: name what you import.",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    goto fail;
++  }
++  for (;;) {
++    if (p_parser->current.type != TOKEN_IDENTIFIER) {
++      error_at(p_parser,
++               p_parser->current,
++               ok_create_string_view("expected an imported name.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      goto fail;
++    }
++    advance(p_parser);
++    ast_import_specifier spec;
++    spec.name = p_parser->previous;
++    spec.alias.type = TOKEN_ERROR;
++    spec.alias.start = "";
++    spec.alias.length = 0;
++    spec.alias.line_info = spec.name.line_info;
++    if (p_parser->current.type == TOKEN_AS) {
++      advance(p_parser); // 'as'
++      if (p_parser->current.type != TOKEN_IDENTIFIER) {
++        error_at(p_parser,
++                 p_parser->current,
++                 ok_create_string_view("expected an identifier after 'as'.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        goto fail;
++      }
++      advance(p_parser);
++      spec.alias = p_parser->previous;
++    }
++    if (!ast_import_specifier_list_append(&symbols, spec)) {
++      error_at(p_parser,
++               from_tok,
++               ok_create_string_view("failed to allocate memory for import list.",
++                                     OK_STRING_VIEW_CALCULATE_LENGTH,
++                                     true));
++      goto fail;
++    }
++    if (p_parser->current.type == TOKEN_COMMA) {
++      advance(p_parser); // ','
++      continue;
++    }
++    break;
++  }
++  if (p_parser->current.type != TOKEN_SEMICOLON) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("expected ';' after from-import statement.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    goto fail;
++  }
++  advance(p_parser);
++  {
++    ast_import_statement* node = (ast_import_statement*)alloc->allocate(alloc, sizeof(ast_import_statement));
++    if (node == NULL) {
++      error_at(p_parser,
++               from_tok,
++               ok_create_string_view("failed to allocate memory for import node.",
++                                     OK_STRING_VIEW_CALCULATE_LENGTH,
++                                     true));
++      goto fail;
++    }
++    token no_alias;
++    no_alias.type = TOKEN_ERROR;
++    no_alias.start = "";
++    no_alias.length = 0;
++    no_alias.line_info = from_tok.line_info;
++    ast_specs s = {alloc};
++    ast_import_statement_init(node, from_tok, path_tok, symbols, false, no_alias, &s);
++    return node;
++  }
++fail:
++  ast_import_specifier_list_deinit(&symbols, alloc);
++  return NULL;
++}
++
+ ast_bindings_list parse_bindings_list(parser* p_parser,
+                                       ast_binding_modifiers_t p_allowed_binds,
+                                       token_type p_delim,
+diff --git a/src/okstate.h b/src/okstate.h
+new file mode 100644
+index 0000000..0150a83
+--- /dev/null
++++ b/src/okstate.h
+@@ -0,0 +1,57 @@
++#ifndef OK_STATE_H
++#define OK_STATE_H
++
++// the ok instance's full layout, shared by ok.c and the module system
++// (okmodules.c). it lived private to ok.c until OR-1: the module driver needs
++// the same reach (compiler, vm, globals, interner, gc guards) ok_run_inner
++// has, and routing it all through accessors would be ceremony - the struct
++// stays an internal affair of the library, just visible to its own files.
++
++#include "ok/ok_fwd.h"
++#include "ok/ok_source.h"
++#include "ok/ok_string.h"
++
++#include "okcompiler.h"
++#include "okglobals_store.h"
++#include "okintern.h"
++#include "okmodules.h"
++#include "okobject_store.h"
++
++// struct ok carries the gc BY VALUE, so every okstate.h consumer needs the
++// full layout - the expose guard is this header's business, exactly like it
++// is okgc.c's. an identical redefinition is legal C, so files that define it
++// first are unaffected.
++#ifndef OK_GC_EXPOSE
++#define OK_GC_EXPOSE
++#endif
++#include "okgc.h"
++
++#include "okvm.h"
++
++struct ok {
++  object_store objects_store;
++  globals_store globals_store;
++  string_interner interner;
++  compiler compiler;
++  vm vm;
++  gc gc;
++  // OR-1: the module system - the registry (canonical path -> module), the
++  // active load chain, and the pending-roots window. a gc root (watched).
++  module_system modules;
++  ok_source source; // the CURRENT run's source (code borrowed for the run)
++  allocators alloc; // gc-hooked wrapper
++  ok_allocators raw_alloc;
++  bool dump_bytecode;
++  bool dump_skip_run;
++};
++
++// the seeds (ok.c): the builtin surface every TU's <main> pre-declares in its
++// hidden scope. the module driver stages them for module mains identically.
++top_level_declarations ok_get_top_level_declarations(ok* p_ok, bool* p_error);
++value_array ok_get_top_level_values(ok* p_ok, bool* p_error);
++
++// stamp a freshly compiled tree with its source id (main + every nested proto
++// in the constants arrays). the module runner stamps module trees with it.
++void ok_stamp_source_ids(object_function* p_function, uint32_t p_source_id);
++
++#endif // OK_STATE_H
+diff --git a/src/oktoken.h b/src/oktoken.h
+index e196d66..b4907dd 100644
+--- a/src/oktoken.h
++++ b/src/oktoken.h
+@@ -57,6 +57,7 @@
+   X(TOKEN_STRING, "string")                                                                                            \
+   X(TOKEN_PRINT, "print")                                                                                              \
+   X(TOKEN_IMPORT, "import")                                                                                            \
++  X(TOKEN_FROM, "from")                                                                                                \
+   X(TOKEN_AS, "as")                                                                                                    \
+   X(TOKEN_IS, "is")                                                                                                    \
+   X(TOKEN_FU, "fu")                                                                                                    \
+@@ -145,6 +146,7 @@ typedef enum {
+ 
+   TOKEN_PRINT,
+   TOKEN_IMPORT,
++  TOKEN_FROM,
+   TOKEN_AS,
+   TOKEN_IS,
+   TOKEN_FU,
+diff --git a/src/okvm.c b/src/okvm.c
+index bcbab79..844de1c 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -1663,7 +1663,11 @@ static inline bool object_as_str(vm* p_vm, object* p_obj, value* p_result) {
+   }
+   case OBJ_INSTANCE: {
+     object_instance* inst = (object_instance*)p_obj;
+-    string str = asprint(p_vm->alloc, "<instance %s>", inst->klass->name->string.chars);
++    // OR-1: a module namespace prints as what it is. the class name is the
++    // canonical path for modules, the root segment for root namespaces.
++    string str = asprint(p_vm->alloc,
++                         inst->klass->module_namespace ? "<module %s>" : "<instance %s>",
++                         inst->klass->name->string.chars);
+     if (str.chars == NULL) {
+       runtime_error(p_vm, OK_EK_CONVERSION, "failed to convert instance to string.");
+       return false;
+@@ -5574,6 +5578,16 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[C]);
+       if (IS_VALUE_INSTANCE(recv)) {
+         object_instance* inst = VALUE_AS_INSTANCE(recv);
++        // OR-1: module namespaces are immutable from script - their fields are
++        // the exports, sealed by the loader before anyone sees the value.
++        if (inst->klass->module_namespace) {
++          runtime_error(p_vm,
++                        OK_EK_VALUE,
++                        "module namespaces are immutable: '%s' is an export, not an assignable field.",
++                        name->string.chars);
++          FAIL_PATH();
++          DISPATCH();
++        }
+         const field_entry* field = object_class_find_field(inst->klass, name);
+         if (field == NULL) {
+           runtime_error(p_vm,
+@@ -5778,18 +5792,22 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       }
+       const field_entry* field = object_class_find_field(klass, name);
+       if (field != NULL) {
+-        // visibility: the calling hierarchy must contain the field's defining
+-        // segment (class-wide privacy, the C++ ring)
+-        const object_class* seg = field_defining_segment(klass, field->slot);
+-        const object_class* caller = frame->closure->owner;
+-        if (seg == NULL || caller == NULL || !object_class_is_a(caller, seg)) {
+-          runtime_error(p_vm,
+-                        OK_EK_TYPE,
+-                        "field '%s' of class '%s' is not visible here.",
+-                        name->string.chars,
+-                        klass->name->string.chars);
+-          FAIL_PATH();
+-          DISPATCH();
++        // OR-1: a module namespace's fields are its exports - public by
++        // doctrine (M9); the visibility ring does not apply.
++        if (!klass->module_namespace) {
++          // visibility: the calling hierarchy must contain the field's defining
++          // segment (class-wide privacy, the C++ ring)
++          const object_class* seg = field_defining_segment(klass, field->slot);
++          const object_class* caller = frame->closure->owner;
++          if (seg == NULL || caller == NULL || !object_class_is_a(caller, seg)) {
++            runtime_error(p_vm,
++                          OK_EK_TYPE,
++                          "field '%s' of class '%s' is not visible here.",
++                          name->string.chars,
++                          klass->name->string.chars);
++            FAIL_PATH();
++            DISPATCH();
++          }
+         }
+         const mic_entry filled = {OBJECT_AS_VALUE(klass), NULL, field->slot, 1, 0};
+         mic_fill(cache, &filled);
+@@ -5821,6 +5839,16 @@ static void* ok_dispatch_table[OP__COUNT] = {
+         REG_AT(A) = OBJECT_AS_VALUE(bound);
+         DISPATCH();
+       }
++      if (klass->module_namespace) {
++        // OR-1: the teaching miss for module namespaces.
++        runtime_error(p_vm,
++                      OK_EK_TYPE,
++                      "module '%s' has no export '%s'.",
++                      klass->name->string.chars,
++                      name->string.chars);
++        FAIL_PATH();
++        DISPATCH();
++      }
+       runtime_error(p_vm,
+                     OK_EK_TYPE,
+                     "class '%s' has no field or method '%s'.",
+@@ -5897,6 +5925,22 @@ static void* ok_dispatch_table[OP__COUNT] = {
+             ip = frame->ip;
+             DISPATCH();
+           }
++          // OR-1: a module namespace's export can be any callable value - a
++          // class (instantiation), later a native (OR-3). the general call
++          // lane takes them; closures took the fast path above.
++          if (inst->klass->module_namespace) {
++            REG_AT(A) = callable;
++            frame->ip = ip;
++            if (!call_value(p_vm, exe, reg, frame->registers_base, A, B, takes_one ? 1u : 0u)) {
++              FAIL_PATH();
++              DISPATCH();
++            }
++            exe = p_vm->current_execution_state;
++            reg = &exe->registers;
++            frame = &exe->call_stack.data[exe->call_stack.count - 1];
++            ip = frame->ip;
++            DISPATCH();
++          }
+           runtime_error(p_vm,
+                         OK_EK_TYPE,
+                         "field holds a value that is not callable in this position.");
+@@ -5959,7 +6003,10 @@ static void* ok_dispatch_table[OP__COUNT] = {
+             const field_entry* field = object_class_find_field(klass, name);
+             const object_class* caller = frame->closure->owner;
+             const object_class* seg = field != NULL ? field_defining_segment(klass, field->slot) : NULL;
+-            if (field != NULL && seg != NULL && caller != NULL && object_class_is_a(caller, seg)) {
++            // OR-1: a module namespace's exports are public (M9) - the ring
++            // does not apply; `mod.export(args)` is the hot import path.
++            if (field != NULL &&
++                (klass->module_namespace || (seg != NULL && caller != NULL && object_class_is_a(caller, seg)))) {
+               value callable = inst->fields[field->slot];
+               if (IS_VALUE_CLOSURE(callable)) {
+                 const mic_entry filled = {OBJECT_AS_VALUE(klass), NULL, field->slot, 1, 0};
+@@ -5977,6 +6024,26 @@ static void* ok_dispatch_table[OP__COUNT] = {
+                 ip = frame->ip;
+                 DISPATCH();
+               }
++              // OR-1: a module namespace's export can be any callable value -
++              // a class (instantiation), later a native (OR-3). the general
++              // call lane takes them; closures took the fast path above. the
++              // cache still holds the slot: the field is immutable, only the
++              // value's kind varies per export.
++              if (klass->module_namespace) {
++                const mic_entry filled = {OBJECT_AS_VALUE(klass), NULL, field->slot, 1, 0};
++                mic_fill(cache, &filled);
++                REG_AT(A) = callable;
++                frame->ip = ip;
++                if (!call_value(p_vm, exe, reg, frame->registers_base, A, B, takes_one ? 1u : 0u)) {
++                  FAIL_PATH();
++                  DISPATCH();
++                }
++                exe = p_vm->current_execution_state;
++                reg = &exe->registers;
++                frame = &exe->call_stack.data[exe->call_stack.count - 1];
++                ip = frame->ip;
++                DISPATCH();
++              }
+               runtime_error(p_vm,
+                             OK_EK_TYPE,
+                             "field '%s' of class '%s' holds a value that is not callable.",
+@@ -5985,6 +6052,16 @@ static void* ok_dispatch_table[OP__COUNT] = {
+               FAIL_PATH();
+               DISPATCH();
+             }
++            if (klass->module_namespace) {
++              // OR-1: the teaching miss for module namespaces.
++              runtime_error(p_vm,
++                            OK_EK_TYPE,
++                            "module '%s' has no export '%s'.",
++                            klass->name->string.chars,
++                            name->string.chars);
++              FAIL_PATH();
++              DISPATCH();
++            }
+             runtime_error(p_vm,
+                           OK_EK_TYPE,
+                           "class '%s' has no method '%s'.",
+diff --git a/src/okvm.h b/src/okvm.h
+index 6abcc77..16de95f 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -38,13 +38,15 @@ typedef enum {
+ 
+ const char* ok_error_kind_name(ok_error_kind p_kind);
+ 
+-// one per ok_run, appended for the run's lifetime. the path is always ok's (copied):
+-// a chunk can name its source after the run that compiled it ended.
+-// the code is the caller's buffer for the duration of the run and NULL after,
+-// unless retention is on (ok_retain_source). then it's an ok-owned copy,
+-// alive until ok_free. this is the v1 of the multi-source:
+-// right path + right lines always, source references when the text is alive,
+-// never a. the 0.7.0 registry (keyed, deduped) will replaces it.
++// one entry per compiled TU: the entry file's run, plus one per loaded
++// module (OR-1) - appended at each load, alive until ok_free. the path is
++// always ok's (copied): a chunk can name its source after the run that
++// compiled it ended. the code is the caller's buffer for the duration of the
++// run and NULL after, unless retention is on (ok_retain_source). then it's
++// an ok-owned copy, alive until ok_free. right path + right lines always,
++// source references when the text is alive. the keyed, deduped registry
++// lives in the module system (okmodules.c, canonical paths) - this table
++// stays the flat per-TU source record.
+ typedef struct {
+   char* path;
+   const char* code;
+diff --git a/tests/e2e/src/main.cpp b/tests/e2e/src/main.cpp
+index 73ba607..c986cce 100644
+--- a/tests/e2e/src/main.cpp
++++ b/tests/e2e/src/main.cpp
+@@ -39,11 +39,12 @@ int decode_system_status(int status) {
+   return status;
+ }
+ 
+-run_result run_oklang(const std::string_view path, const std::string_view okpath) {
++run_result run_oklang(const std::string_view path, const std::string_view okpath, const std::string_view okpath_value) {
+   std::stringstream cmd;
+   std::string stdout_file = "out.log";
+   std::string stderr_file = "err.log";
+-  cmd << "\"" << okpath << "\" " << "\"" << path << "\" > " << stdout_file << " 2> " << stderr_file;
++  cmd << "OKPATH=\"" << okpath_value << "\" \"" << okpath << "\" "
++      << "\"" << path << "\" > " << stdout_file << " 2> " << stderr_file;
+ 
+   std::string cmd_str = cmd.str();
+   int ret = system(cmd_str.c_str());
+@@ -100,6 +101,53 @@ bool is_quarantined(const std::filesystem::path& path) {
+   return false;
+ }
+ 
++// OR-1 module tests: a directory holding main.ok is ONE test case - main.ok
++// is the entry, every other .ok under it is a fixture. any ancestor directory
++// up to the tests root that holds a main.ok claims the file (except the entry
++// itself); test directories are never nested, so the walk stays trivial.
++bool is_fixture(const std::filesystem::path& path, const std::filesystem::path& tests_root) {
++  for (std::filesystem::path dir = path.parent_path(); dir != tests_root && !dir.empty(); dir = dir.parent_path()) {
++    const std::filesystem::path entry = dir / "main.ok";
++    if (entry != path && std::filesystem::exists(entry)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// the `// okpath: a:b` directive: colon-separated import roots, each resolved
++// against the test file's directory, exported as OKPATH for this one run.
++std::string parse_okpath(const std::filesystem::path& path) {
++  std::regex okpath_re(R"(//\s*okpath:\s*(.*))");
++  std::ifstream fs(path);
++  std::string line;
++  while (std::getline(fs, line)) {
++    std::smatch match;
++    if (std::regex_search(line, match, okpath_re)) {
++      const std::string value = match[1].str();
++      const std::filesystem::path dir = path.parent_path();
++      std::string expanded;
++      size_t start = 0;
++      for (;;) {
++        const size_t colon = value.find(':', start);
++        const std::string part = value.substr(start, colon == std::string::npos ? std::string::npos : colon - start);
++        if (!part.empty()) {
++          if (!expanded.empty()) {
++            expanded += ":";
++          }
++          expanded += (dir / part).string();
++        }
++        if (colon == std::string::npos) {
++          break;
++        }
++        start = colon + 1;
++      }
++      return expanded;
++    }
++  }
++  return "";
++}
++
+ int main(int argc, char** argv) {
+   bool has_debug_build = false;
+   if (argc < 3) {
+@@ -131,9 +179,14 @@ int main(int argc, char** argv) {
+       std::println("{}[SKIP]{}: {}", COLOR_BLUE, COLOR_RESET, test_path);
+       continue;
+     }
++    if (is_fixture(entry.path(), tests_path)) {
++      skipped++;
++      continue;
++    }
+ 
++    const std::string okpath_value = parse_okpath(entry.path());
+     auto tc = parse_test_file(test_path);
+-    auto rr = run_oklang(test_path, okpath);
++    auto rr = run_oklang(test_path, okpath, okpath_value);
+ 
+     if (!tc.has_expectation) {
+       std::println("{}[NOTOK]{}: '{}'", COLOR_RED, COLOR_RESET, test_path);
+diff --git a/tests/e2e/tests/modules/abs_path.ok b/tests/e2e/tests/modules/abs_path.ok
+new file mode 100644
+index 0000000..20cef41
+--- /dev/null
++++ b/tests/e2e/tests/modules/abs_path.ok
+@@ -0,0 +1,3 @@
++// absolute filesystem paths are not import paths
++import "/etc/passwd";
++// expect error: absolute filesystem paths are not import paths
+diff --git a/tests/e2e/tests/modules/as/lib.ok b/tests/e2e/tests/modules/as/lib.ok
+new file mode 100644
+index 0000000..8a7bf8c
+--- /dev/null
++++ b/tests/e2e/tests/modules/as/lib.ok
+@@ -0,0 +1,5 @@
++pub fu greet(name) {
++  return "hi " + name;
++}
++
++pub let version = 1;
+diff --git a/tests/e2e/tests/modules/as/main.ok b/tests/e2e/tests/modules/as/main.ok
+new file mode 100644
+index 0000000..fe20cd4
+--- /dev/null
++++ b/tests/e2e/tests/modules/as/main.ok
+@@ -0,0 +1,9 @@
++import "./lib.ok" as l;
++
++// the module value is an ordinary value: pass it, store it, index it
++fu version_of(m) {
++  return m.version;
++}
++print version_of(l); // expect: 1
++let mods = [l];
++print mods[0].version; // expect: 1
+diff --git a/tests/e2e/tests/modules/backslash.ok b/tests/e2e/tests/modules/backslash.ok
+new file mode 100644
+index 0000000..faa5cfc
+--- /dev/null
++++ b/tests/e2e/tests/modules/backslash.ok
+@@ -0,0 +1,3 @@
++// forward slashes only, windows included
++import "a\\b";
++// expect error: forward slashes only
+diff --git a/tests/e2e/tests/modules/basic/lib.ok b/tests/e2e/tests/modules/basic/lib.ok
+new file mode 100644
+index 0000000..c3e2aaf
+--- /dev/null
++++ b/tests/e2e/tests/modules/basic/lib.ok
+@@ -0,0 +1,7 @@
++pub fu greet(name) {
++  return "hi " + name;
++}
++
++pub let version = 1;
++
++let secret = "private";
+diff --git a/tests/e2e/tests/modules/basic/main.ok b/tests/e2e/tests/modules/basic/main.ok
+new file mode 100644
+index 0000000..d20ef00
+--- /dev/null
++++ b/tests/e2e/tests/modules/basic/main.ok
+@@ -0,0 +1,4 @@
++import "./lib.ok";
++
++print lib.greet("ok"); // expect: hi ok
++print lib.version; // expect: 1
+diff --git a/tests/e2e/tests/modules/captured/lib.ok b/tests/e2e/tests/modules/captured/lib.ok
+new file mode 100644
+index 0000000..ea6cbd8
+--- /dev/null
++++ b/tests/e2e/tests/modules/captured/lib.ok
+@@ -0,0 +1,7 @@
++// the exported closure captures a private module local (an upvalue)
++let mut count = 0;
++
++pub fu tick() {
++  count = count + 1;
++  return count;
++}
+diff --git a/tests/e2e/tests/modules/captured/main.ok b/tests/e2e/tests/modules/captured/main.ok
+new file mode 100644
+index 0000000..a0075fe
+--- /dev/null
++++ b/tests/e2e/tests/modules/captured/main.ok
+@@ -0,0 +1,5 @@
++import "./lib.ok";
++
++print lib.tick(); // expect: 1
++print lib.tick(); // expect: 2
++print lib.tick(); // expect: 3
+diff --git a/tests/e2e/tests/modules/chain/leaf.ok b/tests/e2e/tests/modules/chain/leaf.ok
+new file mode 100644
+index 0000000..fe614d1
+--- /dev/null
++++ b/tests/e2e/tests/modules/chain/leaf.ok
+@@ -0,0 +1,2 @@
++pub let name = "leaf";
++print "leaf up";
+diff --git a/tests/e2e/tests/modules/chain/main.ok b/tests/e2e/tests/modules/chain/main.ok
+new file mode 100644
+index 0000000..25a1ea2
+--- /dev/null
++++ b/tests/e2e/tests/modules/chain/main.ok
+@@ -0,0 +1,7 @@
++// init order is depth-first: leaf's top level, then mid's, then this file's
++// expect: leaf up
++// expect: mid up
++import "./mid.ok";
++
++print "main up"; // expect: main up
++print mid.name; // expect: mid
+diff --git a/tests/e2e/tests/modules/chain/mid.ok b/tests/e2e/tests/modules/chain/mid.ok
+new file mode 100644
+index 0000000..ed24735
+--- /dev/null
++++ b/tests/e2e/tests/modules/chain/mid.ok
+@@ -0,0 +1,4 @@
++import "./leaf.ok";
++
++pub let name = "mid";
++print "mid up";
+diff --git a/tests/e2e/tests/modules/classes/lib.ok b/tests/e2e/tests/modules/classes/lib.ok
+new file mode 100644
+index 0000000..9f15e7f
+--- /dev/null
++++ b/tests/e2e/tests/modules/classes/lib.ok
+@@ -0,0 +1,9 @@
++// a pub class is an export like any value
++pub class Counter {
++  let mut count = 0;
++
++  pub fu bump() {
++    count = count + 1;
++    return count;
++  }
++}
+diff --git a/tests/e2e/tests/modules/classes/main.ok b/tests/e2e/tests/modules/classes/main.ok
+new file mode 100644
+index 0000000..16265e1
+--- /dev/null
++++ b/tests/e2e/tests/modules/classes/main.ok
+@@ -0,0 +1,5 @@
++import "./lib.ok";
++
++let c = lib.Counter();
++print c.bump(); // expect: 1
++print c.bump(); // expect: 2
+diff --git a/tests/e2e/tests/modules/collide/lib.ok b/tests/e2e/tests/modules/collide/lib.ok
+new file mode 100644
+index 0000000..c004ed8
+--- /dev/null
++++ b/tests/e2e/tests/modules/collide/lib.ok
+@@ -0,0 +1 @@
++pub let version = 1;
+diff --git a/tests/e2e/tests/modules/collide/main.ok b/tests/e2e/tests/modules/collide/main.ok
+new file mode 100644
+index 0000000..ff07f59
+--- /dev/null
++++ b/tests/e2e/tests/modules/collide/main.ok
+@@ -0,0 +1,5 @@
++// the root binding is a scoped binding like any let: redeclaring is the
++// usual duplicate-binding error
++import "./lib.ok";
++let lib = 5;
++// expect error:
+diff --git a/tests/e2e/tests/modules/cross_trace/lib.ok b/tests/e2e/tests/modules/cross_trace/lib.ok
+new file mode 100644
+index 0000000..50c8f8a
+--- /dev/null
++++ b/tests/e2e/tests/modules/cross_trace/lib.ok
+@@ -0,0 +1,3 @@
++pub fu boom() {
++  throw "boom from lib";
++}
+diff --git a/tests/e2e/tests/modules/cross_trace/main.ok b/tests/e2e/tests/modules/cross_trace/main.ok
+new file mode 100644
+index 0000000..02cad07
+--- /dev/null
++++ b/tests/e2e/tests/modules/cross_trace/main.ok
+@@ -0,0 +1,5 @@
++// the error reports the module's own file and line
++import "./lib.ok";
++
++lib.boom();
++// expect error: lib.ok:2:
+diff --git a/tests/e2e/tests/modules/cycle/a.ok b/tests/e2e/tests/modules/cycle/a.ok
+new file mode 100644
+index 0000000..ceaa10b
+--- /dev/null
++++ b/tests/e2e/tests/modules/cycle/a.ok
+@@ -0,0 +1,2 @@
++import "./b.ok";
++pub let a = 1;
+diff --git a/tests/e2e/tests/modules/cycle/b.ok b/tests/e2e/tests/modules/cycle/b.ok
+new file mode 100644
+index 0000000..cbb5bb1
+--- /dev/null
++++ b/tests/e2e/tests/modules/cycle/b.ok
+@@ -0,0 +1,2 @@
++import "./a.ok";
++pub let b = 2;
+diff --git a/tests/e2e/tests/modules/cycle/main.ok b/tests/e2e/tests/modules/cycle/main.ok
+new file mode 100644
+index 0000000..48b8dd8
+--- /dev/null
++++ b/tests/e2e/tests/modules/cycle/main.ok
+@@ -0,0 +1,3 @@
++// a cycle is in the importer's graph design - a hard error (M13)
++import "./a.ok";
++// expect error: circular import
+diff --git a/tests/e2e/tests/modules/deep/d01.ok b/tests/e2e/tests/modules/deep/d01.ok
+new file mode 100644
+index 0000000..30c5411
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d01.ok
+@@ -0,0 +1,4 @@
++import "./d02.ok";
++
++pub let depth = 1;
++print "d01 up";
+diff --git a/tests/e2e/tests/modules/deep/d02.ok b/tests/e2e/tests/modules/deep/d02.ok
+new file mode 100644
+index 0000000..6a05e2f
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d02.ok
+@@ -0,0 +1,4 @@
++import "./d03.ok";
++
++pub let depth = 2;
++print "d02 up";
+diff --git a/tests/e2e/tests/modules/deep/d03.ok b/tests/e2e/tests/modules/deep/d03.ok
+new file mode 100644
+index 0000000..929a897
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d03.ok
+@@ -0,0 +1,4 @@
++import "./d04.ok";
++
++pub let depth = 3;
++print "d03 up";
+diff --git a/tests/e2e/tests/modules/deep/d04.ok b/tests/e2e/tests/modules/deep/d04.ok
+new file mode 100644
+index 0000000..d5b1202
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d04.ok
+@@ -0,0 +1,4 @@
++import "./d05.ok";
++
++pub let depth = 4;
++print "d04 up";
+diff --git a/tests/e2e/tests/modules/deep/d05.ok b/tests/e2e/tests/modules/deep/d05.ok
+new file mode 100644
+index 0000000..f005491
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d05.ok
+@@ -0,0 +1,4 @@
++import "./d06.ok";
++
++pub let depth = 5;
++print "d05 up";
+diff --git a/tests/e2e/tests/modules/deep/d06.ok b/tests/e2e/tests/modules/deep/d06.ok
+new file mode 100644
+index 0000000..06ab505
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d06.ok
+@@ -0,0 +1,4 @@
++import "./d07.ok";
++
++pub let depth = 6;
++print "d06 up";
+diff --git a/tests/e2e/tests/modules/deep/d07.ok b/tests/e2e/tests/modules/deep/d07.ok
+new file mode 100644
+index 0000000..3089209
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d07.ok
+@@ -0,0 +1,4 @@
++import "./d08.ok";
++
++pub let depth = 7;
++print "d07 up";
+diff --git a/tests/e2e/tests/modules/deep/d08.ok b/tests/e2e/tests/modules/deep/d08.ok
+new file mode 100644
+index 0000000..f0b905a
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d08.ok
+@@ -0,0 +1,4 @@
++import "./d09.ok";
++
++pub let depth = 8;
++print "d08 up";
+diff --git a/tests/e2e/tests/modules/deep/d09.ok b/tests/e2e/tests/modules/deep/d09.ok
+new file mode 100644
+index 0000000..ea08f42
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d09.ok
+@@ -0,0 +1,4 @@
++import "./d10.ok";
++
++pub let depth = 9;
++print "d09 up";
+diff --git a/tests/e2e/tests/modules/deep/d10.ok b/tests/e2e/tests/modules/deep/d10.ok
+new file mode 100644
+index 0000000..9208ec3
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d10.ok
+@@ -0,0 +1,4 @@
++import "./d11.ok";
++
++pub let depth = 10;
++print "d10 up";
+diff --git a/tests/e2e/tests/modules/deep/d11.ok b/tests/e2e/tests/modules/deep/d11.ok
+new file mode 100644
+index 0000000..b1e2c35
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d11.ok
+@@ -0,0 +1,4 @@
++import "./d12.ok";
++
++pub let depth = 11;
++print "d11 up";
+diff --git a/tests/e2e/tests/modules/deep/d12.ok b/tests/e2e/tests/modules/deep/d12.ok
+new file mode 100644
+index 0000000..3fae356
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d12.ok
+@@ -0,0 +1,4 @@
++import "./d13.ok";
++
++pub let depth = 12;
++print "d12 up";
+diff --git a/tests/e2e/tests/modules/deep/d13.ok b/tests/e2e/tests/modules/deep/d13.ok
+new file mode 100644
+index 0000000..b5573e1
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d13.ok
+@@ -0,0 +1,4 @@
++import "./d14.ok";
++
++pub let depth = 13;
++print "d13 up";
+diff --git a/tests/e2e/tests/modules/deep/d14.ok b/tests/e2e/tests/modules/deep/d14.ok
+new file mode 100644
+index 0000000..49fa765
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d14.ok
+@@ -0,0 +1,4 @@
++import "./d15.ok";
++
++pub let depth = 14;
++print "d14 up";
+diff --git a/tests/e2e/tests/modules/deep/d15.ok b/tests/e2e/tests/modules/deep/d15.ok
+new file mode 100644
+index 0000000..9b3b141
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d15.ok
+@@ -0,0 +1,4 @@
++import "./d16.ok";
++
++pub let depth = 15;
++print "d15 up";
+diff --git a/tests/e2e/tests/modules/deep/d16.ok b/tests/e2e/tests/modules/deep/d16.ok
+new file mode 100644
+index 0000000..a9e43fe
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d16.ok
+@@ -0,0 +1,4 @@
++import "./d17.ok";
++
++pub let depth = 16;
++print "d16 up";
+diff --git a/tests/e2e/tests/modules/deep/d17.ok b/tests/e2e/tests/modules/deep/d17.ok
+new file mode 100644
+index 0000000..a76905b
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d17.ok
+@@ -0,0 +1,4 @@
++import "./d18.ok";
++
++pub let depth = 17;
++print "d17 up";
+diff --git a/tests/e2e/tests/modules/deep/d18.ok b/tests/e2e/tests/modules/deep/d18.ok
+new file mode 100644
+index 0000000..9328662
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d18.ok
+@@ -0,0 +1,4 @@
++import "./d19.ok";
++
++pub let depth = 18;
++print "d18 up";
+diff --git a/tests/e2e/tests/modules/deep/d19.ok b/tests/e2e/tests/modules/deep/d19.ok
+new file mode 100644
+index 0000000..23ef5f8
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d19.ok
+@@ -0,0 +1,4 @@
++import "./d20.ok";
++
++pub let depth = 19;
++print "d19 up";
+diff --git a/tests/e2e/tests/modules/deep/d20.ok b/tests/e2e/tests/modules/deep/d20.ok
+new file mode 100644
+index 0000000..14353a1
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/d20.ok
+@@ -0,0 +1,2 @@
++pub let depth = 20;
++print "d20 up";
+diff --git a/tests/e2e/tests/modules/deep/main.ok b/tests/e2e/tests/modules/deep/main.ok
+new file mode 100644
+index 0000000..05a3528
+--- /dev/null
++++ b/tests/e2e/tests/modules/deep/main.ok
+@@ -0,0 +1,26 @@
++// a 20-deep chain loads depth-first: d20's top level first, d01 last,
++// then main. deeper than the gc guard stack (16) - the loader must
++// balance its guards across the recursion.
++// expect: d20 up
++// expect: d19 up
++// expect: d18 up
++// expect: d17 up
++// expect: d16 up
++// expect: d15 up
++// expect: d14 up
++// expect: d13 up
++// expect: d12 up
++// expect: d11 up
++// expect: d10 up
++// expect: d09 up
++// expect: d08 up
++// expect: d07 up
++// expect: d06 up
++// expect: d05 up
++// expect: d04 up
++// expect: d03 up
++// expect: d02 up
++// expect: d01 up
++import "./d01.ok";
++
++print d01.depth; // expect: 1
+diff --git a/tests/e2e/tests/modules/diamond/left.ok b/tests/e2e/tests/modules/diamond/left.ok
+new file mode 100644
+index 0000000..1a3a578
+--- /dev/null
++++ b/tests/e2e/tests/modules/diamond/left.ok
+@@ -0,0 +1,2 @@
++import "./shared.ok";
++pub let l = 1;
+diff --git a/tests/e2e/tests/modules/diamond/main.ok b/tests/e2e/tests/modules/diamond/main.ok
+new file mode 100644
+index 0000000..11b0594
+--- /dev/null
++++ b/tests/e2e/tests/modules/diamond/main.ok
+@@ -0,0 +1,7 @@
++// the registry dedups: shared's top level runs ONCE even though two modules
++// import it
++// expect: shared once
++import "./left.ok";
++import "./right.ok";
++
++print left.l + right.r; // expect: 3
+diff --git a/tests/e2e/tests/modules/diamond/right.ok b/tests/e2e/tests/modules/diamond/right.ok
+new file mode 100644
+index 0000000..5a14a2c
+--- /dev/null
++++ b/tests/e2e/tests/modules/diamond/right.ok
+@@ -0,0 +1,2 @@
++import "./shared.ok";
++pub let r = 2;
+diff --git a/tests/e2e/tests/modules/diamond/shared.ok b/tests/e2e/tests/modules/diamond/shared.ok
+new file mode 100644
+index 0000000..6e736ce
+--- /dev/null
++++ b/tests/e2e/tests/modules/diamond/shared.ok
+@@ -0,0 +1,2 @@
++print "shared once";
++pub let s = 5;
+diff --git a/tests/e2e/tests/modules/earlyret/lib.ok b/tests/e2e/tests/modules/earlyret/lib.ok
+new file mode 100644
+index 0000000..82558bc
+--- /dev/null
++++ b/tests/e2e/tests/modules/earlyret/lib.ok
+@@ -0,0 +1,2 @@
++pub let x = 1;
++return 5;
+diff --git a/tests/e2e/tests/modules/earlyret/main.ok b/tests/e2e/tests/modules/earlyret/main.ok
+new file mode 100644
+index 0000000..c598181
+--- /dev/null
++++ b/tests/e2e/tests/modules/earlyret/main.ok
+@@ -0,0 +1,3 @@
++// the export epilogue must run: a module top level cannot return early
++import "./lib.ok";
++// expect error: a module top level cannot return
+diff --git a/tests/e2e/tests/modules/empty_segment.ok b/tests/e2e/tests/modules/empty_segment.ok
+new file mode 100644
+index 0000000..ba892a8
+--- /dev/null
++++ b/tests/e2e/tests/modules/empty_segment.ok
+@@ -0,0 +1,2 @@
++import "a//b";
++// expect error: empty segment
+diff --git a/tests/e2e/tests/modules/from/lib.ok b/tests/e2e/tests/modules/from/lib.ok
+new file mode 100644
+index 0000000..c3e2aaf
+--- /dev/null
++++ b/tests/e2e/tests/modules/from/lib.ok
+@@ -0,0 +1,7 @@
++pub fu greet(name) {
++  return "hi " + name;
++}
++
++pub let version = 1;
++
++let secret = "private";
+diff --git a/tests/e2e/tests/modules/from/main.ok b/tests/e2e/tests/modules/from/main.ok
+new file mode 100644
+index 0000000..578066c
+--- /dev/null
++++ b/tests/e2e/tests/modules/from/main.ok
+@@ -0,0 +1,4 @@
++from "./lib.ok" import greet, version as ver;
++
++print greet("ok"); // expect: hi ok
++print ver; // expect: 1
+diff --git a/tests/e2e/tests/modules/from_dup/lib.ok b/tests/e2e/tests/modules/from_dup/lib.ok
+new file mode 100644
+index 0000000..c004ed8
+--- /dev/null
++++ b/tests/e2e/tests/modules/from_dup/lib.ok
+@@ -0,0 +1 @@
++pub let version = 1;
+diff --git a/tests/e2e/tests/modules/from_dup/main.ok b/tests/e2e/tests/modules/from_dup/main.ok
+new file mode 100644
+index 0000000..126571f
+--- /dev/null
++++ b/tests/e2e/tests/modules/from_dup/main.ok
+@@ -0,0 +1,2 @@
++from "./lib.ok" import version, version;
++// expect error:
+diff --git a/tests/e2e/tests/modules/from_unquoted.ok b/tests/e2e/tests/modules/from_unquoted.ok
+new file mode 100644
+index 0000000..05904d2
+--- /dev/null
++++ b/tests/e2e/tests/modules/from_unquoted.ok
+@@ -0,0 +1,2 @@
++from lib import x;
++// expect error: expected a quoted import path after 'from'
+diff --git a/tests/e2e/tests/modules/glob/glib.ok b/tests/e2e/tests/modules/glob/glib.ok
+new file mode 100644
+index 0000000..e9101f6
+--- /dev/null
++++ b/tests/e2e/tests/modules/glob/glib.ok
+@@ -0,0 +1,3 @@
++// a module may glob-inject process globals (the deliberate side-effect door)
++glob let injected = 42;
++pub let local = 1;
+diff --git a/tests/e2e/tests/modules/glob/main.ok b/tests/e2e/tests/modules/glob/main.ok
+new file mode 100644
+index 0000000..a86c044
+--- /dev/null
++++ b/tests/e2e/tests/modules/glob/main.ok
+@@ -0,0 +1,4 @@
++import "./glib.ok";
++
++print injected; // expect: 42
++print glib.local; // expect: 1
+diff --git a/tests/e2e/tests/modules/immutable/lib.ok b/tests/e2e/tests/modules/immutable/lib.ok
+new file mode 100644
+index 0000000..c004ed8
+--- /dev/null
++++ b/tests/e2e/tests/modules/immutable/lib.ok
+@@ -0,0 +1 @@
++pub let version = 1;
+diff --git a/tests/e2e/tests/modules/immutable/main.ok b/tests/e2e/tests/modules/immutable/main.ok
+new file mode 100644
+index 0000000..0cb8fb6
+--- /dev/null
++++ b/tests/e2e/tests/modules/immutable/main.ok
+@@ -0,0 +1,4 @@
++// namespaces are sealed by the loader before anyone sees the value
++import "./lib.ok";
++lib.version = 2;
++// expect error: module namespaces are immutable
+diff --git a/tests/e2e/tests/modules/import_in_block.ok b/tests/e2e/tests/modules/import_in_block.ok
+new file mode 100644
+index 0000000..09be998
+--- /dev/null
++++ b/tests/e2e/tests/modules/import_in_block.ok
+@@ -0,0 +1,5 @@
++// imports are module-top-level-only (M4): blocks refuse them
++if (true) {
++  import "./nowhere.ok";
++}
++// expect error: imports are only legal at module top level.
+diff --git a/tests/e2e/tests/modules/import_in_fu.ok b/tests/e2e/tests/modules/import_in_fu.ok
+new file mode 100644
+index 0000000..5c40d83
+--- /dev/null
++++ b/tests/e2e/tests/modules/import_in_fu.ok
+@@ -0,0 +1,5 @@
++fu f() {
++  import "./nowhere.ok";
++}
++f();
++// expect error: imports are only legal at module top level.
+diff --git a/tests/e2e/tests/modules/merge/a/one.ok b/tests/e2e/tests/modules/merge/a/one.ok
+new file mode 100644
+index 0000000..eeb42ec
+--- /dev/null
++++ b/tests/e2e/tests/modules/merge/a/one.ok
+@@ -0,0 +1 @@
++pub let x = 1;
+diff --git a/tests/e2e/tests/modules/merge/a/two.ok b/tests/e2e/tests/modules/merge/a/two.ok
+new file mode 100644
+index 0000000..4d7d471
+--- /dev/null
++++ b/tests/e2e/tests/modules/merge/a/two.ok
+@@ -0,0 +1 @@
++pub let y = 2;
+diff --git a/tests/e2e/tests/modules/merge/main.ok b/tests/e2e/tests/modules/merge/main.ok
+new file mode 100644
+index 0000000..baa4412
+--- /dev/null
++++ b/tests/e2e/tests/modules/merge/main.ok
+@@ -0,0 +1,7 @@
++// M5: import "a/b" binds the root `a`; a second import under the same root
++// merges into the same namespace. re-importing the same module is a no-op.
++import "./a/one";
++import "./a/two";
++import "./a/one";
++
++print a.one.x + a.two.y; // expect: 3
+diff --git a/tests/e2e/tests/modules/merge_conflict/main.ok b/tests/e2e/tests/modules/merge_conflict/main.ok
+new file mode 100644
+index 0000000..895a522
+--- /dev/null
++++ b/tests/e2e/tests/modules/merge_conflict/main.ok
+@@ -0,0 +1,4 @@
++// a path cannot bind a module and a namespace at once (M13)
++import "./x";
++import "./x/y";
++// expect error: import path conflict
+diff --git a/tests/e2e/tests/modules/merge_conflict/x.ok b/tests/e2e/tests/modules/merge_conflict/x.ok
+new file mode 100644
+index 0000000..b27d098
+--- /dev/null
++++ b/tests/e2e/tests/modules/merge_conflict/x.ok
+@@ -0,0 +1 @@
++pub let q = 1;
+diff --git a/tests/e2e/tests/modules/merge_conflict/x/y.ok b/tests/e2e/tests/modules/merge_conflict/x/y.ok
+new file mode 100644
+index 0000000..7dae62f
+--- /dev/null
++++ b/tests/e2e/tests/modules/merge_conflict/x/y.ok
+@@ -0,0 +1 @@
++pub let r = 2;
+diff --git a/tests/e2e/tests/modules/missing_export/lib.ok b/tests/e2e/tests/modules/missing_export/lib.ok
+new file mode 100644
+index 0000000..c004ed8
+--- /dev/null
++++ b/tests/e2e/tests/modules/missing_export/lib.ok
+@@ -0,0 +1 @@
++pub let version = 1;
+diff --git a/tests/e2e/tests/modules/missing_export/main.ok b/tests/e2e/tests/modules/missing_export/main.ok
+new file mode 100644
+index 0000000..91b1295
+--- /dev/null
++++ b/tests/e2e/tests/modules/missing_export/main.ok
+@@ -0,0 +1,3 @@
++import "./lib.ok";
++print lib.nope;
++// expect error: has no export 'nope'
+diff --git a/tests/e2e/tests/modules/missing_from/lib.ok b/tests/e2e/tests/modules/missing_from/lib.ok
+new file mode 100644
+index 0000000..c004ed8
+--- /dev/null
++++ b/tests/e2e/tests/modules/missing_from/lib.ok
+@@ -0,0 +1 @@
++pub let version = 1;
+diff --git a/tests/e2e/tests/modules/missing_from/main.ok b/tests/e2e/tests/modules/missing_from/main.ok
+new file mode 100644
+index 0000000..5e50adf
+--- /dev/null
++++ b/tests/e2e/tests/modules/missing_from/main.ok
+@@ -0,0 +1,2 @@
++from "./lib.ok" import nope;
++// expect error: has no pub export 'nope'
+diff --git a/tests/e2e/tests/modules/native_hint/fake.so b/tests/e2e/tests/modules/native_hint/fake.so
+new file mode 100644
+index 0000000..ed3235a
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_hint/fake.so
+@@ -0,0 +1,2 @@
++not a real shared object: a placeholder so the resolver's native candidate
++fires. native loading lands with OR-3 (the sandbox + the loader).
+diff --git a/tests/e2e/tests/modules/native_hint/main.ok b/tests/e2e/tests/modules/native_hint/main.ok
+new file mode 100644
+index 0000000..486d2b8
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_hint/main.ok
+@@ -0,0 +1,2 @@
++import "./fake";
++// expect error: native loading lands with OR-3
+diff --git a/tests/e2e/tests/modules/notfound_bare.ok b/tests/e2e/tests/modules/notfound_bare.ok
+new file mode 100644
+index 0000000..af71b4b
+--- /dev/null
++++ b/tests/e2e/tests/modules/notfound_bare.ok
+@@ -0,0 +1,3 @@
++// bare names walk OKPATH only
++import "definitely-not-here";
++// expect error: module not found.
+diff --git a/tests/e2e/tests/modules/notfound_relative.ok b/tests/e2e/tests/modules/notfound_relative.ok
+new file mode 100644
+index 0000000..97d9491
+--- /dev/null
++++ b/tests/e2e/tests/modules/notfound_relative.ok
+@@ -0,0 +1,3 @@
++// the 404 must teach: every location and form tried
++import "./definitely_not_here";
++// expect error: module not found.
+diff --git a/tests/e2e/tests/modules/okpath/main.ok b/tests/e2e/tests/modules/okpath/main.ok
+new file mode 100644
+index 0000000..b4dfc8f
+--- /dev/null
++++ b/tests/e2e/tests/modules/okpath/main.ok
+@@ -0,0 +1,5 @@
++// okpath: roots
++// bare names walk OKPATH: plug/ok resolves under the declared root
++import "plug/ok";
++
++print plug.ok.v; // expect: 9
+diff --git a/tests/e2e/tests/modules/okpath/roots/plug/ok.ok b/tests/e2e/tests/modules/okpath/roots/plug/ok.ok
+new file mode 100644
+index 0000000..fb8768b
+--- /dev/null
++++ b/tests/e2e/tests/modules/okpath/roots/plug/ok.ok
+@@ -0,0 +1 @@
++pub let v = 9;
+diff --git a/tests/e2e/tests/modules/parsefail/lib.ok b/tests/e2e/tests/modules/parsefail/lib.ok
+new file mode 100644
+index 0000000..cf5c974
+--- /dev/null
++++ b/tests/e2e/tests/modules/parsefail/lib.ok
+@@ -0,0 +1,2 @@
++pub let x = 1;
++let = 2;
+diff --git a/tests/e2e/tests/modules/parsefail/main.ok b/tests/e2e/tests/modules/parsefail/main.ok
+new file mode 100644
+index 0000000..47c245f
+--- /dev/null
++++ b/tests/e2e/tests/modules/parsefail/main.ok
+@@ -0,0 +1,3 @@
++// the module's parse error carries the module's own path and line
++import "./lib.ok";
++// expect error: lib.ok:2:
+diff --git a/tests/e2e/tests/modules/privacy/lib.ok b/tests/e2e/tests/modules/privacy/lib.ok
+new file mode 100644
+index 0000000..c094d8a
+--- /dev/null
++++ b/tests/e2e/tests/modules/privacy/lib.ok
+@@ -0,0 +1,2 @@
++let secret = "private";
++pub let open = "open";
+diff --git a/tests/e2e/tests/modules/privacy/main.ok b/tests/e2e/tests/modules/privacy/main.ok
+new file mode 100644
+index 0000000..a1df180
+--- /dev/null
++++ b/tests/e2e/tests/modules/privacy/main.ok
+@@ -0,0 +1,3 @@
++// from-imports see pub exports only (M9)
++from "./lib.ok" import secret;
++// expect error: has no pub export 'secret'
+diff --git a/tests/e2e/tests/modules/pub_glob.ok b/tests/e2e/tests/modules/pub_glob.ok
+new file mode 100644
+index 0000000..7f89137
+--- /dev/null
++++ b/tests/e2e/tests/modules/pub_glob.ok
+@@ -0,0 +1,3 @@
++// glob is process-global, the export surface is the module's own
++pub glob let x = 1;
++// expect error: a glob declaration cannot be pub
+diff --git a/tests/e2e/tests/modules/pub_in_block.ok b/tests/e2e/tests/modules/pub_in_block.ok
+new file mode 100644
+index 0000000..6ee3f3c
+--- /dev/null
++++ b/tests/e2e/tests/modules/pub_in_block.ok
+@@ -0,0 +1,4 @@
++if (true) {
++  pub let x = 1;
++}
++// expect error: 'pub' is a module top-level modifier.
+diff --git a/tests/e2e/tests/modules/selfcycle/main.ok b/tests/e2e/tests/modules/selfcycle/main.ok
+new file mode 100644
+index 0000000..939f2dc
+--- /dev/null
++++ b/tests/e2e/tests/modules/selfcycle/main.ok
+@@ -0,0 +1,2 @@
++import "./s.ok";
++// expect error: circular import
+diff --git a/tests/e2e/tests/modules/selfcycle/s.ok b/tests/e2e/tests/modules/selfcycle/s.ok
+new file mode 100644
+index 0000000..3156367
+--- /dev/null
++++ b/tests/e2e/tests/modules/selfcycle/s.ok
+@@ -0,0 +1,2 @@
++import "./s.ok";
++pub let x = 1;
+diff --git a/tests/e2e/tests/modules/spanpub/lib.ok b/tests/e2e/tests/modules/spanpub/lib.ok
+new file mode 100644
+index 0000000..7b0f398
+--- /dev/null
++++ b/tests/e2e/tests/modules/spanpub/lib.ok
+@@ -0,0 +1,5 @@
++pub fu pair() {
++  return 3, 4;
++}
++
++pub let (a, b) = pair();
+diff --git a/tests/e2e/tests/modules/spanpub/main.ok b/tests/e2e/tests/modules/spanpub/main.ok
+new file mode 100644
+index 0000000..1188d32
+--- /dev/null
++++ b/tests/e2e/tests/modules/spanpub/main.ok
+@@ -0,0 +1,3 @@
++// every binding of a pub span let is an export
++import "./lib.ok";
++print lib.a + lib.b; // expect: 7
+diff --git a/tests/e2e/tests/modules/star_from.ok b/tests/e2e/tests/modules/star_from.ok
+new file mode 100644
+index 0000000..e805ef3
+--- /dev/null
++++ b/tests/e2e/tests/modules/star_from.ok
+@@ -0,0 +1,2 @@
++from "./lib.ok" import *;
++// expect error: star imports are rejected
+diff --git a/tests/e2e/tests/modules/star_import.ok b/tests/e2e/tests/modules/star_import.ok
+new file mode 100644
+index 0000000..8eb14c1
+--- /dev/null
++++ b/tests/e2e/tests/modules/star_import.ok
+@@ -0,0 +1,3 @@
++// star imports are rejected (M8): name what you import
++import *;
++// expect error: star imports are rejected
+diff --git a/tests/e2e/tests/modules/std_not_module_yet.ok b/tests/e2e/tests/modules/std_not_module_yet.ok
+new file mode 100644
+index 0000000..ef7a1f5
+--- /dev/null
++++ b/tests/e2e/tests/modules/std_not_module_yet.ok
+@@ -0,0 +1,3 @@
++// the std/ root is reserved (M8) and re-homes with OR-2
++import "std/io";
++// expect error: the standard library is not module-shaped yet
+diff --git a/tests/e2e/tests/modules/std_standalone.ok b/tests/e2e/tests/modules/std_standalone.ok
+new file mode 100644
+index 0000000..33753ea
+--- /dev/null
++++ b/tests/e2e/tests/modules/std_standalone.ok
+@@ -0,0 +1,4 @@
++// a standalone script keeps every name: the std reservation has teeth only
++// in module-world TUs (a module, or any file with imports)
++let std = 1;
++print std; // expect: 1
+diff --git a/tests/e2e/tests/modules/stdalias/lib.ok b/tests/e2e/tests/modules/stdalias/lib.ok
+new file mode 100644
+index 0000000..c004ed8
+--- /dev/null
++++ b/tests/e2e/tests/modules/stdalias/lib.ok
+@@ -0,0 +1 @@
++pub let version = 1;
+diff --git a/tests/e2e/tests/modules/stdalias/main.ok b/tests/e2e/tests/modules/stdalias/main.ok
+new file mode 100644
+index 0000000..312394b
+--- /dev/null
++++ b/tests/e2e/tests/modules/stdalias/main.ok
+@@ -0,0 +1,2 @@
++from "./lib.ok" import version as std;
++// expect error: the name 'std' is reserved
+diff --git a/tests/e2e/tests/modules/stdres/lib.ok b/tests/e2e/tests/modules/stdres/lib.ok
+new file mode 100644
+index 0000000..c004ed8
+--- /dev/null
++++ b/tests/e2e/tests/modules/stdres/lib.ok
+@@ -0,0 +1 @@
++pub let version = 1;
+diff --git a/tests/e2e/tests/modules/stdres/main.ok b/tests/e2e/tests/modules/stdres/main.ok
+new file mode 100644
+index 0000000..d32b075
+--- /dev/null
++++ b/tests/e2e/tests/modules/stdres/main.ok
+@@ -0,0 +1,4 @@
++// in a module-world TU the std root is reserved (M8)
++import "./lib.ok";
++let std = 1;
++// expect error: the name 'std' is reserved
+diff --git a/tests/e2e/tests/modules/topfail/lib.ok b/tests/e2e/tests/modules/topfail/lib.ok
+new file mode 100644
+index 0000000..f9dd025
+--- /dev/null
++++ b/tests/e2e/tests/modules/topfail/lib.ok
+@@ -0,0 +1,2 @@
++throw "lib top level failed";
++pub let x = 1;
+diff --git a/tests/e2e/tests/modules/topfail/main.ok b/tests/e2e/tests/modules/topfail/main.ok
+new file mode 100644
+index 0000000..dc61e72
+--- /dev/null
++++ b/tests/e2e/tests/modules/topfail/main.ok
+@@ -0,0 +1,2 @@
++import "./lib.ok";
++// expect error: while loading this module (its top level failed).
+diff --git a/tests/e2e/tests/modules/trailing_slash.ok b/tests/e2e/tests/modules/trailing_slash.ok
+new file mode 100644
+index 0000000..59d46df
+--- /dev/null
++++ b/tests/e2e/tests/modules/trailing_slash.ok
+@@ -0,0 +1,2 @@
++import "a/";
++// expect error: ends with '/'
+diff --git a/tests/e2e/tests/modules/unquoted.ok b/tests/e2e/tests/modules/unquoted.ok
+new file mode 100644
+index 0000000..e37656a
+--- /dev/null
++++ b/tests/e2e/tests/modules/unquoted.ok
+@@ -0,0 +1,3 @@
++// python-plain is not the language: the path is a quoted string
++import lib;
++// expect error: expected a quoted import path
