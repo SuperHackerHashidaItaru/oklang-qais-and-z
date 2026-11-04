@@ -73,18 +73,24 @@ OPEN for Q at section 11's end):
 - OPEN for Q: the ok_api vtable's read side + type/class identity entries
   (section 7) and the versioning stance (single bumped integer, no semver).
 
-renumbering note: this wave was drafted as 0.6.0; Q's tidy lane (classes
+renumbering note: this wave was drafted as 0.6.0; Q's Epigone lane (classes
 fix + defer continuation + the rename + interning + the coro C API) is
 v0.7.0 now - **named "Epigone"** (Q's pick, recorded) - so modules is
 **0.8.0**. one stale in-tree reference (okvm.h's "the 0.7.0 registry"
 comment) is OR-1 scope. the codename is Q's pick: "O Resolution"
 (wilderun, veil of imagination - we are, after all, resolving paths).
+[session 42 correction: the Epigone patches live in coro's history -
+Q's tidy branch stalled at the bare coros commit ("missing something,
+decided to do all in coros instead") and is retired from the release
+pipeline.]
 
 ## context restore (read this first in a fresh session)
 
 - repos: codeberg.org/qais/oklang is the language (Q applies patches by
-  hand, the standing protocol; branches: master, classes-staging, coro,
-  and Q's tidy = coro + patches 39/40). the collab repo (docs/patches/
+  hand, the standing protocol; branches: master, classes-staging, coro
+  [= the coros commit + the Epigone stretch, patches 38-42; Q's tidy
+  pointed at the bare coros commit and is retired - session 42]). the
+  collab repo (docs/patches/
   bench) mirrors on github (SuperHackerHashidaItaru/oklang-qais-and-z).
 - sandbox: no cmake. build with /home/z/my-project/scripts/build_ok.sh
   [plain|threaded|release|asan|aggressive|...]; the gate is
@@ -95,7 +101,7 @@ comment) is OR-1 scope. the codename is Q's pick: "O Resolution"
 - doc index: docs/permanent/{ROADMAP,DECISIONS,PROJECT_STATE}.md are the
   living truth; docs/drafts/ holds the feature drafts (CLASSES, COROS,
   MODULES=this); WORKLOG.md is the session log, newest at the bottom.
-- the 0.7.0 lane (Q's tidy branch, "Epigone"): defer continuation (D17,
+- the 0.7.0 lane ("Epigone", coro's upper stretch): defer continuation (D17,
   patch 39), the type/object rename (D18, patch 40), universal string
   interning (D20, patch 41), and the coro C API (D21, patch 42 - LANDED
   on modules-staging, appendix A). this wave stacks on top of all of it.

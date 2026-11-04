@@ -4,8 +4,8 @@ status: the complete walkthrough of everything that stacked on master since
 the errors lane, written to be read whole. Q last reviewed at master v0.4.0
 (Eyrie, patches 23-28, e2e 342x4). since then four lanes landed on
 modules-staging, applied patch-by-patch but never reviewed as a whole:
-classes (0.5.0, Citadel), coros (0.6.0), Epigone (0.7.0, Q's tidy lane),
-and O Resolution (0.8.0, modules). this guide is that whole review, ending
+classes (0.5.0, Citadel), coros (0.6.0), Epigone (0.7.0, coro's upper
+stretch), and O Resolution (0.8.0, modules). this guide is that whole review, ending
 with today's two follow-ups: pub members (patch 51) and the semver ABI
 (patch 52). the design records are CLASSES-0.5.0-draft.md, COROS-draft.md,
 MODULES.md (the M/D/R rulings); this is the code-adjacent story. every
@@ -24,7 +24,7 @@ then §1 (classes - the semantic core everything else leans on), then §9
 |---|---|---|---|---|
 | classes | 0.5.0 "Citadel" | 30-37 | frozen classes, operators, the member ring, natives as classes | ~400 |
 | coros | 0.6.0 | 38 | stackful coroutines, per-coro frames, the yield barrier | ~410 |
-| Epigone | 0.7.0 | 39-42 | Q's tidy: defer continuation, the rename, universal interning, the coro C API | 427 |
+| Epigone | 0.7.0 | 39-42 | coro's upper stretch: defer continuation, the rename, universal interning, the coro C API | 427 |
 | O Resolution | 0.8.0 | 43-50 | the module system: compile-time spine, std re-home, sandbox + natives, project.ok | 501 |
 | follow-ups | - | 51-52 | pub members, the semver ABI | 510 |
 
@@ -160,7 +160,12 @@ call-completion arms that carry the native-suspend flag (§3's patch 42).
 
 ---
 
-## §3 — 0.7.0 "Epigone": the tidy lane (patches 39-42)
+## §3 — 0.7.0 "Epigone": coro's upper stretch (patches 39-42)
+
+[session 42 correction: this stretch lives in coro's history, not on
+any "tidy" branch - Q's tidy stalled at the bare coros commit and is
+retired from the release pipeline (runbook round two); coro carries
+everything.]
 
 Q's picks, one apply-session, all debts:
 

@@ -1,9 +1,14 @@
 # oklang - the review & release runbook: v0.5.0 Citadel -> v1.0.0 Celestial
 
-status: DRAFT round one (session 41). this is the git mechanics for the
+status: DRAFT round two (session 42). this is the git mechanics for the
 ruled release plan (ROADMAP-0.9.0-draft, "the release plan" section):
 run the 0.9.0 wave to v1.0-rc, review the whole climb, amend per era,
 then release every version v0.5.0 through v1.0.0 as its own release.
+round two folds Q's correction: the tidy branch is retired from the
+pipeline entirely (it stalled at the bare coros commit, missing the
+Epigone patches - everything was done in coros instead), so 0.6.0
+pins the coros sha inside coro's own history and 0.7.0 Epigone IS
+coro's tip.
 
 Q's own words for the loop this formalizes: "what i was trying to do is
 review each version starting from v0.5.0 (citadel) and when i spot
@@ -24,8 +29,8 @@ been released:
 |---|---|---|---|---|
 | 0.4.0 | Eyrie | 23-28 | master (released) | 342x4 |
 | 0.5.0 | Citadel | 30-37 | classes-staging tip | ~400 |
-| 0.6.0 | (none yet) | 38 | coro tip | ~410 |
-| 0.7.0 | Epigone | 39-42 | tidy tip | 427 |
+| 0.6.0 | (none yet) | 38 | 1672c21 "coros" (inside coro's history) | ~410 |
+| 0.7.0 | Epigone | 39-42 | coro tip (a8c4a99) | 427 |
 | 0.8.0 | O Resolution | 43-52 | modules-staging at 973bcd0 | 510x7 |
 | 0.9.0 | Reconciliation | 53+ | the coming wave (P1-P7) | - |
 | 1.0.0 | Celestial | - | the rc after the review | - |
@@ -34,6 +39,16 @@ been released:
 it never does. the 0.8.0 cut is Q's call during the pin pass: 973bcd0
 is the patch-52 head the guide verified; anything that lands on the
 lane before the wave opens moves the pin.)
+
+[session 42, Q's correction, RULED: the tidy branch participates in
+NOTHING. "it was missing something and i decided to do all in coros
+instead" - tidy still points at 1672c21, the bare patch-38 coros
+commit, while coro carries the whole Epigone stretch (39-42) on top
+of it. consequences, all folded below: rel/v0.6 pins the coros sha
+directly (no tidy involved - the sha is coro's own ancestor), rel/v0.7
+pins coro's tip, and tidy appears in no command in this runbook. it
+can be deleted from codeberg whenever convenient; its sha stays
+reachable through rel/v0.6 forever.]
 
 two properties we get to keep, and they make everything else easy:
 
@@ -93,7 +108,7 @@ git --version
 
 # map what exists; fill section 0's table with real shas as you go
 git fetch origin
-git log --oneline --graph --decorate master classes-staging coro tidy \
+git log --oneline --graph --decorate master classes-staging coro \
   modules-staging | head -80
 git tag --list        # expect v0.1.0 and nothing from the climb
 
@@ -126,8 +141,8 @@ branches, never tags - which is exactly why the tags wait):
 
 ```
 git branch rel/v0.5 classes-staging    # the 0.5.0 cut
-git branch rel/v0.6 coro
-git branch rel/v0.7 tidy               # the Epigone tip
+git branch rel/v0.6 1672c21            # the coros commit (patch 38)
+git branch rel/v0.7 coro               # the Epigone tip (39-42)
 git branch rel/v0.8 973bcd0            # the 0.8.0 cut point
 # rel/v0.9 and rel/v1.0 get pinned when the wave and the rc exist
 
@@ -323,7 +338,7 @@ git push origin modules-staging:master
 
 # 2. the lanes on codeberg moved (the rewrite changed their shas), so
 #    they need force - with the lease, always:
-git push --force-with-lease origin classes-staging coro tidy \
+git push --force-with-lease origin classes-staging coro \
   modules-staging
 
 # 3. the archive tag, so the pre-rewrite head stays fetchable forever
@@ -368,6 +383,8 @@ aftercare, the same day (all cheap, all easy to forget):
   missing them: `git push origin --delete classes-staging` etc., local
   `git branch -d` to match. keep: master, the next wave's lane, rel/*
   until v1.0.0 has been out a while, backup/* and archive/* forever.
+  tidy is pre-retired (session 42): delete it any time - coro owns
+  everything it ever pointed at.
 - **the docs wave**: mark the release plan EXECUTED in ROADMAP and
   DECISIONS; this runbook moves to archive/ with the release receipts
   appended.
@@ -409,8 +426,9 @@ aftercare, the same day (all cheap, all easy to forget):
 git fetch origin && git config rerere.enabled true
 git branch backup/pre-review modules-staging
 git bundle create ../oklang-pre-review-$(date +%F).bundle --all
-git branch rel/v0.5 classes-staging && git branch rel/v0.6 coro
-git branch rel/v0.7 tidy && git branch rel/v0.8 973bcd0
+git branch rel/v0.5 classes-staging
+git branch rel/v0.6 1672c21 && git branch rel/v0.7 coro
+git branch rel/v0.8 973bcd0
 for v in v0.5 v0.6 v0.7 v0.8; do git branch backup/rel/$v rel/$v; done
 
 # review, per era (oldest first)
@@ -429,7 +447,7 @@ full matrix at the tip + per-era plain/aggressive spot pass
 
 # ship
 git push origin modules-staging:master
-git push --force-with-lease origin classes-staging coro tidy modules-staging
+git push --force-with-lease origin classes-staging coro modules-staging
 git tag archive/rc-pre-review backup/pre-review
 git tag -a v0.5.0 -m "oklang 0.5.0 (Citadel)" rel/v0.5   # ... per era
 git push origin v0.5.0 v0.6.0 v0.7.0 v0.8.0 v0.9.0 v1.0.0
@@ -461,6 +479,10 @@ git push origin v0.5.0 v0.6.0 v0.7.0 v0.8.0 v0.9.0 v1.0.0
 - the era table (the guide's section 0, verified at 973bcd0): Citadel,
   coros, Epigone, O Resolution, and the follow-ups 51-52 that closed
   the 0.8.0 lane.
+- tidy out of the pipeline (RULED, Q, session 42): the branch stalled
+  at the coros commit and was superseded - coros carries everything.
+  0.6.0 pins the coros sha, 0.7.0 pins coro's tip, tidy joins no
+  command and no release.
 - cascade fixes, never redesigns (Z's discipline, this round): the
   boundary between "wrong then, wrong now" and "i would build it
   differently today" - the first cascades, the second rides the tip.
