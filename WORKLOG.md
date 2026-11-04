@@ -2250,3 +2250,100 @@ ROADMAP-0.9.0-draft) and the round summaries.]
 - next: P1 (patch 53), the honesty warmup - the version stamp, ok
   --version / ok -v, ok create, OK_ROOT in the harnesses, the c99
   -Werror gate, the warning sweep.
+
+## session 42 (2026-11-04): the tidy correction + P1 + P2 (53, 54)
+
+- context: Q's message opened the wave with two corrections - (1) the
+  tidy branch means nothing, it was missing something and everything was
+  done in coros instead, so tidy participates in no release; (2) a fresh
+  PAT, stored in the local git so the collab repo always syncs. then
+  "lets finish this, and then i go do reviews" - the 0.9.0 wave to
+  v1.0-rc, Q reviews after.
+- the truth the correction forced out: tidy points at 1672c21, the bare
+  patch-38 coros commit, while coro (a8c4a99) carries the whole Epigone
+  stretch (39-42) on top. the runbook had them swapped. round two of the
+  RELEASE-RUNBOOK folded it: rel/v0.6 pins the coros sha directly (no
+  tidy involved - the sha is coro's own ancestor), rel/v0.7 pins coro's
+  tip, tidy appears in no command and is pre-retired in the aftercare.
+  the guide's era table + s3 heading and MODULES' ground notes aligned
+  with bracketed corrections; both courtesy PDFs regenerated.
+- the PAT: stored in the collab clone's remote (and .ghtoken), push
+  verified end to end - the corrections commit, patch 53, and patch 54
+  all rode it.
+- patch 53, P1 the honesty warmup: the version stamp (include/ok/
+  ok_version.h - numbers, lane "rc.1", composed string; `ok --version`
+  / `ok -v` / `ok version` print `ok 0.9.0-rc.1 (abi 0.3)`; the capi
+  harness re-composes and compares - drift fails the gate; the bench
+  workflow's `|| true` tolerance dropped). `ok create <name>` (Q's
+  rename of ok new): project.ok + src/main.ok + tests/ + .gitignore,
+  refusing existing dirs/separators/dotfiles, the scaffold runs and its
+  manifest answers `ok where`. OK_ROOT (Q's flag): the CLI exports it
+  to build-command children (inherited env wins, the compiled-in
+  checkout prefix is the fallback - cmake and build_ok.sh bake it), the
+  C++ e2e runner exports it for fixtures and runs, every
+  -I../../../../../include in the fixture farm is now
+  -I$OK_ROOT/include, the relative reaches are dead. the gate + the
+  sweep: -std=c99 -pedantic -Wall -Wextra -Werror (-Wno-missing-braces
+  rides - the flat-init idiom over the tagged index types, C23's {} is
+  the eventual home; the two anonymous unions, okindex.h and lvalue,
+  are the one chosen C11-ism, pragma-marked at their definitions; the
+  threaded lane keeps -Werror but drops -pedantic - labels-as-values is
+  the documented extension, OK_PURE is the strict gate). 530 warnings
+  -> 0: OK_CAP_ALL became a macro (enumerator values must fit int), the
+  fused-condition width guard was dead (ok_index and the 2w operands
+  are both 16-bit - the window is structural; deleted with a note), the
+  classic dispatch switch spells out the four pre-patch NAME opcodes +
+  OP__COUNT mirroring the threaded table's NOP aliasing (byte-identical
+  by design; -Wswitch asked), a -O2 maybe-uninitialized in the seed
+  switch got a refusing default arm, three %p casts in okgc's paranoid
+  lane, and the dead code deleted (okparser's current/peek/
+  get_precedence declarations, okstring's remove_flag, okvm's
+  run_pending_defers wrapper, a never-jumped fail: label, six unused
+  locals). tests: the new CLI lane (tests/cli/run.sh, 10 checks) wired
+  into CI beside e2e.
+- patch 54, P2 the utf-8 core: as ruled - iteration + index + len are
+  codepoints, the front door validates, \u{} escapes exist, runtime
+  strings are lossy. ok_utf8 (header-only) carries the check table
+  (overlong C0/C1, E0 80-9F, surrogates ED A0-BF, F0 80-8F, F5+, F4
+  90+) with the FIXME resolved into the advance/validate contract;
+  parser_parse gates the whole source (entry, REPL, module loads - one
+  door) with located rejections for malformed utf-8, the bidi controls,
+  and stray C0; the lexer still never learns unicode exists (π, 名字, λ
+  are test-pinned identifiers). the str hidden shape rides ITER_PREP/
+  GET/LOOP (a utf8 byte cursor, U+FFFD for malformed runtime bytes),
+  s[i] is the i-th codepoint (fresh one-codepoint string; writes
+  refuse), len answers codepoints cached lossy on the interned header
+  (str.len() becomes the class's first method - the sealed-empty
+  0.5.0 doctrine retired by the ruling). the string-scanner rework
+  (P2/P3 shared): a backslash never terminates the scan; the parser's
+  unescape lane owns the meaning (\n \t \r \\ \' \" \u{...}),
+  with located errors for the whole failure family; plain literals stay
+  source slices.
+- the P2 find (pre-existing, since the register VM): a call whose dest
+  sits below other locals breaks the call window's contiguity - the
+  callable lands at dest, the args stage above ALL locals, and OP_CALL
+  reads them at dest+1. `for let i = 0 : len(a)` read the uninitialized
+  slot above the limit as its argument (arrays too - proven at the
+  patch-53 head in a stashed tree). the three for slots now compile
+  through a temp and move; the let initializer never had the shape.
+  exposed by the conformance check the roadmap ruled (the hidden shape
+  vs the manual index walk - it earned its keep the day it was born).
+- the fixture archaeology: project_ambiguous's vendor/ray was an empty
+  directory git could never commit, lost with an old sandbox - the M13
+  ambiguity check was unreachable. restored with a .gitkeep. two
+  superseded pins retired honestly (maps/errors/iterate_string - strings
+  iterate now; classes/native_method_error repurposed to a genuinely
+  unknown method).
+- receipts: e2e 510 -> 530 x7, unit 4 -> 5 x3 (oktest_utf8, 54
+  checks), embed x3, capi 325 x5, cli 10/10, 9/9 build flavors under
+  -Werror, delta blue correct at 1.40654e7 and flat (1.91x/1.86x of
+  wren against the standing 1.93x - the codepoint cache is free).
+- delivered: patches/53-p1-honesty-....patch, patches/54-p2-utf8-...patch
+  (+ README entries), the runbook round two + guide/modules corrections,
+  the roadmap draft's P1/P2 markers, this entry. language side: 257c189
+  (53) and c21c7e9 (54) on modules-staging.
+- next: P3, the strings round - f"" interpolation with the RULED ${}
+  delimiter, m"" multiline, the str method toolkit, std.math + idiv, the
+  deprecation windows open. then P4 (fs/env/clock behind OK_CAP_HOST),
+  P5 (parser hardening + fuzz), P6 (optimization), P7 (REPL + the GC
+  attempt). the wave is 2/7.
