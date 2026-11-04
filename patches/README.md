@@ -1043,3 +1043,82 @@ applies on modules-staging after 52 (973bcd0; the commit is 257c189).
 gates: 9/9 build flavors under -Werror, e2e 510x7, unit x3 + embed
 x3, capi 325x5, cli 10/10, delta blue correct at 1.40654e7
 (1.96x/1.88x of wren - the standing 1.93x within run noise).
+
+## 54 — P2, the utf-8 core (codepoint-first ok)
+
+the codepoint-first amendment, as ruled: "thats for iteration + index",
+len = codepoints, the front door, and the string-scanner rework with
+\u{} escapes.
+
+ok_utf8 (src/okutf8.h, new, header-only): the C99 port of the ok::utf8
+sketch with its FIXME resolved into the contract - decode answers 0 on
+malformed input (validated-region callers may assert), validate is the
+ONLY entry that may see bad bytes, and failure carries the byte offset.
+the check table is the ruled one: overlong C0/C1 + E0 80-9F + F0 80-8F,
+surrogates ED A0-BF, out-of-range F5+ and F4 90+, stray/truncated
+continuations. validate additionally rejects raw NUL, the bidi controls
+(U+202A-202E, U+2066-2069 - the trojan-source hole), and C0 other than
+\t \n \r. count_lossy implements the runtime-string ruling: one U+FFFD
+per malformed byte, never a crash, never a rejection at construction.
+encode backs the \u{} escapes.
+
+the front door: parser_parse validates the whole source before any
+lexing - entry compile, REPL lines, and module loads all funnel through
+it, so nothing else changes. the rejection is a located parse error
+(line + column walked from the offset, the reason as the note). C-string
+sources end at their first NUL by construction, so an embedded NUL
+truncates (standing semantics, unchanged); length-carrying loaders can
+gate the full region later. the lexer never learns unicode exists:
+identifiers accept any well-formed non-ascii codepoint (π, 名字, λ all
+test-pinned).
+
+the str hidden shape: ITER_PREP/GET/LOOP grow the OBJ_STRING arms - a
+utf8 byte cursor against the byte end (immutable, so no map-style
+version check), GET decodes and interns the one-codepoint piece (the
+U+FFFD lane for malformed runtime bytes), LOOP re-decodes and advances.
+s[i] is the i-th codepoint as a fresh string (INDEX_GET/GET_LONG arms;
+INDEX_SET refuses - strings are immutable, concatenation exists). len
+answers codepoints: the count is lossy-cached on the interned header at
+creation (object_string.codepoints, beside the hash - strings are
+immutable, the cache is free), the free spelling and str.len() (the
+class's first method - the sealed-empty 0.5.0 doctrine retired by the
+ruling) both read it. byte length stays string_get_length behind its
+own door until an s.bytes() ever earns its keep.
+
+the string-scanner rework (shared with P3, as the roadmap drew it): the
+scanner learns only that a backslash never terminates (escaped quotes
+and newlines ride through raw); the parser's unescape lane owns the
+meaning - \n \t \r \\ \' \" and \u{1-6 hex digits} (range- and
+surrogate-checked, encoded through ok_utf8_encode). unknown escapes,
+dangling escapes, and bad \u{} shapes are located compile errors - the
+diagnostic doctrine. literals without a backslash stay source slices
+(zero copies); the translated bytes live on the AST node.
+
+the find: `for let i = 0 : len(a)` - a call whose dest sits BELOW other
+locals breaks the call window's contiguity (callable at dest, args at
+dest+1.., but args stage above ALL locals). the numeric for's hidden
+limit/step locals were the natural victim: the limit slot read the
+uninitialized register above it as the argument. pre-existing since the
+register VM, exposed by P2's conformance check (the hidden shape vs the
+manual index walk). the three for slots (start/limit/step) now compile
+through a temp and move; the let initializer never had the shape (its
+local is top-of-locals at init). also: the project_ambiguous fixture's
+vendor/ray directory was never committable as an empty dir and had
+vanished with an old sandbox - restored with a .gitkeep so the M13
+ambiguity check is reachable again.
+
+tests: iterate/index/len/escapes/unicode_id (25 checks across the new
+surface, the conformance pair included), 13 error fixtures (bounds,
+whole-number, immutability, the escape error family, the two-binding
+refusal), 4 binary gate fixtures (0xFF, bidi, C0, overlong - written
+with printf, NUL-free so the runner's grep stays text-mode), and
+oktest_utf8 (16 unit tests, 54 checks: the check table, the offsets,
+the lossy counts, the encode round trips). superseded pins retired:
+maps/errors/iterate_string (strings iterate now - the ruling),
+classes/native_method_error repurposed to a genuinely-unknown method.
+
+applies on modules-staging after 53 (257c189; the commit is c21c7e9).
+gates: 9/9 flavors under -Werror, e2e 530x7, unit 5x3 (54 checks) +
+embed x3, capi 325x5, cli 10/10, delta blue correct at 1.40654e7
+(1.91x/1.86x of wren - flat against the standing 1.93x; the codepoint
+cache is free).

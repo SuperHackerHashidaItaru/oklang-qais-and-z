@@ -1,0 +1,1408 @@
+diff --git a/src/ok.c b/src/ok.c
+index cd88abd..b52b167 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -38,9 +38,15 @@ static ok_value native_len(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
+   if (IS_VALUE_MAP(p_argv[0])) {
+     return NUMBER_AS_VALUE((double)VALUE_AS_MAP(p_argv[0])->entries.count);
+   }
++  if (IS_VALUE_STRING(p_argv[0])) {
++    // the P2 ruling: len answers CODEPOINTS, not bytes - both counts live
++    // cached on the interned header; the byte length keeps its own door
++    const object_string* str = (object_string*)VALUE_AS_OBJECT(p_argv[0]);
++    return NUMBER_AS_VALUE((double)str->codepoints);
++  }
+   ok_native_error(p_ok,
+                   ok_create_string_view(
+-                      "invalid argument: 'len' expects an array or a map.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++                      "invalid argument: 'len' expects an array, a map, or a string.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+   return NULL_AS_VALUE();
+ }
+ 
+@@ -308,6 +314,7 @@ static bool ok_define_builtin_surfaces(ok* p_ok) {
+       {OK_BUILTIN_ARRAY, "remove", OK_NATIVE_ARITY_ANY, native_remove},
+       {OK_BUILTIN_MAP, "len", 1, native_len},
+       {OK_BUILTIN_MAP, "remove", OK_NATIVE_ARITY_ANY, native_remove},
++      {OK_BUILTIN_STR, "len", 1, native_len}, // P2: the codepoint count - str's first method
+       {OK_BUILTIN_MAP, "get", OK_NATIVE_ARITY_ANY, native_get},
+   };
+   bool status = true;
+diff --git a/src/okast.c b/src/okast.c
+index 2db95e2..45f5417 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -362,14 +362,23 @@ string ast_number_expression_asprint(const ast_number_expression* p_number) {
+ 
+ void ast_string_expression_init(ast_string_expression* p_string, token p_token, ast_specs* p_specs) {
+   ast_expression_init(&p_string->expression, AST_STRING_EXPRESSION, p_token, p_specs);
++  p_string->unescaped = NULL;
++  p_string->unescaped_length = 0;
+ }
+ 
+ void ast_string_expression_deinit(ast_string_expression* p_string) {
++  if (p_string->unescaped != NULL) {
++    p_string->expression.node.alloc->release(p_string->expression.node.alloc, p_string->unescaped);
++    p_string->unescaped = NULL;
++  }
+   ast_expression_deinit(&p_string->expression);
+ }
+ 
+ ok_string_view ast_string_expression_get_value(const ast_string_expression* p_string) {
+   const ast_node* node = &p_string->expression.node;
++  if (p_string->unescaped != NULL) {
++    return ok_create_string_view(p_string->unescaped, p_string->unescaped_length, false);
++  }
+   return ok_create_string_view(node->token.start + 1, node->token.length - 2, false);
+ }
+ 
+diff --git a/src/okast.h b/src/okast.h
+index 5486066..2afca2b 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -210,6 +210,11 @@ string ast_number_expression_asprint(const ast_number_expression* p_number);
+ 
+ typedef struct {
+   ast_expression expression;
++  // the P2 string rework: when the literal carries escapes (or \u{}
++  // expansions), the translated bytes live here, arena-allocated, and
++  // get_value serves this buffer; a plain literal stays a source slice.
++  char* unescaped;
++  uint32_t unescaped_length;
+ } ast_string_expression;
+ 
+ void ast_string_expression_init(ast_string_expression* p_string, const token p_token, ast_specs* p_specs);
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 1ac2359..3d9937e 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -5083,12 +5083,27 @@ static bool compile_for_numeric_statement(compiler* p_compiler, ast_for_numeric_
+ 
+   // counter = <start>. the counter stays uninitialized while the start resolves,
+   // so it behaves like a let initializer: `for let i = i : ...` sees the outer i.
++  // the three slots compile through a TEMP first, then move into their
++  // local. a call whose dest sits below other locals breaks the call
++  // window's contiguity (the callable at dest, the args at dest + 1..,
++  // but temps stage above ALL locals) - the P2 find: `for let i = 0 :
++  // len(a)` read the uninitialized slot above the limit as its argument.
++  // the let initializer never sees this (its local is the top of locals at
++  // init time); the numeric for's hidden limit/step locals broke it.
+   {
++    _register temp;
++    if (!register_allocator_allocate_temp(regalloc, &temp)) {
++      report_oom(p_compiler, author);
++      goto fail;
++    }
+     expression_result start;
+-    if (!compile_expression(p_compiler, p_for_numeric->start, counter, 1, &start)) {
++    if (!compile_expression(p_compiler, p_for_numeric->start, temp, 1, &start)) {
+       goto fail;
+     }
+-    if (!materialize_into(p_compiler, &start.value, counter, author)) {
++    if (!materialize_into(p_compiler, &start.value, temp, author)) {
++      goto fail;
++    }
++    if (!materialize_into(p_compiler, &(location){temp.index, LOCATION_KIND_REGISTER, LOCATION_OK}, counter, author)) {
+       goto fail;
+     }
+   }
+@@ -5097,22 +5112,38 @@ static bool compile_for_numeric_statement(compiler* p_compiler, ast_for_numeric_
+ 
+   // limit = <limit expr> (evaluated once, frozen for the whole trip)
+   {
++    _register temp;
++    if (!register_allocator_allocate_temp(regalloc, &temp)) {
++      report_oom(p_compiler, author);
++      goto fail;
++    }
+     expression_result limit_value;
+-    if (!compile_expression(p_compiler, p_for_numeric->limit, limit, 1, &limit_value)) {
++    if (!compile_expression(p_compiler, p_for_numeric->limit, temp, 1, &limit_value)) {
++      goto fail;
++    }
++    if (!materialize_into(p_compiler, &limit_value.value, temp, author)) {
+       goto fail;
+     }
+-    if (!materialize_into(p_compiler, &limit_value.value, limit, author)) {
++    if (!materialize_into(p_compiler, &(location){temp.index, LOCATION_KIND_REGISTER, LOCATION_OK}, limit, author)) {
+       goto fail;
+     }
+   }
+ 
+   // step = <step expr> or the default 1
+   if (p_for_numeric->step != NULL) {
++    _register temp;
++    if (!register_allocator_allocate_temp(regalloc, &temp)) {
++      report_oom(p_compiler, author);
++      goto fail;
++    }
+     expression_result step_value;
+-    if (!compile_expression(p_compiler, p_for_numeric->step, step, 1, &step_value)) {
++    if (!compile_expression(p_compiler, p_for_numeric->step, temp, 1, &step_value)) {
++      goto fail;
++    }
++    if (!materialize_into(p_compiler, &step_value.value, temp, author)) {
+       goto fail;
+     }
+-    if (!materialize_into(p_compiler, &step_value.value, step, author)) {
++    if (!materialize_into(p_compiler, &(location){temp.index, LOCATION_KIND_REGISTER, LOCATION_OK}, step, author)) {
+       goto fail;
+     }
+   } else {
+diff --git a/src/oklexer.c b/src/oklexer.c
+index 12ea17e..4d46e8e 100644
+--- a/src/oklexer.c
++++ b/src/oklexer.c
+@@ -75,6 +75,26 @@ static char peek1(lexer* p_lexer) {
+ 
+ static token string(lexer* p_lexer, char p_start, bool p_multiline) {
+   while (peek(p_lexer) != p_start && !at_end(p_lexer)) {
++    if (peek(p_lexer) == '\\') {
++      // the P2 string rework: an escape never terminates the string. the
++      // raw bytes ride through here; the parser's unescape lane owns the
++      // meaning (and its errors).
++      advance(p_lexer);
++      if (at_end(p_lexer)) {
++        break;
++      }
++      if (peek(p_lexer) == '\n') {
++        if (!p_multiline) {
++          return create_error_token(p_lexer, "unterminated string.");
++        }
++        p_lexer->line_info.line++;
++        advance(p_lexer);
++        p_lexer->line_start = p_lexer->current;
++        continue;
++      }
++      advance(p_lexer);
++      continue;
++    }
+     if (peek(p_lexer) == '\n' && !p_multiline) {
+       token error = create_error_token(p_lexer, "unterminated string.");
+       return error;
+diff --git a/src/okobject.c b/src/okobject.c
+index b8c00a9..477ecb0 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -4,6 +4,7 @@
+ #define OK_GC_EXPOSE
+ #include "okgc.h"
+ #include "okobject.h"
++#include "okutf8.h"
+ #include "okobject_store.h"
+ #include "okutils.h"
+ 
+@@ -151,6 +152,9 @@ static void object_string_init(object_string* p_object_string, const ok_string_v
+   object_init(&p_object_string->object, OBJ_STRING);
+   p_object_string->string = create_string_from_string_view(p_string, p_specs->alloc);
+   p_object_string->hash = default_hash_str(p_string);
++  // the P2 cache: codepoints, counted lossily (runtime strings are never
++  // rejected at construction - one U+FFFD per malformed byte)
++  p_object_string->codepoints = ok_utf8_count_lossy(p_string.chars, (size_t)ok_string_view_get_length(&p_string));
+ }
+ 
+ static void object_string_deinit(object_string* p_object_string, object_specs* p_specs) {
+diff --git a/src/okobject.h b/src/okobject.h
+index 2418108..77f0ffe 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -83,6 +83,10 @@ typedef struct {
+   string string;
+   hash_t hash; // FNV-1a over the bytes, cached at creation. strings are immutable,
+                // so map keys (and any future hashed user) never re-walk the bytes.
++  uint64_t codepoints; // the P2 len ruling: the codepoint count, lossy-cached at
++                       // creation (one U+FFFD per malformed byte for runtime
++                       // strings). len() answers this; the byte length stays
++                       // string_get_length until an s.bytes() ever earns its keep.
+ } object_string;
+ 
+ // the single choke point (D20): EVERY ok string routes through the interner
+diff --git a/src/okparser.c b/src/okparser.c
+index 28c1467..4e12868 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -1,10 +1,12 @@
+ #include <assert.h>
+ #include <stddef.h>
+ #include <stdio.h>
++#include <string.h>
+ #include <stdlib.h>
+ 
+ #include "okparser.h"
+ #include "okutils.h"
++#include "okutf8.h"
+ 
+ static ast_root* parse_root(parser* p_parser);
+ static ast_expression* parse_expression(parser* p_parser, precedence p_precedence);
+@@ -198,6 +200,47 @@ void parser_deinit(parser* p_parser) {
+ }
+ 
+ parse_result parser_parse(parser* p_parser) {
++  // the front door (P2): one whole-source validation before any lexing -
++  // malformed utf-8, raw NUL, the bidi controls (the trojan-source hole),
++  // and stray C0 bytes never reach the lexer. everything funnels through
++  // here: the entry compile, the REPL's lines, every module source load.
++  // (C-string sources end at their first NUL by construction - an
++  // embedded NUL truncates the program, which is today's standing
++  // semantics; length-carrying loaders can gate the full region.)
++  {
++    const char* code = p_parser->source->code;
++    uint32_t bad = 0;
++    ok_utf8_rejection why = OK_UTF8_FINE;
++    if (!ok_utf8_validate(code, strlen(code), &bad, &why)) {
++      // locate the byte: line and column by walking the visible source
++      uint32_t line = 1;
++      uint32_t column = 1;
++      for (uint32_t i = 0; i < bad; ++i) {
++        if (code[i] == '\n') {
++          ++line;
++          column = 1;
++        } else {
++          ++column;
++        }
++      }
++      token where;
++      where.type = TOKEN_ERROR;
++      where.start = code + bad;
++      where.length = 1;
++      where.line_info.offset = bad;
++      where.line_info.line = line;
++      where.line_info.column = column;
++      error_at_noted(p_parser,
++                     where,
++                     ok_create_string_view("the source is not acceptable utf-8.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                     ok_create_string_view(ok_utf8_rejection_text(why), OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      parse_result result;
++      result.alloc = p_parser->alloc;
++      result.status = PARSE_ERROR;
++      result.root = NULL;
++      return result;
++    }
++  }
+   ast_root* root = parse_root(p_parser);
+   parse_result result;
+   result.alloc = p_parser->alloc;
+@@ -443,6 +486,156 @@ ast_expression* parse_identifier(parser* p_parser, token p_trigger) {
+   return (ast_expression*)identifier;
+ }
+ 
++// the P2 unescape lane: translate a string literal's raw slice (between
++// the quotes) into its value bytes. the escape set: \n \t \r \\ \' \"
++// and \u{HEX} (1-6 digits, <= U+10FFFF, no surrogates). anything else
++// after a backslash is a located compile error - unknown escapes never
++// pass silently. returns false with the error already reported.
++static bool unescape_string_literal(parser* p_parser, token p_token, ast_string_expression* p_out) {
++  allocators* alloc = p_parser->alloc;
++  const char* raw = p_token.start + 1;
++  const uint32_t raw_length = p_token.length >= 2 ? p_token.length - 2 : 0;
++  // an escape never grows the literal: \u{XXXXXX} (10 raw bytes) encodes
++  // to at most 4. the raw length is a safe upper bound.
++  char* out = (char*)alloc->allocate(alloc, raw_length + 1u);
++  if (out == NULL) {
++    error_at(p_parser,
++             p_token,
++             ok_create_string_view("failed to allocate memory for string node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return false;
++  }
++  uint32_t written = 0;
++  uint32_t i = 0;
++  bool ok = true;
++  while (i < raw_length) {
++    const char c = raw[i];
++    if (c != '\\') {
++      out[written++] = c;
++      ++i;
++      continue;
++    }
++    ++i; // consume the backslash
++    if (i >= raw_length) {
++      error_at(p_parser,
++               p_token,
++               ok_create_string_view("dangling escape at the string's end.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      ok = false;
++      break;
++    }
++    const char e = raw[i];
++    switch (e) {
++    case 'n':
++      out[written++] = '\n';
++      ++i;
++      break;
++    case 't':
++      out[written++] = '\t';
++      ++i;
++      break;
++    case 'r':
++      out[written++] = '\r';
++      ++i;
++      break;
++    case '\\':
++    case '\'':
++    case '"':
++      out[written++] = e;
++      ++i;
++      break;
++    case 'u': {
++      ++i; // consume the u
++      if (i >= raw_length || raw[i] != '{') {
++        error_at(p_parser,
++                 p_token,
++                 ok_create_string_view("a \\u escape wants braces: \\u{1F600}.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        ok = false;
++      } else {
++        ++i; // consume the {
++        uint64_t value = 0;
++        uint32_t digits = 0;
++        while (i < raw_length && raw[i] != '}') {
++          const char h = raw[i];
++          uint32_t d;
++          if (h >= '0' && h <= '9') {
++            d = (uint32_t)(h - '0');
++          } else if (h >= 'a' && h <= 'f') {
++            d = (uint32_t)(h - 'a') + 10u;
++          } else if (h >= 'A' && h <= 'F') {
++            d = (uint32_t)(h - 'A') + 10u;
++          } else {
++            error_at(p_parser,
++                     p_token,
++                     ok_create_string_view("only hex digits live inside \\u{}.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++            ok = false;
++            break;
++          }
++          value = (value << 4) | d;
++          ++digits;
++          ++i;
++          if (digits > 6) {
++            error_at(p_parser,
++                     p_token,
++                     ok_create_string_view("a \\u{} escape takes at most six hex digits.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++            ok = false;
++            break;
++          }
++        }
++        if (ok && (i >= raw_length || raw[i] != '}')) {
++          error_at(p_parser,
++                   p_token,
++                   ok_create_string_view("a \\u{} escape is missing its closing brace.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++          ok = false;
++        }
++        if (ok) {
++          ++i; // consume the }
++          char encoded[4];
++          const uint8_t len = ok_utf8_encode((uint32_t)value, encoded);
++          if (len == 0) {
++            error_at(p_parser,
++                     p_token,
++                     ok_create_string_view("the \\u{} codepoint is out of range (or a surrogate).",
++                                           OK_STRING_VIEW_CALCULATE_LENGTH,
++                                           true));
++            ok = false;
++          } else {
++            for (uint8_t b = 0; b < len; ++b) {
++              out[written++] = encoded[b];
++            }
++          }
++        }
++      }
++      if (!ok) {
++        break;
++      }
++      break;
++    }
++    default: {
++      char message[48];
++      const int printed = snprintf(message, sizeof(message), "unknown escape '\\%c'.", e);
++      if (printed > 0 && (size_t)printed < sizeof(message)) {
++        error_at(p_parser, p_token, ok_create_string_view(message, (uint32_t)printed, false));
++      } else {
++        error_at(p_parser,
++                 p_token,
++                 ok_create_string_view("unknown escape.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++      }
++      ok = false;
++      break;
++    }
++    }
++    if (!ok) {
++      break;
++    }
++  }
++  if (!ok) {
++    alloc->release(alloc, out);
++    return false;
++  }
++  p_out->unescaped = out;
++  p_out->unescaped_length = written;
++  return true;
++}
++
+ ast_expression* parse_string(parser* p_parser, token p_trigger) {
+   allocators* alloc = p_parser->alloc;
+   ast_string_expression* string = (ast_string_expression*)alloc->allocate(alloc, sizeof(ast_string_expression));
+@@ -455,6 +648,22 @@ ast_expression* parse_string(parser* p_parser, token p_trigger) {
+   }
+   ast_specs s = {alloc};
+   ast_string_expression_init(string, p_trigger, &s);
++  // the P2 rework: a literal with a backslash anywhere in its raw slice
++  // goes through the unescape lane; plain literals stay source slices.
++  {
++    const char* raw = p_trigger.start + 1;
++    const uint32_t raw_length = p_trigger.length >= 2 ? p_trigger.length - 2 : 0;
++    for (uint32_t i = 0; i < raw_length; ++i) {
++      if (raw[i] == '\\') {
++        if (!unescape_string_literal(p_parser, p_trigger, string)) {
++          ast_string_expression_deinit(string);
++          alloc->release(alloc, string);
++          return NULL;
++        }
++        break;
++      }
++    }
++  }
+   return (ast_expression*)string;
+ }
+ 
+diff --git a/src/okutf8.h b/src/okutf8.h
+new file mode 100644
+index 0000000..160669a
+--- /dev/null
++++ b/src/okutf8.h
+@@ -0,0 +1,205 @@
++#ifndef OK_UTF8_H
++#define OK_UTF8_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++// ok_utf8 (P2, the 0.9.0 codepoint-first amendment): the whole utf-8 story
++// in one header - the C99 port of the ok::utf8 design sketch, with the old
++// FIXME resolved into a contract:
++//   - decode answers 0 on malformed input. callers walking VALIDATED
++//     regions (any source that passed the front door) may assert on 0 -
++//     it cannot happen there. runtime strings (fs reads, env, argv) are
++//     NOT validated: the lossy ruling stands, one U+FFFD per malformed
++//     sequence at the codepoint operations, never a crash, never a
++//     rejection at construction.
++//   - validate() is the ONLY entry that may see bad bytes. it rejects:
++//     malformed / overlong (C0, C1, E0 80-9F, F0 80-8F) / surrogate
++//     (ED A0-BF) / out-of-range (F5+, F4 90+) sequences, raw NUL, the
++//     bidi controls (U+202A-202E and U+2066-2069, the trojan-source
++//     hole), and C0 bytes other than \t \n \r.
++//   - failure carries the byte offset; the parser turns it into a
++//     located parse error (the diagnostic doctrine).
++// the lexer never learns unicode exists: the front door guarantees
++// well-formedness, identifiers accept any non-ascii codepoint, and only
++// the three codepoint operations (len, iteration, index) ever decode.
++
++typedef enum {
++  OK_UTF8_FINE = 0,
++  OK_UTF8_MALFORMED, // bad lead byte, bad continuation, overlong, surrogate, past U+10FFFF
++  OK_UTF8_NUL,       // a raw NUL byte in the source
++  OK_UTF8_BIDI,      // a bidirectional text control (trojan source)
++  OK_UTF8_CONTROL,   // a C0 byte other than \t \n \r
++} ok_utf8_rejection;
++
++static inline const char* ok_utf8_rejection_text(ok_utf8_rejection p_why) {
++  switch (p_why) {
++  case OK_UTF8_MALFORMED:
++    return "malformed utf-8";
++  case OK_UTF8_NUL:
++    return "a raw NUL byte";
++  case OK_UTF8_BIDI:
++    return "a bidirectional text control";
++  case OK_UTF8_CONTROL:
++    return "a control byte (only tab, newline, and return are allowed)";
++  default:
++    return "fine";
++  }
++}
++
++// decode one codepoint at p_at with p_remaining bytes left. *p_length
++// takes the sequence length (1 on any malformed input, so callers can
++// advance lossily). returns the codepoint, or 0 on malformed input - 0 is
++// unreachable for valid utf-8, so validated-region callers may assert.
++static inline uint32_t ok_utf8_decode(const char* p_at, size_t p_remaining, uint8_t* p_length) {
++  const uint8_t b0 = (uint8_t)p_at[0];
++  if (b0 < 0x80u) {
++    *p_length = 1;
++    return b0;
++  }
++  uint8_t need = 0;
++  uint32_t cp = 0;
++  uint8_t lo = 0x80u; // the FIRST continuation's legal window
++  uint8_t hi = 0xBFu;
++  if (b0 >= 0xC2u && b0 <= 0xDFu) {
++    need = 1;
++    cp = b0 & 0x1Fu;
++  } else if (b0 == 0xE0u) {
++    need = 2;
++    cp = b0 & 0x0Fu;
++    lo = 0xA0u; // E0 80-9F would be overlong
++  } else if ((b0 >= 0xE1u && b0 <= 0xECu) || (b0 >= 0xEEu && b0 <= 0xEFu)) {
++    need = 2;
++    cp = b0 & 0x0Fu;
++  } else if (b0 == 0xEDu) {
++    need = 2;
++    cp = b0 & 0x0Fu;
++    hi = 0x9Fu; // ED A0-BF would be a surrogate
++  } else if (b0 == 0xF0u) {
++    need = 3;
++    cp = b0 & 0x07u;
++    lo = 0x90u; // F0 80-8F would be overlong
++  } else if (b0 >= 0xF1u && b0 <= 0xF3u) {
++    need = 3;
++    cp = b0 & 0x07u;
++  } else if (b0 == 0xF4u) {
++    need = 3;
++    cp = b0 & 0x07u;
++    hi = 0x8Fu; // F4 90+ would be past U+10FFFF
++  } else {
++    // 0x80-BF (stray continuation), 0xC0/0xC1 (overlong), 0xF5-FF (out of range)
++    *p_length = 1;
++    return 0;
++  }
++  if ((size_t)need + 1u > p_remaining) {
++    *p_length = 1;
++    return 0; // truncated sequence at the source end
++  }
++  const uint8_t b1 = (uint8_t)p_at[1];
++  if (b1 < lo || b1 > hi) {
++    *p_length = 1;
++    return 0;
++  }
++  cp = (cp << 6) | (b1 & 0x3Fu);
++  for (uint8_t i = 2; i <= need; ++i) {
++    const uint8_t bi = (uint8_t)p_at[i];
++    if (bi < 0x80u || bi > 0xBFu) {
++      *p_length = 1;
++      return 0;
++    }
++    cp = (cp << 6) | (bi & 0x3Fu);
++  }
++  *p_length = (uint8_t)(need + 1u);
++  return cp;
++}
++
++// the front door: validate a whole source region. false + the byte offset
++// and the reason of the first rejection.
++static inline bool
++ok_utf8_validate(const char* p_src, size_t p_length, uint32_t* p_offset, ok_utf8_rejection* p_why) {
++  size_t i = 0;
++  while (i < p_length) {
++    const uint8_t b = (uint8_t)p_src[i];
++    if (b == 0x00u) {
++      *p_offset = (uint32_t)i;
++      *p_why = OK_UTF8_NUL;
++      return false;
++    }
++    if (b < 0x20u && b != '\t' && b != '\n' && b != '\r') {
++      *p_offset = (uint32_t)i;
++      *p_why = OK_UTF8_CONTROL;
++      return false;
++    }
++    if (b < 0x80u) {
++      ++i;
++      continue;
++    }
++    uint8_t len = 0;
++    const uint32_t cp = ok_utf8_decode(p_src + i, p_length - i, &len);
++    if (cp == 0) {
++      *p_offset = (uint32_t)i;
++      *p_why = OK_UTF8_MALFORMED;
++      return false;
++    }
++    if ((cp >= 0x202Au && cp <= 0x202Eu) || (cp >= 0x2066u && cp <= 0x2069u)) {
++      *p_offset = (uint32_t)i;
++      *p_why = OK_UTF8_BIDI;
++      return false;
++    }
++    i += len;
++  }
++  return true;
++}
++
++// the lossy count: codepoints in possibly-malformed data - one U+FFFD per
++// malformed byte, so len() and the codepoint cursor never crash and never
++// reject at construction (the runtime-string ruling).
++static inline uint64_t ok_utf8_count_lossy(const char* p_src, size_t p_length) {
++  uint64_t count = 0;
++  size_t i = 0;
++  while (i < p_length) {
++    const uint8_t b = (uint8_t)p_src[i];
++    if (b < 0x80u) {
++      ++count;
++      ++i;
++      continue;
++    }
++    uint8_t len = 0;
++    const uint32_t cp = ok_utf8_decode(p_src + i, p_length - i, &len);
++    ++count;      // the codepoint, or this byte's U+FFFD
++    i += len;     // len is 1 on malformed: one replacement per bad byte
++    (void)cp;
++  }
++  return count;
++}
++
++// encode one codepoint (p_out needs >= 4 bytes of room). returns the
++// written length, 0 if the codepoint is out of range or a surrogate.
++static inline uint8_t ok_utf8_encode(uint32_t p_cp, char* p_out) {
++  if (p_cp > 0x10FFFFu || (p_cp >= 0xD800u && p_cp <= 0xDFFFu)) {
++    return 0;
++  }
++  if (p_cp < 0x80u) {
++    p_out[0] = (char)p_cp;
++    return 1;
++  }
++  if (p_cp < 0x800u) {
++    p_out[0] = (char)(0xC0u | (p_cp >> 6));
++    p_out[1] = (char)(0x80u | (p_cp & 0x3Fu));
++    return 2;
++  }
++  if (p_cp < 0x10000u) {
++    p_out[0] = (char)(0xE0u | (p_cp >> 12));
++    p_out[1] = (char)(0x80u | ((p_cp >> 6) & 0x3Fu));
++    p_out[2] = (char)(0x80u | (p_cp & 0x3Fu));
++    return 3;
++  }
++  p_out[0] = (char)(0xF0u | (p_cp >> 18));
++  p_out[1] = (char)(0x80u | ((p_cp >> 12) & 0x3Fu));
++  p_out[2] = (char)(0x80u | ((p_cp >> 6) & 0x3Fu));
++  p_out[3] = (char)(0x80u | (p_cp & 0x3Fu));
++  return 4;
++}
++
++#endif // OK_UTF8_H
+diff --git a/src/okvm.c b/src/okvm.c
+index 842790b..c721324 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -15,6 +15,7 @@
+ #endif // defined(OK_TRACE_EXECUTION)
+ 
+ #include "okarray.h"
++#include "okutf8.h"
+ #include "okdiag.h"
+ #include "okgc.h"
+ #include "okglobals_store.h"
+@@ -2149,6 +2150,50 @@ static inline interpret_result top_level_return(register_file* p_registers, call
+ }
+ 
+ // array index resolution shared by OP_INDEX_GET / OP_INDEX_SET
++// the P2 string lane: s[i] is the i-th CODEPOINT as a fresh one-codepoint
++// string, never the i-th byte. the walk is lossy over malformed runtime
++// strings (one U+FFFD per bad byte), mirroring len and iteration exactly.
++static bool string_index_get(vm* p_vm, value p_base, value p_index, value* p_out) {
++  const object_string* str = (object_string*)VALUE_AS_OBJECT(p_base);
++  double wanted = 0.0;
++  if (IS_VALUE_NUMBER(p_index)) {
++    wanted = VALUE_AS_NUMBER(p_index);
++    if (!(wanted >= MIN_SAFE_INTEGER && wanted <= MAX_SAFE_INTEGER) || wanted != (double)(int64_t)wanted) {
++      runtime_error(p_vm, OK_EK_INDEX, "string index must be a whole number, got %g.", wanted);
++      return false;
++    }
++  } else if (IS_VALUE_INT(p_index)) {
++    wanted = (double)VALUE_AS_INT(p_index);
++  } else {
++    runtime_error(p_vm, OK_EK_INDEX, "string index must be a whole number.");
++    return false;
++  }
++  if (wanted < 0.0 || (uint64_t)wanted >= str->codepoints) {
++    runtime_error(p_vm, OK_EK_INDEX, "index out of bounds: %g (len %llu).", wanted, (unsigned long long)str->codepoints);
++    return false;
++  }
++  const char* chars = str->string.chars;
++  const size_t bytes = (size_t)string_get_length(&str->string);
++  size_t byte_offset = 0;
++  for (uint64_t k = 0; k < (uint64_t)wanted; ++k) {
++    uint8_t len = 1;
++    (void)ok_utf8_decode(chars + byte_offset, bytes - byte_offset, &len);
++    byte_offset += len;
++  }
++  uint8_t len = 1;
++  (void)ok_utf8_decode(chars + byte_offset, bytes - byte_offset, &len);
++  object_specs s = {p_vm->alloc, p_vm->objects_store};
++  object_string* piece = create_object_string(ok_create_string_view(chars + byte_offset, len, false), &s);
++  if (piece == NULL) {
++    runtime_oom(p_vm, "out of memory: failed to allocate the codepoint string.");
++    return false;
++  }
++  gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(piece));
++  *p_out = OBJECT_AS_VALUE(piece);
++  gc_guard_down(p_vm->alloc->gc);
++  return true;
++}
++
+ static bool resolve_array_index(vm* p_vm, value p_index, uint32_t p_count, uint32_t* p_out) {
+   if (IS_VALUE_NUMBER(p_index)) {
+     const double d = VALUE_AS_NUMBER(p_index);
+@@ -4507,6 +4552,15 @@ static void* ok_dispatch_table[OP__COUNT] = {
+           DISPATCH();
+         }
+       }
++      if (value_is_object_type(base, OBJ_STRING)) {
++        // P2: s[i] is the i-th codepoint, a fresh one-codepoint string
++        value read;
++        if (!string_index_get(p_vm, base, key, &read)) {
++          FAIL_PATH();
++        }
++        REG_AT(a) = read;
++        DISPATCH();
++      }
+       const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+       if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
+@@ -4542,6 +4596,14 @@ static void* ok_dispatch_table[OP__COUNT] = {
+           DISPATCH();
+         }
+       }
++      if (value_is_object_type(base, OBJ_STRING)) {
++        value read;
++        if (!string_index_get(p_vm, base, key, &read)) {
++          FAIL_PATH();
++        }
++        REG_AT(A) = read;
++        DISPATCH();
++      }
+       const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+       if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
+@@ -4579,6 +4641,12 @@ static void* ok_dispatch_table[OP__COUNT] = {
+           DISPATCH();
+         }
+       }
++      if (value_is_object_type(base, OBJ_STRING)) {
++        // P2: strings are immutable - reading is codepoint-shaped, writing
++        // refuses outright (build a new string; concatenation exists)
++        runtime_error(p_vm, OK_EK_TYPE, "strings are immutable: cannot assign to an index.");
++        FAIL_PATH();
++      }
+       const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+       if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
+@@ -4614,6 +4682,10 @@ static void* ok_dispatch_table[OP__COUNT] = {
+           DISPATCH();
+         }
+       }
++      if (value_is_object_type(base, OBJ_STRING)) {
++        runtime_error(p_vm, OK_EK_TYPE, "strings are immutable: cannot assign to an index.");
++        FAIL_PATH();
++      }
+       const object_array* arr = resolve_array_base(p_vm, base);
+       uint32_t index = 0;
+       if (arr == NULL || !resolve_array_index(p_vm, key, arr->values.count, &index)) {
+@@ -4698,6 +4770,22 @@ static void* ok_dispatch_table[OP__COUNT] = {
+         }
+         DISPATCH();
+       }
++      if (value_is_object_type(iterable, OBJ_STRING)) {
++        if (p) {
++          runtime_error(p_vm, OK_EK_TYPE, "string iteration binds one loop variable.");
++          FAIL_PATH();
++        }
++        // the str shape (P2): a utf8 byte cursor against the byte end.
++        // strings are immutable, so no map-style version check - the body
++        // cannot move the bytes under the cursor.
++        const uint64_t bytes = string_get_length(&((object_string*)VALUE_AS_OBJECT(iterable))->string);
++        REG_AT(B + 1) = NUMBER_AS_VALUE(0);
++        REG_AT(B + 2) = NUMBER_AS_VALUE((double)bytes);
++        if (bytes == 0) {
++          ip += A;
++        }
++        DISPATCH();
++      }
+       if (value_is_object_type(iterable, OBJ_MAP)) {
+         // snapshot the version for the back edge's size-change check, then
+         // park the cursor on the first occupied slot.
+@@ -4724,6 +4812,33 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       const value iterable = REG_AT(B);
+       // cursor: written only by PREP/LOOP as a plain number, read raw
+       const uint32_t cursor = (uint32_t)VALUE_AS_NUMBER(REG_AT(B + 1));
++      if (value_is_object_type(iterable, OBJ_STRING)) {
++        // the P2 str shape: decode the codepoint at the byte cursor. a
++        // malformed byte (runtime strings are lossy, never rejected)
++        // yields the U+FFFD replacement and advances one byte - the same
++        // rule len counts by.
++        const object_string* str = (object_string*)VALUE_AS_OBJECT(iterable);
++        const char* chars = str->string.chars;
++        const size_t bytes = (size_t)string_get_length(&str->string);
++        uint8_t len = 1;
++        const uint32_t cp = ok_utf8_decode(chars + cursor, bytes - cursor, &len);
++        object_specs s = {p_vm->alloc, p_vm->objects_store};
++        object_string* piece;
++        if (cp == 0) {
++          static const char fffd[3] = {(char)0xEF, (char)0xBF, (char)0xBD};
++          piece = create_object_string(ok_create_string_view(fffd, 3, false), &s);
++        } else {
++          piece = create_object_string(ok_create_string_view(chars + cursor, len, false), &s);
++        }
++        if (piece == NULL) {
++          runtime_oom(p_vm, "out of memory: failed to allocate the codepoint string.");
++          FAIL_PATH();
++        }
++        gc_guard_up(p_vm->alloc->gc, OBJECT_AS_VALUE(piece));
++        REG_AT(C) = OBJECT_AS_VALUE(piece);
++        gc_guard_down(p_vm->alloc->gc);
++        DISPATCH();
++      }
+       if (value_is_object_type(iterable, OBJ_ARRAY)) {
+         REG_AT(C) = VALUE_AS_ARRAY(iterable)->values.data[cursor];
+       } else {
+@@ -4741,6 +4856,24 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       const uint16_t A = A_of(words); // backward offset to the body top
+       const uint16_t B = B_of(words); // state base
+       const value iterable = REG_AT(B);
++      if (value_is_object_type(iterable, OBJ_STRING)) {
++        // advance the byte cursor past the codepoint GET just served
++        // (re-decoded here: the decode is a handful of byte compares, and
++        // keeping the register protocol identical to the array shape -
++        // cursor written by PREP/LOOP only - is worth the second look)
++        const object_string* str = (object_string*)VALUE_AS_OBJECT(iterable);
++        const char* chars = str->string.chars;
++        const size_t bytes = (size_t)string_get_length(&str->string);
++        uint32_t cursor = (uint32_t)VALUE_AS_NUMBER(REG_AT(B + 1));
++        uint8_t len = 1;
++        (void)ok_utf8_decode(chars + cursor, bytes - cursor, &len);
++        cursor += len;
++        REG_AT(B + 1) = NUMBER_AS_VALUE((double)cursor);
++        if ((double)cursor < VALUE_AS_NUMBER(REG_AT(B + 2))) {
++          ip -= A;
++        }
++        DISPATCH();
++      }
+       if (value_is_object_type(iterable, OBJ_ARRAY)) {
+         // the frozen end makes pushes during the body invisible to this trip
+         // (lua-style): the loop runs to the entry-time element count.
+diff --git a/tests/e2e/tests/classes/native_method_error.ok b/tests/e2e/tests/classes/native_method_error.ok
+index 09162a2..e242519 100644
+--- a/tests/e2e/tests/classes/native_method_error.ok
++++ b/tests/e2e/tests/classes/native_method_error.ok
+@@ -1,3 +1,4 @@
+-// str carries no methods in v0.5.0 (nothing existed as a str function
+-// builtin to mirror, and the ruling is no new stdlib)
+-print("abc".len()); // expect error: class 'str' has no method 'len'
++// str carried no methods through 0.8.0; P2's len ruling made it str's
++// first. the unknown-method error lane stays pinned - on a name that
++// genuinely does not exist.
++print("abc".bogus()); // expect error: has no method
+diff --git a/tests/e2e/tests/maps/errors/iterate_string.ok b/tests/e2e/tests/maps/errors/iterate_string.ok
+deleted file mode 100644
+index 88ddcea..0000000
+--- a/tests/e2e/tests/maps/errors/iterate_string.ok
++++ /dev/null
+@@ -1,3 +0,0 @@
+-for let k : "abc" {
+-  print k;
+-} // expect error
+diff --git a/tests/e2e/tests/modules/project_ambiguous/vendor/ray/.gitkeep b/tests/e2e/tests/modules/project_ambiguous/vendor/ray/.gitkeep
+new file mode 100644
+index 0000000..de07c79
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_ambiguous/vendor/ray/.gitkeep
+@@ -0,0 +1,2 @@
++// the dep side of the M13 ambiguity fixture: a directory that resolves
++// (so the dep walk survives) but is not itself a project
+diff --git a/tests/e2e/tests/strings/errors/gate_bidi.ok b/tests/e2e/tests/strings/errors/gate_bidi.ok
+new file mode 100644
+index 0000000..4b01ec7
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/gate_bidi.ok
+@@ -0,0 +1,3 @@
++// a bidi control inside a string: the trojan-source hole, closed at the front door
++// expect error: not acceptable utf-8
++print "a‮b";
+diff --git a/tests/e2e/tests/strings/errors/gate_control.ok b/tests/e2e/tests/strings/errors/gate_control.ok
+new file mode 100644
+index 0000000..cdf0450
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/gate_control.ok
+@@ -0,0 +1,3 @@
++// a raw C0 control byte (only tab, newline, return are allowed)
++// expect error: not acceptable utf-8
++print "ab";
+diff --git a/tests/e2e/tests/strings/errors/gate_malformed.ok b/tests/e2e/tests/strings/errors/gate_malformed.ok
+new file mode 100644
+index 0000000..3f5581a
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/gate_malformed.ok
+@@ -0,0 +1,3 @@
++// expect error: not acceptable utf-8
++print "before";
++�
+diff --git a/tests/e2e/tests/strings/errors/gate_overlong.ok b/tests/e2e/tests/strings/errors/gate_overlong.ok
+new file mode 100644
+index 0000000..099b11c
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/gate_overlong.ok
+@@ -0,0 +1,3 @@
++// an overlong encoding (C0 80) is malformed, not a creative spelling of NUL
++// expect error: not acceptable utf-8
++print "a��b";
+diff --git a/tests/e2e/tests/strings/errors/immutable_set.ok b/tests/e2e/tests/strings/errors/immutable_set.ok
+new file mode 100644
+index 0000000..930aa25
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/immutable_set.ok
+@@ -0,0 +1,4 @@
++// strings are immutable: the write side refuses outright
++let mut s = "ab";
++s[0] = "x";
++// expect error: strings are immutable
+diff --git a/tests/e2e/tests/strings/errors/index_fraction.ok b/tests/e2e/tests/strings/errors/index_fraction.ok
+new file mode 100644
+index 0000000..cf3edf0
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/index_fraction.ok
+@@ -0,0 +1,3 @@
++let s = "ab";
++print s[1.5];
++// expect error: string index must be a whole number
+diff --git a/tests/e2e/tests/strings/errors/index_negative.ok b/tests/e2e/tests/strings/errors/index_negative.ok
+new file mode 100644
+index 0000000..83a0a6a
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/index_negative.ok
+@@ -0,0 +1,3 @@
++let s = "ab";
++print s[-1];
++// expect error: index out of bounds: -1 (len 2)
+diff --git a/tests/e2e/tests/strings/errors/index_not_num.ok b/tests/e2e/tests/strings/errors/index_not_num.ok
+new file mode 100644
+index 0000000..1b95c94
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/index_not_num.ok
+@@ -0,0 +1,3 @@
++let s = "ab";
++print s["x"];
++// expect error: string index must be a whole number
+diff --git a/tests/e2e/tests/strings/errors/index_oob.ok b/tests/e2e/tests/strings/errors/index_oob.ok
+new file mode 100644
+index 0000000..11e265f
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/index_oob.ok
+@@ -0,0 +1,4 @@
++// s[i] past the codepoint count refuses like the array lane
++let s = "ab";
++print s[5];
++// expect error: index out of bounds: 5 (len 2)
+diff --git a/tests/e2e/tests/strings/errors/iter_two_bindings.ok b/tests/e2e/tests/strings/errors/iter_two_bindings.ok
+new file mode 100644
+index 0000000..c72a860
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/iter_two_bindings.ok
+@@ -0,0 +1,5 @@
++// the str shape binds one variable, like the array shape
++for let k, v : "ab" {
++  print k;
++}
++// expect error: string iteration binds one loop variable
+diff --git a/tests/e2e/tests/strings/errors/u_bad_hex.ok b/tests/e2e/tests/strings/errors/u_bad_hex.ok
+new file mode 100644
+index 0000000..ab56d30
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/u_bad_hex.ok
+@@ -0,0 +1,2 @@
++print "\u{4G}";
++// expect error: only hex digits
+diff --git a/tests/e2e/tests/strings/errors/u_missing_brace.ok b/tests/e2e/tests/strings/errors/u_missing_brace.ok
+new file mode 100644
+index 0000000..1930eff
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/u_missing_brace.ok
+@@ -0,0 +1,2 @@
++print "\u{41";
++// expect error: missing its closing brace
+diff --git a/tests/e2e/tests/strings/errors/u_no_braces.ok b/tests/e2e/tests/strings/errors/u_no_braces.ok
+new file mode 100644
+index 0000000..e5b2126
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/u_no_braces.ok
+@@ -0,0 +1,2 @@
++print "\u41";
++// expect error: wants braces
+diff --git a/tests/e2e/tests/strings/errors/u_range.ok b/tests/e2e/tests/strings/errors/u_range.ok
+new file mode 100644
+index 0000000..8d84ab1
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/u_range.ok
+@@ -0,0 +1,2 @@
++print "\u{110000}";
++// expect error: out of range
+diff --git a/tests/e2e/tests/strings/errors/u_surrogate.ok b/tests/e2e/tests/strings/errors/u_surrogate.ok
+new file mode 100644
+index 0000000..f923cc7
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/u_surrogate.ok
+@@ -0,0 +1,2 @@
++print "\u{D800}";
++// expect error: out of range
+diff --git a/tests/e2e/tests/strings/errors/unknown_escape.ok b/tests/e2e/tests/strings/errors/unknown_escape.ok
+new file mode 100644
+index 0000000..e07cbb6
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/unknown_escape.ok
+@@ -0,0 +1,2 @@
++print "a\qb";
++// expect error: unknown escape
+diff --git a/tests/e2e/tests/strings/escapes.ok b/tests/e2e/tests/strings/escapes.ok
+new file mode 100644
+index 0000000..2ea8d04
+--- /dev/null
++++ b/tests/e2e/tests/strings/escapes.ok
+@@ -0,0 +1,18 @@
++// the P2 string-scanner rework: escapes translate at the parser's unescape
++// lane; the scanner itself only learns that a backslash never terminates.
++print "a\tb";
++// expect: a	b
++print "line1\nline2";
++// expect: line1
++// expect: line2
++print "back\\slash"; // expect: back\slash
++print "quote\"inside"; // expect: quote"inside
++print 'single\'quote'; // expect: single'quote
++// the \r escape rides the comparison lane (a raw \r would not split the
++// expect line, so equality proves the byte)
++print "a\rb" == "a\u{D}b"; // expect: true
++// \u{} escapes: the codepoint's utf-8 encoding, inlined
++print "\u{41}"; // expect: A
++print "\u{E9}" == "é"; // expect: true
++print len("\u{1F600}"); // expect: 1
++print "\u{1F600}" == "😀"; // expect: true
+diff --git a/tests/e2e/tests/strings/index.ok b/tests/e2e/tests/strings/index.ok
+new file mode 100644
+index 0000000..7224fa8
+--- /dev/null
++++ b/tests/e2e/tests/strings/index.ok
+@@ -0,0 +1,26 @@
++// the P2 index ruling: s[i] is the i-th CODEPOINT, a fresh one-codepoint
++// string - never the i-th byte. the s[s.len()-1] trap dies.
++let s = "héllo";
++print s[0]; // expect: h
++print s[1]; // expect: é
++print s[4]; // expect: o
++print len(s); // expect: 5
++print s.len(); // expect: 5
++
++// the last-codepoint idiom that used to be a byte trap
++let t = "noël";
++print t[t.len() - 1]; // expect: l
++print t[2]; // expect: ë
++
++// astral codepoints index as one
++let e = "😀";
++print e[0] == "😀"; // expect: true
++print len(e); // expect: 1
++
++// built-at-runtime strings ride the same lane
++let mut built = "";
++built += "é";
++built += "x";
++print built[0]; // expect: é
++print built[1]; // expect: x
++print len(built); // expect: 2
+diff --git a/tests/e2e/tests/strings/iterate.ok b/tests/e2e/tests/strings/iterate.ok
+new file mode 100644
+index 0000000..ab39e76
+--- /dev/null
++++ b/tests/e2e/tests/strings/iterate.ok
+@@ -0,0 +1,55 @@
++// the P2 codepoint amendment: `for c in s` walks CODEPOINTS through the
++// str hidden shape (a utf8 byte cursor, one decode per step)
++let s = "héllo";
++let mut count = 0;
++for let c : s {
++  count += 1;
++}
++print count; // expect: 5
++
++// each c is a fresh one-codepoint string
++let mut second = "";
++let mut i = 0;
++for let c : "héllo" {
++  if i == 1 {
++    second = c;
++  }
++  i += 1;
++}
++print second; // expect: é
++print len(second); // expect: 1
++
++// ascii strings ride the same shape
++let mut built = "";
++for let c : "abc" {
++  built += c;
++}
++print built; // expect: abc
++
++// empty string: zero trips
++let mut trips = 0;
++for let c : "" {
++  trips += 1;
++}
++print trips; // expect: 0
++
++// 4-byte codepoints are one trip each
++let mut emoji = 0;
++for let c : "a😀b" {
++  emoji += 1;
++}
++print emoji; // expect: 3
++
++// conformance: the hidden shape and the manual index walk agree - the
++// contract the roadmap ruled ("observationally identical")
++let u = "αβγδ";
++let mut by_shape = "";
++for let c : u {
++  by_shape += c;
++}
++let mut by_index = "";
++for let k = 0 : len(u) {
++  by_index += u[k];
++}
++print by_shape == by_index; // expect: true
++print by_index; // expect: αβγδ
+diff --git a/tests/e2e/tests/strings/len.ok b/tests/e2e/tests/strings/len.ok
+new file mode 100644
+index 0000000..cf33ab3
+--- /dev/null
++++ b/tests/e2e/tests/strings/len.ok
+@@ -0,0 +1,19 @@
++// the P2 len ruling: codepoints, not bytes. both counts live on the
++// interned header; len answers the codepoint one.
++print len("héllo"); // expect: 5
++print len(""); // expect: 0
++print len("abc"); // expect: 3
++print len("αβγδ"); // expect: 4
++print len("😀"); // expect: 1
++print len("a😀b"); // expect: 3
++// the method spelling agrees with the free one
++print "héllo".len(); // expect: 5
++// runtime-built strings cache the same way
++let mut s = "x";
++s += "é";
++s += "😀";
++print len(s); // expect: 3
++print s.len(); // expect: 3
++// len keeps its array and map lanes untouched
++print len([1, 2, 3]); // expect: 3
++print len({1: 2, 3: 4}); // expect: 2
+diff --git a/tests/e2e/tests/strings/unicode_id.ok b/tests/e2e/tests/strings/unicode_id.ok
+new file mode 100644
+index 0000000..e83d5d6
+--- /dev/null
++++ b/tests/e2e/tests/strings/unicode_id.ok
+@@ -0,0 +1,13 @@
++// the reverse-check lexer + the front door: identifiers accept any
++// well-formed non-ascii codepoint. the lexer never learns unicode exists.
++let π = 3.14159;
++print π > 3.14; // expect: true
++let 名字 = "oklang";
++print 名字; // expect: oklang
++print len(名字); // expect: 6
++fu λ(x) {
++  return x * 2;
++}
++print λ(21); // expect: 42
++let Greek_αβγ = "letters";
++print Greek_αβγ == "letters"; // expect: true
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 25c4080..54c70d1 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -2,6 +2,7 @@ set(tests
+   test_array
+   test_map
+   test_nan
++  test_utf8
+ )
+ 
+ set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
+diff --git a/tests/unit/src/oktest_utf8.c b/tests/unit/src/oktest_utf8.c
+new file mode 100644
+index 0000000..6b24740
+--- /dev/null
++++ b/tests/unit/src/oktest_utf8.c
+@@ -0,0 +1,184 @@
++#include <unity.h>
++
++// the P2 utf-8 core, exercised directly: decode's check table (the exact
++// rejection classes the roadmap ruled), validate's front-door rules,
++// count_lossy's replacement discipline, and encode's round trip.
++
++#include <okutf8.h>
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++void setUp() {
++}
++
++void tearDown() {
++}
++
++void test_decode_ascii() {
++  uint8_t len = 0;
++  TEST_ASSERT_EQUAL_UINT32('a', ok_utf8_decode("a", 1, &len));
++  TEST_ASSERT_EQUAL_UINT8(1, len);
++}
++
++void test_decode_multibyte() {
++  uint8_t len = 0;
++  // é = C3 A9
++  TEST_ASSERT_EQUAL_UINT32(0xE9u, ok_utf8_decode("\xC3\xA9", 2, &len));
++  TEST_ASSERT_EQUAL_UINT8(2, len);
++  // α = CE B1
++  TEST_ASSERT_EQUAL_UINT32(0x3B1u, ok_utf8_decode("\xCE\xB1", 2, &len));
++  TEST_ASSERT_EQUAL_UINT8(2, len);
++  // U+1F600 = F0 9F 98 80
++  TEST_ASSERT_EQUAL_UINT32(0x1F600u, ok_utf8_decode("\xF0\x9F\x98\x80", 4, &len));
++  TEST_ASSERT_EQUAL_UINT8(4, len);
++}
++
++void test_decode_rejects_stray_continuation() {
++  uint8_t len = 99;
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\x80", 1, &len));
++  TEST_ASSERT_EQUAL_UINT8(1, len); // lossy advance: one byte
++}
++
++void test_decode_rejects_overlong() {
++  uint8_t len = 0;
++  // C0 80: two-byte encoding of NUL
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\xC0\x80", 2, &len));
++  // C1 BF: overlong two-byte
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\xC1\xBF", 2, &len));
++  // E0 9F 80: overlong three-byte
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\xE0\x9F\x80", 3, &len));
++  // F0 8F BF BF: overlong four-byte
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\xF0\x8F\xBF\xBF", 4, &len));
++}
++
++void test_decode_rejects_surrogates() {
++  uint8_t len = 0;
++  // ED A0 80 = U+D800, a surrogate
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\xED\xA0\x80", 3, &len));
++  // ED BF BF = U+DFFF, the other edge
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\xED\xBF\xBF", 3, &len));
++  // but ED 9F BF = U+D7FF is legal
++  TEST_ASSERT_EQUAL_UINT32(0xD7FFu, ok_utf8_decode("\xED\x9F\xBF", 3, &len));
++}
++
++void test_decode_rejects_past_range() {
++  uint8_t len = 0;
++  // F4 90 80 80 = U+110000, one past the ceiling
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\xF4\x90\x80\x80", 4, &len));
++  // F5..FF are not lead bytes at all
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\xF5\x80\x80\x80", 4, &len));
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\xFF", 1, &len));
++  // F4 8F BF BF = U+10FFFF, the last legal codepoint
++  TEST_ASSERT_EQUAL_UINT32(0x10FFFFu, ok_utf8_decode("\xF4\x8F\xBF\xBF", 4, &len));
++}
++
++void test_decode_rejects_bad_continuation() {
++  uint8_t len = 0;
++  // C3 41: a two-byte lead followed by 'A'
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\xC3\x41", 2, &len));
++  // truncated at the region end
++  TEST_ASSERT_EQUAL_UINT32(0, ok_utf8_decode("\xC3", 1, &len));
++}
++
++void test_validate_accepts_plain_source() {
++  uint32_t off = 999;
++  ok_utf8_rejection why = OK_UTF8_FINE;
++  TEST_ASSERT_TRUE(ok_utf8_validate("let x = 1;\n", 11, &off, &why));
++  TEST_ASSERT_EQUAL_UINT32(OK_UTF8_FINE, why);
++}
++
++void test_validate_accepts_tab_newline_return() {
++  uint32_t off = 999;
++  ok_utf8_rejection why = OK_UTF8_FINE;
++  TEST_ASSERT_TRUE(ok_utf8_validate("a\tb\nc\rd", 6, &off, &why));
++}
++
++void test_validate_rejects_other_c0() {
++  uint32_t off = 999;
++  ok_utf8_rejection why = OK_UTF8_FINE;
++  TEST_ASSERT_FALSE(ok_utf8_validate("a\x01b", 3, &off, &why));
++  TEST_ASSERT_EQUAL_UINT32(OK_UTF8_CONTROL, why);
++  TEST_ASSERT_EQUAL_UINT32(1, off);
++}
++
++void test_validate_rejects_bidi() {
++  uint32_t off = 999;
++  ok_utf8_rejection why = OK_UTF8_FINE;
++  // U+202E (RIGHT-TO-LEFT OVERRIDE) = E2 80 AE - the trojan-source trick
++  TEST_ASSERT_FALSE(ok_utf8_validate("a" "\xE2\x80\xAE" "b", 5, &off, &why));
++  TEST_ASSERT_EQUAL_UINT32(OK_UTF8_BIDI, why);
++  TEST_ASSERT_EQUAL_UINT32(1, off);
++  // U+2066 (LRI) = E2 81 A6
++  TEST_ASSERT_FALSE(ok_utf8_validate("x" "\xE2\x81\xA6" "y", 5, &off, &why));
++  TEST_ASSERT_EQUAL_UINT32(OK_UTF8_BIDI, why);
++}
++
++void test_validate_rejects_malformed_with_offset() {
++  uint32_t off = 999;
++  ok_utf8_rejection why = OK_UTF8_FINE;
++  TEST_ASSERT_FALSE(ok_utf8_validate("print \"ok\";\n\xFF", 13, &off, &why));
++  TEST_ASSERT_EQUAL_UINT32(OK_UTF8_MALFORMED, why);
++  TEST_ASSERT_EQUAL_UINT32(12, off);
++}
++
++void test_validate_rejects_nul_for_length_carrying_callers() {
++  uint32_t off = 999;
++  ok_utf8_rejection why = OK_UTF8_FINE;
++  TEST_ASSERT_FALSE(ok_utf8_validate("a\0b", 3, &off, &why));
++  TEST_ASSERT_EQUAL_UINT32(OK_UTF8_NUL, why);
++  TEST_ASSERT_EQUAL_UINT32(1, off);
++}
++
++void test_count_lossy_counts_replacements() {
++  // 2 codepoints + 2 malformed bytes = 4, one U+FFFD per bad byte
++  TEST_ASSERT_TRUE(ok_utf8_count_lossy("a" "\xFF\xFE" "b", 4) == 4);
++  TEST_ASSERT_TRUE(ok_utf8_count_lossy("", 0) == 0);
++  TEST_ASSERT_TRUE(ok_utf8_count_lossy("h\xC3\xA9llo", 6) == 5);
++  TEST_ASSERT_TRUE(ok_utf8_count_lossy("\xF0\x9F\x98\x80", 4) == 1);
++}
++
++void test_encode_round_trips() {
++  char buf[4];
++  TEST_ASSERT_EQUAL_UINT8(1, ok_utf8_encode('A', buf));
++  {
++    uint8_t len = 0;
++    TEST_ASSERT_EQUAL_UINT32('A', ok_utf8_decode(buf, 1, &len));
++  }
++  TEST_ASSERT_EQUAL_UINT8(2, ok_utf8_encode(0xE9u, buf));
++  TEST_ASSERT_EQUAL_UINT8(3, ok_utf8_encode(0x202Fu, buf));
++  TEST_ASSERT_EQUAL_UINT8(4, ok_utf8_encode(0x1F600u, buf));
++  // the full decode(encode(cp)) round trip
++  uint8_t len = 0;
++  TEST_ASSERT_EQUAL_UINT32(0x1F600u, ok_utf8_decode(buf, 4, &len));
++  TEST_ASSERT_EQUAL_UINT8(4, len);
++}
++
++void test_encode_rejects_bad_codepoints() {
++  char buf[4];
++  TEST_ASSERT_EQUAL_UINT8(0, ok_utf8_encode(0x110000u, buf));
++  TEST_ASSERT_EQUAL_UINT8(0, ok_utf8_encode(0xD800u, buf));
++  TEST_ASSERT_EQUAL_UINT8(0, ok_utf8_encode(0xDFFFu, buf));
++}
++
++int main() {
++  UNITY_BEGIN();
++  RUN_TEST(test_decode_ascii);
++  RUN_TEST(test_decode_multibyte);
++  RUN_TEST(test_decode_rejects_stray_continuation);
++  RUN_TEST(test_decode_rejects_overlong);
++  RUN_TEST(test_decode_rejects_surrogates);
++  RUN_TEST(test_decode_rejects_past_range);
++  RUN_TEST(test_decode_rejects_bad_continuation);
++  RUN_TEST(test_validate_accepts_plain_source);
++  RUN_TEST(test_validate_accepts_tab_newline_return);
++  RUN_TEST(test_validate_rejects_other_c0);
++  RUN_TEST(test_validate_rejects_bidi);
++  RUN_TEST(test_validate_rejects_malformed_with_offset);
++  RUN_TEST(test_validate_rejects_nul_for_length_carrying_callers);
++  RUN_TEST(test_count_lossy_counts_replacements);
++  RUN_TEST(test_encode_round_trips);
++  RUN_TEST(test_encode_rejects_bad_codepoints);
++  return UNITY_END();
++}

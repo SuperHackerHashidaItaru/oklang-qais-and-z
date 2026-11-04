@@ -457,3 +457,9 @@ next stop: P1 (patch 53), the honesty warmup.
 [session 42: P1 DELIVERED as patch 53 - the stamp, ok create, OK_ROOT,
 the -Werror gate + the 530-warning sweep, the CLI test lane. gates:
 e2e 510x7, capi 325x5, cli 10/10, delta blue flat. P2 is next.]
+
+[session 42, later: P2 DELIVERED as patch 54 - ok_utf8 + the front door,
+codepoint-first iteration/index, len = codepoints cached on the interned
+header, the string-scanner rework + \u{} escapes, and the for-slot
+call-window fix the conformance check exposed. gates: e2e 530x7, unit
+54-check oktest_utf8, capi 325x5, delta blue flat. P3 next.]
