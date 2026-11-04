@@ -867,3 +867,119 @@ applies on modules-staging after 47. gates: e2e 488/488 x7 (plain,
 threaded, asan, aggressive, asan+aggr, threaded-asan,
 threaded-asan-aggr; 5 new native fixtures), unit x3, embed x3, capi
 201 x5, delta blue flat (1.40654e7 in 0.62s).
+
+## 49 — native class fields (the access half of the state question)
+
+Q's state question, scoped: per-instance STATE on C-defined classes
+needed the access lane, not a new storage plane. ok.h grows
+ok_class_add_field + ok_value_get/set_field; the data plane is the
+vm's own field slots, gc-traced by the ordinary walk, no getter
+round-trips through C storage. the C lane is trusted (the ring is
+script doctrine), mut is honored, module namespaces refuse writes.
+the native_state fixture is the proof: a Counter with payload + step
+fields, driven and subclassed from script.
+
+[reconstructed entry - the session's sandbox died before its README
+line was written; the lane receipts bracket it: 488x7 at 48, 501x7 at
+50.] applies on modules-staging after 48.
+
+## 50 — OR-4: project.ok + the build pipeline
+
+project.ok is strictly ok (M10): a plain module evaluated in a fresh
+instance with the full stdlib and NO natives, exporting one pub table
+- name, version, ok, modules (import roots), deps (path deps only,
+M11: no registry, git clone IS the dependency manager), natives (dir,
+build command, artifact; whatever toolchain, M12). discovery walks UP
+from the ENTRY FILE (never cwd - the last implicit working-dir
+dependence dies there) to the nearest project.ok; that root governs.
+the resolution ladder, natives first-class at every rung (M6):
+relative, std (never the path walk), the governing project's roots,
+its native targets (built if stale and allowed), its deps by name
+(recursing into dep projects), OKPATH last. the 404 teaches: the full
+trace of every location and form tried. ok build [--clean|--force]
+runs the declared commands and stamps .okbuild/<target>.stamp;
+auto-build-on-import asks consent the first time (--yes/--no-build,
+the tty prompt); a bare script NEVER builds anything. ok where
+"mathx" prints the resolution trace without running. the manifest
+harvest rides public machinery end to end: ok_module_evaluate (the
+standalone lane), ok_map_pair_at (the keyed-table read the harvest
+needed), the governing project matched by deepest-root prefix against
+the installed graph. the fixture farm: 14 dirs, every failure mode
+covered (missing deps fail eagerly, dep/native name collisions name
+both (M13), cycles name their chain, restricted mode refuses with the
+capability error, where404 teaches).
+
+applies on modules-staging after 49. gates: the lane at 501x7 (488 ->
+501 with the fixture farm), the rest of the matrix green, delta blue
+flat.
+
+## 51 — pub members: fields join the ring
+
+Q's ruling: "yes this what i mean member publicity in scripts (in a
+way that does not comprimise the current design)". methods carried
+pub since Citadel; fields were the gap, and the workaround was
+getters - "so we dont have to make getters and setters and lose perf
+there". pub let / pub let mut / pub static let now compose on
+class-body fields exactly like pub fu: readable outside the defining
+hierarchy (and writable with mut), module boundaries included, a slot
+load on both sides of the module line. private stays the default; the
+ring is unchanged; pub let x without mut reads from anywhere and
+writes nowhere (the mut error, not a visibility error).
+
+the mechanics: the pub flag rides the instruction word's spare R bit
+(64-bit word2 had exactly one free bit after OP/P/A/B/C/Q/CMP),
+carried by OP_DEFINE_FIELD and OP_DEFINE_STATIC_FIELD, decoded into
+field_entry.pub, consulted by the five vm access lanes before the ring
+check. the C lane grows ok_class_add_field_ex (ok.h + the vtable's
+appended tail - the one abi 3 addition); the old entry stays as the
+private default. the module namespaces declare their exports pub
+explicitly (doctrine made honest).
+
+two en-route fixes, both caught by the gates, both reproducing on the
+patch-50 head: the stamp learns the abi (.okbuild stamps record the
+host's native abi line next to the build command - the 2 -> 3 bump
+left a green stamp over a stale .so; an ok upgrade now invalidates
+native artifacts), and the mount guard (api->module_export guards the
+value across the staging append - the window between "the C callback
+holds the class" and "the marked mount array holds it" was always
+collectable; the fn-staging loop always had this guard, the
+mount-callback lane did not).
+
+fixtures: pub_fields, pub_statics (+ both immutable-error pins), the
+cross-module pubmembers pair, native_pubfield (a C class with pub x/y
+from script), and the capi section (an Open class driven from C, 39
+checks).
+
+applies on modules-staging after 50 (fcecbaa). gates: e2e 510x7, unit
+x3, embed x3, capi 324x5, delta blue correct at 1.40654e7. verified
+apply-clean in sequence with 52 on the patch-50 head in a scratch
+worktree.
+
+## 52 — the ABI goes semver-shaped (the compat window)
+
+Q's ask: "since we are approaching v1, that means any bump to the
+number in the abi requires a full major update right? this is bad, we
+have to make it compatible, like versioning in semver combat way so we
+dont get forced to v2 when we just want to incrementally add something
+right?" - and the append-only discipline kept since OR-3 had already
+paid for it. OK_ABI_MAJOR.OK_ABI_MINOR, packed
+((major << 16) | minor). major breaks: reshuffled vtable, changed
+signature, moved field, renumbered tag - the rebuild message. minor is
+additive only: appended vtable entries, appended descriptor tails; the
+loader takes any module with the same major and a minor <= the host's,
+a newer minor refuses with the upgrade message, minor 0 is a zeroed
+descriptor, a rebuild. the encoding keeps history intact: abi 1/2/3
+decode as (0, n) and load. v1.0.0 freezes (1, 0) and the compat window
+opens for real: every 1.x ok runs every 1.y module with y <= x, and no
+addition ever forces a v2. both directions hold: a module compares
+p_api->abi against OK_NATIVE_ABI exactly as before, or decodes the
+pair for a softer stance.
+
+the proof runs on every gate: abiminor_old is a fixture module that
+hardcodes .abi = 2 (frozen in the patch-49 era) - it loads and runs
+unchanged on the (0, 3) host. badmajor declares (1, 0) and takes the
+rebuild message; badabi's 99 is now the newer-than-host lane.
+
+applies on modules-staging after 51. gates: the pair landed together -
+e2e 510x7, capi 324x5, unit + embed green, delta blue correct at
+1.40654e7.

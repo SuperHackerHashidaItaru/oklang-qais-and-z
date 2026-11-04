@@ -52,17 +52,20 @@ source of truth: `https://codeberg.org/qais/oklang`, master at `9ad153c`,
 **tagged v0.1.0**. the `register` branch is history — deletion pending Q's
 confidence, don't touch it.
 
-current phase [perishable — refresh at round end] (oct 31):
-post-v0.1.0. Q ruled: website postponed until post-1.0 (full minimal web
-framework, own repo, THEN sites — no duct tape). focus = the language.
-the plan to 1.0.0 lives in `docs/drafts/ROADMAP-v1.md` (awaiting his
-accept): 0.2.0 maps → 0.3.0 spans (MR+varargs) → 0.4.0 errors → 0.5.0
-classes+types → 0.6.0 coros → 0.7.0 modules → 0.8.0 utf8+std → 0.9.0
-hardening+tooling → 1.0.0 freeze. first feature drafted:
-`docs/drafts/MAPS.md`. Q owes: gh release objects (v0.1.0 + v0.0.5
-backfill), tree-sitter repo tag, the CI account move (token comes with
-it). collab repo cleaned this session (18): patches archived, workflow
-disabled pending the account move.
+current phase [perishable — refresh at round end] (nov 4, session 41):
+the climb through 0.8.0 is complete on the lanes (modules-staging at
+973bcd0, patches 43-52, e2e 510x7, capi 324x5; the whole review map is
+`docs/drafts/GUIDE-0.4.0-to-0.8.0.md`). master still sits at v0.4.0 ON
+PURPOSE: the ruled release plan (ROADMAP-0.9.0-draft) runs the 0.9.0
+wave (Reconciliation, P1-P7) to v1.0-rc, then the review + amend pass,
+then releases v0.5.0 → v1.0.0 as their own cuts — the git mechanics
+are `docs/drafts/RELEASE-RUNBOOK.md`. all six survivors RULED (round
+two): len = codepoints, Reconciliation, property tests post-v1, no
+perf target ("the best version of itself"), GC incremental in v1 /
+generational post-v1, the std door + sys.args/name/err + math.idiv.
+${} is the interpolation delimiter. next: P1 (patch 53). tree-sitter
+still owes the grammar catch-up (Q's flank). the bench workflow is
+live (automated runs pin oklang 0666651, a lane ref).
 
 ## first 60 seconds of every round
 

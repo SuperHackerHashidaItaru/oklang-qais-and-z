@@ -412,3 +412,38 @@ its module membership, the global namespace stays the host's). same
 ruling, same patch: the read side's ok_cstring_view chars are
 NUL-terminated vm strings (every object string's storage carries its
 terminator), strlen is the native-side length.
+
+## D24 — member publicity: fields join the ring [LOCKED 2026-11-04, patch 51]
+Q's ruling: "yes this what i mean member publicity in scripts (in a
+way that does not comprimise the current design)". pub let / pub let
+mut / pub static let compose on class-body fields exactly like pub fu:
+readable outside the defining hierarchy (writable with mut), module
+boundaries included, a slot load on both sides of the module line.
+private stays the default; the ring is unchanged; pub without mut
+reads from anywhere and writes nowhere (the mut error, not a
+visibility error). the flag rides the instruction word's spare R bit
+into field_entry.pub, consulted by the five vm access lanes before the
+ring check; the C lane grew ok_class_add_field_ex (the one abi 3
+addition). module namespaces declare their exports pub explicitly.
+(D-number assigned at fold time, session 41 - the delivering sessions'
+sandbox was lost with their records; the rulings survive verbatim in
+the guide's section 5.1.)
+
+## D25 — the ABI compat window [LOCKED 2026-11-04, patch 52, amends D23]
+Q's ask: "since we are approaching v1, that means any bump to the
+number in the abi requires a full major update right? this is bad..."
+the amendment to D23's single-integer stance: OK_ABI_MAJOR.MINOR,
+packed ((major << 16) | minor). major = the break family (reshuffled
+vtable, changed signature, moved field, renumbered tag) and means the
+rebuild message. minor is additive only (appended vtable entries,
+appended descriptor tails); the loader takes any module with the same
+major and a minor <= the host's, a newer minor refuses with the
+upgrade message, minor 0 is a zeroed descriptor (a rebuild). the
+encoding keeps history intact: abi 1/2/3 decode as (0, n) and load,
+so every module ever built still loads. v1.0.0 freezes (1, 0) and the
+window opens for real: every 1.x ok runs every 1.y module with y <= x,
+and no addition ever forces a v2. both directions hold: a module
+compares p_api->abi exactly as before, or decodes the pair for the
+softer stance. (D-number assigned at fold time, session 41, same
+sandbox-loss note as D24; the ruling survives verbatim in the guide's
+section 5.2.)

@@ -7,8 +7,9 @@ sometimes resets with it. it is the durable memory: round logs, decisions,
 specs, drafts, and the recovery protocol for when local state goes boom.
 
 **this repo contains no oklang source code.** the language lives at
-`https://codeberg.org/qais/oklang` (master, tagged **v0.1.0** = the
-embedding API: roots, traced natives, arrays, print hook). the first game
+`https://codeberg.org/qais/oklang` (master at v0.4.0 "Eyrie"; the climb
+since — 0.5.0 Citadel through 0.8.0 O Resolution — lives on the stacked
+staging lanes, pending the ruled release plan). the first game
 lives at `github.com/QaisAlsaid/dorg3`. this repo is only the
 process/documentation/drafting layer that makes the collaboration survive
 round boundaries.
@@ -25,6 +26,16 @@ round boundaries.
 - **`docs/drafts/ROADMAP-v1.md` — the 0.1.0 → 1.0.0 plan (DRAFT, awaiting
   Q's accept).** the compass doc: phases, standing lanes, versioning +
   naming policy, the 1.0 checklist, open rulings register.
+- **`docs/drafts/GUIDE-0.4.0-to-0.8.0.md` — the whole-climb review map**
+  (the four lanes + the two follow-ups, every claim verified at
+  973bcd0; the era table is the version ledger).
+- **`docs/drafts/ROADMAP-0.9.0-draft.md` — the last pre-v1 wave**
+  ("Reconciliation"): round two folded, all six survivors RULED, the
+  P1-P7 patch series.
+- **`docs/drafts/RELEASE-RUNBOOK.md` — the review & release mechanics**
+  for v0.5.0 → v1.0.0: fixups at the tip while reviewing, ONE
+  autosquash + --update-refs cascade, tags born after, releases
+  oldest-first.
 - `docs/drafts/MAPS.md` — the 0.2.0 first-feature draft (read with the
   roadmap). `docs/drafts/WEBSITE-PLATFORM.md` — the parked post-1.0 web
   platform conversation. `docs/drafts/DECISIONS-DELTA.md` — oct26 rulings
@@ -36,8 +47,10 @@ round boundaries.
   maps-v2 (core algorithm, appendix to MAPS.md), pipeline-isolation
   (0.7.0 modules), debugger-v0.
 - `patches/` — **staging area only**: deliverables awaiting Q's review.
-  empty right now (everything through 16 is applied). applied patches and
-  their review guides live in `archive/patches/` + `archive/review-guides/`.
+  17-52 = the climb (maps era through O Resolution plus the two
+  follow-ups); 17-48 applied by Q on the codeberg lanes, 49-52 delivered
+  with the guide's receipts. applied patches and their review guides
+  live in `archive/patches/` + `archive/review-guides/`.
 - `bench/` — the benchmark suite, results, combine tooling. feeds the
   benches workflow when it comes back online.
 - `tools/dorg3-harness/` — the no-raylib dorg3 integration harness.
@@ -46,12 +59,11 @@ round boundaries.
 
 ## repo status notes
 
-- `.github/workflows/benches.yml.disabled` — the bench workflow is parked:
-  this repo is private and GH gives private repos no free runners. Q plans
-  an account move; when that happens (Q supplies the token), rename back
-  to `benches.yml` and do the first manual dispatch — it closes the
-  v0.0.5-era results staleness and re-baselines outputs after the `%g`
-  change.
+- `.github/workflows/benches.yml` — the bench workflow is live again
+  (the account move happened): weekly monday run + manual dispatch,
+  `oklang_ref` picks the oklang ref to build. master is stale at v0.4.0
+  until the release plan lands, so dispatches pin lane refs (the
+  automated runs currently sit at oklang 0666651).
 - the oklang repo itself stays **minimal** — no website, no site tooling,
   ever. the future web framework gets its own repo post-1.0 (Q's ruling,
   session 17).

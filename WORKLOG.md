@@ -2102,3 +2102,151 @@ still flagged (yield keyword joins the grammar list).
   pdf, master -> present, Q's ask: "a full guide structured from master
   -> where we at now, once the whole feature is complete"). delta blue
   stays the 0.9.0 meter.
+
+## session 39 (2026-11-03, reconstructed): the field trio (49) + OR-4 lands (50)
+
+[reconstruction note: this session's sandbox died before its worklog
+entry was written. the entry is rebuilt from the delivered artifacts
+(patches 49 and 50, the guide's sections 4.4 and 10) and the round
+summaries. every number below is the artifact's own record, nothing
+was re-verified in a fresh sandbox.]
+
+- patch 49, the field trio scoped to its asked half: per-instance STATE
+  on C-defined classes needed the access lane, not a new storage plane.
+  ok.h grows ok_class_add_field + ok_value_get/set_field; the data
+  plane is the vm's own field slots (gc-traced by the ordinary walk, no
+  getter round-trips through C storage). the C lane is trusted (the
+  ring is script doctrine), mut is honored, module namespaces refuse
+  writes. the native_state fixture is the proof: a Counter with payload
+  + step fields, driven and subclassed from script.
+- patch 50, OR-4: project.ok is strictly ok (M10) - a plain module
+  evaluated in a fresh instance with the full stdlib and NO natives,
+  exporting one pub table (name, version, ok, modules, deps, natives;
+  path deps only, declared build commands, whatever toolchain).
+  discovery walks UP from the ENTRY FILE (the last implicit
+  working-dir dependence dies there); the ladder: relative, std (never
+  the path walk), the governing project's roots, its native targets
+  (built if stale and allowed), its deps by name (recursing), OKPATH
+  last - natives first-class at every rung (M6), the 404 teaches the
+  full trace of every location and form tried. ok build [--clean|
+  --force] runs the declared commands and stamps .okbuild; auto-build
+  on import asks consent the first time (--yes / --no-build, the tty
+  prompt); a bare script never builds anything. ok where prints the
+  resolution trace without running. the harvest rides public machinery
+  end to end: ok_module_evaluate (the standalone lane), ok_map_pair_at
+  (the keyed-table read), the governing project matched by
+  deepest-root prefix. the fixture farm: 14 dirs covering every failure
+  mode (eager dep failures, name collisions naming both, cycle chains,
+  restricted mode, where404).
+- receipts (the guide's record): the lane reached e2e 501x7 at patch
+  50's landing (488 at 48), delta blue flat throughout.
+- delivered: patches/49-native-class-fields.patch,
+  patches/50-or4-project-ok-and-build-pipeline.patch, README entries,
+  MODULES.md's OR-4 LANDED marker, this entry (reconstructed).
+- next: the two doors Q's landing reviews opened - members went pub
+  without getters, and the ABI needed to grow without breaking.
+
+## session 40 (2026-11-04, reconstructed): pub members (51) + the semver ABI (52) + the full guide + the 0.9.0 draft
+
+[reconstruction note: same sandbox loss as session 39. rebuilt from the
+delivered artifacts (patches 51/52, GUIDE-0.4.0-to-0.8.0.md, the
+ROADMAP-0.9.0-draft) and the round summaries.]
+
+- patch 51, pub members: fields join the ring. Q's ruling: "yes this
+  what i mean member publicity in scripts (in a way that does not
+  comprimise the current design)". pub let / pub let mut / pub static
+  let compose on class-body fields exactly like pub fu: readable
+  outside the defining hierarchy (writable with mut), module lines
+  included, a slot load on both sides. private stays the default; the
+  ring is unchanged; pub without mut reads from anywhere and writes
+  nowhere (the mut error, not a visibility error). the flag rides the
+  instruction word's spare R bit (OP_DEFINE_FIELD /
+  OP_DEFINE_STATIC_FIELD decode it into field_entry.pub, consulted by
+  the five vm access lanes before the ring check). the C lane grows
+  ok_class_add_field_ex (the one abi 3 addition); module namespaces
+  declare their exports pub explicitly. two en-route fixes the gates
+  caught: the stamp learns the abi (the 2 -> 3 bump sat green over a
+  stale .so), and the mount guard (api->module_export roots the value
+  across the staging append - the aggressive lane caught the reuse
+  window).
+- patch 52, the ABI goes semver-shaped (amending D23's single-integer
+  stance): OK_ABI_MAJOR.MINOR. major = the break family, the rebuild
+  message; minor = additive only; the loader takes same-major with
+  minor <= the host's, a newer minor refuses with the upgrade message,
+  minor 0 is a zeroed descriptor. the encoding keeps history intact:
+  abi 1/2/3 decode as (0, n) and load. v1.0.0 freezes (1, 0) and the
+  compat window opens for real: every 1.x ok runs every 1.y module with
+  y <= x, no addition ever forces a v2. the fossil fixture
+  (abiminor_old, .abi = 2) loads unchanged on the (0, 3) host, every
+  gate run.
+- the full guide (Q's ask: "a full guide structured from master ->
+  where we at now, once the whole feature is complete"):
+  GUIDE-0.4.0-to-0.8.0.md (+ pdf), the four lanes and the two
+  follow-ups, every claim verified against the tree at 973bcd0; e2e
+  510x7, capi 324x5, both patches verified apply-clean in sequence on
+  the patch-50 head (fcecbaa) in a scratch worktree. the guide's era
+  table is the version ledger: 0.5.0 Citadel, 0.6.0 coros, 0.7.0
+  Epigone, 0.8.0 O Resolution.
+- the ROADMAP-0.9.0-draft, round one: Q's framing recorded ("we
+  literally have nothing left, only minor stuff... one version, maybe
+  a session or 2"), the release plan RULED (finish v1.0-rc on the
+  lanes, review and amend, then release the debt v0.5 -> v1 as their
+  own releases), the workstreams (utf8 codepoint-first, the std kills,
+  the cli growing up, parser hardening + fuzz, optimization with delta
+  blue as the meter, the c99/host audit), the P1-P7 series, and six
+  survivors collected for Q.
+- delivered: patches/51-pub-members-fields-join-the-ring.patch,
+  patches/52-abi-semver-the-compat-window.patch, the guide (md + pdf),
+  the roadmap draft, this entry (reconstructed).
+- next: Q's rulings on the six survivors.
+
+## session 41 (2026-11-04): the rulings round + the release runbook + the collab catch-up
+
+- context: Q's message closed all six survivors from the roadmap
+  draft's round one, proposed ${} for interpolation, asked for a clean
+  git review guide ("since i got a bit confused"), and handed a fresh
+  PAT because the collab repo had not seen a push since session 38 -
+  the two sandbox losses ate the clones AND the worklog entries for
+  39/40. this session recovered both (the entries, reconstructed from
+  the artifacts and marked as such) and pushed the whole debt.
+- the rulings, folded (ROADMAP-0.9.0-draft round two): len =
+  codepoints, byte access later via methods ("language surface should
+  stay coherent with itself"); the codename is Reconciliation ("it is
+  a perfect fit"); property tests post-v1, not urgent; NO hard perf
+  target ("we just try to make it the best version of itself" - the
+  bench suite is the compass, never a scoreboard); GC incremental in
+  v1 if time helps, generational post-v1 (P7 stays the attempt slot,
+  measurement the judge); the std door final - the drafted set plus
+  sys.args() (argv after the program name), sys.name() (the process
+  name), sys.err (a stderr line write; placement is Z's default, it
+  moves to std.io if that door ever grows), and math.idiv (trunc
+  toward zero, error on zero divisor, the // slot is comments
+  forever). round two also corrected round one's era table: 0.5.0 is
+  Citadel (per the guide), 0.7.0 Epigone, 0.8.0 O Resolution.
+- ${} RULED as the interpolation delimiter (Q's proposal, Z endorsed):
+  $ is unclaimed by the language, braces go back to being literal
+  (JSON needs no escaping inside f-strings), \${ is the literal, a
+  dollar not followed by { is just a dollar, plain "" never
+  interpolates. P3's {{ }} design amended in the draft.
+- the review & release runbook (Q's ask, the clean git guide):
+  RELEASE-RUNBOOK.md + the pdf courtesy copy, in docs/drafts/. the
+  ruled plan made mechanical: pin rel/ branches per era, review with
+  three-dot diffs and the guide as the map, fixups committed at the
+  tip while the era is hot, ONE autosquash + --update-refs cascade,
+  the replay receipt (the tip diff must come back empty), master
+  fast-forwarded (it never moved - the property that makes the whole
+  plan safe), tags born after the rewrite, releases oldest-first on
+  codeberg, the archive tag keeping the pre-rewrite SHAs fetchable for
+  the bench run-infos, and the discipline that keeps the cascade
+  cheap: cascade fixes, never redesigns.
+- the collab catch-up push (the debt since session 38): patches 49-52
+  with their README entries (49's marked reconstructed), the guide,
+  the roadmap draft (round two folded), the runbook, DECISIONS D24
+  (member publicity) + D25 (the ABI compat window, amends D23 - both
+  D-numbers assigned at fold time, noted inside), the reconstructed
+  worklog entries, Z-GUIDE's perishable section refreshed to the
+  0.9.0-wave state, README map updated (the climb's status, the new
+  drafts, the live bench workflow).
+- next: P1 (patch 53), the honesty warmup - the version stamp, ok
+  --version / ok -v, ok create, OK_ROOT in the harnesses, the c99
+  -Werror gate, the warning sweep.

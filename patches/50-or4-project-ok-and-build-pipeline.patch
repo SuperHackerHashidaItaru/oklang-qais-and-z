@@ -1,0 +1,2755 @@
+diff --git a/cli/CMakeLists.txt b/cli/CMakeLists.txt
+index 304f51a..66c5c70 100644
+--- a/cli/CMakeLists.txt
++++ b/cli/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ add_executable(ok_cli
+   src/main.c
++  src/project.c
+ )
+ 
+ target_link_libraries(ok_cli
+diff --git a/cli/src/main.c b/cli/src/main.c
+index 739ca8b..26b8602 100644
+--- a/cli/src/main.c
++++ b/cli/src/main.c
+@@ -1,12 +1,16 @@
++#define _POSIX_C_SOURCE 200809L // the CLI is the posix-ish default host (dlopen lane, build commands)
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #include "ok/ok.h"
+ #include "ok/ok_module.h"
+ 
++#include "project.h"
++
+ static void repl(ok* p_ok);
+ static void run_file(ok* p_ok, const char* p_path);
+ static char* read_file(const char* p_path);
+@@ -59,6 +63,8 @@ static bool parse_caps(const char* p_list, uint32_t* p_out) {
+ static void usage(void) {
+   fprintf(stderr,
+           "usage: ok [run] [flags] [path]\n"
++          "       ok build [--clean|--force]     run the project's native build commands\n"
++          "       ok where <import> [path]       print where an import resolves from\n"
+           "       ok\n"
+           "flags:\n"
+           "  --dump                   compile and disassemble only\n"
+@@ -66,14 +72,112 @@ static void usage(void) {
+           "  --restrict               drop native load, native build, and host caps\n"
+           "  --sandbox=locked         drop every capability (pure compute)\n"
+           "  --deny=<list>            drop caps (native, build, host, all)\n"
+-          "  --allow=<list>           narrow a previous deny (parse time only)\n");
++          "  --allow=<list>           narrow a previous deny (parse time only)\n"
++          "  --yes                    grant build consent (no prompts)\n"
++          "  --no-build               refuse every build, auto or explicit\n"
++          "  --where <import>         resolve <import> from the entry, print, exit\n");
++}
++
++// ---------------------------------------------------------------- the project verbs (OR-4)
++
++// `ok build [--clean|--force]`: the project above the cwd, its whole graph's
++// native targets, explicit consent (the command itself).
++static int cmd_build(int argc, char** argv) {
++  bool clean = false;
++  bool force = false;
++  for (int i = 0; i < argc; ++i) {
++    if (strcmp(argv[i], "--clean") == 0) {
++      clean = true;
++    } else if (strcmp(argv[i], "--force") == 0) {
++      force = true;
++    } else if (strcmp(argv[i], "--yes") == 0) {
++      // accepted for symmetry: ok build's consent is the command itself
++    } else {
++      usage();
++      return 64;
++    }
++  }
++  bool failed = false;
++  cli_graph* graph = cli_graph_discover(".", true, false, &failed);
++  if (failed) {
++    return 70;
++  }
++  if (graph == NULL) {
++    fprintf(stderr, "no project.ok found above the current directory.\n");
++    return 1;
++  }
++  const int code = cli_build_all(graph, force, clean);
++  cli_graph_free(graph);
++  return code;
++}
++
++// `ok where <import> [path]`: the same resolution a script at path (or the
++// cwd) would use, printed, exit 0/1.
++static int cmd_where(int argc, char** argv) {
++  if (argc < 1 || argc > 2) {
++    usage();
++    return 64;
++  }
++  const char* import = argv[0];
++  char* origin = NULL;
++  if (argc == 2) {
++    const char* slash = strrchr(argv[1], '/');
++    if (slash == NULL) {
++      origin = strdup(".");
++    } else {
++      origin = strndup(argv[1], (size_t)(slash - argv[1]));
++    }
++  } else {
++    origin = getcwd(NULL, 0);
++  }
++  if (origin == NULL) {
++    return 70;
++  }
++
++  ok_specs specs;
++  memset(&specs, 0, sizeof(specs));
++  ok* okay = ok_create(specs);
++  if (okay == NULL) {
++    free(origin);
++    return 70;
++  }
++  bool failed = false;
++  cli_graph* graph = cli_graph_discover(argc == 2 ? argv[1] : ".", true, false, &failed);
++  if (failed) {
++    ok_free(okay);
++    free(origin);
++    return 70;
++  }
++  if (graph != NULL) {
++    cli_graph_install(okay, graph);
++  }
++  const char* canonical = NULL;
++  const bool found = ok_module_where(okay, import, origin, &canonical);
++  if (found) {
++    printf("%s\n", canonical);
++  }
++  cli_graph_free(graph);
++  ok_free(okay);
++  free(origin);
++  return found ? 0 : 1;
+ }
+ 
+ int main(int argc, char** argv) {
++  // the OR-4 verbs
++  if (argc > 1 && strcmp(argv[1], "build") == 0) {
++    return cmd_build(argc - 2, argv + 2);
++  }
++  if (argc > 1 && strcmp(argv[1], "where") == 0) {
++    return cmd_where(argc - 2, argv + 2);
++  }
++
+   ok_specs specs = {0};
+   const char* natives[16];
+   uint32_t natives_count = 0;
+   bool dump = false;
++  bool yes = false;
++  bool no_build = false;
++  const char* where = NULL;
+   const char* path = NULL;
+   bool bad = false;
+ 
+@@ -111,6 +215,16 @@ int main(int argc, char** argv) {
+       // parse-time only: narrowing a deny before the instance exists. the
+       // ratchet itself is untouched (nothing grants after ok_create).
+       specs.caps_dropped &= ~caps;
++    } else if (strcmp(arg, "--yes") == 0) {
++      yes = true;
++    } else if (strcmp(arg, "--no-build") == 0) {
++      no_build = true;
++    } else if (strcmp(arg, "--where") == 0) {
++      if (i + 1 >= argc || where != NULL) {
++        bad = true;
++        break;
++      }
++      where = argv[++i];
+     } else if (arg[0] == '-' && arg[1] != '\0') {
+       bad = true;
+       break;
+@@ -126,11 +240,34 @@ int main(int argc, char** argv) {
+     usage();
+     return 64;
+   }
++  if (where != NULL && path == NULL) {
++    usage(); // --where needs the entry it resolves from
++    return 64;
++  }
+ 
+   ok* ok = ok_create(specs);
+   if (dump) {
+     ok_debug_dump_bytecode(ok, true, true);
+   }
++
++  // OR-4: the project graph, discovered from the ENTRY file's directory
++  // (never cwd, the last implicit working-dir dependence died here). the
++  // REPL discovers from the cwd instead: it has no entry file. the graph
++  // lives in main's frame for the whole run: the instance borrows its
++  // views, and run_file's error exits keep the frame alive with it.
++  cli_graph* graph = NULL;
++  {
++    bool failed = false;
++    graph = cli_graph_discover(path != NULL ? path : ".", yes, no_build, &failed);
++    if (failed) {
++      ok_free(ok);
++      return 70;
++    }
++    if (graph != NULL) {
++      cli_graph_install(ok, graph);
++    }
++  }
++
+   // force-loads happen before the run: scripts import the modules by their
+   // declared names, the registry answers.
+   for (uint32_t n = 0; n < natives_count; ++n) {
+@@ -139,6 +276,30 @@ int main(int argc, char** argv) {
+       return 70;
+     }
+   }
++
++  // --where: the resolution question, asked of the same graph, then exit.
++  // nothing loads and nothing runs (the where lane probes through reads).
++  if (where != NULL) {
++    const char* canonical = NULL;
++    char* dir = NULL;
++    const char* slash = strrchr(path, '/');
++    if (slash == NULL) {
++      dir = strdup(".");
++    } else {
++      dir = strndup(path, (size_t)(slash - path));
++    }
++    bool found = false;
++    if (dir != NULL) {
++      found = ok_module_where(ok, where, dir, &canonical);
++      if (found) {
++        printf("%s\n", canonical);
++      }
++      free(dir);
++    }
++    ok_free(ok);
++    return found ? 0 : 1;
++  }
++
+   if (path == NULL && natives_count == 0) {
+     repl(ok);
+   } else if (path != NULL) {
+@@ -146,9 +307,11 @@ int main(int argc, char** argv) {
+   } else {
+     usage();
+     ok_free(ok);
++    cli_graph_free(graph);
+     return 64;
+   }
+   ok_free(ok);
++  cli_graph_free(graph);
+ }
+ 
+ void repl(ok* p_ok) {
+diff --git a/cli/src/project.c b/cli/src/project.c
+new file mode 100644
+index 0000000..e520fc1
+--- /dev/null
++++ b/cli/src/project.c
+@@ -0,0 +1,852 @@
++#define _XOPEN_SOURCE 700 // the CLI is the posix-ish default host (stamps, realpath, popen)
++// OR-4 "O Resolution" - the CLI's project machinery. see project.h.
++
++#include "project.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++// ---------------------------------------------------------------- small plumbing
++
++static char* dup_str(const char* p_text) {
++  const size_t n = strlen(p_text);
++  char* copy = (char*)malloc(n + 1);
++  if (copy != NULL) {
++    memcpy(copy, p_text, n + 1);
++  }
++  return copy;
++}
++
++static char* dup_view(const ok_cstring_view* p_view) {
++  const size_t n = p_view->chars != NULL ? strlen(p_view->chars) : 0;
++  char* copy = (char*)malloc(n + 1);
++  if (copy != NULL) {
++    if (n > 0) {
++      memcpy(copy, p_view->chars, n);
++    }
++    copy[n] = '\0';
++  }
++  return copy;
++}
++
++static char* join_path(const char* p_dir, const char* p_rel) {
++  if (p_rel[0] == '/') {
++    return dup_str(p_rel);
++  }
++  const size_t a = strlen(p_dir);
++  const size_t b = strlen(p_rel);
++  char* out = (char*)malloc(a + b + 2);
++  if (out == NULL) {
++    return NULL;
++  }
++  memcpy(out, p_dir, a);
++  out[a] = '/';
++  memcpy(out + a + 1, p_rel, b + 1);
++  return out;
++}
++
++// the directory part of a path (a copy): "a/b/c.ok" -> "a/b", "x.ok" -> "."
++static char* dir_name(const char* p_path) {
++  const char* slash = strrchr(p_path, '/');
++  if (slash == NULL) {
++    return dup_str(".");
++  }
++  if (slash == p_path) {
++    return dup_str("/");
++  }
++  const size_t n = (size_t)(slash - p_path);
++  char* out = (char*)malloc(n + 1);
++  if (out != NULL) {
++    memcpy(out, p_path, n);
++    out[n] = '\0';
++  }
++  return out;
++}
++
++// absolute-if-possible: realpath when the path exists, the plain join
++// otherwise (an unbuilt artifact's tail does not exist yet, and the
++// library canonicalizes again at load). frees the input either way.
++static char* canonical_or_free(char* p_path) {
++  char* resolved = realpath(p_path, NULL);
++  if (resolved != NULL) {
++    free(p_path);
++    return resolved;
++  }
++  return p_path;
++}
++
++static bool file_readable(const char* p_path) {
++  FILE* file = fopen(p_path, "rb");
++  if (file == NULL) {
++    return false;
++  }
++  fclose(file);
++  return true;
++}
++
++static bool is_directory(const char* p_path) {
++  struct stat info;
++  return stat(p_path, &info) == 0 && S_ISDIR(info.st_mode);
++}
++
++static char* read_file_or_null(const char* p_path) {
++  FILE* file = fopen(p_path, "rb");
++  if (file == NULL) {
++    return NULL;
++  }
++  fseek(file, 0L, SEEK_END);
++  const long size = ftell(file);
++  rewind(file);
++  if (size < 0) {
++    fclose(file);
++    return NULL;
++  }
++  char* buffer = (char*)malloc((size_t)size + 1);
++  if (buffer == NULL) {
++    fclose(file);
++    return NULL;
++  }
++  const size_t read = fread(buffer, 1, (size_t)size, file);
++  fclose(file);
++  buffer[read] = '\0';
++  return buffer;
++}
++
++// ---------------------------------------------------------------- discovery
++
++// walk up from p_dir looking for project.ok. NULL = none up there.
++static char* find_project_root(const char* p_dir) {
++  char* current = canonical_or_free(dup_str(p_dir));
++  if (current == NULL) {
++    return NULL;
++  }
++  for (;;) {
++    char* manifest = join_path(current, "project.ok");
++    if (manifest == NULL) {
++      free(current);
++      return NULL;
++    }
++    const bool found = file_readable(manifest);
++    free(manifest);
++    if (found) {
++      return current;
++    }
++    // up one (stop at the filesystem root: "/" has no parent)
++    const size_t length = strlen(current);
++    if (length == 1 && current[0] == '/') {
++      free(current);
++      return NULL;
++    }
++    char* slash = strrchr(current, '/');
++    if (slash == current) {
++      current[1] = '\0'; // "/x" -> "/"
++    } else if (slash != NULL) {
++      *slash = '\0';
++    } else {
++      free(current);
++      current = dup_str(".");
++      if (current == NULL) {
++        return NULL;
++      }
++    }
++  }
++}
++
++// ---------------------------------------------------------------- the manifest harvest
++
++// one manifest table field read: the value for a string key
++static bool map_field(ok* p_ok, const ok_value p_map, const char* p_key, ok_value* p_out) {
++  ok_value key = ok_value_string(p_ok, ok_create_string_view(p_key, (uint32_t)strlen(p_key), true));
++  return ok_map_get(p_map, key, p_out);
++}
++
++static bool string_field(ok* p_ok, const ok_value p_map, const char* p_key, char** p_out) {
++  ok_value value;
++  if (!map_field(p_ok, p_map, p_key, &value) || !ok_value_is_string(value)) {
++    return false;
++  }
++  const ok_cstring_view text = ok_value_as_string(value);
++  *p_out = dup_view(&text);
++  return *p_out != NULL;
++}
++
++static void project_deinit(cli_project* p_project) {
++  free(p_project->root);
++  for (uint32_t i = 0; i < p_project->module_roots_count; ++i) {
++    free(p_project->module_roots[i]);
++  }
++  free(p_project->module_roots);
++  for (uint32_t i = 0; i < p_project->natives_count; ++i) {
++    free(p_project->natives[i].name);
++    free(p_project->natives[i].dir);
++    free(p_project->natives[i].build);
++    free(p_project->natives[i].artifact);
++  }
++  free(p_project->natives);
++  for (uint32_t i = 0; i < p_project->deps_count; ++i) {
++    free(p_project->deps[i].name);
++    free(p_project->deps[i].path);
++  }
++  free(p_project->deps);
++  memset(p_project, 0, sizeof(*p_project));
++}
++
++// evaluate one project.ok into a cli_project. prints its own diagnostics
++// (the manifest's own path, the teaching errors). false = failure.
++static bool eval_manifest(const char* p_root, cli_project* p_out) {
++  memset(p_out, 0, sizeof(*p_out));
++  char* manifest_path = join_path(p_root, "project.ok");
++  if (manifest_path == NULL) {
++    return false;
++  }
++  char* code = read_file_or_null(manifest_path);
++  if (code == NULL) {
++    fprintf(stderr, "can't read the manifest: \"%s\".\n", manifest_path);
++    free(manifest_path);
++    return false;
++  }
++
++  // the manifest instance: full stdlib, both native caps refused, always
++  // (M10: "not limited, but it can't load native")
++  ok_specs specs;
++  memset(&specs, 0, sizeof(specs));
++  specs.caps_dropped = OK_CAP_NATIVE_LOAD | OK_CAP_NATIVE_BUILD;
++  ok* eval_ok = ok_create(specs);
++  if (eval_ok == NULL) {
++    free(code);
++    free(manifest_path);
++    return false;
++  }
++
++  const ok_source source = {code, manifest_path};
++  ok_value manifest = ok_module_evaluate(eval_ok, source);
++  free(code);
++  if (ok_value_is_null(manifest)) {
++    // the evaluation's diagnostics printed with the manifest's own path
++    ok_free(eval_ok);
++    free(manifest_path);
++    return false;
++  }
++  const uint32_t manifest_root = ok_root(eval_ok, manifest);
++  if (manifest_root == OK_ROOT_INVALID) {
++    ok_free(eval_ok);
++    free(manifest_path);
++    return false;
++  }
++
++  // harvest: the pub 'project' table
++  ok_value table = ok_value_null();
++  bool found = false;
++  const uint32_t exports = ok_module_export_count(eval_ok, manifest);
++  for (uint32_t i = 0; i < exports; ++i) {
++    const char* name = ok_module_export_name(eval_ok, manifest, i);
++    if (name != NULL && strcmp(name, "project") == 0) {
++      table = ok_module_export_get(eval_ok, manifest, i);
++      found = true;
++      break;
++    }
++  }
++  bool ok = false;
++  if (!found || !ok_value_is_map(table)) {
++    fprintf(stderr,
++            "%s: the manifest exports no 'project' table: a pub let named 'project', holding the project's "
++            "modules, deps and natives.\n",
++            manifest_path);
++    goto done;
++  }
++
++  p_out->root = dup_str(p_root);
++
++  // "modules": an array of strings, default ["src"]
++  {
++    ok_value modules;
++    if (map_field(eval_ok, table, "modules", &modules)) {
++      if (!ok_value_is_array(modules)) {
++        fprintf(stderr, "%s: the 'modules' field must be an array of strings.\n", manifest_path);
++        goto done;
++      }
++      const uint32_t count = ok_array_len(modules);
++      p_out->module_roots = (char**)calloc(count > 0 ? count : 1, sizeof(char*));
++      if (p_out->module_roots == NULL) {
++        goto oom;
++      }
++      for (uint32_t i = 0; i < count; ++i) {
++        const ok_value item = ok_array_get(modules, i);
++        if (!ok_value_is_string(item)) {
++          fprintf(stderr, "%s: the 'modules' field must be an array of strings.\n", manifest_path);
++          goto done;
++        }
++        const ok_cstring_view text = ok_value_as_string(item);
++        p_out->module_roots[i] = dup_view(&text);
++        if (p_out->module_roots[i] == NULL) {
++          goto oom;
++        }
++        p_out->module_roots_count++;
++      }
++    }
++  }
++  if (p_out->module_roots_count == 0) {
++    p_out->module_roots = (char**)calloc(1, sizeof(char*));
++    if (p_out->module_roots == NULL) {
++      goto oom;
++    }
++    p_out->module_roots[0] = dup_str("src");
++    if (p_out->module_roots[0] == NULL) {
++      goto oom;
++    }
++    p_out->module_roots_count = 1;
++  }
++
++  // "deps": a map of names to tables with a string "path"
++  {
++    ok_value deps;
++    if (map_field(eval_ok, table, "deps", &deps)) {
++      if (!ok_value_is_map(deps)) {
++        fprintf(stderr, "%s: the 'deps' field must be a map of names to tables.\n", manifest_path);
++        goto done;
++      }
++      const uint32_t count = ok_map_len(deps);
++      p_out->deps = (cli_dep*)calloc(count > 0 ? count : 1, sizeof(cli_dep));
++      if (p_out->deps == NULL) {
++        goto oom;
++      }
++      for (uint32_t i = 0; i < count; ++i) {
++        ok_value key;
++        ok_value entry;
++        if (!ok_map_pair_at(deps, i, &key, &entry) || !ok_value_is_string(key)) {
++          fprintf(stderr, "%s: the 'deps' field must be a map of names to tables.\n", manifest_path);
++          goto done;
++        }
++        const ok_cstring_view name = ok_value_as_string(key);
++        if (name.chars == NULL || name.chars[0] == '\0') {
++          fprintf(stderr, "%s: a project dep needs a name.\n", manifest_path);
++          goto done;
++        }
++        cli_dep* dep = &p_out->deps[p_out->deps_count];
++        dep->name = dup_view(&name);
++        if (dep->name == NULL) {
++          goto oom;
++        }
++        if (strcmp(dep->name, "std") == 0) {
++          fprintf(stderr, "%s: the dep name 'std' is reserved.\n", manifest_path);
++          goto done;
++        }
++        if (!ok_value_is_map(entry)) {
++          fprintf(stderr, "%s: project dep '%s' needs a string 'path' field.\n", manifest_path, dep->name);
++          goto done;
++        }
++        char* rel = NULL;
++        if (!string_field(eval_ok, entry, "path", &rel) || rel == NULL) {
++          fprintf(stderr, "%s: project dep '%s' needs a string 'path' field.\n", manifest_path, dep->name);
++          goto done;
++        }
++        char* joined = canonical_or_free(join_path(p_root, rel));
++        free(rel);
++        dep->path = joined;
++        if (dep->path == NULL || !is_directory(dep->path)) {
++          fprintf(stderr,
++                  "%s: project dep '%s' does not exist: %s.\n",
++                  manifest_path,
++                  dep->name,
++                  joined != NULL ? joined : "(unresolvable path)");
++          goto done;
++        }
++        char* dep_manifest = join_path(dep->path, "project.ok");
++        if (dep_manifest == NULL) {
++          goto oom;
++        }
++        dep->is_project = file_readable(dep_manifest);
++        free(dep_manifest);
++        p_out->deps_count++;
++      }
++    }
++  }
++
++  // "natives": a map of names to tables with string "build" and "artifact"
++  {
++    ok_value natives;
++    if (map_field(eval_ok, table, "natives", &natives)) {
++      if (!ok_value_is_map(natives)) {
++        fprintf(stderr, "%s: the 'natives' field must be a map of names to tables.\n", manifest_path);
++        goto done;
++      }
++      const uint32_t count = ok_map_len(natives);
++      p_out->natives = (cli_native*)calloc(count > 0 ? count : 1, sizeof(cli_native));
++      if (p_out->natives == NULL) {
++        goto oom;
++      }
++      for (uint32_t i = 0; i < count; ++i) {
++        ok_value key;
++        ok_value entry;
++        if (!ok_map_pair_at(natives, i, &key, &entry) || !ok_value_is_string(key)) {
++          fprintf(stderr, "%s: the 'natives' field must be a map of names to tables.\n", manifest_path);
++          goto done;
++        }
++        const ok_cstring_view name = ok_value_as_string(key);
++        if (name.chars == NULL || name.chars[0] == '\0') {
++          fprintf(stderr, "%s: a native target needs a name.\n", manifest_path);
++          goto done;
++        }
++        cli_native* native = &p_out->natives[p_out->natives_count];
++        native->name = dup_view(&name);
++        if (native->name == NULL) {
++          goto oom;
++        }
++        if (strcmp(native->name, "std") == 0) {
++          fprintf(stderr, "%s: the native target name 'std' is reserved.\n", manifest_path);
++          goto done;
++        }
++        if (!ok_value_is_map(entry) || !string_field(eval_ok, entry, "build", &native->build) ||
++            native->build == NULL) {
++          fprintf(stderr,
++                  "%s: native target '%s' needs string 'build' and 'artifact' fields.\n",
++                  manifest_path,
++                  native->name);
++          goto done;
++        }
++        char* artifact_rel = NULL;
++        if (!string_field(eval_ok, entry, "artifact", &artifact_rel) || artifact_rel == NULL) {
++          fprintf(stderr,
++                  "%s: native target '%s' needs string 'build' and 'artifact' fields.\n",
++                  manifest_path,
++                  native->name);
++          goto done;
++        }
++        native->artifact = canonical_or_free(join_path(p_root, artifact_rel));
++        free(artifact_rel);
++        if (native->artifact == NULL) {
++          goto oom;
++        }
++        string_field(eval_ok, entry, "dir", &native->dir); // optional, display only
++        p_out->natives_count++;
++      }
++    }
++  }
++
++  // the ambiguity check (M13): one name, one meaning. a dep and a native
++  // target sharing a name would answer one import two ways.
++  for (uint32_t d = 0; d < p_out->deps_count; ++d) {
++    for (uint32_t n = 0; n < p_out->natives_count; ++n) {
++      if (strcmp(p_out->deps[d].name, p_out->natives[n].name) == 0) {
++        fprintf(stderr,
++                "%s: the name '%s' is both a dep (%s) and a native target (%s): rename one of them.\n",
++                manifest_path,
++                p_out->deps[d].name,
++                p_out->deps[d].path,
++                p_out->natives[n].artifact);
++        goto done;
++      }
++    }
++  }
++
++  ok = true;
++  goto done;
++
++oom:
++  fprintf(stderr, "out of memory while reading the manifest.\n");
++done:
++  ok_unroot(eval_ok, manifest_root);
++  ok_free(eval_ok);
++  free(manifest_path);
++  if (!ok) {
++    project_deinit(p_out);
++  }
++  return ok;
++}
++
++// ---------------------------------------------------------------- the graph
++
++typedef struct {
++  cli_project* items;
++  uint32_t count;
++  uint32_t capacity;
++  // the roots in flight (the cycle chain, in order)
++  const char** visiting;
++  uint32_t visiting_count;
++  uint32_t visiting_capacity;
++} graph_build;
++
++static void graph_build_deinit(graph_build* p_build) {
++  for (uint32_t i = 0; i < p_build->count; ++i) {
++    project_deinit(&p_build->items[i]);
++  }
++  free(p_build->items);
++  free(p_build->visiting);
++}
++
++static bool projects_push(graph_build* p_build, cli_project p_project) {
++  if (p_build->count == p_build->capacity) {
++    const uint32_t grown = p_build->capacity == 0 ? 4 : p_build->capacity * 2;
++    cli_project* items = (cli_project*)realloc(p_build->items, sizeof(cli_project) * grown);
++    if (items == NULL) {
++      return false;
++    }
++    p_build->items = items;
++    p_build->capacity = grown;
++  }
++  p_build->items[p_build->count++] = p_project;
++  return true;
++}
++
++static bool visiting_push(graph_build* p_build, const char* p_root) {
++  if (p_build->visiting_count == p_build->visiting_capacity) {
++    const uint32_t grown = p_build->visiting_capacity == 0 ? 8 : p_build->visiting_capacity * 2;
++    const char** visiting = (const char**)realloc(p_build->visiting, sizeof(const char*) * grown);
++    if (visiting == NULL) {
++      return false;
++    }
++    p_build->visiting = visiting;
++    p_build->visiting_capacity = grown;
++  }
++  p_build->visiting[p_build->visiting_count++] = p_root;
++  return true;
++}
++
++// evaluate the project at p_root and recurse into its project deps. roots
++// are evaluated once (dedup by path), cycles name their chain.
++static bool add_project(graph_build* p_build, const char* p_root) {
++  // already in the graph: nothing to do (the library matches by root)
++  for (uint32_t i = 0; i < p_build->count; ++i) {
++    if (strcmp(p_build->items[i].root, p_root) == 0) {
++      return true;
++    }
++  }
++  // the cycle chain check
++  for (uint32_t i = 0; i < p_build->visiting_count; ++i) {
++    if (strcmp(p_build->visiting[i], p_root) == 0) {
++      fprintf(stderr, "project dependency cycle:");
++      for (uint32_t j = i; j < p_build->visiting_count; ++j) {
++        fprintf(stderr, " %s ->", p_build->visiting[j]);
++      }
++      fprintf(stderr, " %s.\n", p_root);
++      return false;
++    }
++  }
++
++  cli_project project;
++  if (!eval_manifest(p_root, &project)) {
++    return false;
++  }
++  if (!visiting_push(p_build, p_root)) {
++    project_deinit(&project);
++    fprintf(stderr, "out of memory while walking the project graph.\n");
++    return false;
++  }
++  for (uint32_t d = 0; d < project.deps_count; ++d) {
++    if (project.deps[d].is_project && !add_project(p_build, project.deps[d].path)) {
++      p_build->visiting_count--;
++      project_deinit(&project);
++      return false;
++    }
++  }
++  p_build->visiting_count--;
++  if (!projects_push(p_build, project)) {
++    project_deinit(&project);
++    fprintf(stderr, "out of memory while walking the project graph.\n");
++    return false;
++  }
++  return true;
++}
++
++cli_graph* cli_graph_discover(const char* p_entry_path, bool p_yes, bool p_no_build, bool* p_failed) {
++  *p_failed = false;
++  char* dir = dir_name(p_entry_path);
++  if (dir == NULL) {
++    *p_failed = true;
++    fprintf(stderr, "out of memory.\n");
++    return NULL;
++  }
++  char* root = find_project_root(dir);
++  free(dir);
++  if (root == NULL) {
++    return NULL; // the standalone lane, not an error
++  }
++
++  graph_build build;
++  memset(&build, 0, sizeof(build));
++  if (!add_project(&build, root)) {
++    free(root);
++    graph_build_deinit(&build);
++    *p_failed = true;
++    return NULL;
++  }
++  free(root);
++  free(build.visiting); // the cycle chain is spent; the items move to the graph
++
++  cli_graph* graph = (cli_graph*)calloc(1, sizeof(cli_graph));
++  if (graph == NULL) {
++    graph_build_deinit(&build);
++    *p_failed = true;
++    fprintf(stderr, "out of memory.\n");
++    return NULL;
++  }
++  graph->projects = build.items;
++  graph->count = build.count;
++  graph->yes = p_yes;
++  graph->no_build = p_no_build;
++
++  // the borrowed views: flat arrays, per-project slices
++  uint32_t total_roots = 0;
++  uint32_t total_natives = 0;
++  uint32_t total_deps = 0;
++  for (uint32_t i = 0; i < graph->count; ++i) {
++    total_roots += graph->projects[i].module_roots_count;
++    total_natives += graph->projects[i].natives_count;
++    total_deps += graph->projects[i].deps_count;
++  }
++  graph->view = (ok_project*)calloc(graph->count > 0 ? graph->count : 1, sizeof(ok_project));
++  graph->view_roots = (const char**)calloc(total_roots > 0 ? total_roots : 1, sizeof(char*));
++  graph->view_natives = (ok_project_native*)calloc(total_natives > 0 ? total_natives : 1, sizeof(ok_project_native));
++  graph->view_deps = (ok_project_dep*)calloc(total_deps > 0 ? total_deps : 1, sizeof(ok_project_dep));
++  if (graph->view == NULL || graph->view_roots == NULL || graph->view_natives == NULL || graph->view_deps == NULL) {
++    cli_graph_free(graph); // frees the moved projects array and every view
++    *p_failed = true;
++    fprintf(stderr, "out of memory.\n");
++    return NULL;
++  }
++  uint32_t root_cursor = 0;
++  uint32_t native_cursor = 0;
++  uint32_t dep_cursor = 0;
++  for (uint32_t i = 0; i < graph->count; ++i) {
++    const cli_project* project = &graph->projects[i];
++    ok_project* view = &graph->view[i];
++    view->root = project->root;
++    view->module_roots = &graph->view_roots[root_cursor];
++    for (uint32_t r = 0; r < project->module_roots_count; ++r) {
++      graph->view_roots[root_cursor++] = project->module_roots[r];
++    }
++    view->module_roots_count = project->module_roots_count;
++    view->natives = &graph->view_natives[native_cursor];
++    for (uint32_t n = 0; n < project->natives_count; ++n) {
++      graph->view_natives[native_cursor].name = project->natives[n].name;
++      graph->view_natives[native_cursor].artifact = project->natives[n].artifact;
++      graph->view_natives[native_cursor].build = project->natives[n].build;
++      native_cursor++;
++    }
++    view->natives_count = project->natives_count;
++    view->deps = &graph->view_deps[dep_cursor];
++    for (uint32_t d = 0; d < project->deps_count; ++d) {
++      graph->view_deps[dep_cursor].name = project->deps[d].name;
++      graph->view_deps[dep_cursor].path = project->deps[d].path;
++      graph->view_deps[dep_cursor].is_project = project->deps[d].is_project;
++      dep_cursor++;
++    }
++    view->deps_count = project->deps_count;
++  }
++  return graph;
++}
++
++void cli_graph_free(cli_graph* p_graph) {
++  if (p_graph == NULL) {
++    return;
++  }
++  for (uint32_t i = 0; i < p_graph->count; ++i) {
++    project_deinit(&p_graph->projects[i]);
++  }
++  free(p_graph->projects);
++  free(p_graph->view);
++  free(p_graph->view_roots);
++  free(p_graph->view_natives);
++  free(p_graph->view_deps);
++  free(p_graph);
++}
++
++// ---------------------------------------------------------------- the build lane
++
++// the staleness stamp: <root>/.okbuild/<name>.stamp holds the build command
++// of the last success. fresh = artifact readable AND stamp == command.
++static char* stamp_path(const char* p_root, const char* p_name) {
++  const size_t a = strlen(p_root);
++  const size_t b = strlen(p_name);
++  char* out = (char*)malloc(a + b + sizeof("/.okbuild/.stamp"));
++  if (out == NULL) {
++    return NULL;
++  }
++  sprintf(out, "%s/.okbuild/%s.stamp", p_root, p_name);
++  return out;
++}
++
++static bool target_fresh(const char* p_root, const char* p_name, const char* p_build, const char* p_artifact) {
++  if (!file_readable(p_artifact)) {
++    return false;
++  }
++  char* stamp = stamp_path(p_root, p_name);
++  if (stamp == NULL) {
++    return false;
++  }
++  char* recorded = read_file_or_null(stamp);
++  free(stamp);
++  if (recorded == NULL) {
++    return false;
++  }
++  // the command string, unchanged since the last recorded success
++  const bool same = strcmp(recorded, p_build) == 0;
++  free(recorded);
++  return same;
++}
++
++static void write_stamp(const char* p_root, const char* p_name, const char* p_build) {
++  char* dir = (char*)malloc(strlen(p_root) + sizeof("/.okbuild"));
++  if (dir == NULL) {
++    return;
++  }
++  sprintf(dir, "%s/.okbuild", p_root);
++  mkdir(dir, 0777); // EEXIST is fine
++  free(dir);
++  char* stamp = stamp_path(p_root, p_name);
++  if (stamp == NULL) {
++    return;
++  }
++  FILE* file = fopen(stamp, "wb");
++  if (file != NULL) {
++    fwrite(p_build, 1, strlen(p_build), file);
++    fclose(file);
++  }
++  free(stamp);
++}
++
++// run one declared build command from the project root, through the shell,
++// with both output streams captured. quiet on success (the declared-build
++// contract), the captured output prints only on failure.
++static bool run_build_command(const char* p_root, const char* p_name, const char* p_build) {
++  const size_t room = strlen(p_root) + strlen(p_build) + sizeof("cd \"\" && (\" \") 2>&1");
++  char* command = (char*)malloc(room);
++  if (command == NULL) {
++    fprintf(stderr, "out of memory while building '%s'.\n", p_name);
++    return false;
++  }
++  sprintf(command, "cd \"%s\" && (%s) 2>&1", p_root, p_build);
++  FILE* pipe = popen(command, "r");
++  free(command);
++  if (pipe == NULL) {
++    fprintf(stderr, "could not run the build command for '%s'.\n", p_name);
++    return false;
++  }
++  char* output = NULL;
++  size_t length = 0;
++  for (;;) {
++    char buffer[4096];
++    const size_t read = fread(buffer, 1, sizeof(buffer), pipe);
++    if (read == 0) {
++      break;
++    }
++    char* grown = (char*)realloc(output, length + read + 1);
++    if (grown == NULL) {
++      free(output);
++      pclose(pipe);
++      fprintf(stderr, "out of memory while building '%s'.\n", p_name);
++      return false;
++    }
++    output = grown;
++    memcpy(output + length, buffer, read);
++    length += read;
++  }
++  const int status = pclose(pipe);
++  if (status != 0) {
++    fprintf(stderr, "the build command for native target '%s' failed:\n", p_name);
++    if (output != NULL) {
++      fwrite(output, 1, length, stderr);
++      if (length > 0 && output[length - 1] != '\n') {
++        fputc('\n', stderr);
++      }
++    }
++    free(output);
++    return false;
++  }
++  free(output);
++  return true;
++}
++
++// the one ensure: staleness, consent, the run, the verification, the stamp.
++// p_explicit = ok build's lane (the command itself is the consent, no
++// prompts); p_force skips the freshness check.
++static bool ensure_native(const char* p_root,
++                          const char* p_name,
++                          const char* p_build,
++                          const char* p_artifact,
++                          bool p_yes,
++                          bool p_no_build,
++                          bool p_explicit,
++                          bool p_force,
++                          char* p_err,
++                          size_t p_err_capacity) {
++  if (!p_force && target_fresh(p_root, p_name, p_build, p_artifact)) {
++    return true;
++  }
++  if (p_no_build && !p_explicit) {
++    snprintf(p_err, p_err_capacity, "auto-build refused: --no-build. run 'ok build' first, or drop the flag.");
++    return false;
++  }
++  if (!p_yes && !p_explicit) {
++    if (!isatty(0)) {
++      snprintf(p_err,
++               p_err_capacity,
++               "auto-build needs consent and stdin is not a terminal: pass --yes, or run 'ok build' first.");
++      return false;
++    }
++    printf("first build of native target '%s':\n  %s\nproceed? [y/N] ", p_name, p_build);
++    fflush(stdout);
++    char answer[32];
++    if (fgets(answer, sizeof(answer), stdin) == NULL || (answer[0] != 'y' && answer[0] != 'Y')) {
++      snprintf(p_err, p_err_capacity, "consent refused: native target '%s' was not built.", p_name);
++      return false;
++    }
++  }
++  if (!run_build_command(p_root, p_name, p_build)) {
++    snprintf(p_err, p_err_capacity, "the build command failed.");
++    return false;
++  }
++  if (!file_readable(p_artifact)) {
++    snprintf(p_err, p_err_capacity, "the build finished but the artifact is missing: %s.", p_artifact);
++    return false;
++  }
++  write_stamp(p_root, p_name, p_build);
++  return true;
++}
++
++// the library's hook: the graph carries the policy flags
++static bool ensure_hook(void* p_ctx, const ok_project* p_project, const ok_project_native* p_target, char* p_err,
++                       size_t p_err_capacity) {
++  const cli_graph* graph = (const cli_graph*)p_ctx;
++  return ensure_native(p_project->root, p_target->name, p_target->build != NULL ? p_target->build : "true",
++                       p_target->artifact, graph->yes, graph->no_build, false, false, p_err, p_err_capacity);
++}
++
++void cli_graph_install(ok* p_ok, const cli_graph* p_graph) {
++  ok_project_build_hooks hooks;
++  hooks.ensure = ensure_hook;
++  hooks.p_ctx = (void*)p_graph;
++  ok_set_projects(p_ok, p_graph->view, p_graph->count, hooks);
++}
++
++int cli_build_all(const cli_graph* p_graph, bool p_force, bool p_clean) {
++  for (uint32_t i = 0; i < p_graph->count; ++i) {
++    const cli_project* project = &p_graph->projects[i];
++    for (uint32_t n = 0; n < project->natives_count; ++n) {
++      const cli_native* native = &project->natives[n];
++      if (p_clean) {
++        char* stamp = stamp_path(project->root, native->name);
++        if (stamp != NULL) {
++          remove(stamp);
++          free(stamp);
++        }
++      }
++      if (target_fresh(project->root, native->name, native->build, native->artifact) && !p_force && !p_clean) {
++        printf("ok build: %s up to date (%s)\n", native->name, native->artifact);
++        continue;
++      }
++      char err[512];
++      err[0] = '\0';
++      if (!ensure_native(project->root, native->name, native->build, native->artifact, true, false, true,
++                         p_force || p_clean, err, sizeof(err))) {
++        fprintf(stderr, "ok build: %s failed: %s\n", native->name, err);
++        return 1;
++      }
++      printf("ok build: %s built (%s)\n", native->name, native->artifact);
++    }
++  }
++  return 0;
++}
+diff --git a/cli/src/project.h b/cli/src/project.h
+new file mode 100644
+index 0000000..a662a9f
+--- /dev/null
++++ b/cli/src/project.h
+@@ -0,0 +1,70 @@
++#ifndef OK_CLI_PROJECT_H
++#define OK_CLI_PROJECT_H
++
++// OR-4 "O Resolution" - the CLI's project machinery: project.ok discovery,
++// the manifest evaluator's harvest, the dependency graph, the .okbuild
++// staleness stamps, and the consent-gated build lane. the library carries
++// the resolution semantics (ok_set_projects); this file is the host that
++// knows what a file system and a shell are.
++
++#include "ok/ok.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++
++// one declared native target (the manifest's "natives" table entry)
++typedef struct {
++  char* name;     // the import name
++  char* dir;      // the declared source dir, display only (may be NULL)
++  char* build;    // the declared build command
++  char* artifact; // what the name resolves to, absolute
++} cli_native;
++
++// one path dependency (the manifest's "deps" table entry)
++typedef struct {
++  char* name;
++  char* path; // absolute
++  bool is_project;
++} cli_dep;
++
++// one evaluated project
++typedef struct {
++  char* root; // absolute canonical
++  char** module_roots;
++  uint32_t module_roots_count;
++  cli_native* natives;
++  uint32_t natives_count;
++  cli_dep* deps;
++  uint32_t deps_count;
++} cli_project;
++
++typedef struct {
++  cli_project* projects;
++  uint32_t count;
++  // the borrowed views handed to ok_set_projects (all pointing into the
++  // owned strings above)
++  ok_project* view;
++  const char** view_roots;
++  ok_project_native* view_natives;
++  ok_project_dep* view_deps;
++  // the build policy (the run path's flags)
++  bool yes;
++  bool no_build;
++} cli_graph;
++
++// discover + evaluate the project graph above the entry path (walking up,
++// never cwd). NULL without failure = no project.ok up there (the standalone
++// lane, not an error). NULL with *p_failed = the diagnostics printed.
++cli_graph* cli_graph_discover(const char* p_entry_path, bool p_yes, bool p_no_build, bool* p_failed);
++
++void cli_graph_free(cli_graph* p_graph);
++
++// install the borrowed views + the ensure hook (the whole graph).
++void cli_graph_install(ok* p_ok, const cli_graph* p_graph);
++
++// ok build: ensure every native target in the graph, explicitly (no
++// consent prompts: the command itself is the consent). prints one line per
++// target. returns 0 on success, 1 on any failure (diagnostics printed).
++int cli_build_all(const cli_graph* p_graph, bool p_force, bool p_clean);
++
++#endif // OK_CLI_PROJECT_H
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index f5a80f6..6d00055 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -161,6 +161,13 @@ bool ok_map_set(ok* p_ok, ok_value p_map, ok_value p_key, ok_value p_value);
+ // (no store happens either way). never allocates.
+ bool ok_map_remove(ok_value p_map, ok_value p_key);
+ 
++// one map's entries as an indexed walk (OR-4: the manifest harvest, the
++// same read-side ruling that gave the module export table its api). the
++// order is the table's internal slot order: stable for the same content,
++// not declaration order. p_index < ok_map_len. false = not a map or out
++// of range, no values stored. never allocates.
++bool ok_map_pair_at(ok_value p_map, uint32_t p_index, ok_value* p_out_key, ok_value* p_out_value);
++
+ /* classes (embedder side) */
+ 
+ bool ok_value_is_class(ok_value p_value);
+@@ -311,6 +318,83 @@ uint32_t ok_module_export_count(ok* p_ok, ok_value p_module);
+ const char* ok_module_export_name(ok* p_ok, ok_value p_module, uint32_t p_index);
+ ok_value ok_module_export_get(ok* p_ok, ok_value p_module, uint32_t p_index);
+ 
++/* projects (OR-4: project.ok, the build pipeline) */
++
++// one declared native build target: the manifest's "natives" table entry.
++// every string is borrowed for the installation's lifetime (until the next
++// ok_set_projects call on this instance): the library copies nothing.
++typedef struct ok_project_native {
++  const char* name;     // the import name ("raylib")
++  const char* artifact; // what the name resolves to (absolute, importable)
++  const char* build;    // the declared build command. NULL = no build: the
++                        // artifact must already exist, staleness is foreign
++} ok_project_native;
++
++// one path dependency: the manifest's "deps" table entry. the dep's NAME is
++// an import root: import "mathx/vec" resolves inside dep mathx.
++typedef struct ok_project_dep {
++  const char* name; // the import root name
++  const char* path; // the dep's directory (absolute)
++  bool is_project;  // the dep has its own project.ok: its own roots, native
++                    // targets and deps apply when resolving under it
++} ok_project_dep;
++
++// one evaluated project. the host (the CLI, or an embedder with its own
++// manifest source) discovers and evaluates project.ok files, then installs
++// the resolved graph before ok_run.
++typedef struct ok_project {
++  const char* root;                // the project root (absolute, no trailing
++                                   // slash). an importing file is governed by
++                                   // the deepest installed root containing it
++  const char* const* module_roots; // import roots, relative to root (["src"]
++                                   // is the manifest default). searched with
++                                   // the full ladder, native candidates
++                                   // included
++  uint32_t module_roots_count;
++  const ok_project_native* natives; // declared native targets
++  uint32_t natives_count;
++  const ok_project_dep* deps;       // path dependencies
++  uint32_t deps_count;
++} ok_project;
++
++// the auto-build door. the resolution ladder reached a declared native
++// target and is about to load its artifact: the host ensures the artifact
++// is current (staleness is host data: .okbuild stamps, mtimes, whatever).
++// return false with a message in p_err to fail the import (consent refused,
++// build failed, artifact missing). NULL hooks load artifacts as they are.
++typedef struct ok_project_build_hooks {
++  bool (*ensure)(void* p_ctx, const ok_project* p_project, const ok_project_native* p_target,
++                 char* p_err, size_t p_err_capacity);
++  void* p_ctx;
++} ok_project_build_hooks;
++
++// install the project graph BEFORE ok_run (or ok_module_where). imports of
++// bare names resolve through the governing project's module roots, then its
++// native targets (through the ensure hook when OK_CAP_NATIVE_BUILD is up),
++// then its deps by name, before OKPATH. all pointers are borrowed until the
++// next call replaces them.
++void ok_set_projects(ok* p_ok, const ok_project* p_projects, uint32_t p_count,
++                     ok_project_build_hooks p_hooks);
++
++// resolve one import path exactly the way a script in p_from_dir would: the
++// same ladder (file-relative, the governing project, std, OKPATH), the same
++// teaching trace on failure (the error lane, like every module diagnostic).
++// NOTHING loads and NOTHING runs: sources are probed through the loader's
++// read only, natives are reported without being opened, no build hook fires.
++// true + *p_out_canonical (borrowed until the next call on this instance)
++// on success, false after the trace prints.
++bool ok_module_where(ok* p_ok, const char* p_import, const char* p_from_dir, const char** p_out_canonical);
++
++// evaluate one source as a single standalone module: the manifest lane.
++// pub top-level declarations become the namespace's fields, imports are
++// refused with the teaching error (a manifest is a script, not a module
++// graph node), nothing registers in the module system. the caller normally
++// restricts the instance at ok_create (the CLI refuses both native caps).
++// returns the sealed namespace value, NOT rooted: ok_root it (or finish
++// harvesting) before your next allocation. a null return means the
++// evaluation failed, its diagnostics already printed.
++ok_value ok_module_evaluate(ok* p_ok, ok_source p_source);
++
+ /* output */
+ 
+ // print statements route through p_cb when set. the default (NULL) keeps the
+diff --git a/src/ok.c b/src/ok.c
+index decbc8d..70bf758 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -600,6 +600,20 @@ void ok_set_loader(ok* p_ok, ok_loader p_loader) {
+   ok_modules_set_loader(&p_ok->modules, p_loader);
+ }
+ 
++/* projects (OR-4) */
++
++void ok_set_projects(ok* p_ok, const ok_project* p_projects, uint32_t p_count, ok_project_build_hooks p_hooks) {
++  ok_modules_set_projects(&p_ok->modules, p_projects, p_count, p_hooks);
++}
++
++bool ok_module_where(ok* p_ok, const char* p_import, const char* p_from_dir, const char** p_out_canonical) {
++  return ok_modules_where(&p_ok->modules, p_import, p_from_dir, p_out_canonical);
++}
++
++ok_value ok_module_evaluate(ok* p_ok, ok_source p_source) {
++  return ok_modules_evaluate(&p_ok->modules, &p_source);
++}
++
+ /* modules (embedder side, OR-3) */
+ 
+ // the registry read side: what got loaded, in load order. file modules key
+@@ -1276,3 +1290,26 @@ bool ok_map_remove(ok_value p_map, ok_value p_key) {
+   }
+   return object_map_remove(VALUE_AS_MAP(p_map), p_key);
+ }
++
++bool ok_map_pair_at(ok_value p_map, uint32_t p_index, ok_value* p_out_key, ok_value* p_out_value) {
++  if (!IS_VALUE_MAP(p_map)) {
++    return false;
++  }
++  // the keys array is the occupancy authority: walk occupied slots only
++  // (empty slots hold the strict-null sentinel, their value slots are
++  // stale garbage - the gc trace's comment, the same discipline here)
++  const object_map* map = VALUE_AS_MAP(p_map);
++  uint32_t seen = 0;
++  for (uint32_t i = 0; i < map->entries.capacity; ++i) {
++    if (IS_VALUE_STRICTLY_NULL(map->entries.keys[i])) {
++      continue;
++    }
++    if (seen == p_index) {
++      *p_out_key = map->entries.keys[i];
++      *p_out_value = map->entries.values[i];
++      return true;
++    }
++    ++seen;
++  }
++  return false;
++}
+diff --git a/src/okmodules.c b/src/okmodules.c
+index 1c961ad..06786a7 100644
+--- a/src/okmodules.c
++++ b/src/okmodules.c
+@@ -155,6 +155,8 @@ static void module_note(const ok_source* p_source, const token* p_site, const ch
+   fprintf(stderr, "%s:%u:%u: note: %s\n", p_source->path, span.line, span.column, p_text);
+ }
+ 
++
++
+ // ---------------------------------------------------------------- path plumbing
+ 
+ // a growable list of copied strings (the 404's trace). raw user-allocator
+@@ -334,6 +336,7 @@ static bool probe_ladder(module_system* p_modules,
+                          str_list* p_tried,
+                          char* p_native_error,
+                          size_t p_native_error_capacity,
++                         bool p_where,
+                          resolved_module* p_out) {
+   const ok_allocators* a = &p_modules->ok->raw_alloc;
+   static const char* const forms[] = {"", ".ok", "/index.ok"};
+@@ -391,6 +394,22 @@ static bool probe_ladder(module_system* p_modules,
+   if (canonical == NULL) {
+     return false;
+   }
++  // OR-4's where mode: report the candidate without opening it. the
++  // existence probe is the loader's read (a diagnostic may dlopen nothing);
++  // a broken native still shows as found by path, the import is the truth.
++  if (p_where) {
++    ok_source probe;
++    if (p_modules->loader.read_source != NULL &&
++        p_modules->loader.read_source(p_modules->loader.p_ctx, canonical, &probe)) {
++      mod_free(a, (void*)probe.code);
++      p_out->canonical = canonical;
++      p_out->is_native = true;
++      return true;
++    }
++    str_list_append(p_tried, a, canonical); // best effort: the trace wants it
++    mod_free(a, canonical);
++    return false;
++  }
+   // an already-registered native answers from the registry (a module loads
+   // once per ok instance, ever)
+   if (registry_find(p_modules, canonical) != NULL) {
+@@ -802,6 +821,38 @@ static void plain_report(const char* p_path, const char* p_message) {
+                 NULL);
+ }
+ 
++// OR-4: the where lane's site-less note (ok_module_where has no import
++// statement to point at, the query itself is the context).
++static void plain_note(const char* p_display, const char* p_text) {
++  fprintf(stderr, "%s: note: %s\n", p_display, p_text);
++}
++
++// report/note through whichever lane is active: an import site, or the
++// where display. p_where NULL = the normal import lane.
++static void lane_report(const char* p_where, const ok_source* p_source, const token* p_site, const char* p_message) {
++  if (p_where != NULL) {
++    plain_report(p_where, p_message);
++  } else {
++    module_report(p_source, p_site, p_message);
++  }
++}
++
++static void lane_note(const char* p_where, const ok_source* p_source, const token* p_site, const char* p_text) {
++  if (p_where != NULL) {
++    plain_note(p_where, p_text);
++  } else {
++    module_note(p_source, p_site, p_text);
++  }
++}
++
++// the project lanes' tri-state: a miss (fall through to OKPATH), a find,
++// or a hard error (already printed, resolution stops, no 404 on top).
++typedef enum {
++  PROJECT_MISS = 0,
++  PROJECT_FOUND,
++  PROJECT_ERROR,
++} project_lane_result;
++
+ // the register lane's one report: at the import site when there is one,
+ // bare with the module's own path when there is not (force-load).
+ static void module_report_or_plain(const ok_source* p_from_source,
+@@ -1345,11 +1396,24 @@ static ok_result std_build_module(module_system* p_modules, const std_module_def
+ // module (canonical + the loader's read, or the native lane's descriptor),
+ // or prints the teaching 404 with the full trace of locations and forms
+ // tried (and returns false).
++static project_lane_result resolve_in_project(module_system* p_modules,
++                                              const ok_project* p_project,
++                                              const ok_string_view p_path,
++                                              str_list* p_tried,
++                                              char* p_native_error,
++                                              size_t p_native_error_capacity,
++                                              const ok_source* p_source,
++                                              const token* p_site,
++                                              const char* p_where,
++                                              uint32_t p_depth,
++                                              resolved_module* p_out);
++
+ static bool resolve_import(module_system* p_modules,
+                            const ok_string_view p_path,
+                            const char* p_from_dir,
+                            const ok_source* p_source,
+                            const token* p_site,
++                           const char* p_where,
+                            resolved_module* p_out) {
+   const ok_allocators* a = &p_modules->ok->raw_alloc;
+   str_list tried;
+@@ -1363,7 +1427,7 @@ static bool resolve_import(module_system* p_modules,
+     // needed.
+     char* joined = join_normalize(a, p_from_dir, p_path);
+     if (joined != NULL) {
+-      resolved = probe_ladder(p_modules, joined, &tried, native_error, sizeof(native_error), p_out);
++      resolved = probe_ladder(p_modules, joined, &tried, native_error, sizeof(native_error), p_where != NULL, p_out);
+       mod_free(a, joined);
+     }
+   } else if (view_equals(p_path, "std")) {
+@@ -1391,7 +1455,7 @@ static bool resolve_import(module_system* p_modules,
+       str_list_deinit(&tried, a);
+       return false;
+     }
+-    if (std_build_module(p_modules, def) != OK) {
++    if (p_where == NULL && std_build_module(p_modules, def) != OK) {
+       module_report(p_source, p_site, "out of memory while building the module's namespace.");
+       str_list_deinit(&tried, a);
+       return false;
+@@ -1424,6 +1488,46 @@ static bool resolve_import(module_system* p_modules,
+       str_list_deinit(&tried, a);
+       return p_out->canonical != NULL;
+     }
++    // the project lane (OR-4, the draft's section 5 step 3): the governing
++    // project's module roots, then its native targets, then its deps by
++    // name, recursing into project deps. the governing project is the
++    // deepest installed root containing the importing file's directory.
++    if (!resolved && p_modules->projects_count > 0) {
++      // canonicalize_path DESTROYS its input (the ladder's ownership
++      // discipline): the from_dir is the caller's, a copy goes in
++      char* from_dir_copy = mod_strdup(a, p_from_dir);
++      char* canon_dir = from_dir_copy != NULL ? canonicalize_path(a, from_dir_copy) : NULL;
++      if (canon_dir != NULL) {
++        const ok_project* governor = NULL;
++        size_t governor_length = 0;
++        for (uint32_t i = 0; i < p_modules->projects_count; ++i) {
++          const ok_project* candidate = &p_modules->projects[i];
++          const size_t root_length = strlen(candidate->root);
++          const size_t dir_length = strlen(canon_dir);
++          const bool under = dir_length == root_length ||
++                             (dir_length > root_length && canon_dir[root_length] == '/' &&
++                              memcmp(canon_dir, candidate->root, root_length) == 0);
++          if (under && root_length >= governor_length) {
++            governor = candidate;
++            governor_length = root_length;
++          }
++        }
++        mod_free(a, canon_dir);
++        if (governor != NULL) {
++          const project_lane_result lane = resolve_in_project(p_modules, governor, p_path, &tried, native_error,
++                                                              sizeof(native_error), p_source, p_site, p_where, 0,
++                                                              p_out);
++          if (lane == PROJECT_FOUND) {
++            resolved = true;
++          } else if (lane == PROJECT_ERROR) {
++            // the hard error already printed (a refused capability, a
++            // refused build, a project dep imported bare): no 404 on top
++            str_list_deinit(&tried, a);
++            return false;
++          }
++        }
++      }
++    }
+     // the OKPATH lane: colon-separated roots, the same ladder at each.
+     const char* okpath = getenv("OKPATH");
+     if (okpath != NULL && *okpath != '\0') {
+@@ -1438,7 +1542,8 @@ static bool resolve_import(module_system* p_modules,
+           if (*cursor != '\0') {
+             char* joined = join_normalize(a, cursor, p_path);
+             if (joined != NULL) {
+-              resolved = probe_ladder(p_modules, joined, &tried, native_error, sizeof(native_error), p_out);
++              resolved = probe_ladder(p_modules, joined, &tried, native_error, sizeof(native_error), p_where != NULL,
++                                      p_out);
+               mod_free(a, joined);
+             }
+           }
+@@ -1454,25 +1559,25 @@ static bool resolve_import(module_system* p_modules,
+     // message is the note (a text file named .so, a corrupt image, a
+     // missing ok_native_export)
+     if (native_error[0] != '\0') {
+-      module_report(p_source, p_site, "the native module could not be loaded.");
+-      module_note(p_source, p_site, native_error);
++      lane_report(p_where, p_source, p_site, "the native module could not be loaded.");
++      lane_note(p_where, p_source, p_site, native_error);
+       str_list_deinit(&tried, a);
+       return false;
+     }
+     // the 404 must teach (M3): every location and form tried, plus the hint.
+-    module_report(p_source, p_site, "module not found.");
++    lane_report(p_where, p_source, p_site, "module not found.");
+     for (uint32_t i = 0; i < tried.count; ++i) {
+-      module_note(p_source, p_site, tried.items[i]);
++      lane_note(p_where, p_source, p_site, tried.items[i]);
+     }
+-    if ((p_modules->ok->caps_dropped & OK_CAP_NATIVE_LOAD) != 0) {
+-      module_note(p_source, p_site,
+-                  "native modules are not searched: OK_CAP_NATIVE_LOAD is dropped in this ok instance.");
++    if (p_where == NULL && (p_modules->ok->caps_dropped & OK_CAP_NATIVE_LOAD) != 0) {
++      lane_note(p_where, p_source, p_site,
++                "native modules are not searched: OK_CAP_NATIVE_LOAD is dropped in this ok instance.");
+     }
+     if (tried.count == 0) {
+-      module_note(p_source, p_site, "no locations were searched: file-relative paths need './' or '../', "
+-                                    "bare names search OKPATH (unset).");
++      lane_note(p_where, p_source, p_site, "no locations were searched: file-relative paths need './' or '../', "
++                                           "bare names search the project roots and OKPATH (unset).");
+     } else {
+-      module_note(p_source, p_site, "add the module's directory to OKPATH, or fix the path.");
++      lane_note(p_where, p_source, p_site, "add the module's directory to OKPATH, or fix the path.");
+     }
+     str_list_deinit(&tried, a);
+     return false;
+@@ -1608,7 +1713,7 @@ ok_result ok_modules_prepare(module_system* p_modules,
+     char* canonical = NULL;
+     resolved_module resolved;
+     resolved_init(&resolved);
+-    if (!resolve_import(p_modules, path, from_dir, p_source, site, &resolved)) {
++    if (!resolve_import(p_modules, path, from_dir, p_source, site, NULL, &resolved)) {
+       result = OK_COMPILE_ERROR;
+       break;
+     }
+@@ -1907,6 +2012,391 @@ ok_result ok_modules_prepare(module_system* p_modules,
+   return result;
+ }
+ 
++
++// ---------------------------------------------------------------- projects (OR-4)
++
++// one path split at its first segment: "mathx/vec" -> ("mathx", "vec"),
++// "app" -> ("app", ""). the views borrow p_path's chars.
++static void split_first_segment(const ok_string_view p_path, ok_string_view* p_head, ok_string_view* p_rest) {
++  const uint64_t length = ok_string_view_get_length(&p_path);
++  uint64_t slash = 0;
++  while (slash < length && p_path.chars[slash] != '/') {
++    ++slash;
++  }
++  *p_head = ok_create_string_view(p_path.chars, slash, false);
++  if (slash < length) {
++    *p_rest = ok_create_string_view(p_path.chars + slash + 1, length - slash - 1, false);
++  } else {
++    *p_rest = ok_create_string_view(NULL, 0, false);
++  }
++}
++
++static bool view_seg_equals(const ok_string_view p_view, const char* p_text) {
++  const size_t length = strlen(p_text);
++  return ok_string_view_get_length(&p_view) == length && memcmp(p_view.chars, p_text, length) == 0;
++}
++
++// join <dir>/<sub>/<rel> with normalization, one allocation out. p_sub may
++// be NULL (skipped). every join is a view join: join_normalize takes views.
++static char* join_three(const ok_allocators* p_a, const char* p_dir, const char* p_sub, const ok_string_view p_rel) {
++  const ok_string_view sub_view =
++      p_sub != NULL ? ok_create_string_view(p_sub, (uint32_t)strlen(p_sub), true)
++                    : ok_create_string_view(".", 1, true);
++  char* base = join_normalize(p_a, p_dir, sub_view);
++  if (base == NULL) {
++    return NULL;
++  }
++  char* joined = join_normalize(p_a, base, p_rel);
++  mod_free(p_a, base);
++  return joined;
++}
++
++// the native-target lane inside one project: the import names a declared
++// target. caps first (the doctrine: LOAD gates the load, BUILD gates the
++// ensure hook), the hook second (staleness and consent are host data), the
++// load third. p_where short-circuits to reporting the artifact.
++static project_lane_result resolve_native_target(module_system* p_modules,
++                                  const ok_project* p_project,
++                                  const ok_project_native* p_target,
++                                  str_list* p_tried,
++                                  char* p_native_error,
++                                  size_t p_native_error_capacity,
++                                  const ok_source* p_source,
++                                  const token* p_site,
++                                  const char* p_where,
++                                  resolved_module* p_out) {
++  const ok_allocators* a = &p_modules->ok->raw_alloc;
++
++  if (p_where != NULL) {
++    // report without ensuring, opening, or building
++    char* artifact_copy = mod_strdup(a, p_target->artifact);
++    char* canonical = artifact_copy != NULL ? canonicalize_path(a, artifact_copy) : NULL;
++    if (canonical == NULL) {
++      return PROJECT_ERROR;
++    }
++    p_out->canonical = canonical;
++    p_out->is_native = true;
++    return PROJECT_FOUND;
++  }
++
++  if ((p_modules->ok->caps_dropped & OK_CAP_NATIVE_LOAD) != 0) {
++    char message[320];
++    snprintf(message, sizeof(message), "native target '%s' refused: OK_CAP_NATIVE_LOAD is dropped in this ok instance.",
++             p_target->name);
++    lane_report(p_where, p_source, p_site, message);
++    return PROJECT_ERROR;
++  }
++  if ((p_modules->ok->caps_dropped & OK_CAP_NATIVE_BUILD) == 0 && p_modules->project_hooks.ensure != NULL) {
++    char err[512];
++    err[0] = '\0';
++    if (!p_modules->project_hooks.ensure(p_modules->project_hooks.p_ctx, p_project, p_target, err, sizeof(err))) {
++      char message[640];
++      snprintf(message, sizeof(message), "native target '%s' could not be built: %s", p_target->name,
++               err[0] != '\0' ? err : "the build hook refused it.");
++      lane_report(p_where, p_source, p_site, message);
++      return PROJECT_ERROR;
++    }
++  } else if ((p_modules->ok->caps_dropped & OK_CAP_NATIVE_BUILD) != 0) {
++    // no hook ran (the cap is dropped): the artifact must already exist.
++    // the loader's read is the existence probe, the where lane's trick.
++    ok_source probe;
++    if (p_modules->loader.read_source == NULL ||
++        !p_modules->loader.read_source(p_modules->loader.p_ctx, p_target->artifact, &probe)) {
++      char message[512];
++      snprintf(message,
++               sizeof(message),
++               "native target '%s' has no artifact at %s, and OK_CAP_NATIVE_BUILD is dropped: no build was attempted.",
++               p_target->name,
++               p_target->artifact);
++      lane_report(p_where, p_source, p_site, message);
++      return PROJECT_ERROR;
++    }
++    mod_free(a, (void*)probe.code);
++  }
++  if (p_modules->loader.load_native == NULL) {
++    lane_report(p_where, p_source, p_site, "this ok instance's loader has no native lane.");
++    return PROJECT_ERROR;
++  }
++  // the artifact string is the host's (borrowed, const): a copy goes into
++  // the destroying canonicalizer, the canonical is this lane's to spend
++  char* artifact_copy = mod_strdup(a, p_target->artifact);
++  char* canonical = artifact_copy != NULL ? canonicalize_path(a, artifact_copy) : NULL;
++  if (canonical == NULL) {
++    return PROJECT_ERROR;
++  }
++  // already loaded answers from the registry (one load per instance, ever)
++  if (registry_find(p_modules, canonical) != NULL) {
++    p_out->canonical = canonical;
++    p_out->is_native = true;
++    return PROJECT_FOUND;
++  }
++  const ok_native_module* descriptor = NULL;
++  void* handle = NULL;
++  char err[256];
++  err[0] = '\0';
++  const bool loaded =
++      p_modules->loader.load_native(p_modules->loader.p_ctx, canonical, ok_api_table(), &descriptor, &handle, err,
++                                    sizeof(err));
++  if (!loaded) {
++    if (err[0] != '\0') {
++      snprintf(p_native_error, p_native_error_capacity, "%s", err);
++    }
++    str_list_append(p_tried, a, canonical); // best effort: the trace wants it
++    mod_free(a, canonical);
++    return PROJECT_MISS; // unreadable or broken: the caller's lanes go on
++  }
++  p_out->canonical = canonical;
++  p_out->is_native = true;
++  p_out->descriptor = descriptor;
++  p_out->handle = handle;
++  return PROJECT_FOUND;
++}
++
++// resolve one import path inside one project (the draft's section 5 step 3):
++// the module roots, then the native targets, then the deps by name. project
++// deps recurse with their own tables. depth caps the (host-supplied, maybe
++// cyclic) dep graph. false = not found in this project's lanes (the caller
++// falls through), hard errors print and return false with p_out untouched.
++static project_lane_result resolve_in_project(module_system* p_modules,
++                                              const ok_project* p_project,
++                                              const ok_string_view p_path,
++                                              str_list* p_tried,
++                                              char* p_native_error,
++                                              size_t p_native_error_capacity,
++                                              const ok_source* p_source,
++                                              const token* p_site,
++                                              const char* p_where,
++                                              uint32_t p_depth,
++                                              resolved_module* p_out) {
++  const ok_allocators* a = &p_modules->ok->raw_alloc;
++
++  // the module roots, the full ladder at each (native candidates included)
++  for (uint32_t r = 0; r < p_project->module_roots_count; ++r) {
++    char* candidate = join_three(a, p_project->root, p_project->module_roots[r], p_path);
++    if (candidate == NULL) {
++      return PROJECT_ERROR;
++    }
++    const bool found =
++        probe_ladder(p_modules, candidate, p_tried, p_native_error, p_native_error_capacity, p_where != NULL, p_out);
++    mod_free(a, candidate);
++    if (found) {
++      return PROJECT_FOUND;
++    }
++  }
++
++  // the native targets: the import names one (single-segment paths only,
++  // a native is one module, not a namespace)
++  const uint64_t path_length = ok_string_view_get_length(&p_path);
++  bool has_slash = false;
++  for (uint64_t i = 0; i < path_length; ++i) {
++    if (p_path.chars[i] == '/') {
++      has_slash = true;
++      break;
++    }
++  }
++  if (!has_slash) {
++    for (uint32_t n = 0; n < p_project->natives_count; ++n) {
++      if (view_seg_equals(p_path, p_project->natives[n].name)) {
++        return resolve_native_target(p_modules, p_project, &p_project->natives[n], p_tried, p_native_error,
++                                     p_native_error_capacity, p_source, p_site, p_where, p_out);
++      }
++    }
++  }
++
++  // the deps by name: the first segment names the dep, the rest resolves
++  // inside it (a project dep's own roots/natives/deps, a raw dir's ladder)
++  if (p_depth >= 32) {
++    lane_report(p_where, p_source, p_site, "project dependency nesting is too deep: the limit is 32.");
++    return PROJECT_ERROR;
++  }
++  ok_string_view head;
++  ok_string_view rest;
++  split_first_segment(p_path, &head, &rest);
++  for (uint32_t d = 0; d < p_project->deps_count; ++d) {
++    const ok_project_dep* dep = &p_project->deps[d];
++    if (!view_seg_equals(head, dep->name)) {
++      continue;
++    }
++    if (dep->is_project) {
++      // the dep's own project table: the installed project at dep->path
++      const ok_project* dep_project = NULL;
++      for (uint32_t i = 0; i < p_modules->projects_count; ++i) {
++        if (strcmp(p_modules->projects[i].root, dep->path) == 0) {
++          dep_project = &p_modules->projects[i];
++          break;
++        }
++      }
++      if (dep_project == NULL) {
++        // the host's graph is inconsistent: fall back to the raw-dir lanes
++        dep_project = NULL;
++      }
++      if (dep_project != NULL) {
++        if (ok_string_view_get_length(&rest) == 0) {
++          char message[320];
++          snprintf(message,
++                   sizeof(message),
++                   "'%s' is a project dependency: import a module under it, like \"%s/module\".",
++                   dep->name,
++                   dep->name);
++          lane_report(p_where, p_source, p_site, message);
++          return PROJECT_ERROR;
++        }
++        return resolve_in_project(p_modules, dep_project, rest, p_tried, p_native_error, p_native_error_capacity,
++                                  p_source, p_site, p_where, p_depth + 1, p_out);
++      }
++    }
++    // the raw-dir lane (also the fallback for an unresolved project dep):
++    // the dep directory is an import root, the full ladder under it. a bare
++    // dep name probes the directory itself: D/index.ok, D.ok, D.so
++    char* candidate = join_three(a, dep->path, NULL, ok_string_view_get_length(&rest) == 0
++                                                        ? ok_create_string_view(".", 1, true)
++                                                        : rest);
++    if (candidate == NULL) {
++      return PROJECT_ERROR;
++    }
++    const bool found =
++        probe_ladder(p_modules, candidate, p_tried, p_native_error, p_native_error_capacity, p_where != NULL, p_out);
++    mod_free(a, candidate);
++    if (found) {
++      return PROJECT_FOUND;
++    }
++  }
++  return PROJECT_MISS;
++}
++
++// ok.h's ok_set_projects: the borrowed graph moves in wholesale.
++void ok_modules_set_projects(module_system* p_modules,
++                             const ok_project* p_projects,
++                             uint32_t p_count,
++                             ok_project_build_hooks p_hooks) {
++  p_modules->projects = p_projects;
++  p_modules->projects_count = p_count;
++  p_modules->project_hooks = p_hooks;
++}
++
++// ok.h's ok_module_where: the resolution question, asked directly. nothing
++// loads, nothing runs, nothing builds: the same ladder, read probes only.
++bool ok_modules_where(module_system* p_modules, const char* p_import, const char* p_from_dir,
++                      const char** p_out_canonical) {
++  const ok_allocators* a = &p_modules->ok->raw_alloc;
++  const ok_string_view view = ok_create_string_view(p_import, (uint32_t)strlen(p_import), false);
++  resolved_module resolved;
++  resolved_init(&resolved);
++  if (!resolve_import(p_modules, view, p_from_dir, NULL, NULL, "ok where", &resolved)) {
++    return false;
++  }
++  // the answer buffer: one slot, the previous answer dies with the call
++  if (p_modules->where_canonical != NULL) {
++    mod_free(a, p_modules->where_canonical);
++  }
++  p_modules->where_canonical = resolved.canonical;
++  resolved.canonical = NULL;
++  resolved_deinit(a, &resolved);
++  if (p_modules->where_canonical == NULL) {
++    return false;
++  }
++  if (p_out_canonical != NULL) {
++    *p_out_canonical = p_modules->where_canonical;
++  }
++  return true;
++}
++
++// ok.h's ok_module_evaluate: one source as a standalone module, the
++// manifest lane. imports are refused (a manifest is a script), the pub
++// surface becomes a namespace value, nothing registers.
++ok_value ok_modules_evaluate(module_system* p_modules, ok_source* p_source) {
++  ok* okay = p_modules->ok;
++
++  // parse: the manifest's own diagnostics (syntax errors carry its path)
++  parser parser;
++  parser_specs parser_specs = {.alloc = &okay->alloc, .source = p_source};
++  parser_init(&parser, parser_specs);
++  parse_result parsed = parser_parse(&parser);
++  if (parsed.status != PARSE_OK) {
++    parser_deinit(&parser);
++    parse_result_deinit(&parsed);
++    return NULL_AS_VALUE();
++  }
++
++  // imports are refused with the import site's own location
++  for (uint32_t i = 0; i < parsed.root->statements.count; ++i) {
++    if (parsed.root->statements.data[i]->node.node_type == AST_IMPORT_STATEMENT) {
++      ast_import_statement* import = (ast_import_statement*)parsed.root->statements.data[i];
++      module_report(p_source,
++                    &import->statement.node.token,
++                    "the manifest may not import: it is evaluated standalone, with no import lane.");
++      parser_deinit(&parser);
++      parse_result_deinit(&parsed);
++      return NULL_AS_VALUE();
++    }
++  }
++
++  // compile in module mode: pub top-levels recorded, the export epilogue
++  // emitted (the same lane every imported module compiles through)
++  compile_specs compile_specs;
++  compile_specs.source = p_source;
++  compile_specs.root = parsed.root;
++  bool err = false;
++  compile_specs.top_level_declarations = ok_get_top_level_declarations(okay, &err);
++  if (err) {
++    parser_deinit(&parser);
++    parse_result_deinit(&parsed);
++    return NULL_AS_VALUE();
++  }
++  compile_specs.imports = (ok_import_bindings){NULL, 0};
++  compile_specs.is_module = true;
++  compile_specs.module_path = ok_create_string_view(p_source->path, (uint32_t)strlen(p_source->path), true);
++  compile_result compiled = compiler_compile(&okay->compiler, compile_specs);
++  top_level_declarations_deinit(&compile_specs.top_level_declarations, &okay->alloc);
++  parser_deinit(&parser);
++  if (compiled.status != COMPILE_OK) {
++    parse_result_deinit(&parsed);
++    module_exports_deinit(&compiled.exports, &okay->alloc);
++    return NULL_AS_VALUE();
++  }
++
++  // run the top level: one source registration so runtime failures carry
++  // the manifest's own path and trace
++  if (!gc_guard_up(&okay->gc, OBJECT_AS_VALUE(compiled.function))) {
++    parse_result_deinit(&parsed);
++    module_exports_deinit(&compiled.exports, &okay->alloc);
++    return NULL_AS_VALUE();
++  }
++  const uint32_t source_id = vm_begin_source(&okay->vm, p_source->code, p_source->path);
++  if (source_id == VM_SOURCE_UNSTAMPED) {
++    gc_guard_down(&okay->gc);
++    parse_result_deinit(&parsed);
++    module_exports_deinit(&compiled.exports, &okay->alloc);
++    return NULL_AS_VALUE();
++  }
++  ok_stamp_source_ids(compiled.function, source_id);
++  err = false;
++  interpret_specs interpret_specs;
++  interpret_specs.function = compiled.function;
++  interpret_specs.source_id = source_id;
++  interpret_specs.top_level_values = ok_get_top_level_values(okay, &err);
++  const interpret_result ran = err ? (interpret_result){0} : vm_interpret(&okay->vm, interpret_specs);
++  gc_guard_down(&okay->gc);
++  value_array_deinit(&interpret_specs.top_level_values, &okay->alloc);
++  vm_end_source(&okay->vm, source_id);
++  if (err || ran.status != RUNTIME_OK) {
++    parse_result_deinit(&parsed);
++    module_exports_deinit(&compiled.exports, &okay->alloc);
++    return NULL_AS_VALUE(); // the runtime error printed with the manifest's path
++  }
++
++  // harvest into the sealed namespace; NOT registered (the host owns it)
++  value namespace = NULL_AS_VALUE();
++  if (!build_namespace(p_modules, p_source->path, &compiled.exports, &namespace)) {
++    parse_result_deinit(&parsed);
++    module_exports_deinit(&compiled.exports, &okay->alloc);
++    return NULL_AS_VALUE();
++  }
++  parse_result_deinit(&parsed);
++  module_exports_deinit(&compiled.exports, &okay->alloc);
++  return namespace;
++}
++
+ // ---------------------------------------------------------------- lifecycle
+ 
+ void ok_modules_init(module_system* p_modules, ok* p_ok, allocators* p_alloc) {
+@@ -1924,6 +2414,11 @@ void ok_modules_init(module_system* p_modules, ok* p_ok, allocators* p_alloc) {
+   p_modules->native_handles = NULL;
+   p_modules->native_handles_count = 0;
+   p_modules->native_handles_capacity = 0;
++  p_modules->projects = NULL;
++  p_modules->projects_count = 0;
++  p_modules->project_hooks.ensure = NULL;
++  p_modules->project_hooks.p_ctx = NULL;
++  p_modules->where_canonical = NULL;
+   // the CLI default loader: fs reads (this file) + the dylib-based native
+   // lane (okdylib.c). both halves reach the instance through the shared ctx.
+   ok_loader loader;
+@@ -1968,6 +2463,13 @@ void ok_modules_deinit(module_system* p_modules) {
+   p_modules->native_handles = NULL;
+   p_modules->native_handles_count = 0;
+   p_modules->native_handles_capacity = 0;
++  // OR-4: the where answer buffer (the project graph itself is borrowed)
++  if (p_modules->where_canonical != NULL) {
++    mod_free(a, p_modules->where_canonical);
++    p_modules->where_canonical = NULL;
++  }
++  p_modules->projects = NULL;
++  p_modules->projects_count = 0;
+   p_modules->ok = NULL;
+ }
+ 
+diff --git a/src/okmodules.h b/src/okmodules.h
+index 6005f7c..1051acc 100644
+--- a/src/okmodules.h
++++ b/src/okmodules.h
+@@ -104,6 +104,15 @@ typedef struct module_system {
+   void** native_handles;
+   uint32_t native_handles_count;
+   uint32_t native_handles_capacity;
++  // OR-4: the installed project graph (ok_set_projects). all borrowed
++  // pointers, replaced wholesale by the next call. the governing project of
++  // an importing file is the deepest installed root containing it.
++  const ok_project* projects;
++  uint32_t projects_count;
++  ok_project_build_hooks project_hooks;
++  // OR-4: ok_module_where's answer buffer (owned, user allocators). one
++  // slot: the latest call owns it, the previous answer dies with the call.
++  char* where_canonical;
+ } module_system;
+ 
+ void ok_modules_init(module_system* p_modules, ok* p_ok, allocators* p_alloc);
+@@ -136,6 +145,18 @@ ok_result ok_modules_prepare(module_system* p_modules,
+ // over the ok.h surface, one table per process, every ok instance.
+ const ok_api* ok_api_table(void);
+ 
++// OR-4: the project graph install (ok.h's ok_set_projects), the where
++// probe (ok.h's ok_module_where), and the standalone manifest evaluator
++// (ok.h's ok_module_evaluate). all live here, next to the ladder they
++// extend.
++void ok_modules_set_projects(module_system* p_modules,
++                             const ok_project* p_projects,
++                             uint32_t p_count,
++                             ok_project_build_hooks p_hooks);
++bool ok_modules_where(module_system* p_modules, const char* p_import, const char* p_from_dir,
++                      const char** p_out_canonical);
++ok_value ok_modules_evaluate(module_system* p_modules, ok_source* p_source);
++
+ // the gc's walk (called from okgc.c's mark): the registry's namespaces, the
+ // pending-roots window, and the native mount window's staged values.
+ // canonical/name/class strings ride the class (reachable through the
+diff --git a/tests/capi/src/main.c b/tests/capi/src/main.c
+index e872988..75fe8c1 100644
+--- a/tests/capi/src/main.c
++++ b/tests/capi/src/main.c
+@@ -723,6 +723,83 @@ int main(void) {
+     CHECK(ok_unroot(p_ok, box_root));
+   }
+ 
++  // ---------- OR-4: the where probe, the map walk, the manifest lane ----------
++  {
++    // where over the memory loader: nothing loads, the answer borrows
++    ok* w_ok = ok_create(specs);
++    CHECK(w_ok != NULL);
++    ok_loader loader;
++    loader.read_source = mem_read_source;
++    loader.load_native = NULL;
++    loader.p_ctx = NULL;
++    ok_set_loader(w_ok, loader);
++    const char* canonical = NULL;
++    CHECK(ok_module_where(w_ok, "./deep.ok", "mem:/", &canonical));
++    CHECK(canonical != NULL && strstr(canonical, "deep.ok") != NULL); // realpath may refuse virtual paths
++    CHECK(!ok_module_where(w_ok, "./nope", "mem:/", &canonical));
++    ok_free(w_ok);
++
++    // the manifest lane: one source as a standalone module. pub table
++    // harvested through the export read api, imports refused with the
++    // teaching error, nothing registers.
++    ok* m_ok = ok_create(specs);
++    CHECK(m_ok != NULL);
++    ok_source manifest = {
++        "pub let project = {\n"
++        "  \"name\": \"capi\",\n"
++        "  \"modules\": [\"lib\"],\n"
++        "  \"deps\": {\"vendor\": {\"path\": \"/nowhere\"}},\n"
++        "};\n",
++        "project.ok"};
++    ok_value table = ok_module_evaluate(m_ok, manifest);
++    CHECK(!ok_value_is_null(table));
++    const uint32_t m_root = ok_root(m_ok, table);
++    CHECK(m_root != OK_ROOT_INVALID);
++    CHECK(ok_module_count(m_ok) == 0); // nothing registered: standalone
++    CHECK(ok_module_export_count(m_ok, table) == 1);
++    CHECK(strcmp(ok_module_export_name(m_ok, table, 0), "project") == 0);
++    ok_value project = ok_module_export_get(m_ok, table, 0);
++    CHECK(ok_value_is_map(project));
++
++    // the indexed map walk: the harvest's own lane (slot order, complete)
++    ok_value key = ok_value_null();
++    ok_value value = ok_value_null();
++    uint32_t pairs = 0;
++    bool saw_name = false;
++    bool saw_modules = false;
++    bool saw_deps = false;
++    while (ok_map_pair_at(project, pairs, &key, &value)) {
++      if (ok_value_is_string(key)) {
++        const ok_cstring_view name = ok_value_as_string(key);
++        if (strcmp(name.chars, "name") == 0) {
++          saw_name = ok_value_is_string(value);
++        } else if (strcmp(name.chars, "modules") == 0) {
++          saw_modules = ok_value_is_array(value) && ok_array_len(value) == 1 &&
++                        ok_value_is_string(ok_array_get(value, 0));
++        } else if (strcmp(name.chars, "deps") == 0) {
++          saw_deps = ok_value_is_map(value) && ok_map_len(value) == 1;
++        }
++      }
++      ++pairs;
++    }
++    CHECK(pairs == 3 && saw_name && saw_modules && saw_deps);
++    CHECK(!ok_map_pair_at(project, 3, &key, &value)); // out of range
++    ok_unroot(m_ok, m_root);
++
++    // a manifest that imports is refused, its own path and line in the
++    // report
++    ok_source importing = {"import \"std/array\";\n", "bad.ok"};
++    CHECK(ok_value_is_null(ok_module_evaluate(m_ok, importing)));
++    // and one with no pub project table still evaluates (the harvest is
++    // the caller's business): a namespace with the exports it declared
++    ok_source bare = {"pub let alone = 1;\n", "bare.ok"};
++    ok_value alone_ns = ok_module_evaluate(m_ok, bare);
++    CHECK(!ok_value_is_null(alone_ns));
++    CHECK(ok_module_export_count(m_ok, alone_ns) == 1);
++    CHECK(strcmp(ok_module_export_name(m_ok, alone_ns, 0), "alone") == 0);
++    ok_free(m_ok);
++  }
++
+   ok_free(p_ok);
+ 
+   printf("capi: %d checks OK\n", g_checks);
+diff --git a/tests/e2e/src/main.cpp b/tests/e2e/src/main.cpp
+index a5c706f..af9b403 100644
+--- a/tests/e2e/src/main.cpp
++++ b/tests/e2e/src/main.cpp
+@@ -190,14 +190,15 @@ std::string parse_okflags(const std::filesystem::path& path) {
+ 
+ // the native fixture builds (OR-3): every build.sh under the tests root,
+ // from its own directory, before any test runs. the declared-build contract:
+-// whatever toolchain, idempotent, quiet on success.
+-void build_native_fixtures(const std::string& tests_path) {
++// whatever toolchain, idempotent, quiet on success. OK_BIN is the ok binary
++// itself (OR-4: project fixtures build through 'ok build').
++void build_native_fixtures(const std::string& tests_path, const std::string& ok_path) {
+   for (auto& entry : std::filesystem::recursive_directory_iterator(tests_path)) {
+     if (entry.path().filename() != "build.sh") {
+       continue;
+     }
+     const std::string dir = entry.path().parent_path().string();
+-    const std::string cmd = "cd \"" + dir + "\" && bash build.sh";
++    const std::string cmd = "cd \"" + dir + "\" && OK_BIN=\"" + ok_path + "\" bash build.sh";
+     if (decode_system_status(system(cmd.c_str())) != 0) {
+       std::println(stderr, "FIXTURE BUILD FAILED: {}", entry.path().string());
+       std::exit(1);
+@@ -226,7 +227,7 @@ int main(int argc, char** argv) {
+ 
+   uint32_t ok = 0, notok = 0, skipped = 0;
+ 
+-  build_native_fixtures(tests_path);
++  build_native_fixtures(tests_path, okpath);
+ 
+   for (auto& entry : std::filesystem::recursive_directory_iterator(tests_path)) {
+     if (entry.path().extension() != ".ok")
+diff --git a/tests/e2e/tests/modules/project_ambiguous/main.ok b/tests/e2e/tests/modules/project_ambiguous/main.ok
+new file mode 100644
+index 0000000..d1c03db
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_ambiguous/main.ok
+@@ -0,0 +1 @@
++// expect error: is both a dep
+diff --git a/tests/e2e/tests/modules/project_ambiguous/project.ok b/tests/e2e/tests/modules/project_ambiguous/project.ok
+new file mode 100644
+index 0000000..223a989
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_ambiguous/project.ok
+@@ -0,0 +1,14 @@
++// the ambiguity (M13): one name, two meanings. the evaluator refuses,
++// naming both declarations.
++pub let project = {
++  "name": "ambiguous",
++  "deps": {
++    "ray": {"path": "vendor/ray"},
++  },
++  "natives": {
++    "ray": {
++      "build": "true",
++      "artifact": "ray.so",
++    },
++  },
++};
+diff --git a/tests/e2e/tests/modules/project_app/main.ok b/tests/e2e/tests/modules/project_app/main.ok
+new file mode 100644
+index 0000000..f73d4eb
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_app/main.ok
+@@ -0,0 +1,5 @@
++// the project lane (OR-4): bare names resolve through the governing
++// project's module roots, discovered by walking up from THIS file.
++import "app";
++
++print app.greeting; // expect: <hello from src>
+diff --git a/tests/e2e/tests/modules/project_app/project.ok b/tests/e2e/tests/modules/project_app/project.ok
+new file mode 100644
+index 0000000..8dd7346
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_app/project.ok
+@@ -0,0 +1,7 @@
++// the manifest: a plain ok module, evaluated in a sandboxed instance (the
++// full stdlib, natives refused). the pub 'project' table is the surface.
++pub let project = {
++  "name": "app",
++  "version": "0.1.0",
++  "modules": ["src"],
++};
+diff --git a/tests/e2e/tests/modules/project_app/src/app.ok b/tests/e2e/tests/modules/project_app/src/app.ok
+new file mode 100644
+index 0000000..8293bde
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_app/src/app.ok
+@@ -0,0 +1,5 @@
++// a project module. its own imports resolve through the same governing
++// project (walk up from here, the same root answers).
++import "util";
++
++pub let greeting = util.deco("hello from src");
+diff --git a/tests/e2e/tests/modules/project_app/src/util.ok b/tests/e2e/tests/modules/project_app/src/util.ok
+new file mode 100644
+index 0000000..745aa5e
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_app/src/util.ok
+@@ -0,0 +1,3 @@
++pub fu deco(s) {
++  return "<" + s + ">";
++}
+diff --git a/tests/e2e/tests/modules/project_autobuild/.okbuild/adder.stamp b/tests/e2e/tests/modules/project_autobuild/.okbuild/adder.stamp
+new file mode 100644
+index 0000000..55dec1c
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_autobuild/.okbuild/adder.stamp
+@@ -0,0 +1 @@
++gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c
+\ No newline at end of file
+diff --git a/tests/e2e/tests/modules/project_autobuild/build.sh b/tests/e2e/tests/modules/project_autobuild/build.sh
+new file mode 100755
+index 0000000..341cf3e
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_autobuild/build.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# the clean fixture: every run starts like a fresh clone (no artifact, no
++# stamps), so the auto-build lane fires during the test itself
++set -e
++cd "$(dirname "$0")"
++rm -f adder.so
++rm -rf .okbuild
+diff --git a/tests/e2e/tests/modules/project_autobuild/main.ok b/tests/e2e/tests/modules/project_autobuild/main.ok
+new file mode 100644
+index 0000000..15c3005
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_autobuild/main.ok
+@@ -0,0 +1,6 @@
++// okflags: --yes
++// auto-build on import (OR-4): only inside a project, only with consent.
++// --yes grants it here; the build command runs from the project root.
++import "adder";
++
++print adder.add(20, 22); // expect: 42
+diff --git a/tests/e2e/tests/modules/project_autobuild/native/adder.c b/tests/e2e/tests/modules/project_autobuild/native/adder.c
+new file mode 100644
+index 0000000..53d0a97
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_autobuild/native/adder.c
+@@ -0,0 +1,35 @@
++// the ok build acceptance lane: a native target with a declared build
++// command, built through `ok build`, imported by name.
++#include "ok/ok_module.h"
++
++static const ok_api* api = NULL;
++
++static ok_value adder_add(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  if (p_argc != 2 || api->value_type(p_argv[0]) != OK_TYPE_NUM || api->value_type(p_argv[1]) != OK_TYPE_NUM) {
++    api->native_error(p_ok, api->view("add expects two numbers.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  return api->value_number(api->value_as_number(p_argv[0]) + api->value_as_number(p_argv[1]));
++}
++
++static const ok_native_fn_def adder_fns[] = {
++    {"add", 2, adder_add},
++};
++
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  if (p_api == NULL || p_api->abi != OK_NATIVE_ABI) {
++    return NULL;
++  }
++  api = p_api;
++  static const ok_native_module adder_module = {
++      OK_NATIVE_ABI,
++      "adder",
++      "0.1.0",
++      1,
++      adder_fns,
++      NULL,
++      NULL,
++      NULL,
++  };
++  return &adder_module;
++}
+diff --git a/tests/e2e/tests/modules/project_autobuild/project.ok b/tests/e2e/tests/modules/project_autobuild/project.ok
+new file mode 100644
+index 0000000..35c75e5
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_autobuild/project.ok
+@@ -0,0 +1,12 @@
++// the auto-build lane: the artifact is missing (the fixture cleans it every
++// run), the import itself triggers the consented build
++pub let project = {
++  "name": "autobuild",
++  "natives": {
++    "adder": {
++      "dir": "native",
++      "build": "gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c",
++      "artifact": "adder.so",
++    },
++  },
++};
+diff --git a/tests/e2e/tests/modules/project_cycle/main.ok b/tests/e2e/tests/modules/project_cycle/main.ok
+new file mode 100644
+index 0000000..938c011
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_cycle/main.ok
+@@ -0,0 +1 @@
++// expect error: project dependency cycle
+diff --git a/tests/e2e/tests/modules/project_cycle/project.ok b/tests/e2e/tests/modules/project_cycle/project.ok
+new file mode 100644
+index 0000000..9e7f6c7
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_cycle/project.ok
+@@ -0,0 +1,7 @@
++// the cycle: b's manifest deps back on this project's root
++pub let project = {
++  "name": "cyc",
++  "deps": {
++    "b": {"path": "vendor/b"},
++  },
++};
+diff --git a/tests/e2e/tests/modules/project_cycle/vendor/b/project.ok b/tests/e2e/tests/modules/project_cycle/vendor/b/project.ok
+new file mode 100644
+index 0000000..7514423
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_cycle/vendor/b/project.ok
+@@ -0,0 +1,6 @@
++pub let project = {
++  "name": "b",
++  "deps": {
++    "a": {"path": "../.."},
++  },
++};
+diff --git a/tests/e2e/tests/modules/project_dep/main.ok b/tests/e2e/tests/modules/project_dep/main.ok
+new file mode 100644
+index 0000000..e656112
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_dep/main.ok
+@@ -0,0 +1,7 @@
++// the dep names are import roots: "mathx/vec" resolves inside dep mathx
++// (its own project's module roots), "helpers/x" inside the raw dir.
++import "mathx/vec";
++import "helpers/x";
++
++print mathx.vec.mag2(3, 4); // expect: 25
++print helpers.x.twice(21); // expect: 42
+diff --git a/tests/e2e/tests/modules/project_dep/project.ok b/tests/e2e/tests/modules/project_dep/project.ok
+new file mode 100644
+index 0000000..5997562
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_dep/project.ok
+@@ -0,0 +1,9 @@
++// deps-on-project + a raw dir dep (M7's mixing). mathx is itself a project:
++// its own roots and deps apply under it. helpers is a plain directory.
++pub let project = {
++  "name": "depapp",
++  "deps": {
++    "mathx": {"path": "vendor/mathx"},
++    "helpers": {"path": "vendor/helpers"},
++  },
++};
+diff --git a/tests/e2e/tests/modules/project_dep/vendor/helpers/x.ok b/tests/e2e/tests/modules/project_dep/vendor/helpers/x.ok
+new file mode 100644
+index 0000000..b4598e6
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_dep/vendor/helpers/x.ok
+@@ -0,0 +1,3 @@
++pub fu twice(x) {
++  return x * 2;
++}
+diff --git a/tests/e2e/tests/modules/project_dep/vendor/mathx/project.ok b/tests/e2e/tests/modules/project_dep/vendor/mathx/project.ok
+new file mode 100644
+index 0000000..84084b4
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_dep/vendor/mathx/project.ok
+@@ -0,0 +1,8 @@
++// the nested project: its deps answer for files under it (vec.ok's own
++// imports resolve through THIS table, not the parent's)
++pub let project = {
++  "name": "mathx",
++  "deps": {
++    "tiny": {"path": "../tiny"},
++  },
++};
+diff --git a/tests/e2e/tests/modules/project_dep/vendor/mathx/src/vec.ok b/tests/e2e/tests/modules/project_dep/vendor/mathx/src/vec.ok
+new file mode 100644
+index 0000000..1285cd8
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_dep/vendor/mathx/src/vec.ok
+@@ -0,0 +1,7 @@
++// resolved through mathx's own governing project: "tiny/t" is mathx's dep,
++// M5 binds the path (tiny.t), same as every import lane
++import "tiny/t";
++
++pub fu mag2(a, b) {
++  return tiny.t.square(a) + tiny.t.square(b);
++}
+diff --git a/tests/e2e/tests/modules/project_dep/vendor/tiny/t.ok b/tests/e2e/tests/modules/project_dep/vendor/tiny/t.ok
+new file mode 100644
+index 0000000..18de88e
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_dep/vendor/tiny/t.ok
+@@ -0,0 +1,3 @@
++pub fu square(x) {
++  return x * x;
++}
+diff --git a/tests/e2e/tests/modules/project_manifest_imports/main.ok b/tests/e2e/tests/modules/project_manifest_imports/main.ok
+new file mode 100644
+index 0000000..d8d78e3
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_manifest_imports/main.ok
+@@ -0,0 +1 @@
++// expect error: the manifest may not import
+diff --git a/tests/e2e/tests/modules/project_manifest_imports/project.ok b/tests/e2e/tests/modules/project_manifest_imports/project.ok
+new file mode 100644
+index 0000000..2be130c
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_manifest_imports/project.ok
+@@ -0,0 +1,6 @@
++// the manifest may not import (M10: a script, not a module graph node)
++import "std/array";
++
++pub let project = {
++  "name": "importing",
++};
+diff --git a/tests/e2e/tests/modules/project_manifest_missing/main.ok b/tests/e2e/tests/modules/project_manifest_missing/main.ok
+new file mode 100644
+index 0000000..71acade
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_manifest_missing/main.ok
+@@ -0,0 +1 @@
++// expect error: the manifest exports no 'project' table
+diff --git a/tests/e2e/tests/modules/project_manifest_missing/project.ok b/tests/e2e/tests/modules/project_manifest_missing/project.ok
+new file mode 100644
+index 0000000..2ec3a18
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_manifest_missing/project.ok
+@@ -0,0 +1,2 @@
++// no pub 'project' table: the evaluator refuses with the teaching error
++pub let wrong = 1;
+diff --git a/tests/e2e/tests/modules/project_missing_dep/main.ok b/tests/e2e/tests/modules/project_missing_dep/main.ok
+new file mode 100644
+index 0000000..5f97e03
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_missing_dep/main.ok
+@@ -0,0 +1 @@
++// expect error: project dep 'gone' does not exist
+diff --git a/tests/e2e/tests/modules/project_missing_dep/project.ok b/tests/e2e/tests/modules/project_missing_dep/project.ok
+new file mode 100644
+index 0000000..c882769
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_missing_dep/project.ok
+@@ -0,0 +1,7 @@
++// the missing dep: the path does not exist, the discovery fails eagerly
++pub let project = {
++  "name": "missingdep",
++  "deps": {
++    "gone": {"path": "vendor/gone"},
++  },
++};
+diff --git a/tests/e2e/tests/modules/project_native/.okbuild/adder.stamp b/tests/e2e/tests/modules/project_native/.okbuild/adder.stamp
+new file mode 100644
+index 0000000..55dec1c
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_native/.okbuild/adder.stamp
+@@ -0,0 +1 @@
++gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c
+\ No newline at end of file
+diff --git a/tests/e2e/tests/modules/project_native/build.sh b/tests/e2e/tests/modules/project_native/build.sh
+new file mode 100755
+index 0000000..017d0eb
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_native/build.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# the fixture's declared build runs through the CLI's own build command:
++# ok build discovers the project here, runs the target, stamps it. OK_BIN
++# is the runner's gift (the fixture-build contract).
++set -e
++cd "$(dirname "$0")"
++"${OK_BIN:-../../../../../build-gcc/ok}" build --yes
+diff --git a/tests/e2e/tests/modules/project_native/main.ok b/tests/e2e/tests/modules/project_native/main.ok
+new file mode 100644
+index 0000000..cf065e7
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_native/main.ok
+@@ -0,0 +1,6 @@
++// the native target by name: the project lane hands the import to the
++// artifact ok build produced
++import "adder";
++
++print adder.add(2, 3); // expect: 5
++print adder.add(40, 2); // expect: 42
+diff --git a/tests/e2e/tests/modules/project_native/native/adder.c b/tests/e2e/tests/modules/project_native/native/adder.c
+new file mode 100644
+index 0000000..53d0a97
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_native/native/adder.c
+@@ -0,0 +1,35 @@
++// the ok build acceptance lane: a native target with a declared build
++// command, built through `ok build`, imported by name.
++#include "ok/ok_module.h"
++
++static const ok_api* api = NULL;
++
++static ok_value adder_add(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  if (p_argc != 2 || api->value_type(p_argv[0]) != OK_TYPE_NUM || api->value_type(p_argv[1]) != OK_TYPE_NUM) {
++    api->native_error(p_ok, api->view("add expects two numbers.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  return api->value_number(api->value_as_number(p_argv[0]) + api->value_as_number(p_argv[1]));
++}
++
++static const ok_native_fn_def adder_fns[] = {
++    {"add", 2, adder_add},
++};
++
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  if (p_api == NULL || p_api->abi != OK_NATIVE_ABI) {
++    return NULL;
++  }
++  api = p_api;
++  static const ok_native_module adder_module = {
++      OK_NATIVE_ABI,
++      "adder",
++      "0.1.0",
++      1,
++      adder_fns,
++      NULL,
++      NULL,
++      NULL,
++  };
++  return &adder_module;
++}
+diff --git a/tests/e2e/tests/modules/project_native/project.ok b/tests/e2e/tests/modules/project_native/project.ok
+new file mode 100644
+index 0000000..76e30b5
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_native/project.ok
+@@ -0,0 +1,13 @@
++// the native target (M12): whatever toolchain, one declared build command,
++// the artifact is the importable module. ok build runs it, .okbuild stamps
++// the success.
++pub let project = {
++  "name": "nativeapp",
++  "natives": {
++    "adder": {
++      "dir": "native",
++      "build": "gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c",
++      "artifact": "adder.so",
++    },
++  },
++};
+diff --git a/tests/e2e/tests/modules/project_nobuild/build.sh b/tests/e2e/tests/modules/project_nobuild/build.sh
+new file mode 100755
+index 0000000..e2f089e
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_nobuild/build.sh
+@@ -0,0 +1,6 @@
++#!/bin/sh
++# the clean fixture: no artifact, so --no-build's refusal is the one tested
++set -e
++cd "$(dirname "$0")"
++rm -f adder.so
++rm -rf .okbuild
+diff --git a/tests/e2e/tests/modules/project_nobuild/main.ok b/tests/e2e/tests/modules/project_nobuild/main.ok
+new file mode 100644
+index 0000000..c8564aa
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_nobuild/main.ok
+@@ -0,0 +1,7 @@
++// okflags: --no-build
++// the consent refusal: the caps stay up, the flag refuses the needed build
++// with the teaching error
++import "adder";
++
++print adder.add(1, 1);
++// expect error: auto-build refused: --no-build
+diff --git a/tests/e2e/tests/modules/project_nobuild/native/adder.c b/tests/e2e/tests/modules/project_nobuild/native/adder.c
+new file mode 100644
+index 0000000..53d0a97
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_nobuild/native/adder.c
+@@ -0,0 +1,35 @@
++// the ok build acceptance lane: a native target with a declared build
++// command, built through `ok build`, imported by name.
++#include "ok/ok_module.h"
++
++static const ok_api* api = NULL;
++
++static ok_value adder_add(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  if (p_argc != 2 || api->value_type(p_argv[0]) != OK_TYPE_NUM || api->value_type(p_argv[1]) != OK_TYPE_NUM) {
++    api->native_error(p_ok, api->view("add expects two numbers.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  return api->value_number(api->value_as_number(p_argv[0]) + api->value_as_number(p_argv[1]));
++}
++
++static const ok_native_fn_def adder_fns[] = {
++    {"add", 2, adder_add},
++};
++
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  if (p_api == NULL || p_api->abi != OK_NATIVE_ABI) {
++    return NULL;
++  }
++  api = p_api;
++  static const ok_native_module adder_module = {
++      OK_NATIVE_ABI,
++      "adder",
++      "0.1.0",
++      1,
++      adder_fns,
++      NULL,
++      NULL,
++      NULL,
++  };
++  return &adder_module;
++}
+diff --git a/tests/e2e/tests/modules/project_nobuild/project.ok b/tests/e2e/tests/modules/project_nobuild/project.ok
+new file mode 100644
+index 0000000..0a972b2
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_nobuild/project.ok
+@@ -0,0 +1,12 @@
++// the --no-build lane: consent policy, not capability. the caps stay up,
++// the flag refuses the build with the teaching error
++pub let project = {
++  "name": "nobuild",
++  "natives": {
++    "adder": {
++      "dir": "native",
++      "build": "gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c",
++      "artifact": "adder.so",
++    },
++  },
++};
+diff --git a/tests/e2e/tests/modules/project_restrict/build.sh b/tests/e2e/tests/modules/project_restrict/build.sh
+new file mode 100755
+index 0000000..8cadf29
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_restrict/build.sh
+@@ -0,0 +1,6 @@
++#!/bin/sh
++# the clean fixture: no artifact, so the refusal path is the one under test
++set -e
++cd "$(dirname "$0")"
++rm -f adder.so
++rm -rf .okbuild
+diff --git a/tests/e2e/tests/modules/project_restrict/main.ok b/tests/e2e/tests/modules/project_restrict/main.ok
+new file mode 100644
+index 0000000..761aa08
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_restrict/main.ok
+@@ -0,0 +1,7 @@
++// okflags: --restrict
++// the capability refusal: no consent prompt, no build, one clear error.
++// --restrict drops OK_CAP_NATIVE_LOAD first, so the refusal names it.
++import "adder";
++
++print adder.add(1, 1);
++// expect error: native target 'adder' refused: OK_CAP_NATIVE_LOAD is dropped
+diff --git a/tests/e2e/tests/modules/project_restrict/native/adder.c b/tests/e2e/tests/modules/project_restrict/native/adder.c
+new file mode 100644
+index 0000000..53d0a97
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_restrict/native/adder.c
+@@ -0,0 +1,35 @@
++// the ok build acceptance lane: a native target with a declared build
++// command, built through `ok build`, imported by name.
++#include "ok/ok_module.h"
++
++static const ok_api* api = NULL;
++
++static ok_value adder_add(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  if (p_argc != 2 || api->value_type(p_argv[0]) != OK_TYPE_NUM || api->value_type(p_argv[1]) != OK_TYPE_NUM) {
++    api->native_error(p_ok, api->view("add expects two numbers.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  return api->value_number(api->value_as_number(p_argv[0]) + api->value_as_number(p_argv[1]));
++}
++
++static const ok_native_fn_def adder_fns[] = {
++    {"add", 2, adder_add},
++};
++
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  if (p_api == NULL || p_api->abi != OK_NATIVE_ABI) {
++    return NULL;
++  }
++  api = p_api;
++  static const ok_native_module adder_module = {
++      OK_NATIVE_ABI,
++      "adder",
++      "0.1.0",
++      1,
++      adder_fns,
++      NULL,
++      NULL,
++      NULL,
++  };
++  return &adder_module;
++}
+diff --git a/tests/e2e/tests/modules/project_restrict/project.ok b/tests/e2e/tests/modules/project_restrict/project.ok
+new file mode 100644
+index 0000000..e8fd250
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_restrict/project.ok
+@@ -0,0 +1,13 @@
++// the restricted lane: --restrict drops OK_CAP_NATIVE_LOAD and
++// OK_CAP_NATIVE_BUILD, the declared target refuses with the capability
++// error, not a consent prompt
++pub let project = {
++  "name": "restricted",
++  "natives": {
++    "adder": {
++      "dir": "native",
++      "build": "gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c",
++      "artifact": "adder.so",
++    },
++  },
++};
+diff --git a/tests/e2e/tests/modules/project_where404/main.ok b/tests/e2e/tests/modules/project_where404/main.ok
+new file mode 100644
+index 0000000..7f1f568
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_where404/main.ok
+@@ -0,0 +1,5 @@
++// okflags: --where gone
++// the where lane (OR-4): the resolution question, asked of the same graph,
++// the same teaching trace as an import's 404, nothing loads, nothing runs
++// (the process exits before the script does anything).
++// expect error: module not found.
+diff --git a/tests/e2e/tests/modules/project_where404/project.ok b/tests/e2e/tests/modules/project_where404/project.ok
+new file mode 100644
+index 0000000..886416b
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_where404/project.ok
+@@ -0,0 +1,4 @@
++pub let project = {
++  "name": "whereapp",
++  "modules": ["src"],
++};
+diff --git a/tests/e2e/tests/modules/project_where404/src/real.ok b/tests/e2e/tests/modules/project_where404/src/real.ok
+new file mode 100644
+index 0000000..9aeba67
+--- /dev/null
++++ b/tests/e2e/tests/modules/project_where404/src/real.ok
+@@ -0,0 +1 @@
++// a module under the project roots

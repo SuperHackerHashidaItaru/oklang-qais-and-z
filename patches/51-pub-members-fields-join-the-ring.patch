@@ -1,0 +1,1061 @@
+diff --git a/cli/src/project.c b/cli/src/project.c
+index e520fc1..047bffd 100644
+--- a/cli/src/project.c
++++ b/cli/src/project.c
+@@ -3,6 +3,8 @@
+ 
+ #include "project.h"
+ 
++#include "ok/ok_module.h"
++
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -656,8 +658,22 @@ void cli_graph_free(cli_graph* p_graph) {
+ 
+ // ---------------------------------------------------------------- the build lane
+ 
+-// the staleness stamp: <root>/.okbuild/<name>.stamp holds the build command
+-// of the last success. fresh = artifact readable AND stamp == command.
++// the staleness stamp: <root>/.okbuild/<name>.stamp holds the host's
++// native abi line and the build command of the last success. fresh =
++// artifact readable AND stamp == expected. the abi line (patch 51) is the
++// toolchain's fingerprint: an ok whose abi changed never trusts an older
++// artifact - the bump that taught this was 2 -> 3 leaving a green stamp
++// over a stale .so.
++static char* stamp_content(const char* p_build) {
++  const size_t room = 16 + strlen(p_build) + 2;
++  char* out = (char*)malloc(room);
++  if (out == NULL) {
++    return NULL;
++  }
++  sprintf(out, "%u\n%s", (unsigned)OK_NATIVE_ABI, p_build);
++  return out;
++}
++
+ static char* stamp_path(const char* p_root, const char* p_name) {
+   const size_t a = strlen(p_root);
+   const size_t b = strlen(p_name);
+@@ -682,8 +698,10 @@ static bool target_fresh(const char* p_root, const char* p_name, const char* p_b
+   if (recorded == NULL) {
+     return false;
+   }
+-  // the command string, unchanged since the last recorded success
+-  const bool same = strcmp(recorded, p_build) == 0;
++  // the abi line and the command string, unchanged since the last success
++  char* expected = stamp_content(p_build);
++  const bool same = expected != NULL && strcmp(recorded, expected) == 0;
++  free(expected);
+   free(recorded);
+   return same;
+ }
+@@ -702,7 +720,11 @@ static void write_stamp(const char* p_root, const char* p_name, const char* p_bu
+   }
+   FILE* file = fopen(stamp, "wb");
+   if (file != NULL) {
+-    fwrite(p_build, 1, strlen(p_build), file);
++    char* content = stamp_content(p_build);
++    if (content != NULL) {
++      fwrite(content, 1, strlen(content), file);
++      free(content);
++    }
+     fclose(file);
+   }
+   free(stamp);
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index 6d00055..9eec01a 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -208,9 +208,24 @@ bool ok_class_freeze(ok* p_ok, ok_value p_class);
+ // with ok_value_set_field; a field declared without mut can never be
+ // written, from C any more than from script. false = p_class is not a class
+ // value, the class is frozen, an empty name, a redeclaration anywhere in
+-// the chain, or OOM.
++// the chain, or OOM. the field is PRIVATE from script (the ring); C reads
++// and writes it through this api either way. ok_class_add_field_ex (patch
++// 51) is the pub form: a pub field is script-readable (and, with mut,
++// script-writable) from outside the class, the getter-free surface.
+ bool ok_class_add_field(ok* p_ok, ok_value p_class, ok_string_view p_name, bool p_mut, ok_value p_initial);
+ 
++// the pub form (patch 51): same contract as ok_class_add_field, plus the
++// visibility bit. p_pub true opens the member ring - script code anywhere
++// (other modules included) may read the field, and write it when mut. the
++// raylib shape: `vec.x` is a slot load, not a getter call. p_pub false is
++// exactly ok_class_add_field.
++bool ok_class_add_field_ex(ok* p_ok,
++                           ok_value p_class,
++                           ok_string_view p_name,
++                           bool p_mut,
++                           bool p_pub,
++                           ok_value p_initial);
++
+ // read one instance field by name. false = p_value is not an instance, or
+ // no field of that name exists on its class chain. allocation-free: the
+ // name is probed in the interner first, an unseen spelling cannot be a
+diff --git a/include/ok/ok_module.h b/include/ok/ok_module.h
+index 029a424..69922d0 100644
+--- a/include/ok/ok_module.h
++++ b/include/ok/ok_module.h
+@@ -37,7 +37,8 @@ extern "C" {
+ // refuses with the rebuild message. no semver, no compat promises pre-1.0:
+ // "rebuild your natives" is the honest stance. the one discipline kept
+ // anyway: vtable entries are APPEND-ONLY, never repurposed, never reordered.
+-#define OK_NATIVE_ABI 2u
++// 3: class_add_field_ex appended (patch 51, the pub-field door).
++#define OK_NATIVE_ABI 3u
+ 
+ // the one symbol a native shared object exports. msvc needs dllexport on
+ // the building side and dllimport on the consuming side; everywhere else
+@@ -181,6 +182,18 @@ struct ok_api {
+   bool (*class_add_field)(ok* p_ok, ok_value p_class, ok_string_view p_name, bool p_mut, ok_value p_initial);
+   bool (*value_get_field)(ok* p_ok, ok_value p_instance, ok_string_view p_name, ok_value* p_out);
+   bool (*value_set_field)(ok* p_ok, ok_value p_instance, ok_string_view p_name, ok_value p_new_value);
++  // the pub-field door (patch 51, ABI 3): the trio's ex form. same contract
++  // as class_add_field, plus the visibility bit - a pub field is
++  // script-readable (and, with mut, script-writable) from outside the
++  // class, module boundaries included. the raylib shape: `vec.x` is a
++  // slot load, not a getter call. the old entry stays (append-only) as
++  // the private-default form.
++  bool (*class_add_field_ex)(ok* p_ok,
++                             ok_value p_class,
++                             ok_string_view p_name,
++                             bool p_mut,
++                             bool p_pub,
++                             ok_value p_initial);
+ };
+ 
+ // the dynamic-library hooks, host-provided like malloc: the host supplies
+diff --git a/src/ok.c b/src/ok.c
+index 70bf758..b24cf9d 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -795,6 +795,17 @@ bool ok_class_freeze(ok* p_ok, ok_value p_class) {
+ // read them from any native method. the machinery is the VM's own (flat
+ // slots, the frozen field map), this is only the door.
+ bool ok_class_add_field(ok* p_ok, ok_value p_class, ok_string_view p_name, bool p_mut, ok_value p_initial) {
++  return ok_class_add_field_ex(p_ok, p_class, p_name, p_mut, false, p_initial);
++}
++
++// the pub form (patch 51): the private default stays the patch-49 behavior,
++// p_pub opens the member ring from script. the C lane is trusted either way.
++bool ok_class_add_field_ex(ok* p_ok,
++                           ok_value p_class,
++                           ok_string_view p_name,
++                           bool p_mut,
++                           bool p_pub,
++                           ok_value p_initial) {
+   if (!IS_VALUE_CLASS(p_class) || p_name.chars == NULL || ok_string_view_get_length(&p_name) == 0) {
+     return false;
+   }
+@@ -832,7 +843,7 @@ bool ok_class_add_field(ok* p_ok, ok_value p_class, ok_string_view p_name, bool
+     gc_guard_down(p_ok->alloc.gc);
+     return false;
+   }
+-  const bool added = object_class_add_field(klass, name, p_mut, NULL, p_initial, NULL);
++  const bool added = object_class_add_field(klass, name, p_mut, p_pub, NULL, p_initial, NULL);
+   gc_guard_down(p_ok->alloc.gc);
+   gc_guard_down(p_ok->alloc.gc);
+   gc_guard_down(p_ok->alloc.gc);
+diff --git a/src/okapi.c b/src/okapi.c
+index c316074..1f6bf4e 100644
+--- a/src/okapi.c
++++ b/src/okapi.c
+@@ -228,8 +228,20 @@ static bool api_module_export(ok* p_ok, ok_string_view p_name, ok_value p_value)
+   }
+   memcpy(copy, p_name.chars, length);
+   copy[length] = '\0';
+-  // the value rides the marked mount window (mark_modules), not a guard
+-  if (!value_array_append(&mount->values, p_value)) {
++  // the value rides the marked mount window once appended; the append itself
++  // can collect (aggressive gc), and until it lands the value is only a C
++  // local in the mount callback. guard across exactly that call - the same
++  // dance the fn-staging loop does. the hole was always here; patch 51's
++  // extra field-array append shifted the allocation order enough to reuse
++  // the swept class's memory before the namespace read it back.
++  if (!gc_guard_up(p_ok->alloc.gc, p_value)) {
++    p_ok->raw_alloc.release(copy);
++    mount->failure = "out of memory while staging a mount export.";
++    return false;
++  }
++  const bool appended = value_array_append(&mount->values, p_value);
++  gc_guard_down(p_ok->alloc.gc);
++  if (!appended) {
+     p_ok->raw_alloc.release(copy);
+     mount->failure = "out of memory while staging a mount export.";
+     return false;
+@@ -284,6 +296,12 @@ static bool api_class_add_field(ok* p_ok, ok_value p_class, ok_string_view p_nam
+   return ok_class_add_field(p_ok, p_class, p_name, p_mut, p_initial);
+ }
+ 
++// the pub form (patch 51, ABI 3): appended at the tail, the append-only way.
++static bool api_class_add_field_ex(
++    ok* p_ok, ok_value p_class, ok_string_view p_name, bool p_mut, bool p_pub, ok_value p_initial) {
++  return ok_class_add_field_ex(p_ok, p_class, p_name, p_mut, p_pub, p_initial);
++}
++
+ static bool api_value_get_field(ok* p_ok, ok_value p_instance, ok_string_view p_name, ok_value* p_out) {
+   return ok_value_get_field(p_ok, p_instance, p_name, p_out);
+ }
+@@ -334,6 +352,7 @@ static const ok_api g_ok_api = {
+     api_class_add_field,
+     api_value_get_field,
+     api_value_set_field,
++    api_class_add_field_ex,
+ };
+ 
+ const ok_api* ok_api_table(void) {
+diff --git a/src/okchunk.h b/src/okchunk.h
+index 02c994c..67c8b40 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -469,6 +469,7 @@ ARRAY_DECLARE_DEFAULT(identifiers, string)
+ #define C_MASK UINT64_C(0x00ffff0000000000)  // 16 bit width
+ #define Q_MASK UINT64_C(0x0100000000000000)  // 1 bit width
+ #define CMP_MASK UINT64_C(0x0e00000000000000) // 3 bit width (OP_JUMP_IF_CMP's comparator)
++#define R_MASK UINT64_C(0x1000000000000000)  // 1 bit width (the field-define ops' pub flag)
+ 
+ #define OP_LOFFSET 0u
+ #define P_LOFFSET (OP_LOFFSET + 7u)
+@@ -477,6 +478,7 @@ ARRAY_DECLARE_DEFAULT(identifiers, string)
+ #define C_LOFFSET (B_LOFFSET + 16u)
+ #define Q_LOFFSET (C_LOFFSET + 16u)
+ #define CMP_LOFFSET (Q_LOFFSET + 1u)
++#define R_LOFFSET (CMP_LOFFSET + 3u)
+ 
+ #define a_MAX UINT8_MAX
+ #define b_MAX a_MAX
+@@ -597,6 +599,20 @@ static inline word2 encode_OPPABCQC(
+   return encode_OPPABCQ(p_OP, p_P, p_A, p_B, p_C, p_Q) | (((word2)p_cmp << CMP_LOFFSET) & CMP_MASK);
+ }
+ 
++// the pub flag rides the instruction word's one spare bit (patch 51): the
++// field-define ops carry mut in Q already, and a second flag operand would
++// otherwise cost a new opcode pair. R is touched by exactly two producers
++// (OP_DEFINE_FIELD, OP_DEFINE_STATIC_FIELD) and two decoders.
++static inline word2 encode_OPPABCQR(
++    const opcode p_OP, const bool p_P, const uint16_t p_A, const uint16_t p_B, const uint16_t p_C, const bool p_Q,
++    const bool p_R) {
++  return encode_OPPABCQ(p_OP, p_P, p_A, p_B, p_C, p_Q) | (((word2)p_R << R_LOFFSET) & R_MASK);
++}
++
++static inline bool R_of(const word2 p_word) {
++  return (p_word & R_MASK) >> R_LOFFSET;
++}
++
+ // chunks reference their source by index into the vm's source table.
+ // UINT32_MAX = unstamped: a chunk compiled outside ok_run.
+ // none today, but the guard keeps reports honest instead of accidentally reading entry 0.
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 3018c40..a69ed7a 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -1841,6 +1841,10 @@ static bool compile_class_declaration(compiler* p_compiler, ast_class_declaratio
+       }
+       const bool is_mut = (let->binding->modifiers & BINDING_MUT) != 0;
+       const bool is_static = (let->declaration.modifiers & DECLARATION_STATIC) != 0;
++      // patch 51: fields join the visibility ring. `pub` on a class-body let
++      // opens the member outside the defining hierarchy (module boundaries
++      // included); the default stays the private ring the classes lane set.
++      const bool is_pub = (let->declaration.modifiers & DECLARATION_PUB) != 0;
+       if (is_static) {
+         // static field: the initializer runs inline, at definition time, in
+         // this context (it may read earlier statics and call static methods
+@@ -1866,12 +1870,13 @@ static bool compile_class_declaration(compiler* p_compiler, ast_class_declaratio
+           }
+         }
+         if (!emit_word2(p_compiler,
+-                        encode_OPPABCQ(OP_DEFINE_STATIC_FIELD,
+-                                       false,
+-                                       klass_reg.index,
+-                                       value_reg.index,
+-                                       CONSTANT_RAW_INDEX(field_const),
+-                                       is_mut),
++                        encode_OPPABCQR(OP_DEFINE_STATIC_FIELD,
++                                        false,
++                                        klass_reg.index,
++                                        value_reg.index,
++                                        CONSTANT_RAW_INDEX(field_const),
++                                        is_mut,
++                                        is_pub),
+                         (ast_node*)member)) {
+           report_oom(p_compiler, author);
+           return false;
+@@ -1890,24 +1895,26 @@ static bool compile_class_declaration(compiler* p_compiler, ast_class_declaratio
+           return false;
+         }
+         if (!emit_word2(p_compiler,
+-                        encode_OPPABCQ(OP_DEFINE_FIELD,
+-                                       false,
+-                                       klass_reg.index,
+-                                       thunk_reg.index,
+-                                       CONSTANT_RAW_INDEX(field_const),
+-                                       is_mut),
++                        encode_OPPABCQR(OP_DEFINE_FIELD,
++                                        false,
++                                        klass_reg.index,
++                                        thunk_reg.index,
++                                        CONSTANT_RAW_INDEX(field_const),
++                                        is_mut,
++                                        is_pub),
+                         (ast_node*)member)) {
+           report_oom(p_compiler, author);
+           return false;
+         }
+       } else {
+         if (!emit_word2(p_compiler,
+-                        encode_OPPABCQ(OP_DEFINE_FIELD,
+-                                       true,
+-                                       klass_reg.index,
+-                                       0,
+-                                       CONSTANT_RAW_INDEX(field_const),
+-                                       is_mut),
++                        encode_OPPABCQR(OP_DEFINE_FIELD,
++                                        true,
++                                        klass_reg.index,
++                                        0,
++                                        CONSTANT_RAW_INDEX(field_const),
++                                        is_mut,
++                                        is_pub),
+                         (ast_node*)member)) {
+           report_oom(p_compiler, author);
+           return false;
+diff --git a/src/okmodules.c b/src/okmodules.c
+index 06786a7..aaea70d 100644
+--- a/src/okmodules.c
++++ b/src/okmodules.c
+@@ -563,8 +563,9 @@ static bool build_namespace(module_system* p_modules,
+     }
+     const object_string* previous_owner = NULL;
+     const bool added =
+-        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */,
+-                              NULL_AS_VALUE() /* default: the loader fills the slot */, &previous_owner);
++        object_class_add_field(klass, field_name, false /* mut */, true /* pub: an export */,
++                              NULL /* init thunk */, NULL_AS_VALUE() /* default: the loader fills the slot */,
++                              &previous_owner);
+     gc_guard_down(collector); // the class owns the name now
+     if (!added) {
+       gc_guard_down(collector);
+@@ -691,8 +692,9 @@ static bool materialize_ns(module_system* p_modules, pending_ns* p_node, value*
+     }
+     const object_string* previous_owner = NULL;
+     const bool added =
+-        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */,
+-                              NULL_AS_VALUE() /* default: the loader fills the slot */, &previous_owner);
++        object_class_add_field(klass, field_name, false /* mut */, true /* pub: an export */,
++                              NULL /* init thunk */, NULL_AS_VALUE() /* default: the loader fills the slot */,
++                              &previous_owner);
+     gc_guard_down(collector); // the class owns the name now
+     if (!added) {
+       gc_guard_down(collector);
+@@ -777,8 +779,9 @@ static bool build_namespace_members(module_system* p_modules,
+     }
+     const object_string* previous_owner = NULL;
+     const bool added =
+-        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */,
+-                              NULL_AS_VALUE() /* default: the loader fills the slot */, &previous_owner);
++        object_class_add_field(klass, field_name, false /* mut */, true /* pub: an export */,
++                              NULL /* init thunk */, NULL_AS_VALUE() /* default: the loader fills the slot */,
++                              &previous_owner);
+     gc_guard_down(collector); // the class owns the name now
+     if (!added) {
+       gc_guard_down(collector);
+diff --git a/src/okobject.c b/src/okobject.c
+index 0fcc280..3e9d47d 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -456,6 +456,7 @@ static void object_class_init(object_class* p_class,
+   p_class->nown = 0;
+   object_string_array_init(&p_class->own_names, p_specs->alloc);
+   uint8_array_init(&p_class->own_muts, p_specs->alloc);
++  uint8_array_init(&p_class->own_pubs, p_specs->alloc);
+   object_closure_array_init(&p_class->own_inits, p_specs->alloc);
+   value_array_init(&p_class->own_defaults, p_specs->alloc);
+   field_map_init(&p_class->fields, p_specs->alloc);
+@@ -463,6 +464,7 @@ static void object_class_init(object_class* p_class,
+   method_map_init(&p_class->statics, p_specs->alloc);
+   object_string_array_init(&p_class->own_static_names, p_specs->alloc);
+   uint8_array_init(&p_class->own_static_muts, p_specs->alloc);
++  uint8_array_init(&p_class->own_static_pubs, p_specs->alloc);
+   value_array_init(&p_class->static_values, p_specs->alloc);
+   field_map_init(&p_class->static_fields, p_specs->alloc);
+   for (uint32_t i = 0; i < CLASS_OP_COUNT; ++i) {
+@@ -477,6 +479,7 @@ static void object_class_deinit(object_class* p_class, object_specs* p_specs) {
+   // only the backing buffers die here.
+   object_string_array_deinit(&p_class->own_names, p_specs->alloc);
+   uint8_array_deinit(&p_class->own_muts, p_specs->alloc);
++  uint8_array_deinit(&p_class->own_pubs, p_specs->alloc);
+   object_closure_array_deinit(&p_class->own_inits, p_specs->alloc);
+   value_array_deinit(&p_class->own_defaults, p_specs->alloc);
+   field_map_deinit(&p_class->fields);
+@@ -484,6 +487,7 @@ static void object_class_deinit(object_class* p_class, object_specs* p_specs) {
+   method_map_deinit(&p_class->statics);
+   object_string_array_deinit(&p_class->own_static_names, p_specs->alloc);
+   uint8_array_deinit(&p_class->own_static_muts, p_specs->alloc);
++  uint8_array_deinit(&p_class->own_static_pubs, p_specs->alloc);
+   value_array_deinit(&p_class->static_values, p_specs->alloc);
+   field_map_deinit(&p_class->static_fields);
+   object_deinit(&p_class->object);
+@@ -502,6 +506,7 @@ object_class* create_object_class(object_string* p_name, object_class* p_parent,
+ bool object_class_add_field(object_class* p_class,
+                             const object_string* p_name,
+                             bool p_mut,
++                            bool p_pub,
+                             object_closure* p_init_thunk,
+                             value p_default,
+                             const object_string** p_previous_owner) {
+@@ -532,6 +537,7 @@ bool object_class_add_field(object_class* p_class,
+   }
+   if (!object_string_array_append(&p_class->own_names, (object_string*)p_name) ||
+       !uint8_array_append(&p_class->own_muts, p_mut ? 1u : 0u) ||
++      !uint8_array_append(&p_class->own_pubs, p_pub ? 1u : 0u) ||
+       !object_closure_array_append(&p_class->own_inits, p_init_thunk) ||
+       !value_array_append(&p_class->own_defaults, p_default)) {
+     return false;
+@@ -565,7 +571,7 @@ bool object_class_freeze(object_class* p_class) {
+   }
+   const uint16_t base = p_class->parent != NULL ? p_class->parent->nfields : 0;
+   for (uint32_t i = 0; i < p_class->own_names.count; ++i) {
+-    const field_entry entry = {(uint16_t)(base + i), p_class->own_muts.data[i]};
++    const field_entry entry = {(uint16_t)(base + i), p_class->own_muts.data[i], p_class->own_pubs.data[i]};
+     if (!field_map_set(&p_class->fields, p_class->own_names.data[i], entry)) {
+       return false;
+     }
+@@ -600,6 +606,7 @@ bool object_class_is_a(const object_class* p_class, const object_class* p_maybe_
+ bool object_class_add_static_field(object_class* p_class,
+                                     const object_string* p_name,
+                                     bool p_mut,
++                                    bool p_pub,
+                                     value p_value,
+                                     const object_string** p_previous_owner) {
+   if (p_class->frozen) {
+@@ -615,9 +622,10 @@ bool object_class_add_static_field(object_class* p_class,
+       return false;
+     }
+   }
+-  const field_entry entry = {(uint16_t)p_class->static_values.count, p_mut ? 1u : 0u};
++  const field_entry entry = {(uint16_t)p_class->static_values.count, p_mut ? 1u : 0u, p_pub ? 1u : 0u};
+   if (!object_string_array_append(&p_class->own_static_names, (object_string*)p_name) ||
+       !uint8_array_append(&p_class->own_static_muts, p_mut ? 1u : 0u) ||
++      !uint8_array_append(&p_class->own_static_pubs, p_pub ? 1u : 0u) ||
+       !value_array_append(&p_class->static_values, p_value) ||
+       !field_map_set(&p_class->static_fields, p_name, entry)) {
+     return false;
+diff --git a/src/okobject.h b/src/okobject.h
+index 8da65ef..2418108 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -317,10 +317,15 @@ typedef enum {
+ // and the mangled-name suffix of an `operator str`-style conversion.
+ const char* builtin_class_name(builtin_class_id p_id);
+ 
+-// one flat-layout field: its absolute slot in the instance array + mutability.
++// one flat-layout field: its absolute slot in the instance array, mutability,
++// and visibility. pub (patch 51) opens the member ring: a pub field is
++// readable (and, with mut, writable) from outside the defining hierarchy,
++// module boundaries included - the getter-free surface. private stays the
++// default, exactly as before.
+ typedef struct {
+   uint16_t slot;
+   uint8_t mut;
++  uint8_t pub;
+ } field_entry;
+ 
+ MAP_DECLARE(field_map, object_string*, field_entry, const object_string*)
+@@ -337,6 +342,7 @@ struct object_class {
+   uint16_t nown;               // own field declarations (diagnostics)
+   object_string_array own_names; // own field names, declaration order
+   uint8_array own_muts;        // parallel mut flags
++  uint8_array own_pubs;        // parallel pub flags (patch 51: fields join the ring)
+   object_closure_array own_inits; // parallel initializer thunks (NULL = none)
+   value_array own_defaults;    // parallel C-side initial values (patch 49: the
+                                // native-class lane, always null for script
+@@ -350,6 +356,7 @@ struct object_class {
+                                // the class value itself, never an instance
+   object_string_array own_static_names; // own static fields, declaration order
+   uint8_array own_static_muts; // parallel mut flags
++  uint8_array own_static_pubs; // parallel pub flags (patch 51)
+   value_array static_values;   // own statics' storage: one slot each, never
+                                // copied down the chain (shared by lookup)
+   field_map static_fields;     // own statics only: name -> {slot, mut}
+@@ -406,10 +413,12 @@ bool object_class_define_native_static_method(object_class* p_class,
+ // is the C-side initial value (patch 49): every instance's slot starts as
+ // this value instead of null. the script lane always passes null - its
+ // per-instance initializer is the thunk, which re-evaluates per
+-// construction; a C default is evaluated once at definition time.
++// construction; a C default is evaluated once at definition time. p_pub
++// (patch 51) marks the field readable outside the defining hierarchy.
+ bool object_class_add_field(object_class* p_class,
+                             const object_string* p_name,
+                             bool p_mut,
++                            bool p_pub,
+                             object_closure* p_init_thunk,
+                             value p_default,
+                             const object_string** p_previous_owner);
+@@ -430,10 +439,12 @@ bool object_class_is_a(const object_class* p_class, const object_class* p_maybe_
+ // definition-time: append one own static field with its (already evaluated)
+ // value. false = OOM or a redeclaration anywhere in the chain (statics are
+ // never shadowed: one name, one slot, the defining class owns it). the
+-// previous owner names the ancestor that already declared it.
++// previous owner names the ancestor that already declared it. p_pub (patch
++// 51) opens the ring for the static, the fields' rule one table over.
+ bool object_class_add_static_field(object_class* p_class,
+                                     const object_string* p_name,
+                                     bool p_mut,
++                                    bool p_pub,
+                                     value p_value,
+                                     const object_string** p_previous_owner);
+ 
+diff --git a/src/okparser.c b/src/okparser.c
+index d5be764..674773d 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -1159,11 +1159,12 @@ ast_let_declaration* parse_let_declaration(parser* p_parser,
+   allocators* alloc = p_parser->alloc;
+   const token let_tok = p_parser->previous;
+   // static is a class-member modifier: fields only exist in class bodies.
+-  // pub (OR-1, M9) is the module-export modifier: top level only - inside a
+-  // class body fields are still not the surface, methods are.
++  // pub (OR-1, M9) is the module-export modifier at top level; inside a
++  // class body it is the member-visibility modifier (patch 51: fields join
++  // the methods - `pub let` opens the ring, the getter-free surface).
+   const ast_declaration_modifiers_t let_allowed_decl_mods =
+       DECLARATION_GLOB | DECLARATION_EXPORT |
+-      (p_in_class_body ? DECLARATION_STATIC : DECLARATION_PUB);
++      (p_in_class_body ? (DECLARATION_STATIC | DECLARATION_PUB) : DECLARATION_PUB);
+   if ((p_declaration_modifiers & ~let_allowed_decl_mods) != 0) {
+     string mods_str = ast_declaration_modifiers_asprint(p_declaration_modifiers, alloc);
+     string message = asprint(alloc,
+@@ -1703,7 +1704,8 @@ ast_expression* parse_super(parser* p_parser, token p_trigger) {
+ }
+ 
+ // `class Name : Parent { members }`. members are let fields and fu methods
+-// (pub composes on methods); anything else is a parse error.
++// (pub composes on both - the methods since the classes lane, the fields
++// since patch 51); anything else is a parse error.
+ ast_class_declaration* parse_class_declaration(parser* p_parser, ast_declaration_modifiers_t p_modifiers) {
+   allocators* alloc = p_parser->alloc;
+   token class_tok = p_parser->previous;
+diff --git a/src/okvm.c b/src/okvm.c
+index ba43064..60907f5 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -4942,6 +4942,7 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       const bool is_mut = Q_of(words);
++      const bool is_pub = R_of(words);
+       if (!IS_VALUE_CLASS(REG_AT(A)) || !IS_VALUE_STRING(frame->closure->function->chunk.constants.data[C])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt class field definition.");
+         FAIL_PATH();
+@@ -4960,7 +4961,7 @@ static void* ok_dispatch_table[OP__COUNT] = {
+         thunk->owner = klass;
+       }
+       const object_string* previous_owner = NULL;
+-      if (!object_class_add_field(klass, name, is_mut, thunk, NULL_AS_VALUE(), &previous_owner)) {
++      if (!object_class_add_field(klass, name, is_mut, is_pub, thunk, NULL_AS_VALUE(), &previous_owner)) {
+         if (previous_owner != NULL) {
+           runtime_error(p_vm,
+                         OK_EK_TYPE,
+@@ -5193,6 +5194,7 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       const uint16_t B = B_of(words);
+       const uint16_t C = C_of(words);
+       const bool is_mut = Q_of(words);
++      const bool is_pub = R_of(words);
+       if (!IS_VALUE_CLASS(REG_AT(A)) || !IS_VALUE_STRING(frame->closure->function->chunk.constants.data[C])) {
+         runtime_error(p_vm, OK_EK_INTERNAL, "corrupt static field definition.");
+         FAIL_PATH();
+@@ -5201,7 +5203,7 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       object_class* klass = VALUE_AS_CLASS(REG_AT(A));
+       object_string* name = VALUE_AS_STRING(frame->closure->function->chunk.constants.data[C]);
+       const object_string* previous_owner = NULL;
+-      if (!object_class_add_static_field(klass, name, is_mut, REG_AT(B), &previous_owner)) {
++      if (!object_class_add_static_field(klass, name, is_mut, is_pub, REG_AT(B), &previous_owner)) {
+         if (previous_owner != NULL) {
+           runtime_error(p_vm,
+                         OK_EK_TYPE,
+@@ -5600,7 +5602,7 @@ static void* ok_dispatch_table[OP__COUNT] = {
+         }
+         const object_class* seg = field_defining_segment(inst->klass, field->slot);
+         const object_class* caller = frame->closure->owner;
+-        if (seg == NULL || caller == NULL || !object_class_is_a(caller, seg)) {
++        if (!field->pub && (seg == NULL || caller == NULL || !object_class_is_a(caller, seg))) {
+           runtime_error(p_vm,
+                         OK_EK_TYPE,
+                         "field '%s' of class '%s' is not visible here.",
+@@ -5634,7 +5636,7 @@ static void* ok_dispatch_table[OP__COUNT] = {
+           DISPATCH();
+         }
+         const object_class* caller = frame->closure->owner;
+-        if (caller == NULL || !object_class_is_a(caller, owner)) {
++        if (!statik->pub && (caller == NULL || !object_class_is_a(caller, owner))) {
+           runtime_error(p_vm,
+                         OK_EK_TYPE,
+                         "static '%s' of class '%s' is not visible here.",
+@@ -5742,10 +5744,10 @@ static void* ok_dispatch_table[OP__COUNT] = {
+         const object_class* owner = NULL;
+         const field_entry* sf = object_class_find_static(klass, name, &owner);
+         if (sf != NULL) {
+-          // the field doctrine: statics are hierarchy-internal, the ring is
+-          // the defining class and everything below it.
++          // the field doctrine: statics are hierarchy-internal unless pub
++          // (patch 51), the ring is the defining class and everything below it.
+           const object_class* caller = frame->closure->owner;
+-          if (caller == NULL || !object_class_is_a(caller, owner)) {
++          if (!sf->pub && (caller == NULL || !object_class_is_a(caller, owner))) {
+             runtime_error(p_vm,
+                           OK_EK_TYPE,
+                           "static '%s' of class '%s' is not visible here.",
+@@ -5795,11 +5797,12 @@ static void* ok_dispatch_table[OP__COUNT] = {
+         // OR-1: a module namespace's fields are its exports - public by
+         // doctrine (M9); the visibility ring does not apply.
+         if (!klass->module_namespace) {
+-          // visibility: the calling hierarchy must contain the field's defining
++          // visibility: pub fields are the surface (patch 51); everything
++          // else needs the calling hierarchy to contain the field's defining
+           // segment (class-wide privacy, the C++ ring)
+           const object_class* seg = field_defining_segment(klass, field->slot);
+           const object_class* caller = frame->closure->owner;
+-          if (seg == NULL || caller == NULL || !object_class_is_a(caller, seg)) {
++          if (!field->pub && (seg == NULL || caller == NULL || !object_class_is_a(caller, seg))) {
+             runtime_error(p_vm,
+                           OK_EK_TYPE,
+                           "field '%s' of class '%s' is not visible here.",
+@@ -6005,8 +6008,10 @@ static void* ok_dispatch_table[OP__COUNT] = {
+             const object_class* seg = field != NULL ? field_defining_segment(klass, field->slot) : NULL;
+             // OR-1: a module namespace's exports are public (M9) - the ring
+             // does not apply; `mod.export(args)` is the hot import path.
++            // patch 51: a pub field is the surface everywhere else.
+             if (field != NULL &&
+-                (klass->module_namespace || (seg != NULL && caller != NULL && object_class_is_a(caller, seg)))) {
++                (field->pub || klass->module_namespace ||
++                 (seg != NULL && caller != NULL && object_class_is_a(caller, seg)))) {
+               value callable = inst->fields[field->slot];
+               if (IS_VALUE_CLOSURE(callable)) {
+                 const mic_entry filled = {OBJECT_AS_VALUE(klass), NULL, field->slot, 1, 0};
+diff --git a/tests/capi/src/main.c b/tests/capi/src/main.c
+index 75fe8c1..bea5d0f 100644
+--- a/tests/capi/src/main.c
++++ b/tests/capi/src/main.c
+@@ -136,6 +136,22 @@ static ok_value box_bump(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
+   return next;
+ }
+ 
++// the patch-51 fixture: Open's pub fields are filled by the native init
++// (the C lane is trusted either way), peek exposes the private counter.
++static ok_value open_init(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  CHECK(p_argc == 3);
++  CHECK(ok_value_set_field(p_ok, p_argv[0], sv("x"), p_argv[1]));
++  CHECK(ok_value_set_field(p_ok, p_argv[0], sv("y"), p_argv[2]));
++  return ok_value_null();
++}
++
++static ok_value open_peek(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  ok_value hidden = ok_value_null();
++  CHECK(ok_value_get_field(p_ok, p_argv[0], sv("hidden"), &hidden));
++  return hidden;
++}
++
+ // reads :what: out of a materialized {:kind:, :what:} error map.
+ static bool error_what_contains(ok* p_ok, const char* p_needle) {
+   ok_value error = ok_last_error(p_ok);
+@@ -723,6 +739,69 @@ int main(void) {
+     CHECK(ok_unroot(p_ok, box_root));
+   }
+ 
++  // ---------- patch 51: pub fields from the C lane ----------
++  {
++    ok* p_ok = ok_create(specs);
++    CHECK(p_ok != NULL);
++    // Open: x and y are pub (script reads and writes them directly), hidden
++    // stays private (the ring). the ex form is the whole difference.
++    ok_value open = ok_class_new(p_ok, sv("Open"), ok_value_null());
++    CHECK(ok_value_is_class(open));
++    const uint32_t open_root = ok_root(p_ok, open);
++    CHECK(open_root != OK_ROOT_INVALID);
++    CHECK(ok_class_add_field_ex(p_ok, open, sv("x"), true, true, ok_value_number(0)));
++    CHECK(ok_class_add_field_ex(p_ok, open, sv("y"), true, true, ok_value_number(0)));
++    CHECK(ok_class_add_field(p_ok, open, sv("hidden"), true, ok_value_number(1))); // the private default
++    CHECK(ok_class_define_native_method(p_ok, open, sv("init"), 3, open_init, false));
++    CHECK(ok_class_define_native_method(p_ok, open, sv("peek"), 1, open_peek, true));
++    CHECK(ok_class_freeze(p_ok, open));
++    CHECK(ok_global_define(p_ok, sv("Open"), open, false));
++
++    // the script side reads and writes the pub fields as slot loads, and the
++    // private one refuses with the ring's error
++    CHECK(run(p_ok,
++              "glob let v = Open(3, 4);\n"
++              "glob let read_x = v.x;\n"
++              "v.y = 40;\n"
++              "glob let read_y = v.y;\n"
++              "glob let seen = v.peek();\n"));
++    ok_value read_x = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("read_x"), &read_x));
++    CHECK(ok_value_is_number(read_x) && ok_value_as_number(read_x) == 3.0);
++    ok_value read_y = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("read_y"), &read_y));
++    CHECK(ok_value_is_number(read_y) && ok_value_as_number(read_y) == 40.0);
++    ok_value seen = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("seen"), &seen));
++    CHECK(ok_value_is_number(seen) && ok_value_as_number(seen) == 1.0);
++
++    // the ring: script cannot read the private field, C still can
++    CHECK(!run(p_ok, "glob let no = Open(1, 1).hidden;\n"));
++    ok_value v = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("v"), &v));
++    ok_value hidden = ok_value_null();
++    CHECK(ok_value_get_field(p_ok, v, sv("hidden"), &hidden));
++    CHECK(ok_value_is_number(hidden) && ok_value_as_number(hidden) == 1.0);
++
++    // a pub field without mut: the read works, the script write refuses
++    ok_value locked = ok_class_new(p_ok, sv("Locked"), ok_value_null());
++    CHECK(ok_value_is_class(locked));
++    const uint32_t locked_root = ok_root(p_ok, locked);
++    CHECK(locked_root != OK_ROOT_INVALID);
++    CHECK(ok_class_add_field_ex(p_ok, locked, sv("name"), false, true, ok_value_string(p_ok, sv("fixed"))));
++    CHECK(ok_class_freeze(p_ok, locked));
++    CHECK(ok_global_define(p_ok, sv("Locked"), locked, false));
++    CHECK(run(p_ok, "glob let n = Locked().name;\n"));
++    ok_value n = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("n"), &n));
++    CHECK(ok_value_is_string(n));
++    CHECK(!run(p_ok, "Locked().name = \"other\";\n"));
++
++    CHECK(ok_unroot(p_ok, locked_root));
++    CHECK(ok_unroot(p_ok, open_root));
++    ok_free(p_ok);
++  }
++
+   // ---------- OR-4: the where probe, the map walk, the manifest lane ----------
+   {
+     // where over the memory loader: nothing loads, the answer borrows
+diff --git a/tests/e2e/tests/classes/pub_field_immutable_error.ok b/tests/e2e/tests/classes/pub_field_immutable_error.ok
+new file mode 100644
+index 0000000..88e7a7f
+--- /dev/null
++++ b/tests/e2e/tests/classes/pub_field_immutable_error.ok
+@@ -0,0 +1,7 @@
++// a pub field without mut reads from anywhere, writes nowhere
++class Conf {
++  pub let name = "fixed";
++}
++let c = Conf();
++print c.name; // expect: fixed
++c.name = "other"; // expect error: cannot assign to field 'name': declared without 'mut'
+diff --git a/tests/e2e/tests/classes/pub_fields.ok b/tests/e2e/tests/classes/pub_fields.ok
+new file mode 100644
+index 0000000..007d71a
+--- /dev/null
++++ b/tests/e2e/tests/classes/pub_fields.ok
+@@ -0,0 +1,34 @@
++// patch 51: fields join the visibility ring. `pub let` opens the member
++// outside the defining hierarchy, the getter-free surface. the private
++// default stays pinned by privacy_fields.ok.
++class Point {
++  pub let mut x;
++  pub let mut y;
++  let label = "p";
++
++  fu init(x, y) {
++    this.x = x;
++    this.y = y;
++  }
++
++  pub fu sum() { return x + y; }
++}
++let p = Point(2, 3);
++print p.x; // expect: 2
++print p.y; // expect: 3
++p.x = 20;
++print p.x + p.y; // expect: 23
++print p.sum(); // expect: 23
++
++// the initializer thunk runs per instance, pub or not
++let q = Point(7, 1);
++print q.x; // expect: 7
++
++// inherited pub fields ride the flat layout down the chain
++class Big : Point {
++  pub fu area() { return this.x * this.y; }
++}
++let b = Big(5, 6);
++print b.x; // expect: 5
++b.y = 60;
++print b.area(); // expect: 300
+diff --git a/tests/e2e/tests/classes/pub_static_immutable_error.ok b/tests/e2e/tests/classes/pub_static_immutable_error.ok
+new file mode 100644
+index 0000000..ed548ff
+--- /dev/null
++++ b/tests/e2e/tests/classes/pub_static_immutable_error.ok
+@@ -0,0 +1,6 @@
++// a pub static without mut reads from anywhere, writes nowhere
++class Conf {
++  pub static let name = "fixed";
++}
++print Conf.name; // expect: fixed
++Conf.name = "other"; // expect error: cannot assign to static 'name': declared without 'mut'
+diff --git a/tests/e2e/tests/classes/pub_statics.ok b/tests/e2e/tests/classes/pub_statics.ok
+new file mode 100644
+index 0000000..4cc3d06
+--- /dev/null
++++ b/tests/e2e/tests/classes/pub_statics.ok
+@@ -0,0 +1,20 @@
++// pub statics (patch 51): the class value is the receiver, the ring opens
++// the same way as instance fields. private statics keep the ring.
++class Registry {
++  pub static let mut made = 0;
++  pub static let scale = 2;
++  static let hidden = 99; // the ring keeps this one
++  pub static fu note() { Registry.made = Registry.made + 1; return Registry.made; }
++  pub static fu peek() { return hidden; }
++}
++print Registry.made; // expect: 0
++print Registry.note(); // expect: 1
++print Registry.made; // expect: 1
++Registry.made = 10;
++print Registry.made; // expect: 10
++print Registry.scale; // expect: 2
++
++// a subclass reads the ancestor's pub static through its own name
++class Sub : Registry {}
++print Sub.made; // expect: 10
++print Sub.peek(); // expect: 99
+diff --git a/tests/e2e/tests/modules/native_badabi/main.ok b/tests/e2e/tests/modules/native_badabi/main.ok
+index 644ee76..2900d2e 100644
+--- a/tests/e2e/tests/modules/native_badabi/main.ok
++++ b/tests/e2e/tests/modules/native_badabi/main.ok
+@@ -1,2 +1,2 @@
+ import "./badabi";
+-// expect error: abi 99, expected 2, rebuild it against include/ok/ok_module.h.
++// expect error: abi 99, expected 3, rebuild it against include/ok/ok_module.h.
+diff --git a/tests/e2e/tests/modules/native_pubfield/build.sh b/tests/e2e/tests/modules/native_pubfield/build.sh
+new file mode 100644
+index 0000000..9116061
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_pubfield/build.sh
+@@ -0,0 +1,5 @@
++#!/bin/sh
++# the fixture's declared build: a raw gcc command (M12: whatever toolchain).
++set -e
++cd "$(dirname "$0")"
++gcc -shared -fPIC -I../../../../../include -o pubfield.so pubfield.c
+diff --git a/tests/e2e/tests/modules/native_pubfield/main.ok b/tests/e2e/tests/modules/native_pubfield/main.ok
+new file mode 100644
+index 0000000..2b1edc9
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_pubfield/main.ok
+@@ -0,0 +1,13 @@
++// the patch-51 acceptance lane: pub fields on a native class. script reads
++// and writes them as slot loads (the getter-free surface), the private
++// counter stays behind the ring.
++import "./pubfield";
++
++let v = pubfield.Vec(3, 4);
++print v.x; // expect: 3
++print v.y; // expect: 4
++v.x = 30;
++print v.x; // expect: 30
++print v.length_sq(); // expect: 916
++print v.reads(); // expect: 1
++print v.taps; // expect error: is not visible here
+diff --git a/tests/e2e/tests/modules/native_pubfield/pubfield.c b/tests/e2e/tests/modules/native_pubfield/pubfield.c
+new file mode 100644
+index 0000000..26d3a2a
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_pubfield/pubfield.c
+@@ -0,0 +1,98 @@
++// the patch-51 acceptance lane: the pub-field door from C. class_add_field_ex
++// opens the member ring - script reads and writes the native class's fields
++// as slot loads, no getter round-trips. the private counter stays ringed:
++// script reaches it only through its methods.
++#include "ok/ok_module.h"
++
++static const ok_api* api = NULL;
++
++// init(x, y): the receiver rides argv[0], the construction lane's contract
++static ok_value vec_init(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  if (p_argc != 3 || api->value_type(p_argv[1]) != OK_TYPE_NUM || api->value_type(p_argv[2]) != OK_TYPE_NUM) {
++    api->native_error(p_ok, api->view("Vec expects two numbers.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  if (!api->value_set_field(p_ok, p_argv[0], api->view("x", 1), p_argv[1]) ||
++      !api->value_set_field(p_ok, p_argv[0], api->view("y", 1), p_argv[2])) {
++    api->native_error(p_ok, api->view("Vec init could not write its fields.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  return api->value_null();
++}
++
++// length_sq(): x*x + y*y, counted. the pub fields read through the trusted
++// lane (the ring never applied to C), the counter proves per-instance state.
++static ok_value vec_length_sq(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  ok_value x = api->value_null();
++  ok_value y = api->value_null();
++  ok_value taps = api->value_null();
++  if (!api->value_get_field(p_ok, p_argv[0], api->view("x", 1), &x) ||
++      !api->value_get_field(p_ok, p_argv[0], api->view("y", 1), &y) ||
++      !api->value_get_field(p_ok, p_argv[0], api->view("taps", 4), &taps)) {
++    api->native_error(p_ok, api->view("Vec could not read its fields.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  if (!api->value_set_field(p_ok, p_argv[0], api->view("taps", 4), api->value_number(api->value_as_number(taps) + 1))) {
++    api->native_error(p_ok, api->view("Vec could not count.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  return api->value_number(api->value_as_number(x) * api->value_as_number(x) +
++                           api->value_as_number(y) * api->value_as_number(y));
++}
++
++// reads(): the private counter read back through a pub method
++static ok_value vec_reads(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  ok_value taps = api->value_null();
++  if (!api->value_get_field(p_ok, p_argv[0], api->view("taps", 4), &taps)) {
++    api->native_error(p_ok, api->view("Vec could not read its counter.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  return taps;
++}
++
++static bool pubfield_mount(ok* p_ok) {
++  ok_value vec = api->class_new(p_ok, api->view("Vec", 3), api->value_null());
++  if (api->value_type(vec) != OK_TYPE_CLASS) {
++    return false;
++  }
++  // the patch-51 door: pub fields, script-visible, mut for the write side
++  if (!api->class_add_field_ex(p_ok, vec, api->view("x", 1), true, true, api->value_number(0)) ||
++      !api->class_add_field_ex(p_ok, vec, api->view("y", 1), true, true, api->value_number(0))) {
++    return false;
++  }
++  // the private counter: the patch-49 entry, the ring keeps it
++  if (!api->class_add_field(p_ok, vec, api->view("taps", 4), true, api->value_number(0))) {
++    return false;
++  }
++  if (!api->class_define_native_method(p_ok, vec, api->view("init", 4), 3, vec_init, false) ||
++      !api->class_define_native_method(p_ok, vec, api->view("length_sq", 9), 1, vec_length_sq, true) ||
++      !api->class_define_native_method(p_ok, vec, api->view("reads", 5), 1, vec_reads, true)) {
++    return false;
++  }
++  if (!api->class_freeze(p_ok, vec)) {
++    return false;
++  }
++  return api->module_export(p_ok, api->view("Vec", 3), vec);
++}
++
++static const ok_native_fn_def pubfield_fns[] = {};
++
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  if (p_api == NULL || p_api->abi != OK_NATIVE_ABI) {
++    return NULL;
++  }
++  api = p_api;
++  static const ok_native_module pubfield_module = {
++      OK_NATIVE_ABI,
++      "pubfield",
++      "0.1.0",
++      0,
++      pubfield_fns,
++      pubfield_mount,
++      NULL,
++      NULL,
++  };
++  return &pubfield_module;
++}
+diff --git a/tests/e2e/tests/modules/project_autobuild/.okbuild/adder.stamp b/tests/e2e/tests/modules/project_autobuild/.okbuild/adder.stamp
+index 55dec1c..0153e5a 100644
+--- a/tests/e2e/tests/modules/project_autobuild/.okbuild/adder.stamp
++++ b/tests/e2e/tests/modules/project_autobuild/.okbuild/adder.stamp
+@@ -1 +1,2 @@
++3
+ gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c
+\ No newline at end of file
+diff --git a/tests/e2e/tests/modules/project_native/.okbuild/adder.stamp b/tests/e2e/tests/modules/project_native/.okbuild/adder.stamp
+index 55dec1c..0153e5a 100644
+--- a/tests/e2e/tests/modules/project_native/.okbuild/adder.stamp
++++ b/tests/e2e/tests/modules/project_native/.okbuild/adder.stamp
+@@ -1 +1,2 @@
++3
+ gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c
+\ No newline at end of file
+diff --git a/tests/e2e/tests/modules/pubmembers/lib.ok b/tests/e2e/tests/modules/pubmembers/lib.ok
+new file mode 100644
+index 0000000..2118fc7
+--- /dev/null
++++ b/tests/e2e/tests/modules/pubmembers/lib.ok
+@@ -0,0 +1,15 @@
++// a module's exported class: pub members are the importer's surface, the
++// private ring holds across the module boundary (patch 51).
++pub class Account {
++  pub let mut balance = 0;
++  pub let owner = "anon";
++  let fee = 1;
++
++  pub fu deposit(amount) {
++    this.balance = this.balance + amount - this.fee;
++    return this.balance;
++  }
++  pub fu charged() { return this.fee; }
++  pub static let mut opened = 0;
++  pub static fu house() { Account.opened = Account.opened + 1; return Account.opened; }
++}
+diff --git a/tests/e2e/tests/modules/pubmembers/main.ok b/tests/e2e/tests/modules/pubmembers/main.ok
+new file mode 100644
+index 0000000..7433a25
+--- /dev/null
++++ b/tests/e2e/tests/modules/pubmembers/main.ok
+@@ -0,0 +1,24 @@
++// cross-module pub fields (patch 51): the imported class's pub members are
++// the surface, slot loads both sides of the module line.
++import "./lib.ok";
++
++let a = lib.Account();
++print a.owner; // expect: anon
++a.balance = 10;
++print a.balance; // expect: 10
++print a.deposit(5); // expect: 14
++print a.balance; // expect: 14
++print a.charged(); // expect: 1
++
++print lib.Account.opened; // expect: 0
++print lib.Account.house(); // expect: 1
++print lib.Account.opened; // expect: 1
++lib.Account.opened = 9;
++print lib.Account.opened; // expect: 9
++
++// a script subclass of the imported class inherits the pub layout
++class Joint : lib.Account {}
++let j = Joint();
++j.balance = 100;
++print j.balance; // expect: 100
++print j.deposit(1); // expect: 100
+diff --git a/tests/e2e/tests/modules/pubmembers_private/lib.ok b/tests/e2e/tests/modules/pubmembers_private/lib.ok
+new file mode 100644
+index 0000000..d10ac66
+--- /dev/null
++++ b/tests/e2e/tests/modules/pubmembers_private/lib.ok
+@@ -0,0 +1,9 @@
++// the module boundary does not dissolve the private ring: an imported
++// class's pub-less field stays invisible to the importer (patch 51's
++// counterweight, already true since OR-1, pinned here for the fields).
++pub class Vault {
++  pub let mut gold = 0;
++  let combination = 42;
++
++  pub fu peek() { return this.combination; }
++}
+diff --git a/tests/e2e/tests/modules/pubmembers_private/main.ok b/tests/e2e/tests/modules/pubmembers_private/main.ok
+new file mode 100644
+index 0000000..f5d4fc3
+--- /dev/null
++++ b/tests/e2e/tests/modules/pubmembers_private/main.ok
+@@ -0,0 +1,9 @@
++// the ring holds across the module line: pub-less fields of an imported
++// class are invisible to the importer's code.
++import "./lib.ok";
++
++let v = lib.Vault();
++print v.gold; // expect: 0
++v.gold = 3;
++print v.peek(); // expect: 42
++print v.combination; // expect error: is not visible here

@@ -1,0 +1,255 @@
+diff --git a/include/ok/ok_module.h b/include/ok/ok_module.h
+index 69922d0..b7f104a 100644
+--- a/include/ok/ok_module.h
++++ b/include/ok/ok_module.h
+@@ -30,15 +30,33 @@
+ extern "C" {
+ #endif // __cplusplus
+ 
+-// the ABI number: a single integer, bumped on ANY change to the vtable, the
+-// descriptor layouts, or the tag enum. every module carries the number it
+-// was built against; the loader checks at load (and a module may check the
+-// api's number the other way, refusing a host it does not know). mismatch
+-// refuses with the rebuild message. no semver, no compat promises pre-1.0:
+-// "rebuild your natives" is the honest stance. the one discipline kept
+-// anyway: vtable entries are APPEND-ONLY, never repurposed, never reordered.
+-// 3: class_add_field_ex appended (patch 51, the pub-field door).
+-#define OK_NATIVE_ABI 3u
++// the ABI version (patch 52): a (major, minor) pair, semver-shaped, encoded
++// into the single uint32 the descriptor has carried since OR-3:
++// OK_NATIVE_ABI == (OK_ABI_MAJOR << 16) | OK_ABI_MINOR.
++//
++// MAJOR breaks compatibility: a reshuffled vtable, a changed entry
++// signature, a moved descriptor field, a renumbered tag. a module built
++// against another major is refused with the rebuild message.
++// MINOR is additive only: entries appended to the vtable's tail, fields
++// appended to the descriptor's tail. the loader accepts any module whose
++// minor is <= the host's (a host runs everything its own generation ever
++// loaded) and refuses a module from a newer minor with the upgrade
++// message. an addition is a minor bump, never a language major.
++//
++// pre-1.0 the major is 0 and history already fits the scheme: minor 1 was
++// OR-3's table, minor 2 the field trio (patch 49), minor 3 the pub-field
++// door (patch 51). the encoding keeps those integers intact, so an old
++// module decodes as (0, its number) and loads. v1.0.0 freezes (1, 0) and
++// the compat window opens for real: every 1.x ok runs every 1.y module
++// with y <= x, and no addition forces a v2. minor 0 is not a version: a
++// zeroed descriptor is refused with the rebuild message.
++//
++// the check is both directions, as ever: a module may compare p_api->abi
++// against OK_NATIVE_ABI exactly as before, or decode the pair for a
++// softer stance.
++#define OK_ABI_MAJOR 0u
++#define OK_ABI_MINOR 3u
++#define OK_NATIVE_ABI ((OK_ABI_MAJOR << 16) | OK_ABI_MINOR)
+ 
+ // the one symbol a native shared object exports. msvc needs dllexport on
+ // the building side and dllimport on the consuming side; everywhere else
+diff --git a/src/okmodules.c b/src/okmodules.c
+index aaea70d..1e8caad 100644
+--- a/src/okmodules.c
++++ b/src/okmodules.c
+@@ -915,17 +915,40 @@ static ok_result register_native(module_system* p_modules,
+   ok* okay = p_modules->ok;
+   const ok_allocators* a = &okay->raw_alloc;
+ 
+-  // the abi check (both directions is the module's own job at export time,
+-  // comparing against the api table it was handed)
+-  if (p_descriptor->abi != OK_NATIVE_ABI) {
+-    string message = asprint(&okay->alloc,
+-                             "module '%s': abi %u, expected %u, rebuild it against include/ok/ok_module.h.",
+-                             p_display,
+-                             (unsigned)p_descriptor->abi,
+-                             (unsigned)OK_NATIVE_ABI);
+-    module_report_or_plain_fmt(p_from_source, p_site, p_display, &message, "native module abi mismatch.");
+-    string_deinit(&message, &okay->alloc);
+-    return OK_COMPILE_ERROR;
++  // the abi check (patch 52, semver-shaped): major must match, minor must be
++  // a real version at most the host's. an older minor loads unchanged (the
++  // additions were append-only, the old entries never moved), a newer minor
++  // refuses with the upgrade message, a major mismatch with the rebuild
++  // message. minor 0 is not a version: a zeroed descriptor is a rebuild.
++  // (both directions is the module's own job at export time, comparing
++  // against the api table it was handed)
++  {
++    const uint32_t module_major = p_descriptor->abi >> 16;
++    const uint32_t module_minor = p_descriptor->abi & 0xffffu;
++    if (module_major != OK_ABI_MAJOR) {
++      string message =
++          asprint(&okay->alloc,
++                  "module '%s': abi major %u, expected %u, rebuild it against include/ok/ok_module.h.",
++                  p_display,
++                  (unsigned)module_major,
++                  (unsigned)OK_ABI_MAJOR);
++      module_report_or_plain_fmt(p_from_source, p_site, p_display, &message, "native module abi mismatch.");
++      string_deinit(&message, &okay->alloc);
++      return OK_COMPILE_ERROR;
++    }
++    if (module_minor == 0 || module_minor > OK_ABI_MINOR) {
++      string message = asprint(&okay->alloc,
++                               "module '%s': abi %u.%u is newer than this ok (%u.%u), upgrade ok or rebuild the "
++                               "module against include/ok/ok_module.h.",
++                               p_display,
++                               (unsigned)module_major,
++                               (unsigned)module_minor,
++                               (unsigned)OK_ABI_MAJOR,
++                               (unsigned)OK_ABI_MINOR);
++      module_report_or_plain_fmt(p_from_source, p_site, p_display, &message, "native module abi mismatch.");
++      string_deinit(&message, &okay->alloc);
++      return OK_COMPILE_ERROR;
++    }
+   }
+   // the name check (graph loads): the descriptor's declared name and the
+   // import's stem must agree, so a moved or renamed .so cannot lie about
+diff --git a/tests/capi/src/main.c b/tests/capi/src/main.c
+index bea5d0f..9f04d76 100644
+--- a/tests/capi/src/main.c
++++ b/tests/capi/src/main.c
+@@ -223,6 +223,13 @@ static bool mem_read_source(void* p_ctx, const char* p_path, ok_source* p_out) {
+ }
+ 
+ int main(void) {
++  // patch 52's scheme is load-bearing: the pair must keep encoding to the
++  // historic integer (an old module's abi 2 decodes as (0, 2) and loads),
++  // and the minor must be at least the trio's era for the fossil fixtures.
++  CHECK(OK_ABI_MAJOR == 0u);
++  CHECK(OK_ABI_MINOR >= 3u);
++  CHECK(((OK_ABI_MAJOR << 16) | OK_ABI_MINOR) == OK_NATIVE_ABI);
++
+   ok_specs specs = {};
+   ok* p_ok = ok_create(specs);
+   CHECK(p_ok != NULL);
+diff --git a/tests/e2e/tests/modules/native_abimajor/badmajor.c b/tests/e2e/tests/modules/native_abimajor/badmajor.c
+new file mode 100644
+index 0000000..0efa51b
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_abimajor/badmajor.c
+@@ -0,0 +1,34 @@
++// the abi major-mismatch fixture: declares the v1-shaped pair (1, 0). the
++// host is pre-1.0 (major 0), so the loader must refuse with the rebuild
++// message - the one lane a minor bump can never smooth over.
++#include "ok/ok_module.h"
++
++static const ok_api* api = NULL;
++
++static ok_value era_answer(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  (void)p_argv;
++  return api->value_null();
++}
++
++static const ok_native_fn_def era_fns[] = {
++    {"answer", 0, era_answer},
++};
++
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  if (p_api == NULL) {
++    return NULL;
++  }
++  api = p_api;
++  static const ok_native_module era_module = {
++      (1u << 16) | 0u, // the future (1, 0): a major this host does not speak
++      "era",
++      "0.0.1",
++      1,
++      era_fns,
++      NULL,
++      NULL,
++      NULL,
++  };
++  return &era_module;
++}
+diff --git a/tests/e2e/tests/modules/native_abimajor/build.sh b/tests/e2e/tests/modules/native_abimajor/build.sh
+new file mode 100644
+index 0000000..5d2ed44
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_abimajor/build.sh
+@@ -0,0 +1,5 @@
++#!/bin/sh
++# the fixture's declared build: a raw gcc command (M12: whatever toolchain).
++set -e
++cd "$(dirname "$0")"
++gcc -shared -fPIC -I../../../../../include -o badmajor.so badmajor.c
+diff --git a/tests/e2e/tests/modules/native_abimajor/main.ok b/tests/e2e/tests/modules/native_abimajor/main.ok
+new file mode 100644
+index 0000000..ab38300
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_abimajor/main.ok
+@@ -0,0 +1,2 @@
++import "./badmajor";
++// expect error: abi major 1, expected 0, rebuild it against include/ok/ok_module.h.
+diff --git a/tests/e2e/tests/modules/native_abiminor_old/build.sh b/tests/e2e/tests/modules/native_abiminor_old/build.sh
+new file mode 100644
+index 0000000..e6eb680
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_abiminor_old/build.sh
+@@ -0,0 +1,5 @@
++#!/bin/sh
++# the fixture's declared build: a raw gcc command (M12: whatever toolchain).
++set -e
++cd "$(dirname "$0")"
++gcc -shared -fPIC -I../../../../../include -o fossil.so fossil.c
+diff --git a/tests/e2e/tests/modules/native_abiminor_old/fossil.c b/tests/e2e/tests/modules/native_abiminor_old/fossil.c
+new file mode 100644
+index 0000000..360032a
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_abiminor_old/fossil.c
+@@ -0,0 +1,39 @@
++// the abi old-minor fixture: a module frozen in the patch-49 era. the
++// descriptor hardcodes abi 2 (the field trio's number) while the export
++// check uses the CURRENT header - the honest simulation of a stale .so
++// meeting a newer ok. the loader must load it unchanged: same major, older
++// minor, the additions were append-only. this fixture is the compat
++// promise's proof, run on every gate.
++#include "ok/ok_module.h"
++
++static const ok_api* api = NULL;
++
++static ok_value fossil_answer(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  (void)p_argv;
++  return api->value_number(42);
++}
++
++static const ok_native_fn_def fossil_fns[] = {
++    {"answer", 0, fossil_answer},
++};
++
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  // the module's own both-direction check stays exact: it knows the table
++  // it was compiled against, and the host's table is a superset of it
++  if (p_api == NULL || p_api->abi != OK_NATIVE_ABI) {
++    return NULL;
++  }
++  api = p_api;
++  static const ok_native_module fossil_module = {
++      2u, // frozen in the patch-49 era: (0, 2), before the pub-field door
++      "fossil",
++      "0.1.0",
++      1,
++      fossil_fns,
++      NULL,
++      NULL,
++      NULL,
++  };
++  return &fossil_module;
++}
+diff --git a/tests/e2e/tests/modules/native_abiminor_old/main.ok b/tests/e2e/tests/modules/native_abiminor_old/main.ok
+new file mode 100644
+index 0000000..e443360
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_abiminor_old/main.ok
+@@ -0,0 +1,5 @@
++// the compat window's proof: a patch-49-era module (abi 2) loads and runs
++// unchanged on a newer host - same major, older minor, append-only history.
++import "./fossil";
++
++print fossil.answer(); // expect: 42
+diff --git a/tests/e2e/tests/modules/native_badabi/main.ok b/tests/e2e/tests/modules/native_badabi/main.ok
+index 2900d2e..a83d1e2 100644
+--- a/tests/e2e/tests/modules/native_badabi/main.ok
++++ b/tests/e2e/tests/modules/native_badabi/main.ok
+@@ -1,2 +1,2 @@
+ import "./badabi";
+-// expect error: abi 99, expected 3, rebuild it against include/ok/ok_module.h.
++// expect error: abi 0.99 is newer than this ok (0.3), upgrade ok or rebuild the module

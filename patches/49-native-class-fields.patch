@@ -1,0 +1,676 @@
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index b7fd4be..f5a80f6 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -192,6 +192,34 @@ bool ok_class_define_native_method(ok* p_ok,
+ // after this, definitions are refused forever.
+ bool ok_class_freeze(ok* p_ok, ok_value p_class);
+ 
++// declare one field on an unfrozen C-defined class (the patch-49 door: a
++// native class with per-instance state). every instance's slot starts as
++// p_initial (null is the honest default; a reference-typed initial value is
++// shared by every instance, the documented footgun of evaluating once at
++// definition time - prefer null plus a mut field plus an init method).
++// fill mut fields from a native "init" method (the receiver rides argv[0])
++// with ok_value_set_field; a field declared without mut can never be
++// written, from C any more than from script. false = p_class is not a class
++// value, the class is frozen, an empty name, a redeclaration anywhere in
++// the chain, or OOM.
++bool ok_class_add_field(ok* p_ok, ok_value p_class, ok_string_view p_name, bool p_mut, ok_value p_initial);
++
++// read one instance field by name. false = p_value is not an instance, or
++// no field of that name exists on its class chain. allocation-free: the
++// name is probed in the interner first, an unseen spelling cannot be a
++// field. C is the trusted lane: the script-side visibility ring (fields
++// are hierarchy-internal) does not apply here, the host chose to load your
++// code and that is the trust decision. a module namespace's exports read
++// through this door too. statics are not reachable here: instances only.
++bool ok_value_get_field(ok* p_ok, ok_value p_value, ok_string_view p_name, ok_value* p_out);
++
++// write one instance field by name. false = not an instance, no such field,
++// the field is immutable (declared without mut), or the instance is a
++// module namespace (exports are sealed). the call allocates nothing, so
++// neither value needs guarding across it; keeping p_new_value alive
++// afterwards is the instance's own reachability, the usual rooting contract.
++bool ok_value_set_field(ok* p_ok, ok_value p_value, ok_string_view p_name, ok_value p_new_value);
++
+ /* coroutines (embedder side) */
+ 
+ // the lifecycle ok_coro_status reports. a dead coro answers null on resume
+diff --git a/include/ok/ok_module.h b/include/ok/ok_module.h
+index 1aa5bd4..029a424 100644
+--- a/include/ok/ok_module.h
++++ b/include/ok/ok_module.h
+@@ -37,7 +37,7 @@ extern "C" {
+ // refuses with the rebuild message. no semver, no compat promises pre-1.0:
+ // "rebuild your natives" is the honest stance. the one discipline kept
+ // anyway: vtable entries are APPEND-ONLY, never repurposed, never reordered.
+-#define OK_NATIVE_ABI 1u
++#define OK_NATIVE_ABI 2u
+ 
+ // the one symbol a native shared object exports. msvc needs dllexport on
+ // the building side and dllimport on the consuming side; everywhere else
+@@ -100,9 +100,14 @@ typedef enum {
+ // the api vtable (M14: "the vm only cares about its vtable"). carries the
+ // whole ok.h surface a module needs, both directions, per Q's ruling:
+ // "support everything we have and expose to the abi". deliberately OUT of
+-// v1: method enumeration, dynamic member get/set, subclass creation from
+-// native, global define/get (a native's registration is its module
+-// membership, the global namespace stays the host's).
++// v1: member ENUMERATION (listing a class's fields or methods - its shape
++// is entangled with the member-visibility round the pub-members question
++// opens, and no in-tree consumer exists; a later ABI bump adds it whole),
++// subclass creation from native, global define/get (a native's registration
++// is its module membership, the global namespace stays the host's). the
++// field-access trio below IS in (patch 49, Q's question): declare, read,
++// write instance fields - a native class with per-instance state, the
++// getter-free representation.
+ struct ok_api {
+   uint32_t abi; // OK_NATIVE_ABI
+   // view construction: the module builds the string views every other
+@@ -167,6 +172,15 @@ struct ok_api {
+   uint32_t (*coro_status)(ok* p_ok, ok_value p_coro);
+   ok_value (*coro_current)(ok* p_ok);
+   bool (*native_suspend)(ok* p_ok);
++  // the field-access trio (patch 49, ABI 2): a native class with
++  // per-instance state. declare fields before class_freeze (every
++  // instance's slot starts as p_initial), fill them from a native init
++  // method (the receiver rides argv[0]), read them anywhere. the write
++  // honors mut and refuses module namespaces; the read is allocation-free.
++  // C is the trusted lane: the script-side visibility ring does not apply.
++  bool (*class_add_field)(ok* p_ok, ok_value p_class, ok_string_view p_name, bool p_mut, ok_value p_initial);
++  bool (*value_get_field)(ok* p_ok, ok_value p_instance, ok_string_view p_name, ok_value* p_out);
++  bool (*value_set_field)(ok* p_ok, ok_value p_instance, ok_string_view p_name, ok_value p_new_value);
+ };
+ 
+ // the dynamic-library hooks, host-provided like malloc: the host supplies
+diff --git a/src/ok.c b/src/ok.c
+index a6d16b2..decbc8d 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -776,6 +776,94 @@ bool ok_class_freeze(ok* p_ok, ok_value p_class) {
+   return frozen;
+ }
+ 
++// patch 49: the field-access trio. a native class grows per-instance state:
++// declare fields before the freeze, fill them from a native init method,
++// read them from any native method. the machinery is the VM's own (flat
++// slots, the frozen field map), this is only the door.
++bool ok_class_add_field(ok* p_ok, ok_value p_class, ok_string_view p_name, bool p_mut, ok_value p_initial) {
++  if (!IS_VALUE_CLASS(p_class) || p_name.chars == NULL || ok_string_view_get_length(&p_name) == 0) {
++    return false;
++  }
++  object_class* klass = VALUE_AS_CLASS(p_class);
++  if (klass->module_namespace) {
++    // the loader's territory: a namespace class is built and frozen by the
++    // module system, never handed out unfrozen. the frozen check below
++    // covers it in practice; this stays explicit for the reader.
++    return false;
++  }
++  // the class and the initial value are caller-held (the define sequence's
++  // rooting contract): guard both across the interner's allocation. the
++  // interner owns the name from here on, the class owns the default. each
++  // failed guard pops exactly what it pushed, the up/down pairs stay honest.
++  if (!gc_guard_up(p_ok->alloc.gc, p_class)) {
++    return false;
++  }
++  if (!gc_guard_up(p_ok->alloc.gc, p_initial)) {
++    gc_guard_down(p_ok->alloc.gc);
++    return false;
++  }
++  object_specs specs = {&p_ok->alloc, &p_ok->objects_store};
++  object_string* name = string_interner_intern(&p_ok->interner, p_name, &specs);
++  if (name == NULL) {
++    gc_guard_down(p_ok->alloc.gc);
++    gc_guard_down(p_ok->alloc.gc);
++    return false;
++  }
++  // the interned name rides unrooted from here until the class's own_names
++  // adopts it: the appends inside object_class_add_field allocate, and
++  // under aggressive gc that collection must not sweep it (the interner
++  // does not root it for you - build_namespace guards the same window)
++  if (!gc_guard_up(p_ok->alloc.gc, OBJECT_AS_VALUE(name))) {
++    gc_guard_down(p_ok->alloc.gc);
++    gc_guard_down(p_ok->alloc.gc);
++    return false;
++  }
++  const bool added = object_class_add_field(klass, name, p_mut, NULL, p_initial, NULL);
++  gc_guard_down(p_ok->alloc.gc);
++  gc_guard_down(p_ok->alloc.gc);
++  gc_guard_down(p_ok->alloc.gc);
++  return added;
++}
++
++bool ok_value_get_field(ok* p_ok, ok_value p_value, ok_string_view p_name, ok_value* p_out) {
++  if (!IS_VALUE_INSTANCE(p_value) || p_name.chars == NULL) {
++    return false;
++  }
++  // an unseen spelling cannot be a field (universal interning, D20): the
++  // probe allocates nothing, so the read is allocation-free end to end
++  const object_string* name = string_interner_find(&p_ok->interner, p_name);
++  if (name == NULL) {
++    return false;
++  }
++  object_instance* instance = VALUE_AS_INSTANCE(p_value);
++  const field_entry* field = object_class_find_field(instance->klass, name);
++  if (field == NULL) {
++    return false;
++  }
++  *p_out = instance->fields[field->slot];
++  return true;
++}
++
++bool ok_value_set_field(ok* p_ok, ok_value p_value, ok_string_view p_name, ok_value p_new_value) {
++  if (!IS_VALUE_INSTANCE(p_value) || p_name.chars == NULL) {
++    return false;
++  }
++  const object_string* name = string_interner_find(&p_ok->interner, p_name);
++  if (name == NULL) {
++    return false;
++  }
++  object_instance* instance = VALUE_AS_INSTANCE(p_value);
++  if (instance->klass->module_namespace) {
++    return false; // a module's exports are sealed, same doctrine as script
++  }
++  const field_entry* field = object_class_find_field(instance->klass, name);
++  if (field == NULL || !field->mut) {
++    return false;
++  }
++  instance->fields[field->slot] = p_new_value;
++  return true;
++}
++
+ ok_value ok_last_error(ok* p_ok) {
+   return vm_last_error(&p_ok->vm);
+ }
+diff --git a/src/okapi.c b/src/okapi.c
+index 3dc5179..c316074 100644
+--- a/src/okapi.c
++++ b/src/okapi.c
+@@ -278,6 +278,20 @@ static bool api_native_suspend(ok* p_ok) {
+   return ok_native_suspend(p_ok);
+ }
+ 
++// ---------------------------------------------------------------- the field-access trio (patch 49)
++
++static bool api_class_add_field(ok* p_ok, ok_value p_class, ok_string_view p_name, bool p_mut, ok_value p_initial) {
++  return ok_class_add_field(p_ok, p_class, p_name, p_mut, p_initial);
++}
++
++static bool api_value_get_field(ok* p_ok, ok_value p_instance, ok_string_view p_name, ok_value* p_out) {
++  return ok_value_get_field(p_ok, p_instance, p_name, p_out);
++}
++
++static bool api_value_set_field(ok* p_ok, ok_value p_instance, ok_string_view p_name, ok_value p_new_value) {
++  return ok_value_set_field(p_ok, p_instance, p_name, p_new_value);
++}
++
+ // ---------------------------------------------------------------- the table
+ 
+ static const ok_api g_ok_api = {
+@@ -317,6 +331,9 @@ static const ok_api g_ok_api = {
+     api_coro_status,
+     api_coro_current,
+     api_native_suspend,
++    api_class_add_field,
++    api_value_get_field,
++    api_value_set_field,
+ };
+ 
+ const ok_api* ok_api_table(void) {
+diff --git a/src/okgc.c b/src/okgc.c
+index d90cc41..370bd0b 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -527,6 +527,12 @@ static bool trace_object(gc* p_gc, object* p_object) {
+         return false;
+       }
+     }
++    // patch 49: the C-side declared defaults are values (immediates or refs)
++    for (uint32_t i = 0; i < klass->own_defaults.count; ++i) {
++      if (!mark_value(p_gc, klass->own_defaults.data[i])) {
++        return false;
++      }
++    }
+     for (uint32_t i = 0; i < klass->methods.capacity; ++i) {
+       if (klass->methods.keys[i] != NULL) {
+         if (!mark_object(p_gc, (object*)klass->methods.keys[i]) ||
+diff --git a/src/okmodules.c b/src/okmodules.c
+index dd1532c..1c961ad 100644
+--- a/src/okmodules.c
++++ b/src/okmodules.c
+@@ -544,7 +544,8 @@ static bool build_namespace(module_system* p_modules,
+     }
+     const object_string* previous_owner = NULL;
+     const bool added =
+-        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */, &previous_owner);
++        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */,
++                              NULL_AS_VALUE() /* default: the loader fills the slot */, &previous_owner);
+     gc_guard_down(collector); // the class owns the name now
+     if (!added) {
+       gc_guard_down(collector);
+@@ -671,7 +672,8 @@ static bool materialize_ns(module_system* p_modules, pending_ns* p_node, value*
+     }
+     const object_string* previous_owner = NULL;
+     const bool added =
+-        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */, &previous_owner);
++        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */,
++                              NULL_AS_VALUE() /* default: the loader fills the slot */, &previous_owner);
+     gc_guard_down(collector); // the class owns the name now
+     if (!added) {
+       gc_guard_down(collector);
+@@ -756,7 +758,8 @@ static bool build_namespace_members(module_system* p_modules,
+     }
+     const object_string* previous_owner = NULL;
+     const bool added =
+-        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */, &previous_owner);
++        object_class_add_field(klass, field_name, false /* mut */, NULL /* init thunk */,
++                              NULL_AS_VALUE() /* default: the loader fills the slot */, &previous_owner);
+     gc_guard_down(collector); // the class owns the name now
+     if (!added) {
+       gc_guard_down(collector);
+diff --git a/src/okobject.c b/src/okobject.c
+index 9dbe83c..0fcc280 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -457,6 +457,7 @@ static void object_class_init(object_class* p_class,
+   object_string_array_init(&p_class->own_names, p_specs->alloc);
+   uint8_array_init(&p_class->own_muts, p_specs->alloc);
+   object_closure_array_init(&p_class->own_inits, p_specs->alloc);
++  value_array_init(&p_class->own_defaults, p_specs->alloc);
+   field_map_init(&p_class->fields, p_specs->alloc);
+   method_map_init(&p_class->methods, p_specs->alloc);
+   method_map_init(&p_class->statics, p_specs->alloc);
+@@ -477,6 +478,7 @@ static void object_class_deinit(object_class* p_class, object_specs* p_specs) {
+   object_string_array_deinit(&p_class->own_names, p_specs->alloc);
+   uint8_array_deinit(&p_class->own_muts, p_specs->alloc);
+   object_closure_array_deinit(&p_class->own_inits, p_specs->alloc);
++  value_array_deinit(&p_class->own_defaults, p_specs->alloc);
+   field_map_deinit(&p_class->fields);
+   method_map_deinit(&p_class->methods);
+   method_map_deinit(&p_class->statics);
+@@ -501,6 +503,7 @@ bool object_class_add_field(object_class* p_class,
+                             const object_string* p_name,
+                             bool p_mut,
+                             object_closure* p_init_thunk,
++                            value p_default,
+                             const object_string** p_previous_owner) {
+   if (p_class->frozen) {
+     return false;
+@@ -529,7 +532,8 @@ bool object_class_add_field(object_class* p_class,
+   }
+   if (!object_string_array_append(&p_class->own_names, (object_string*)p_name) ||
+       !uint8_array_append(&p_class->own_muts, p_mut ? 1u : 0u) ||
+-      !object_closure_array_append(&p_class->own_inits, p_init_thunk)) {
++      !object_closure_array_append(&p_class->own_inits, p_init_thunk) ||
++      !value_array_append(&p_class->own_defaults, p_default)) {
+     return false;
+   }
+   p_class->nown++;
+@@ -714,6 +718,18 @@ object_instance* create_object_instance(object_class* p_class, object_specs* p_s
+   for (uint32_t i = 0; i < p_class->nfields; ++i) {
+     instance->fields[i] = NULL_AS_VALUE();
+   }
++  // patch 49: the C-side declared defaults (native classes). root segments
++  // first so a subclass's default never lands in a parent's slot range, and
++  // ALL of them before any initializer thunk runs - a thunk may read a
++  // default declared before it (the same reason run_field_inits is
++  // root-first). script classes carry all-null defaults here, so this loop
++  // is a no-op store loop for them.
++  for (const object_class* c = p_class; c != NULL; c = c->parent) {
++    const uint16_t base = c->parent != NULL ? c->parent->nfields : 0;
++    for (uint32_t i = 0; i < c->own_defaults.count; ++i) {
++      instance->fields[base + i] = c->own_defaults.data[i];
++    }
++  }
+   object_store_append(p_specs->store, (object*)instance);
+   return instance;
+ }
+diff --git a/src/okobject.h b/src/okobject.h
+index 4820744..8da65ef 100644
+--- a/src/okobject.h
++++ b/src/okobject.h
+@@ -338,6 +338,12 @@ struct object_class {
+   object_string_array own_names; // own field names, declaration order
+   uint8_array own_muts;        // parallel mut flags
+   object_closure_array own_inits; // parallel initializer thunks (NULL = none)
++  value_array own_defaults;    // parallel C-side initial values (patch 49: the
++                               // native-class lane, always null for script
++                               // fields - their per-instance initializer is
++                               // the thunk. a reference-typed default is
++                               // shared by every instance, the documented
++                               // footgun of the static shape)
+   field_map fields;            // flat name -> slot, built at freeze
+   method_map methods;          // name -> entry, frozen at definition end
+   method_map statics;          // static methods: name -> entry. the receiver is
+@@ -396,11 +402,16 @@ bool object_class_define_native_static_method(object_class* p_class,
+                                               object_specs* p_specs);
+ 
+ // definition-time: append one own field. false = OOM or a redeclaration
+-// (p_previous_owner names the ancestor that already declared it).
++// (p_previous_owner names the ancestor that already declared it). p_default
++// is the C-side initial value (patch 49): every instance's slot starts as
++// this value instead of null. the script lane always passes null - its
++// per-instance initializer is the thunk, which re-evaluates per
++// construction; a C default is evaluated once at definition time.
+ bool object_class_add_field(object_class* p_class,
+                             const object_string* p_name,
+                             bool p_mut,
+                             object_closure* p_init_thunk,
++                            value p_default,
+                             const object_string** p_previous_owner);
+ 
+ // definition end: build the flat field map over the parent chain and freeze
+diff --git a/src/okvm.c b/src/okvm.c
+index a94973d..ba43064 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -4960,7 +4960,7 @@ static void* ok_dispatch_table[OP__COUNT] = {
+         thunk->owner = klass;
+       }
+       const object_string* previous_owner = NULL;
+-      if (!object_class_add_field(klass, name, is_mut, thunk, &previous_owner)) {
++      if (!object_class_add_field(klass, name, is_mut, thunk, NULL_AS_VALUE(), &previous_owner)) {
+         if (previous_owner != NULL) {
+           runtime_error(p_vm,
+                         OK_EK_TYPE,
+diff --git a/tests/capi/src/main.c b/tests/capi/src/main.c
+index ce9198f..e872988 100644
+--- a/tests/capi/src/main.c
++++ b/tests/capi/src/main.c
+@@ -110,6 +110,32 @@ static ok_string_view sv(const char* p_chars) {
+   return ok_create_string_view(p_chars, OK_STRING_VIEW_CALCULATE_LENGTH, true);
+ }
+ 
++// the patch-49 fixture: a stateful C class. Box carries a mut payload field
++// (filled by the native init through ok_value_set_field) and an immutable
++// tag field (a declared initial value, every instance reads the same one).
++static ok_value g_box_seen_tag;
++
++static ok_value box_init(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  CHECK(p_argc == 2);
++  ok_value tag = ok_value_null();
++  CHECK(ok_value_get_field(p_ok, p_argv[0], sv("tag"), &tag));
++  g_box_seen_tag = tag; // the declared default, read before any write
++  CHECK(ok_value_set_field(p_ok, p_argv[0], sv("payload"), p_argv[1]));
++  // the tag is immutable from C exactly as from script
++  CHECK(!ok_value_set_field(p_ok, p_argv[0], sv("tag"), ok_value_number(9)));
++  return ok_value_null();
++}
++
++static ok_value box_bump(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  ok_value payload = ok_value_null();
++  CHECK(ok_value_get_field(p_ok, p_argv[0], sv("payload"), &payload));
++  CHECK(ok_value_is_number(payload));
++  const ok_value next = ok_value_number(ok_value_as_number(payload) + 1.0);
++  CHECK(ok_value_set_field(p_ok, p_argv[0], sv("payload"), next));
++  return next;
++}
++
+ // reads :what: out of a materialized {:kind:, :what:} error map.
+ static bool error_what_contains(ok* p_ok, const char* p_needle) {
+   ok_value error = ok_last_error(p_ok);
+@@ -612,6 +638,91 @@ int main(void) {
+     ok_free(s_ok);
+   }
+ 
++  // ---------- the field-access trio (patch 49): a stateful C class ----------
++  {
++    ok_value box = ok_class_new(p_ok, sv("Box"), ok_value_null());
++    CHECK(ok_value_is_class(box));
++    const uint32_t box_root = ok_root(p_ok, box);
++    CHECK(box_root != OK_ROOT_INVALID);
++    CHECK(ok_class_add_field(p_ok, box, sv("payload"), true, ok_value_null()));
++    CHECK(ok_class_add_field(p_ok, box, sv("tag"), false, ok_value_number(7)));
++    CHECK(!ok_class_add_field(p_ok, box, sv("payload"), true, ok_value_null())); // redeclare
++    CHECK(!ok_class_add_field(p_ok, box, sv(""), true, ok_value_null()));        // empty name
++    CHECK(ok_class_define_native_method(p_ok, box, sv("init"), 2, box_init, false));
++    CHECK(ok_class_define_native_method(p_ok, box, sv("bump"), 1, box_bump, true));
++    CHECK(ok_class_freeze(p_ok, box));
++    CHECK(!ok_class_add_field(p_ok, box, sv("late"), true, ok_value_null())); // frozen
++
++    // the class rides a global; the script constructs and drives it
++    CHECK(ok_global_define(p_ok, sv("Box"), box, false));
++    CHECK(run(p_ok,
++              "glob let b1 = Box(41);\n"
++              "glob let b2 = Box(1);\n"
++              "glob let up1 = b1.bump();\n"
++              "glob let up2 = b2.bump();\n"
++              "glob let up1b = b1.bump();\n"));
++    ok_value up1 = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("up1"), &up1));
++    CHECK(ok_value_is_number(up1) && ok_value_as_number(up1) == 42.0);
++    ok_value up2 = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("up2"), &up2));
++    CHECK(ok_value_is_number(up2) && ok_value_as_number(up2) == 2.0);
++    ok_value up1b = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("up1b"), &up1b));
++    CHECK(ok_value_is_number(up1b) && ok_value_as_number(up1b) == 43.0);
++
++    // per-instance isolation from the C lane: read both boxes' payloads
++    ok_value b1 = ok_value_null();
++    ok_value b2 = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("b1"), &b1));
++    CHECK(ok_global_get(p_ok, sv("b2"), &b2));
++    ok_value p1 = ok_value_null();
++    ok_value p2 = ok_value_null();
++    CHECK(ok_value_get_field(p_ok, b1, sv("payload"), &p1));
++    CHECK(ok_value_get_field(p_ok, b2, sv("payload"), &p2));
++    CHECK(ok_value_as_number(p1) == 43.0 && ok_value_as_number(p2) == 2.0);
++
++    // the immutable default survived every construction untouched
++    CHECK(ok_value_is_number(g_box_seen_tag) && ok_value_as_number(g_box_seen_tag) == 7.0);
++    ok_value tag = ok_value_null();
++    CHECK(ok_value_get_field(p_ok, b1, sv("tag"), &tag));
++    CHECK(ok_value_is_number(tag) && ok_value_as_number(tag) == 7.0);
++
++    // the refusals: a missing name, a non-instance, a class value (statics
++    // are a later entry), an immutable field
++    CHECK(!ok_value_get_field(p_ok, b1, sv("nope"), &p1));
++    CHECK(!ok_value_get_field(p_ok, ok_value_number(1), sv("payload"), &p1));
++    CHECK(!ok_value_get_field(p_ok, box, sv("payload"), &p1));
++    CHECK(!ok_value_set_field(p_ok, b1, sv("tag"), ok_value_number(8)));
++    CHECK(!ok_value_set_field(p_ok, b1, sv("nope"), ok_value_number(8)));
++
++    // a script subclass inherits the C layout: the fields and the native
++    // methods both ride the chain
++    CHECK(run(p_ok,
++              "class BigBox : Box {\n"
++              "  pub fu big() { return 1000; }\n"
++              "}\n"
++              "glob let big = BigBox(5);\n"
++              "glob let big_up = big.bump();\n"
++              "glob let big_hit = big.big();\n"));
++    ok_value big_up = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("big_up"), &big_up));
++    CHECK(ok_value_is_number(big_up) && ok_value_as_number(big_up) == 6.0);
++    ok_value big_hit = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("big_hit"), &big_hit));
++    CHECK(ok_value_is_number(big_hit) && ok_value_as_number(big_hit) == 1000.0);
++
++    // the C lane still reaches the inherited field through the subclass
++    // instance (the flat map covers the chain)
++    ok_value big = ok_value_null();
++    CHECK(ok_global_get(p_ok, sv("big"), &big));
++    ok_value big_payload = ok_value_null();
++    CHECK(ok_value_get_field(p_ok, big, sv("payload"), &big_payload));
++    CHECK(ok_value_as_number(big_payload) == 6.0);
++
++    CHECK(ok_unroot(p_ok, box_root));
++  }
++
+   ok_free(p_ok);
+ 
+   printf("capi: %d checks OK\n", g_checks);
+diff --git a/tests/e2e/tests/modules/native_badabi/main.ok b/tests/e2e/tests/modules/native_badabi/main.ok
+index c5e7210..644ee76 100644
+--- a/tests/e2e/tests/modules/native_badabi/main.ok
++++ b/tests/e2e/tests/modules/native_badabi/main.ok
+@@ -1,2 +1,2 @@
+ import "./badabi";
+-// expect error: abi 99, expected 1, rebuild it against include/ok/ok_module.h.
++// expect error: abi 99, expected 2, rebuild it against include/ok/ok_module.h.
+diff --git a/tests/e2e/tests/modules/native_state/build.sh b/tests/e2e/tests/modules/native_state/build.sh
+new file mode 100644
+index 0000000..d58126e
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_state/build.sh
+@@ -0,0 +1,5 @@
++#!/bin/sh
++# the fixture's declared build: a raw gcc command (M12: whatever toolchain).
++set -e
++cd "$(dirname "$0")"
++gcc -shared -fPIC -I../../../../../include -o state.so state.c
+diff --git a/tests/e2e/tests/modules/native_state/main.ok b/tests/e2e/tests/modules/native_state/main.ok
+new file mode 100644
+index 0000000..19d586c
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_state/main.ok
+@@ -0,0 +1,23 @@
++// the patch-49 acceptance lane: per-instance state in a native class
++import "./state";
++
++let a = state.Counter(10);
++let b = state.Counter(0);
++
++print a.count(); // expect: 10
++print a.bump(); // expect: 13
++print a.bump(); // expect: 16
++print b.count(); // expect: 0
++print a.count(); // expect: 16
++print a.step(); // expect: 3
++print b.bump(); // expect: 3
++
++// a script subclass inherits the C layout and the native methods both
++class Loud : state.Counter {
++  pub fu loud_bump() { return this.bump() + 1000; }
++}
++
++let loud = Loud(100);
++print loud.count(); // expect: 100
++print loud.loud_bump(); // expect: 1103
++print loud.count(); // expect: 103
+diff --git a/tests/e2e/tests/modules/native_state/state.c b/tests/e2e/tests/modules/native_state/state.c
+new file mode 100644
+index 0000000..f19779d
+--- /dev/null
++++ b/tests/e2e/tests/modules/native_state/state.c
+@@ -0,0 +1,117 @@
++// the patch-49 acceptance lane: a native module whose class carries REAL
++// per-instance state in vm fields (no C-side payload, no getter penalty on
++// the data plane - the fields are gc-traced values like any script class's).
++// the build is a raw gcc command on purpose (M12: whatever toolchain).
++//
++// Counter(start): payload = start (written by the native init through
++// api->value_set_field), step = 3 (a declared initial value, immutable).
++// bump() adds step through get/set; count() reads it back.
++
++#include "ok/ok_module.h"
++
++static const ok_api* api = NULL;
++
++// init(start): the receiver rides argv[0], the construction lane's contract
++static ok_value counter_init(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  if (p_argc != 2 || api->value_type(p_argv[1]) != OK_TYPE_NUM) {
++    api->native_error(p_ok, api->view("Counter expects one number.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  if (!api->value_set_field(p_ok, p_argv[0], api->view("payload", 7), p_argv[1])) {
++    api->native_error(p_ok, api->view("Counter init could not write its payload field.",
++                                      OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  return api->value_null();
++}
++
++// bump(): payload = payload + step, answers the new payload
++static ok_value counter_bump(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  ok_value payload = api->value_null();
++  ok_value step = api->value_null();
++  if (!api->value_get_field(p_ok, p_argv[0], api->view("payload", 7), &payload) ||
++      !api->value_get_field(p_ok, p_argv[0], api->view("step", 4), &step)) {
++    api->native_error(p_ok, api->view("Counter could not read its fields.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  const ok_value next = api->value_number(api->value_as_number(payload) + api->value_as_number(step));
++  if (!api->value_set_field(p_ok, p_argv[0], api->view("payload", 7), next)) {
++    api->native_error(p_ok, api->view("Counter could not write its payload field.",
++                                      OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  return next;
++}
++
++// count(): the payload read back
++static ok_value counter_count(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  ok_value payload = api->value_null();
++  if (!api->value_get_field(p_ok, p_argv[0], api->view("payload", 7), &payload)) {
++    api->native_error(p_ok, api->view("Counter could not read its payload.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  return payload;
++}
++
++// step(): the immutable declared default, read-only proof
++static ok_value counter_step(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  ok_value step = api->value_null();
++  if (!api->value_get_field(p_ok, p_argv[0], api->view("step", 4), &step)) {
++    api->native_error(p_ok, api->view("Counter could not read its step.", OK_STRING_VIEW_CALCULATE_LENGTH));
++    return api->value_null();
++  }
++  return step;
++}
++
++static bool state_mount(ok* p_ok) {
++  ok_value counter = api->class_new(p_ok, api->view("Counter", 7), api->value_null());
++  if (api->value_type(counter) != OK_TYPE_CLASS) {
++    return false;
++  }
++  // the patch-49 door: fields on a C-defined class, before the freeze
++  if (!api->class_add_field(p_ok, counter, api->view("payload", 7), true, api->value_null())) {
++    return false;
++  }
++  if (!api->class_add_field(p_ok, counter, api->view("step", 4), false, api->value_number(3))) {
++    return false;
++  }
++  if (!api->class_define_native_method(p_ok, counter, api->view("init", 4), 2, counter_init, false)) {
++    return false;
++  }
++  if (!api->class_define_native_method(p_ok, counter, api->view("bump", 4), 1, counter_bump, true)) {
++    return false;
++  }
++  if (!api->class_define_native_method(p_ok, counter, api->view("count", 5), 1, counter_count, true)) {
++    return false;
++  }
++  if (!api->class_define_native_method(p_ok, counter, api->view("step", 4), 1, counter_step, true)) {
++    return false;
++  }
++  if (!api->class_freeze(p_ok, counter)) {
++    return false;
++  }
++  return api->module_export(p_ok, api->view("Counter", 7), counter);
++}
++
++static const ok_native_fn_def state_fns[] = {};
++
++OK_API const ok_native_module* ok_native_export(const ok_api* p_api) {
++  if (p_api == NULL || p_api->abi != OK_NATIVE_ABI) {
++    return NULL;
++  }
++  api = p_api;
++  static const ok_native_module state_module = {
++      OK_NATIVE_ABI,
++      "state",
++      "0.1.0",
++      0,
++      state_fns,
++      state_mount,
++      NULL,
++      NULL,
++  };
++  return &state_module;
++}
