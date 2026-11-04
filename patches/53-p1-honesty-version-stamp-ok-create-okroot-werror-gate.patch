@@ -1,0 +1,1483 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 983e0f7..1cbc99b 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -53,6 +53,9 @@ jobs:
+         working-directory: build
+         run: ./tests/e2e/oktest-e2e-runner ./ok ../tests/e2e/tests/
+ 
++      - name: cli tests
++        run: bash tests/cli/run.sh "$PWD/build/ok"
++
+       - name: embedding test
+         run: ./build/tests/integration/embedding/oktest_embedding
+ 
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 58508ac..19b8c5c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -102,11 +102,23 @@ if(UNIX)
+   target_link_libraries(ok PUBLIC ${CMAKE_DL_LIBS})
+ endif()
+ 
+-target_compile_options(ok PRIVATE
+-  -Wall
+-  -Wextra
+-  -Wpedantic
+-)
++# the P1 gate: c99 + -Werror on every gcc/clang build. -pedantic rides only
++# the strict-C shape - the threaded dispatch lane rides labels-as-values, a
++# deliberate GNU extension (see the dispatch comment above), and OK_PURE is
++# the portable gate that earns the pedantic spelling. -Wno-missing-braces
++# keeps the flat-initializer idiom legal (the tagged index types initialize
++# flat everywhere; C23's {} is the eventual home).
++if (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID MATCHES "Clang")
++    if (OK_PURE)
++        target_compile_options(ok PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-missing-braces)
++    else()
++        target_compile_options(ok PRIVATE -Wall -Wextra -Werror -Wno-missing-braces)
++    endif()
++else()
++    # other compilers keep the advisory flags; the gate earns its spelling
++    # per-compiler when one ships in CI
++    target_compile_options(ok PRIVATE -Wall -Wextra -Wpedantic)
++endif()
+ 
+ add_library(ok_sanitizers INTERFACE)
+ 
+diff --git a/cli/CMakeLists.txt b/cli/CMakeLists.txt
+index 66c5c70..44a4037 100644
+--- a/cli/CMakeLists.txt
++++ b/cli/CMakeLists.txt
+@@ -9,6 +9,20 @@ target_link_libraries(ok_cli
+   ok_sanitizers
+ )
+ 
++# P1: the compiled-in OK_ROOT fallback - the checkout this binary was built
++# from, exported to declared build commands when the environment has no
++# OK_ROOT of its own (the test-path fix; the ../../ reaches are dead).
++target_compile_definitions(ok_cli PRIVATE OK_ROOT_PREFIX="${PROJECT_SOURCE_DIR}")
++
++# the P1 gate, same shape as libok's (see the root CMakeLists comment)
++if (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID MATCHES "Clang")
++    if (OK_PURE)
++        target_compile_options(ok_cli PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-missing-braces)
++    else()
++        target_compile_options(ok_cli PRIVATE -Wall -Wextra -Werror -Wno-missing-braces)
++    endif()
++endif()
++
+ # give access to internal apis for now
+ target_include_directories(ok_cli
+   PRIVATE
+diff --git a/cli/src/main.c b/cli/src/main.c
+index 26b8602..747681a 100644
+--- a/cli/src/main.c
++++ b/cli/src/main.c
+@@ -4,13 +4,23 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
+ #include "ok/ok.h"
+ #include "ok/ok_module.h"
++#include "ok/ok_version.h"
+ 
+ #include "project.h"
+ 
++// the compiled-in OK_ROOT fallback (P1): the checkout the binary was built
++// from. the sandbox's build script and cmake both pass it; an unset prefix
++// (installed binaries) simply never injects one, and an OK_ROOT already in
++// the environment always wins.
++#ifndef OK_ROOT_PREFIX
++#define OK_ROOT_PREFIX ""
++#endif
++
+ static void repl(ok* p_ok);
+ static void run_file(ok* p_ok, const char* p_path);
+ static char* read_file(const char* p_path);
+@@ -65,8 +75,11 @@ static void usage(void) {
+           "usage: ok [run] [flags] [path]\n"
+           "       ok build [--clean|--force]     run the project's native build commands\n"
+           "       ok where <import> [path]       print where an import resolves from\n"
++          "       ok create <name>               scaffold a project (project.ok + src/ + tests/)\n"
++          "       ok version                     print the version stamp\n"
+           "       ok\n"
+           "flags:\n"
++          "  --version | -v           print the version stamp and exit\n"
+           "  --dump                   compile and disassemble only\n"
+           "  --native <path>          force-load a native module (repeatable)\n"
+           "  --restrict               drop native load, native build, and host caps\n"
+@@ -78,6 +91,99 @@ static void usage(void) {
+           "  --where <import>         resolve <import> from the entry, print, exit\n");
+ }
+ 
++// ---------------------------------------------------------------- the version stamp (P1)
++
++// `ok --version` / `ok -v` / `ok version`: one compiled line - the version
++// (carrying the wave's pre-release lane while mid-wave) and the native abi
++// (ok_module.h's semver encoding, the patch-52 truth). the bench workflow
++// parses this line; keep it one line and greppable.
++static int cmd_version(void) {
++  printf("ok %s (abi %u.%u)\n", OK_VERSION_STRING, OK_ABI_MAJOR, OK_ABI_MINOR);
++  return 0;
++}
++
++// ---------------------------------------------------------------- `ok create` (P1)
++
++// scaffolds <name>/{project.ok, src/main.ok, tests/, .gitignore}. the
++// manifest is a plain ok module the OR-4 discovery walk already knows how
++// to read; the entry runs with `ok src/main.ok` from the project root.
++static int write_small_file(const char* p_path, const char* p_content) {
++  FILE* file = fopen(p_path, "w");
++  if (file == NULL) {
++    fprintf(stderr, "can't create file: \"%s\".\n", p_path);
++    return 1;
++  }
++  const size_t length = strlen(p_content);
++  if (fwrite(p_content, 1, length, file) != length) {
++    fprintf(stderr, "can't write file: \"%s\".\n", p_path);
++    fclose(file);
++    return 1;
++  }
++  fclose(file);
++  return 0;
++}
++
++static int cmd_create(const char* p_name) {
++  // one path segment: no separators, no dotfiles, not a scaffold dir's own
++  // name. refusing here is cheaper than untangling a bad tree later.
++  if (p_name[0] == '\0' || strchr(p_name, '/') != NULL || strchr(p_name, '.') != NULL ||
++      strcmp(p_name, "src") == 0 || strcmp(p_name, "tests") == 0) {
++    fprintf(stderr, "project name must be one path segment (letters, digits, '-', '_').\n");
++    return 64;
++  }
++  struct stat st;
++  if (stat(p_name, &st) == 0) {
++    fprintf(stderr, "\"%s\" already exists - refusing to touch it.\n", p_name);
++    return 1;
++  }
++  char path[512];
++  if (snprintf(path, sizeof(path), "%s/src", p_name) >= (int)sizeof(path)) {
++    return 70; // a name this long cannot happen through the segment checks, but stay honest
++  }
++  if (mkdir(p_name, 0777) != 0 || mkdir(path, 0777) != 0) {
++    fprintf(stderr, "can't create the project directories under \"%s\".\n", p_name);
++    return 70;
++  }
++  snprintf(path, sizeof(path), "%s/tests", p_name);
++  mkdir(path, 0777);
++  snprintf(path, sizeof(path), "%s/.gitignore", p_name);
++  if (write_small_file(path, ".okbuild/\n") != 0) {
++    return 70;
++  }
++  snprintf(path, sizeof(path), "%s/tests/.gitkeep", p_name);
++  write_small_file(path, "");
++  // the manifest: minimal on purpose - the keys the CLI reads today are
++  // name, version, deps, natives; everything else is the module's own.
++  char manifest[768];
++  snprintf(manifest, sizeof(manifest),
++           "// the project manifest: a plain ok module the CLI evaluates in a fresh\n"
++           "// instance to discover deps and native targets (OR-4). keys it reads:\n"
++           "// name, version, deps, natives.\n"
++           "pub let project = {\n"
++           "  \"name\": \"%s\",\n"
++           "  \"version\": \"0.1.0\",\n"
++           "};\n",
++           p_name);
++  snprintf(path, sizeof(path), "%s/project.ok", p_name);
++  if (write_small_file(path, manifest) != 0) {
++    return 70;
++  }
++  char entry[512];
++  snprintf(entry, sizeof(entry),
++           "// the entry point. from the project root:\n"
++           "//   ok src/main.ok\n"
++           "print \"hello from %s\";\n",
++           p_name);
++  snprintf(path, sizeof(path), "%s/src/main.ok", p_name);
++  if (write_small_file(path, entry) != 0) {
++    return 70;
++  }
++  printf("created %s/ (project.ok, src/main.ok, tests/, .gitignore)\n", p_name);
++  printf("  cd %s && ok src/main.ok     run it\n", p_name);
++  printf("  ok build                     build the project's native targets (none yet)\n");
++  return 0;
++}
++
+ // ---------------------------------------------------------------- the project verbs (OR-4)
+ 
+ // `ok build [--clean|--force]`: the project above the cwd, its whole graph's
+@@ -163,6 +269,33 @@ static int cmd_where(int argc, char** argv) {
+ }
+ 
+ int main(int argc, char** argv) {
++  // OK_ROOT (P1): the checkout this binary was built from, exported (never
++  // overriding an existing value) so declared native build commands and the
++  // test fixtures can reach the headers without ../../ reaches. the
++  // relative paths are dead; this prefix is the compiled-in fallback the
++  // roadmap ruled.
++  if (getenv("OK_ROOT") == NULL && OK_ROOT_PREFIX[0] != '\0') {
++    setenv("OK_ROOT", OK_ROOT_PREFIX, 0);
++  }
++
++  // P1: the version spellings - one stamp, three doors. -v / --version win
++  // over everything (they answer and leave), wherever they appear.
++  for (int i = 1; i < argc; ++i) {
++    if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
++      return cmd_version();
++    }
++  }
++  if (argc > 1 && strcmp(argv[1], "version") == 0) {
++    return cmd_version();
++  }
++  if (argc > 1 && strcmp(argv[1], "create") == 0) {
++    if (argc != 3) {
++      usage();
++      return 64;
++    }
++    return cmd_create(argv[2]);
++  }
++
+   // the OR-4 verbs
+   if (argc > 1 && strcmp(argv[1], "build") == 0) {
+     return cmd_build(argc - 2, argv + 2);
+diff --git a/include/ok/ok_module.h b/include/ok/ok_module.h
+index b7f104a..538f27c 100644
+--- a/include/ok/ok_module.h
++++ b/include/ok/ok_module.h
+@@ -78,7 +78,9 @@ typedef struct ok_native_fn_def {
+   ok_native_fn call;
+ } ok_native_fn_def;
+ 
+-typedef struct ok_native_module {
++// the definition carries the tag only: the name binding lives in ok_fwd.h's
++// forward typedef, so C99 sees one typedef, not two (the P1 warning sweep).
++struct ok_native_module {
+   uint32_t abi;        // must equal OK_NATIVE_ABI, checked at load
+   const char* name;    // self-declared; must match the import stem for graph loads
+   const char* version; // the module's own version string, display only
+@@ -96,7 +98,7 @@ typedef struct ok_native_module {
+   // or call into the api beyond simple teardown.
+   bool (*on_load)(ok* p_ok);
+   void (*on_unload)(ok* p_ok);
+-} ok_native_module;
++};
+ 
+ typedef const ok_native_module* (*ok_native_export_fn)(const ok_api* p_api);
+ 
+diff --git a/include/ok/ok_specs.h b/include/ok/ok_specs.h
+index f7799d0..2d9c803 100644
+--- a/include/ok/ok_specs.h
++++ b/include/ok/ok_specs.h
+@@ -28,9 +28,13 @@ typedef enum {
+   OK_CAP_NATIVE_LOAD = 1u << 0,  // dlopen natives (import + force-load)
+   OK_CAP_NATIVE_BUILD = 1u << 1, // run declared native build commands (OR-4)
+   OK_CAP_HOST = 1u << 2,         // host-touching stdlib (fs/env/clock, later)
+-  OK_CAP_ALL = 0xffffffffu,
+ } ok_cap;
+ 
++// every capability bit at once. a macro, not an enumerator: C99 keeps
++// enumerator values inside int and the full mask does not fit (the P1
++// warning sweep's find; the value is unchanged).
++#define OK_CAP_ALL ((ok_cap)0xffffffffu)
++
+ struct ok_specs {
+   ok_allocators allocators;
+   // capabilities refused at birth (the ratchet's starting point). 0, the
+diff --git a/include/ok/ok_version.h b/include/ok/ok_version.h
+new file mode 100644
+index 0000000..1ff3a49
+--- /dev/null
++++ b/include/ok/ok_version.h
+@@ -0,0 +1,29 @@
++#ifndef OK_VERSION_H
++#define OK_VERSION_H
++
++// the version stamp, P1's single source of truth. `ok --version` prints
++// it, the capi harness composes it (drift between the numbers and the
++// string fails the gate), the bench workflow reads it.
++//
++// all five defines move together at a version bump: the three numbers,
++// the lane, and the composed string. the lane is the pre-release channel
++// while a wave is in flight ("rc.1" below, per the roadmap's stamp
++// ruling); release day sets it to the empty string and the stamp collapses
++// to the bare version.
++//
++// the abi is NOT here - it lives in ok_module.h (OK_ABI_MAJOR.MINOR, the
++// patch-52 semver encoding) because it belongs to the native-module
++// contract, not the version. the stamp prints both; the truth stays
++// where it lives.
++
++#define OK_VERSION_MAJOR 0u
++#define OK_VERSION_MINOR 9u
++#define OK_VERSION_PATCH 0u
++
++// mid-wave: the Reconciliation rc. "" on release day.
++#define OK_VERSION_LANE "rc.1"
++
++// hand-composed from the four above; tests/capi re-composes and compares.
++#define OK_VERSION_STRING "0.9.0-rc.1"
++
++#endif // OK_VERSION_H
+diff --git a/src/ok.c b/src/ok.c
+index b24cf9d..cd88abd 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -373,7 +373,7 @@ top_level_declarations ok_get_top_level_declarations(ok* p_ok, bool* p_error) {
+   top_level_declarations decls;
+   top_level_declarations_init(&decls, &p_ok->alloc);
+   for (uint32_t i = 0; i < sizeof(top_level_seeds) / sizeof(top_level_seeds[0]); ++i) {
+-    variable_declaration decl = {
++    variable_declaration decl = {.identifier =
+         ok_create_string_view(top_level_seeds[i].name, OK_STRING_VIEW_CALCULATE_LENGTH, true)};
+     if (!top_level_declarations_append(&decls, decl)) {
+       *p_error = true;
+@@ -413,6 +413,12 @@ value_array ok_get_top_level_values(ok* p_ok, bool* p_error) {
+     case SEED_CLASS:
+       temp = OBJECT_AS_VALUE(p_ok->vm.class_singleton);
+       break;
++    default:
++      // the sweep's -O2 find: an unknown seed kind must refuse, never
++      // append an uninitialized value (the enum is closed in this file,
++      // but the analyzer is right to ask)
++      *p_error = true;
++      break;
+     }
+     if (*p_error || !value_array_append(&vals, temp)) {
+       *p_error = true;
+@@ -700,6 +706,7 @@ const char* ok_module_export_name(ok* p_ok, ok_value p_module, uint32_t p_index)
+ }
+ 
+ ok_value ok_module_export_get(ok* p_ok, ok_value p_module, uint32_t p_index) {
++  (void)p_ok;
+   const object_class* klass = module_namespace_class_of(p_module);
+   if (klass == NULL || p_index >= klass->own_names.count) {
+     return ok_value_null();
+diff --git a/src/okarray.h b/src/okarray.h
+index 20b61b2..66613a8 100644
+--- a/src/okarray.h
++++ b/src/okarray.h
+@@ -38,6 +38,7 @@
+   }                                                                                                                    \
+                                                                                                                        \
+   void name##_deinit(name* p_array, allocators* p_alloc) {                                                             \
++    (void)p_alloc; /* the array owns its allocators; the parameter stays for signature symmetry */                      \
+     for (size_type i = 0; i < p_array->count; ++i) {                                                                   \
+       deinit_type(&p_array->data[i], p_array->alloc);                                                                  \
+     }                                                                                                                  \
+diff --git a/src/okast.c b/src/okast.c
+index 0c46a4c..2db95e2 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -67,10 +67,12 @@ void ast_node_deinit(ast_node* p_node) {
+ }
+ 
+ bool ast_node_print(const ast_node* p_node) {
++  (void)p_node;
+   return false;
+ }
+ 
+ string ast_node_asprint(const ast_node* p_node) {
++  (void)p_node;
+   return create_static_string(NULL, 0);
+ }
+ 
+@@ -86,10 +88,12 @@ void ast_expression_deinit(ast_expression* p_expression) {
+ }
+ 
+ bool ast_expression_print(const ast_expression* p_expression) {
++  (void)p_expression;
+   return false;
+ }
+ 
+ string ast_expression_asprint(const ast_expression* p_expression) {
++  (void)p_expression;
+   return create_static_string(NULL, 0);
+ }
+ 
+@@ -105,15 +109,17 @@ void ast_statement_deinit(ast_statement* p_statement) {
+ }
+ 
+ bool ast_statement_print(const ast_statement* p_statement) {
++  (void)p_statement;
+   return false;
+ }
+ 
+ string ast_statement_asprint(const ast_statement* p_statement) {
++  (void)p_statement;
+   return create_static_string(NULL, 0);
+ }
+ 
+ string ast_binding_modifiers_asprint(ast_binding_modifiers_t p_modifiers) {
+-  if (p_modifiers == BINDING_NONE != 0) {
++  if (p_modifiers == BINDING_NONE) {
+     return create_static_string("", 0);
+   }
+   if ((p_modifiers & BINDING_MUT) != 0) {
+@@ -414,6 +420,7 @@ void ast_null_expression_deinit(ast_null_expression* p_null) {
+ }
+ 
+ bool ast_null_expression_print(const ast_null_expression* p_null) {
++  (void)p_null;
+   return printf("null") > 0;
+ }
+ 
+@@ -430,6 +437,7 @@ void ast_this_expression_deinit(ast_this_expression* p_this) {
+ }
+ 
+ bool ast_this_expression_print(const ast_this_expression* p_this) {
++  (void)p_this;
+   return printf("this") > 0;
+ }
+ 
+@@ -446,6 +454,7 @@ void ast_super_expression_deinit(ast_super_expression* p_super) {
+ }
+ 
+ bool ast_super_expression_print(const ast_super_expression* p_super) {
++  (void)p_super;
+   return printf("super") > 0;
+ }
+ 
+@@ -1104,10 +1113,12 @@ void ast_eof_statement_deinit(ast_eof_statement* p_eof) {
+ }
+ 
+ bool ast_eof_statement_print(const ast_eof_statement* p_eof) {
++  (void)p_eof;
+   return true;
+ }
+ 
+ string ast_eof_statement_asprint(const ast_eof_statement* p_eof) {
++  (void)p_eof;
+   return create_static_string("", 0);
+ }
+ 
+@@ -1120,10 +1131,12 @@ void ast_empty_statement_deinit(ast_empty_statement* p_empty) {
+ }
+ 
+ bool ast_empty_statement_print(const ast_empty_statement* p_empty) {
++  (void)p_empty;
+   return true;
+ }
+ 
+ string ast_empty_statement_asprint(const ast_empty_statement* p_empty) {
++  (void)p_empty;
+   return create_static_string("", 0);
+ }
+ 
+@@ -1351,6 +1364,7 @@ bool ast_for_in_statement_print(const ast_for_in_statement* p_for_in) {
+ }
+ 
+ string ast_for_in_statement_asprint(const ast_for_in_statement* p_for_in) {
++  (void)p_for_in;
+   return create_static_string("for in", STRING_CALCULATE_LENGTH);
+ }
+ 
+@@ -1401,6 +1415,7 @@ bool ast_for_numeric_statement_print(const ast_for_numeric_statement* p_for_nume
+ }
+ 
+ string ast_for_numeric_statement_asprint(const ast_for_numeric_statement* p_for_numeric) {
++  (void)p_for_numeric;
+   return create_static_string("for numeric", STRING_CALCULATE_LENGTH);
+ }
+ 
+@@ -1698,6 +1713,7 @@ void ast_import_statement_deinit(ast_import_statement* p_import) {
+ }
+ 
+ bool ast_import_statement_print(const ast_import_statement* p_import) {
++  (void)p_import;
+   return printf("import") > 0;
+ }
+ 
+diff --git a/src/okchunk.c b/src/okchunk.c
+index b8ffb7c..adcd657 100644
+--- a/src/okchunk.c
++++ b/src/okchunk.c
+@@ -71,6 +71,7 @@ bool chunk_write_word2(chunk* p_chunk, const word2 p_words, const ok_line_info p
+ }
+ 
+ index_wrapper chunk_add_constant(chunk* p_chunk, const value p_constant, const ok_line_info p_line_info) {
++  (void)p_line_info;
+   if (p_chunk->constants.count >= CONSTANTS_MAX) {
+     return (index_wrapper){0, 0, CONSTANT_OVERFLOW};
+   }
+@@ -81,6 +82,7 @@ index_wrapper chunk_add_constant(chunk* p_chunk, const value p_constant, const o
+ }
+ 
+ index_wrapper chunk_add_identifier(chunk* p_chunk, const ok_string_view p_identifier, const ok_line_info p_line_info) {
++  (void)p_line_info;
+   if (p_chunk->identifiers.count >= IDENTIFIERS_MAX) {
+     return (index_wrapper){0, 0, IDENTIFIER_OVERFLOW};
+   }
+diff --git a/src/okchunk.h b/src/okchunk.h
+index 67c8b40..ca8ec71 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -508,33 +508,33 @@ static inline word2 join_words(word p_w1, word p_w2) {
+ 
+ static inline word
+ encode_oppabc(const opcode p_op, const bool p_p, const uint8_t p_a, const uint8_t p_b, const uint8_t p_c) {
+-  return ((uint32_t)p_op << op_LOFFSET) & op_MASK | (((uint32_t)p_p) << p_LOFFSET) & p_MASK |
+-         (((uint32_t)p_a) << a_LOFFSET) & a_MASK | (((uint32_t)p_b) << b_LOFFSET) & b_MASK |
+-         (((uint32_t)p_c) << c_LOFFSET) & c_MASK;
++  return (((uint32_t)p_op << op_LOFFSET) & op_MASK) | ((((uint32_t)p_p) << p_LOFFSET) & p_MASK) |
++         ((((uint32_t)p_a) << a_LOFFSET) & a_MASK) | ((((uint32_t)p_b) << b_LOFFSET) & b_MASK) |
++         ((((uint32_t)p_c) << c_LOFFSET) & c_MASK);
+ }
+ 
+ static inline word
+ encode_oppabprime(const opcode p_op, const bool p_p, const uint16_t p_aprime, const uint16_t p_bprime) {
+-  return ((uint32_t)p_op << op_LOFFSET) & op_MASK | (((uint32_t)p_p) << p_LOFFSET) & p_MASK |
++  return (((uint32_t)p_op << op_LOFFSET) & op_MASK) | ((((uint32_t)p_p) << p_LOFFSET) & p_MASK) |
+          (((uint32_t)p_aprime << aprime_LOFFSET) & aprime_MASK) |
+-         (((uint32_t)p_bprime) << bprime_LOFFSET) & bprime_MASK;
++         ((((uint32_t)p_bprime) << bprime_LOFFSET) & bprime_MASK);
+ }
+ 
+ static inline word encode_oppA(const opcode p_op, const bool p_p, const uint16_t p_A) {
+-  return ((uint32_t)p_op << op_LOFFSET) & op_MASK | (((uint32_t)p_p) << p_LOFFSET) & p_MASK |
+-         (((uint32_t)p_A) << A_LARGE_LOFFSET) & A_LARGE_MASK;
++  return (((uint32_t)p_op << op_LOFFSET) & op_MASK) | ((((uint32_t)p_p) << p_LOFFSET) & p_MASK) |
++         ((((uint32_t)p_A) << A_LARGE_LOFFSET) & A_LARGE_MASK);
+ }
+ 
+ static inline word encode_oppAe(const opcode p_op, const bool p_p, const uint16_t p_A, const uint8_t p_e) {
+-  return ((uint32_t)p_op << op_LOFFSET) & op_MASK | (((uint32_t)p_p) << p_LOFFSET) & p_MASK |
+-         (((uint32_t)p_A) << A_LARGE_LOFFSET) & A_LARGE_MASK | (((uint32_t)p_e) << e_LARGE_LOFFSET) & e_LARGE_MASK;
++  return (((uint32_t)p_op << op_LOFFSET) & op_MASK) | ((((uint32_t)p_p) << p_LOFFSET) & p_MASK) |
++         ((((uint32_t)p_A) << A_LARGE_LOFFSET) & A_LARGE_MASK) | ((((uint32_t)p_e) << e_LARGE_LOFFSET) & e_LARGE_MASK);
+ }
+ 
+ static inline word2 encode_OPPABCQ(
+     const opcode p_OP, const bool p_P, const uint16_t p_A, const uint16_t p_B, const uint16_t p_C, const bool p_Q) {
+-  return ((uint64_t)p_OP << OP_LOFFSET) & OP_MASK | (((uint64_t)p_P) << P_LOFFSET) & P_MASK |
+-         (((uint64_t)p_A) << A_LOFFSET) & A_MASK | (((uint64_t)p_B) << B_LOFFSET) & B_MASK |
+-         (((uint64_t)p_C) << C_LOFFSET) & C_MASK | (((uint64_t)p_Q) << Q_LOFFSET) & Q_MASK;
++  return (((uint64_t)p_OP << OP_LOFFSET) & OP_MASK) | ((((uint64_t)p_P) << P_LOFFSET) & P_MASK) |
++         ((((uint64_t)p_A) << A_LOFFSET) & A_MASK) | ((((uint64_t)p_B) << B_LOFFSET) & B_MASK) |
++         ((((uint64_t)p_C) << C_LOFFSET) & C_MASK) | ((((uint64_t)p_Q) << Q_LOFFSET) & Q_MASK);
+ }
+ 
+ static inline opcode op_of(const word p_word) {
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index a69ed7a..1ac2359 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -10,7 +10,7 @@
+ #include "okutils.h"
+ #include "okvalue.h"
+ 
+-ARRAY_DEFINE_DEFAULT(top_level_declarations, variable_declaration, ARRAY_DEFAULT_TYPE_DEINIT);
++ARRAY_DEFINE_DEFAULT(top_level_declarations, variable_declaration, ARRAY_DEFAULT_TYPE_DEINIT)
+ 
+ #define SR_KEY_IS_EMPTY(k) ((k).chars == NULL)
+ #define SR_KEY_SET_EMPTY(k)                                                                                            \
+@@ -1460,7 +1460,6 @@ static bool write_upvalue(compiler* p_compiler, upvalue p_upvalue, expression_re
+ 
+ static global add_global(compiler* p_compiler, variable_declaration p_declaration, ast_node* p_author) {
+   allocators* alloc = p_compiler->alloc;
+-  chunk* chunk = current_chunk(p_compiler);
+   global index = globals_store_add(p_compiler->globals_store,
+                                    p_declaration.identifier,
+                                    (p_declaration.flags & VARIABLE_DECLARATION_FLAGS_MUTABLE) != 0);
+@@ -2033,7 +2032,6 @@ store_global(compiler* p_compiler, location p_global_location, expression_result
+ 
+ static bool
+ store_local(compiler* p_compiler, location p_local_location, expression_result p_value, ast_node* p_author) {
+-  allocators* alloc = p_compiler->alloc;
+   _register local = current_context(p_compiler)->register_allocator.registers.data[p_local_location.index];
+   if ((local.flags & REGISTER_FLAG_MUTABLE) == 0) {
+     ok_note note;
+@@ -2683,6 +2681,7 @@ static bool compile_identifier(compiler* p_compiler,
+                                _register p_dest,
+                                uint32_t p_requested_count,
+                                expression_result* p_out) {
++                               (void)p_dest;
+   ASSERT_MSG(p_requested_count <= 1, "invalid requested count to compile_identifier.");
+   if (p_requested_count == 0) {
+     return true;
+@@ -2701,6 +2700,8 @@ static bool compile_identifier(compiler* p_compiler,
+ }
+ 
+ bool compile_eof_statement(compiler* p_compiler, ast_eof_statement* p_eof) {
++  (void)p_compiler;
++  (void)p_eof;
+   return true;
+ }
+ 
+@@ -2754,7 +2755,6 @@ static bool emit_incomplete_jump(compiler* p_compiler, opcode p_op, uint32_t* p_
+ }
+ 
+ static bool emit_loop(compiler* p_compiler, const uint32_t p_loop_start, ast_node* p_author) {
+-  allocators* alloc = p_compiler->alloc;
+   chunk* chunk = current_chunk(p_compiler);
+   // OP_LOOP reads its offset from the ip after instruction, which is (this word index + 1)
+   const uint32_t loop_length = (chunk->code.count + 1) - p_loop_start;
+@@ -2870,12 +2870,10 @@ static fused_condition_result compile_fused_condition_jump(
+           p_compiler, &is_rhs_const, LOCATION_KIND_CONSTANT, &rhs.value, rhs_dest, p_author)) {
+     return FUSED_CONDITION_ERROR;
+   }
+-  if (lhs.value.index > B_MAX || rhs.value.index > C_MAX) {
+-    // the 2w form carries 16 bit operands; a compile window this wide keeps
+-    // the generic path (whose LONG variants exist) rather than growing a
+-    // fused LONG spelling nobody has benched yet.
+-    return FUSED_CONDITION_UNSUPPORTED;
+-  }
++  // (P1 sweep note: no width guard is needed here - ok_index and the 2w
++  // operand fields are both 16 bit, so the fused window is structural.
++  // the guard this replaces compared a uint16 against UINT16_MAX and
++  // could never fire.)
+   *p_out = current_chunk(p_compiler)->code.count;
+   if (!emit_word2(p_compiler,
+                   encode_OPPABCQC(OP_JUMP_IF_CMP,
+@@ -2993,7 +2991,6 @@ static bool patch_jump_if_set(compiler* p_compiler,
+   const opcode op = op_of(words[0]);
+   const bool p = p_of(words[0]);
+   const uint16_t B = B_of(joined);
+-  const uint16_t C = C_of(joined);
+   const bool Q = Q_of(joined);
+   word2 patched = encode_OPPABCQ(op, p, jmp, B, p_target.index, Q);
+   words[0] = (word)(patched & UINT64_C(0xffffffff));
+@@ -3351,7 +3348,6 @@ static bool compile_throw_statement(compiler* p_compiler, ast_throw_statement* p
+ // (temps die, locals stay). entering the handler consumes the record, so a throw inside H finds
+ // only outer handlers. and a bare `throw;` reads e's register directly.
+ static bool compile_try_statement(compiler* p_compiler, ast_try_statement* p_try) {
+-  allocators* alloc = p_compiler->alloc;
+   compile_context* ctx = current_context(p_compiler);
+   ast_node* author = (ast_node*)p_try;
+ 
+@@ -3732,6 +3728,7 @@ static bool compile_number_expression(compiler* p_compiler,
+                                       _register p_dest,
+                                       uint32_t p_requested_count,
+                                       expression_result* p_out) {
++                                      (void)p_dest;
+   ASSERT(p_requested_count <= 1);
+   if (p_requested_count == 0) {
+     return true;
+@@ -3763,6 +3760,7 @@ static bool compile_string_expression(compiler* p_compiler,
+                                       _register p_dest,
+                                       uint32_t p_requested_count,
+                                       expression_result* p_out) {
++                                      (void)p_dest;
+   ASSERT(p_requested_count <= 1);
+   if (p_requested_count == 0) {
+     return true;
+@@ -3859,7 +3857,6 @@ static bool compile_logical_operator(compiler* p_compiler,
+                                      expression_result* p_result) {
+   expression_result lhs;
+   expression_result rhs;
+-  register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
+ 
+   if (!compile_expression(p_compiler, p_logical->left, p_dest, 1, &lhs)) {
+     return false;
+@@ -4322,7 +4319,6 @@ bool compile_call_expression(compiler* p_compiler,
+   //   n >= 2 = destructuring position - the binding count (the destructuring
+   //       let is the only caller that passes n. call() checks it).
+   allocators* alloc = p_compiler->alloc;
+-  register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
+   // the fused lanes: obj.name(args) is one OP_INVOKE (the receiver doubles as
+   // the call window base), super.name(args) and the bare super(args) are one
+   // OP_SUPER_INVOKE (the receiver rides the running method's register 0).
+@@ -4726,6 +4722,7 @@ static bool compile_compound_assign_expression(compiler* p_compiler,
+                                                _register p_dest,
+                                                uint32_t p_requested_count,
+                                                expression_result* p_out) {
++                                               (void)p_dest;
+   CRASH_MSG(p_requested_count <= 1, "unimplemented multi-assign.");
+   register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
+   ast_node* author = (ast_node*)p_compound;
+@@ -5184,6 +5181,11 @@ static bool compile_postfix_unary_expression(compiler* p_compiler,
+                                              _register p_dest,
+                                              uint32_t p_requested_count,
+                                              expression_result* p_out) {
++                                             (void)p_compiler;
++                                             (void)p_dest;
++                                             (void)p_expression;
++                                             (void)p_out;
++                                             (void)p_requested_count;
+   CRASH_MSG(false, "unimplemented postfix expression.");
+   return false;
+ }
+diff --git a/src/okcompiler.h b/src/okcompiler.h
+index 223ac48..48b22cc 100644
+--- a/src/okcompiler.h
++++ b/src/okcompiler.h
+@@ -97,6 +97,13 @@ typedef enum {
+ 
+ typedef struct {
+   lvalue_kind kind;
++  // the anonymous union is ok's one chosen C11-ism (see okindex.h for the
++  // ruling): each lvalue kind reads its own view, flat compound literals
++  // like (lvalue){LVALUE_VARIABLE, loc} bind positionally through it.
++#if defined(__GNUC__)
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wpedantic"
++#endif
+   union {
+     location variable;
+     struct {
+@@ -114,6 +121,9 @@ typedef struct {
+       location name; // the static field's string constant (LVALUE_STATIC)
+     } statik;
+   };
++#if defined(__GNUC__)
++#pragma GCC diagnostic pop
++#endif
+ } lvalue;
+ 
+ typedef struct {
+@@ -314,7 +324,7 @@ typedef struct {
+   module_exports exports;
+ } compile_result;
+ 
+-ARRAY_DECLARE_DEFAULT(top_level_declarations, variable_declaration);
++ARRAY_DECLARE_DEFAULT(top_level_declarations, variable_declaration)
+ 
+ typedef struct {
+   allocators* alloc;
+diff --git a/src/okdebug.c b/src/okdebug.c
+index f743cf8..e4cf21c 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -275,7 +275,7 @@ bool debug_disassemble_chunk(disassembler* p_disassembler, const char* p_name) {
+   int last_line = -1;
+   for (uint32_t offset = 0; offset < chunk->code.count;) {
+     const ok_line_info_repeated* info = chunk_find_line_info(chunk, offset);
+-    if (info != NULL && info->line_info.line != last_line) {
++    if (info != NULL && (last_line < 0 || (uint32_t)last_line != info->line_info.line)) {
+       last_line = (int)info->line_info.line;
+       printf("          ; line %d\n", last_line);
+     }
+diff --git a/src/okgc.c b/src/okgc.c
+index 370bd0b..ad31cde 100644
+--- a/src/okgc.c
++++ b/src/okgc.c
+@@ -173,7 +173,7 @@ static bool mark_object(gc* p_gc, object* p_object) {
+   }
+   object_set_marked(p_object, true);
+ #ifdef OK_LOG_GC
+-  printf("marked object: %p ", p_object);
++  printf("marked object: %p ", (void*)p_object);
+   object_debug_print(p_object);
+   puts("\n");
+ #endif
+@@ -386,7 +386,7 @@ static bool sweep(gc* p_gc) {
+         p_gc->object_store->objects = curr;
+       }
+ #ifdef OK_LOG_GC
+-      printf("sweeping object: %p: ", unreached);
++      printf("sweeping object: %p: ", (void*)unreached);
+       object_debug_print(unreached);
+       puts("\n");
+ #endif // OK_LOG_GC
+@@ -428,7 +428,7 @@ static bool collect(gc* p_gc) {
+ 
+ static bool trace_object(gc* p_gc, object* p_object) {
+ #ifdef OK_LOG_GC
+-  printf("tracing object: %p ", p_object);
++  printf("tracing object: %p ", (void*)p_object);
+   object_debug_print(p_object);
+   puts("\n");
+ #endif // OK_LOG_GC
+diff --git a/src/okindex.h b/src/okindex.h
+index abf9031..3afb46d 100644
+--- a/src/okindex.h
++++ b/src/okindex.h
+@@ -14,6 +14,15 @@ typedef enum { INDEX_OK = 0 } index_error;
+ 
+ typedef struct {
+   ok_index index;
++  // the two anonymous unions are ok's one chosen C11-ism: context-named
++  // views over the same bytes (a kind for the writer, a flag for the
++  // reader). naming them would redesign the tagged-index idiom the whole
++  // tree leans on, so the deviation is marked exactly here instead, and
++  // the C99 pedantic gate stays on everywhere else.
++#if defined(__GNUC__)
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wpedantic"
++#endif
+   union {
+     uint8_t flags;
+     uint8_t kind;
+@@ -23,6 +32,9 @@ typedef struct {
+     uint8_t errors;
+     uint8_t error;
+   };
++#if defined(__GNUC__)
++#pragma GCC diagnostic pop
++#endif
+ } index_wrapper;
+ 
+ #endif // OK_INDEX_H
+diff --git a/src/okmm.c b/src/okmm.c
+index a2ea201..3726967 100644
+--- a/src/okmm.c
++++ b/src/okmm.c
+@@ -7,7 +7,7 @@
+ #include <stdio.h>
+ 
+ void release_impl(allocators* p_alloc, void* p_ptr) {
+-  return p_alloc->raw_allocators->release(p_ptr);
++  p_alloc->raw_allocators->release(p_ptr);
+ }
+ 
+ void* reallocate_impl(allocators* p_alloc, void* p_ptr, const size_t p_old_size, const size_t p_new_size) {
+@@ -40,10 +40,11 @@ allocators create_allocators(ok_allocators* p_alloc) {
+ }
+ 
+ void release_wrapper_impl(allocators* p_alloc, void* p_ptr) {
+-  return p_alloc->raw_allocators->release(p_ptr);
++  p_alloc->raw_allocators->release(p_ptr);
+ }
+ 
+ void* reallocate_wrapper_impl(allocators* p_alloc, void* p_ptr, const size_t p_old_size, const size_t p_new_size) {
++  (void)p_old_size;
+   if (p_new_size == 0) {
+     release_impl(p_alloc, p_ptr);
+     return NULL;
+diff --git a/src/okmodules.h b/src/okmodules.h
+index 1051acc..1cdd343 100644
+--- a/src/okmodules.h
++++ b/src/okmodules.h
+@@ -77,7 +77,9 @@ typedef struct {
+ ARRAY_DECLARE_DEFAULT(ok_module_records, ok_module_record)
+ ARRAY_DECLARE_DEFAULT(ok_import_binding_array, ok_import_binding)
+ 
+-typedef struct module_system {
++// tag-only definition: the name binding lives in okfwd.h's forward typedef
++// (the P1 warning sweep - one typedef, not two).
++struct module_system {
+   ok* ok;                      // the owning instance
+   ok_module_records loaded;    // every initialized module, load order
+   const char* chain[OK_MODULES_MAX_DEPTH]; // the active load chain's canonical paths (borrowed
+@@ -113,7 +115,7 @@ typedef struct module_system {
+   // OR-4: ok_module_where's answer buffer (owned, user allocators). one
+   // slot: the latest call owns it, the previous answer dies with the call.
+   char* where_canonical;
+-} module_system;
++};
+ 
+ void ok_modules_init(module_system* p_modules, ok* p_ok, allocators* p_alloc);
+ void ok_modules_deinit(module_system* p_modules);
+diff --git a/src/okobject.c b/src/okobject.c
+index 3e9d47d..b8c00a9 100644
+--- a/src/okobject.c
++++ b/src/okobject.c
+@@ -127,6 +127,7 @@ static void object_init(object* p_object, uint32_t p_type) {
+ }
+ 
+ static void object_deinit(object* p_object) {
++  (void)p_object;
+ }
+ 
+ uint32_t object_get_type(object* p_object) {
+@@ -242,6 +243,7 @@ object_closure* create_object_closure(object_function* p_function, object_specs*
+ }
+ 
+ static void object_upvalue_init(object_upvalue* p_object_upvalue, uint32_t p_location, object_specs* p_specs) {
++  (void)p_specs;
+   object_init(&p_object_upvalue->object, OBJ_UPVALUE);
+   p_object_upvalue->info = p_location & 0x00ffffff;
+   p_object_upvalue->next = NULL;
+@@ -249,6 +251,7 @@ static void object_upvalue_init(object_upvalue* p_object_upvalue, uint32_t p_loc
+ }
+ 
+ static void object_upvalue_deinit(object_upvalue* p_object_upvalue, object_specs* p_specs) {
++  (void)p_specs;
+   p_object_upvalue->closed = NULL_AS_VALUE();
+   p_object_upvalue->next = NULL;
+   p_object_upvalue->info = 0;
+@@ -298,6 +301,7 @@ void object_native_value_init(object_native_value* p_native_value,
+                               ok_native_destructor p_destructor,
+                               ok_native_tracer p_tracer,
+                               object_specs* p_specs) {
++                              (void)p_specs;
+   object_init(&p_native_value->object, OBJ_NATIVE_VALUE);
+   p_native_value->user_data = p_user_data;
+   p_native_value->destructor = p_destructor;
+@@ -305,6 +309,7 @@ void object_native_value_init(object_native_value* p_native_value,
+ }
+ 
+ void object_native_value_deinit(object_native_value* p_native_value, object_specs* p_specs) {
++  (void)p_specs;
+   if (p_native_value->destructor) {
+     p_native_value->destructor(p_native_value->user_data);
+   }
+@@ -385,6 +390,7 @@ static void object_map_init(object_map* p_object_map, object_specs* p_specs) {
+ }
+ 
+ static void object_map_deinit(object_map* p_object_map, object_specs* p_specs) {
++  (void)p_specs;
+   // entry keys and values are gc owned (the instantiation's deinits are no-ops),
+   // this only releases the parallel backing buffers.
+   value_map_deinit(&p_object_map->entries);
+@@ -414,7 +420,9 @@ object_map* create_object_map(object_specs* p_specs) {
+   ((p) == (k) ||                                                                                              \
+    (string_get_length(&(p)->string) == string_get_length(&(k)->string) &&                                     \
+     memcmp((p)->string.chars, (k)->string.chars, string_get_length(&(p)->string)) == 0))
+-#define SM_KEY_CLONE(p, a) (p)
++// the clone drops the probe's const: stored keys are the interned
++// canonicals the probe already names (D20), never map-owned storage.
++#define SM_KEY_CLONE(p, a) ((object_string*)(p))
+ #define SM_NO_DEINIT(k, a) ((void)0)
+ 
+ MAP_DEFINE(method_map,
+@@ -977,7 +985,7 @@ void object_debug_print(object* p_object) {
+     break;
+   }
+   case OBJ_UPVALUE: {
+-    printf("<upvalue %p>", p_object);
++    printf("<upvalue %p>", (void*)p_object);
+     break;
+   }
+   case OBJ_NATIVE_VALUE: {
+@@ -986,7 +994,7 @@ void object_debug_print(object* p_object) {
+   }
+   case OBJ_NATIVE_FUNCTION: {
+     object_native_function* fu = (object_native_function*)p_object;
+-    printf("<native function %s a: %d %p>", fu->name.chars, fu->arity, fu->function);
++    printf("<native function %s a: %d %p>", fu->name.chars, fu->arity, (void*)(uintptr_t)fu->function);
+     break;
+   }
+   case OBJ_ARRAY: {
+diff --git a/src/okparser.c b/src/okparser.c
+index 674773d..28c1467 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -6,8 +6,6 @@
+ #include "okparser.h"
+ #include "okutils.h"
+ 
+-static precedence get_precedence(token_type p_type);
+-
+ static ast_root* parse_root(parser* p_parser);
+ static ast_expression* parse_expression(parser* p_parser, precedence p_precedence);
+ static ast_statement* parse_statement(parser* p_parser);
+@@ -55,8 +53,6 @@ error_at_noted(parser* p_parser, token p_token, const ok_string_view p_message,
+ 
+ static bool advance(parser* p_parser);
+ static bool expect(parser* p_parser, token_type p_type, const ok_string_view p_message);
+-static token current(parser* p_parser);
+-static token peek(parser* p_parser);
+ static void sync_state(parser* p_parser);
+ 
+ static ast_expression* parse_unary_prefix(parser* p_parser, token p_trigger);
+@@ -386,6 +382,7 @@ ast_expression* parse_unary_prefix(parser* p_parser, token p_trigger) {
+ }
+ 
+ ast_expression* parse_grouping(parser* p_parser, token p_trigger) {
++  (void)p_trigger;
+   allocators* alloc = p_parser->alloc;
+   if (!advance(p_parser)) {
+     return NULL;
+@@ -568,6 +565,7 @@ ast_expression* parse_yield(parser* p_parser, token p_trigger) {
+ }
+ 
+ static ast_expression* parse_function(parser* p_parser, token p_trigger) {
++  (void)p_trigger;
+   allocators* alloc = p_parser->alloc;
+   token fu_tok = p_parser->previous;
+   if (p_parser->current.type != TOKEN_LEFT_PAREN) {
+@@ -649,6 +647,8 @@ static bool is_lvalue(ast_expression* p_expression) {
+ 
+ ast_expression* parse_assign_expression(
+     parser* p_parser, ast_expression* p_left, precedence p_precedence, bool is_right_associative, token p_trigger) {
++    (void)is_right_associative;
++    (void)p_precedence;
+   allocators* alloc = p_parser->alloc;
+   advance(p_parser);
+   if (!is_lvalue(p_left)) {
+@@ -735,6 +735,9 @@ fail:
+ 
+ ast_expression* parse_call(
+     parser* p_parser, ast_expression* p_left, precedence p_precedence, bool is_right_associative, token p_trigger) {
++    (void)is_right_associative;
++    (void)p_precedence;
++    (void)p_trigger;
+   allocators* alloc = p_parser->alloc;
+   token trigger = p_parser->previous;
+   ast_expressions_list args = parse_expressions_list(p_parser, TOKEN_COMMA, TOKEN_RIGHT_PAREN);
+@@ -761,6 +764,7 @@ ast_expression* parse_call(
+ }
+ 
+ ast_expression* parse_array_literal(parser* p_parser, token p_trigger) {
++  (void)p_trigger;
+   allocators* alloc = p_parser->alloc;
+   token trigger = p_parser->previous; // '['
+   ast_expressions_list elements = parse_expressions_list(p_parser, TOKEN_COMMA, TOKEN_RIGHT_BRACKET);
+@@ -790,6 +794,7 @@ ast_expression* parse_array_literal(parser* p_parser, token p_trigger) {
+ // empty map: a leading ':' is unambiguous because no expression starts with
+ // one. a trailing comma is allowed, mirroring arrays.
+ ast_expression* parse_map_literal(parser* p_parser, token p_trigger) {
++  (void)p_trigger;
+   allocators* alloc = p_parser->alloc;
+   token trigger = p_parser->previous; // '{'
+   ast_expressions_list keys;
+@@ -902,6 +907,7 @@ fail_lists:
+ 
+ ast_expression* parse_subscript(
+     parser* p_parser, ast_expression* p_left, precedence p_precedence, bool is_right_associative, token p_trigger) {
++    (void)p_trigger;
+   (void)p_precedence;
+   (void)is_right_associative;
+   allocators* alloc = p_parser->alloc;
+@@ -2046,7 +2052,9 @@ ast_while_statement* parse_while_statement(parser* p_parser) {
+     error_at(p_parser,
+              p_parser->previous,
+              ok_create_string_view("failed to allocate memory for while node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+-  fail:
++    // (the P1 sweep removed an unused `fail:` label that lived here; the
++    // fallthrough cleanup is the if's own error exit, and `goto fail_cond`
++    // above still jumps in.)
+     ast_dispatch_deinit((ast_node*)body);
+     alloc->release(alloc, body);
+   fail_cond:
+diff --git a/src/okstring.c b/src/okstring.c
+index 47e0a30..509d733 100644
+--- a/src/okstring.c
++++ b/src/okstring.c
+@@ -15,9 +15,8 @@ static void set_flag(uint8_t p_flag, uint64_t* p_info) {
+   *p_info |= UINT64_C(1) << (56 + p_flag);
+ }
+ 
+-static void remove_flag(uint8_t p_flag, uint64_t* p_info) {
+-  *p_info &= ~(UINT64_C(1) << (56 + p_flag));
+-}
++// (a remove_flag twin lived here until the P1 sweep: interning made string
++// flags set-once, nothing ever cleared one.)
+ 
+ #define STRING_FLAG_DYNAMIC 0
+ bool string_init(string* p_string, const char* p_chars, uint64_t p_length, bool p_is_dynamic, allocators* p_alloc) {
+diff --git a/src/okutils.h b/src/okutils.h
+index a6b5e4a..52762b3 100644
+--- a/src/okutils.h
++++ b/src/okutils.h
+@@ -50,7 +50,7 @@ inline static hash_t default_hash_str(const ok_string_view p_str) {
+ }
+ 
+ inline static hash_t hash_combine(const hash_t p_first, hash_t p_second) {
+-  return p_first ^ p_second + 0x9e3779b9 + (p_first << 6) + (p_first >> 2);
++  return p_first ^ (p_second + 0x9e3779b9 + (p_first << 6) + (p_first >> 2));
+ }
+ 
+ inline static hash_t splitmix64(hash_t p_x) {
+diff --git a/src/okvm.c b/src/okvm.c
+index 60907f5..842790b 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -80,10 +80,10 @@ static inline bool call(vm* p_vm,
+                         uint16_t p_argc,
+                         uint32_t p_retc);
+ static bool stage_defer_thunk(vm* p_vm, execution_state* p_exe, register_file* p_reg, object_closure* p_thunk);
+-static bool run_pending_defers(vm* p_vm, uint32_t p_from, uint32_t p_uptill);
+ static interpret_result create_closure(
+     vm* p_vm, execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_src);
+ void interpret_result_deinit(interpret_result* p_interpret_result) {
++  (void)p_interpret_result;
+ }
+ 
+ // a runtime error fired somewhere under the current C entry point. callers
+@@ -439,6 +439,7 @@ interpret_result vm_interpret(vm* p_vm, interpret_specs p_specs) {
+ }
+ 
+ interpret_result vm_call(vm* p_vm, value p_callee, uint32_t p_argc) {
++  (void)p_callee;
+   execution_state* exe = p_vm->current_execution_state;
+   register_file* reg = &exe->registers;
+   const uint32_t call_depth = exe->call_stack.count;
+@@ -1826,6 +1827,7 @@ static ok_value as_num(vm* p_vm, ok_value p_value, value* p_result) {
+ }
+ 
+ static ok_value as_bool(vm* p_vm, value p_value, value* p_result) {
++  (void)p_vm;
+   if (IS_VALUE_STRICTLY_BOOL(p_value)) {
+     *p_result = p_value;
+   } else if (IS_VALUE_STRICTLY_NULL(p_value)) {
+@@ -2510,9 +2512,8 @@ static bool run_pending_defers_ex(vm* p_vm, uint32_t p_from, uint32_t p_uptill,
+   return true;
+ }
+ 
+-static bool run_pending_defers(vm* p_vm, uint32_t p_from, uint32_t p_uptill) {
+-  return run_pending_defers_ex(p_vm, p_from, p_uptill, false);
+-}
++// (a run_pending_defers convenience wrapper over run_pending_defers_ex
++// lived here until the P1 sweep: nothing ever called it.)
+ 
+ // the unwind. walk the handler
+ // stack top-down, the first live record above this run_until's depth wins:
+@@ -3541,6 +3542,21 @@ static void* ok_dispatch_table[OP__COUNT] = {
+     goto *ok_dispatch_table[op_of(instruction)];
+ #else
+     switch (op_of(instruction)) {
++#endif
++#if !defined(OK_DISPATCH_THREADED)
++    // the classic switch spells out what the threaded table aliases: the
++    // four pre-patch NAME forms never dispatch in a well-formed chunk
++    // (patch_chunk_fields rewrites them at class freeze), and the sentinel
++    // can only come out of a corrupt word. skipping both, identically to
++    // the table's NOP entries, keeps the two dispatch modes byte-identical
++    // in that (impossible) case.
++    CASE(OP_GET_FIELD_NAME):
++    CASE(OP_GET_FIELD_NAME_LONG):
++    CASE(OP_STORE_FIELD_NAME):
++    CASE(OP_STORE_FIELD_NAME_LONG):
++    CASE(OP__COUNT): {
++      DISPATCH();
++    }
+ #endif
+     CASE(OP_NOP): {
+       DISPATCH();
+@@ -3763,8 +3779,8 @@ static void* ok_dispatch_table[OP__COUNT] = {
+                       reg,
+                       frame->registers_base,
+                       a,
+-                      p ? reg->top - (frame->registers_base + a + 1) : b,
+-                      c == 0 ? RETURN_COUNT_DYNAMIC : c - 1)) {
++                      p ? (uint16_t)(reg->top - (frame->registers_base + a + 1)) : b,
++                      c == 0 ? RETURN_COUNT_DYNAMIC : (uint32_t)(c - 1))) {
+         FAIL_PATH();
+       }
+       // not sure if exe is gonna be modified here or not (resume??) but we set it anyways
+@@ -3789,8 +3805,8 @@ static void* ok_dispatch_table[OP__COUNT] = {
+                       reg,
+                       frame->registers_base,
+                       A,
+-                      p ? reg->top - (frame->registers_base + A + 1) : B,
+-                      C == 0 ? RETURN_COUNT_DYNAMIC : C - 1)) {
++                      p ? (uint16_t)(reg->top - (frame->registers_base + A + 1)) : B,
++                      C == 0 ? RETURN_COUNT_DYNAMIC : (uint32_t)(C - 1))) {
+         FAIL_PATH();
+       }
+       // not sure if exe is gonna be modified here or not (resume??) but we set it anyways
+@@ -6737,6 +6753,7 @@ invalid_call:
+ 
+ static interpret_result create_closure(
+     vm* p_vm, execution_state* p_exe, register_file* p_reg, call_frame* p_frame, uint16_t p_dest, uint16_t p_src) {
++    (void)p_exe;
+   object_function* function = VALUE_AS_FUNCTION(p_frame->closure->function->chunk.constants.data[p_src]);
+   object_specs s = {p_vm->alloc, p_vm->objects_store};
+   object_closure* closure = create_object_closure(function, &s);
+@@ -6847,7 +6864,7 @@ static inline value* upvalue_cell(vm* p_vm, execution_state* p_exe, object_upval
+ ARRAY_DEFINE_DEFAULT(register_array, value, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(vm_sources, vm_source_entry, ARRAY_DEFAULT_TYPE_DEINIT)
+ ARRAY_DEFINE_DEFAULT(handler_stack, handler_record, ARRAY_DEFAULT_TYPE_DEINIT)
+-ARRAY_DEFINE_DEFAULT(call_stack, call_frame, ARRAY_DEFAULT_TYPE_DEINIT);
++ARRAY_DEFINE_DEFAULT(call_stack, call_frame, ARRAY_DEFAULT_TYPE_DEINIT)
+ 
+ void register_file_init(register_file* p_registers, allocators* p_alloc) {
+   p_registers->top = 0;
+diff --git a/tests/capi/src/main.c b/tests/capi/src/main.c
+index 9f04d76..966339b 100644
+--- a/tests/capi/src/main.c
++++ b/tests/capi/src/main.c
+@@ -13,6 +13,7 @@
+ 
+ #include <ok/ok.h>
+ #include <ok/ok_module.h>
++#include <ok/ok_version.h>
+ 
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -229,6 +230,19 @@ int main(void) {
+   CHECK(OK_ABI_MAJOR == 0u);
+   CHECK(OK_ABI_MINOR >= 3u);
+   CHECK(((OK_ABI_MAJOR << 16) | OK_ABI_MINOR) == OK_NATIVE_ABI);
++  // the version stamp composes (P1): the numbers and the lane must equal
++  // the hand-written string - drift between them fails the gate, which is
++  // the whole point of a single source of truth.
++  {
++    char composed[64];
++    if (OK_VERSION_LANE[0] == '\0') {
++      snprintf(composed, sizeof composed, "%u.%u.%u", OK_VERSION_MAJOR, OK_VERSION_MINOR, OK_VERSION_PATCH);
++    } else {
++      snprintf(composed, sizeof composed, "%u.%u.%u-%s", OK_VERSION_MAJOR, OK_VERSION_MINOR, OK_VERSION_PATCH,
++               OK_VERSION_LANE);
++    }
++    CHECK(strcmp(composed, OK_VERSION_STRING) == 0);
++  }
+ 
+   ok_specs specs = {};
+   ok* p_ok = ok_create(specs);
+diff --git a/tests/cli/run.sh b/tests/cli/run.sh
+new file mode 100644
+index 0000000..d97f17e
+--- /dev/null
++++ b/tests/cli/run.sh
+@@ -0,0 +1,67 @@
++#!/usr/bin/env bash
++# tests/cli/run.sh - the CLI lane (P1). the e2e runner drives .ok files
++# through the interpreter; this one drives the BINARY's own surface: the
++# version spellings, the scaffold, the refusals. the e2e culture applies:
++# every CLI feature lands with its checks here, in the same commit.
++#
++# usage: OK_BIN=<path/to/ok> bash tests/cli/run.sh   (or $1 = the binary)
++set -u
++OK_BIN="${1:-${OK_BIN:-/home/z/my-project/oklang/build-gcc/ok}}"
++# absolutize before any cd happens below
++case "$OK_BIN" in
++/*) ;;
++*) OK_BIN="$PWD/${OK_BIN#./}" ;;
++esac
++pass=0; fail=0
++
++ok() { pass=$((pass + 1)); }
++no() { echo "FAIL: $1"; echo "  got: $2" | head -2; fail=$((fail + 1)); }
++
++# the stamp's shape: one line, version (with the wave's lane while
++# mid-wave), the abi pair. anchored both ends - nothing else may print.
++STAMP='^ok [0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)? \(abi [0-9]+\.[0-9]+\)$'
++
++out=$("$OK_BIN" --version 2>&1)
++echo "$out" | grep -qE "$STAMP" && ok || no "--version prints the stamp" "$out"
++out=$("$OK_BIN" -v 2>&1)
++echo "$out" | grep -qE "$STAMP" && ok || no "-v prints the stamp" "$out"
++out=$("$OK_BIN" version 2>&1)
++echo "$out" | grep -qE "$STAMP" && ok || no "the version verb prints the stamp" "$out"
++
++# -v wins over other args (it answers and leaves)
++out=$("$OK_BIN" run -v whatever.ok 2>&1)
++echo "$out" | grep -qE '^ok [0-9]+\.[0-9]+\.[0-9]+' && ok || no "-v answers and leaves" "$out"
++
++# ok create: the scaffold
++tmp=$(mktemp -d) || exit 70
++cd "$tmp" || exit 70
++"$OK_BIN" create hello >/dev/null 2>&1
++if [ -f hello/project.ok ] && [ -f hello/src/main.ok ] && [ -f hello/tests/.gitkeep ] && [ -f hello/.gitignore ] &&
++  grep -q '.okbuild' hello/.gitignore; then
++  ok
++else
++  no "ok create scaffolds the four pieces" "missing files under $tmp/hello"
++fi
++
++out=$("$OK_BIN" hello/src/main.ok 2>&1)
++echo "$out" | grep -q 'hello from hello' && ok || no "the scaffolded project runs" "$out"
++
++"$OK_BIN" create hello >/dev/null 2>&1
++if [ $? -ne 0 ]; then ok; else no "ok create refuses an existing dir" "exit 0"; fi
++
++"$OK_BIN" create a/b >/dev/null 2>&1
++if [ $? -eq 64 ]; then ok; else no "ok create refuses path separators (usage)" "exit $?"; fi
++
++# the manifest is a real project: the where lane reads it through the same
++# discovery a run uses
++"$OK_BIN" where std/io hello/src/main.ok >/dev/null 2>&1
++if [ $? -eq 0 ]; then ok; else no "the scaffold's discovery finds std" "where failed"; fi
++
++# unknown flags still refuse with usage
++"$OK_BIN" --bogus </dev/null >/dev/null 2>&1
++if [ $? -eq 64 ]; then ok; else no "unknown flag exits 64" "exit $?"; fi
++
++cd / || exit 70
++rm -rf "$tmp"
++echo "cli: PASS $pass  FAIL $fail"
++[ $fail -eq 0 ]
+diff --git a/tests/e2e/CMakeLists.txt b/tests/e2e/CMakeLists.txt
+index c909495..06be223 100644
+--- a/tests/e2e/CMakeLists.txt
++++ b/tests/e2e/CMakeLists.txt
+@@ -9,3 +9,8 @@ file(GLOB_RECURSE OKTEST_E2E_SRC CONFIGURE_DEPENDS ${OKTEST_E2E_PATH}/src/*.cpp)
+ 
+ add_executable(${PROJECT_NAME} ${OKTEST_E2E_SRC})
+ target_include_directories(${PROJECT_NAME} PRIVATE ${OKTEST_E2E_PATH}/src/)
++
++# P1: the OK_ROOT fallback the runner exports when the environment has none
++# (the fixtures reach the headers through it; the compiled-in prefix is the
++# checkout cmake configured against)
++target_compile_definitions(${PROJECT_NAME} PRIVATE OKTEST_ROOT_PREFIX="${CMAKE_SOURCE_DIR}")
+diff --git a/tests/e2e/src/main.cpp b/tests/e2e/src/main.cpp
+index af9b403..62045e6 100644
+--- a/tests/e2e/src/main.cpp
++++ b/tests/e2e/src/main.cpp
+@@ -10,6 +10,12 @@
+ #include <string_view>
+ #include <sys/wait.h>
+ 
++// the compiled-in OK_ROOT fallback (P1): cmake passes the checkout; an
++// environment OK_ROOT always wins at runtime
++#ifndef OKTEST_ROOT_PREFIX
++#define OKTEST_ROOT_PREFIX ""
++#endif
++
+ #define COLOR_RED "\x1b[31m"
+ #define COLOR_GREEN "\x1b[32m"
+ #define COLOR_YELLOW "\x1b[33m"
+@@ -225,6 +231,14 @@ int main(int argc, char** argv) {
+     ok_debug_path = argv[3];
+   }
+ 
++  // OK_ROOT (P1): the checkout the fixtures and build commands reach the
++  // headers through, exported to every child (fixture build.sh runs and ok
++  // invocations alike). the environment wins; the compiled-in prefix is the
++  // fallback. the relative ../../ reaches are dead.
++  if (std::getenv("OK_ROOT") == nullptr && OKTEST_ROOT_PREFIX[0] != '\0') {
++    setenv("OK_ROOT", OKTEST_ROOT_PREFIX, 0);
++  }
++
+   uint32_t ok = 0, notok = 0, skipped = 0;
+ 
+   build_native_fixtures(tests_path, okpath);
+diff --git a/tests/e2e/tests/modules/native_abimajor/build.sh b/tests/e2e/tests/modules/native_abimajor/build.sh
+index 5d2ed44..b903bbb 100644
+--- a/tests/e2e/tests/modules/native_abimajor/build.sh
++++ b/tests/e2e/tests/modules/native_abimajor/build.sh
+@@ -2,4 +2,4 @@
+ # the fixture's declared build: a raw gcc command (M12: whatever toolchain).
+ set -e
+ cd "$(dirname "$0")"
+-gcc -shared -fPIC -I../../../../../include -o badmajor.so badmajor.c
++gcc -shared -fPIC -I"${OK_ROOT}/include" -o badmajor.so badmajor.c
+diff --git a/tests/e2e/tests/modules/native_abiminor_old/build.sh b/tests/e2e/tests/modules/native_abiminor_old/build.sh
+index e6eb680..7e3efce 100644
+--- a/tests/e2e/tests/modules/native_abiminor_old/build.sh
++++ b/tests/e2e/tests/modules/native_abiminor_old/build.sh
+@@ -2,4 +2,4 @@
+ # the fixture's declared build: a raw gcc command (M12: whatever toolchain).
+ set -e
+ cd "$(dirname "$0")"
+-gcc -shared -fPIC -I../../../../../include -o fossil.so fossil.c
++gcc -shared -fPIC -I"${OK_ROOT}/include" -o fossil.so fossil.c
+diff --git a/tests/e2e/tests/modules/native_badabi/build.sh b/tests/e2e/tests/modules/native_badabi/build.sh
+index e8d76d9..4947598 100755
+--- a/tests/e2e/tests/modules/native_badabi/build.sh
++++ b/tests/e2e/tests/modules/native_badabi/build.sh
+@@ -1,4 +1,4 @@
+ #!/bin/sh
+ set -e
+ cd "$(dirname "$0")"
+-gcc -shared -fPIC -I../../../../../include -o badabi.so badabi.c
++gcc -shared -fPIC -I"${OK_ROOT}/include" -o badabi.so badabi.c
+diff --git a/tests/e2e/tests/modules/native_badname/build.sh b/tests/e2e/tests/modules/native_badname/build.sh
+index f588b58..6154468 100755
+--- a/tests/e2e/tests/modules/native_badname/build.sh
++++ b/tests/e2e/tests/modules/native_badname/build.sh
+@@ -1,4 +1,4 @@
+ #!/bin/sh
+ set -e
+ cd "$(dirname "$0")"
+-gcc -shared -fPIC -I../../../../../include -o badname.so badname.c
++gcc -shared -fPIC -I"${OK_ROOT}/include" -o badname.so badname.c
+diff --git a/tests/e2e/tests/modules/native_force/build.sh b/tests/e2e/tests/modules/native_force/build.sh
+index 6b55857..476b095 100755
+--- a/tests/e2e/tests/modules/native_force/build.sh
++++ b/tests/e2e/tests/modules/native_force/build.sh
+@@ -1,4 +1,4 @@
+ #!/bin/sh
+ set -e
+ cd "$(dirname "$0")"
+-gcc -shared -fPIC -I../../../../../include -o forced.so forced.c
++gcc -shared -fPIC -I"${OK_ROOT}/include" -o forced.so forced.c
+diff --git a/tests/e2e/tests/modules/native_hello/build.sh b/tests/e2e/tests/modules/native_hello/build.sh
+index 030aa10..e2ec5a2 100755
+--- a/tests/e2e/tests/modules/native_hello/build.sh
++++ b/tests/e2e/tests/modules/native_hello/build.sh
+@@ -2,4 +2,4 @@
+ # the fixture's declared build: a raw gcc command (M12: whatever toolchain).
+ set -e
+ cd "$(dirname "$0")"
+-gcc -shared -fPIC -I../../../../../include -o hello.so hello.c
++gcc -shared -fPIC -I"${OK_ROOT}/include" -o hello.so hello.c
+diff --git a/tests/e2e/tests/modules/native_pubfield/build.sh b/tests/e2e/tests/modules/native_pubfield/build.sh
+index 9116061..f74dd66 100644
+--- a/tests/e2e/tests/modules/native_pubfield/build.sh
++++ b/tests/e2e/tests/modules/native_pubfield/build.sh
+@@ -2,4 +2,4 @@
+ # the fixture's declared build: a raw gcc command (M12: whatever toolchain).
+ set -e
+ cd "$(dirname "$0")"
+-gcc -shared -fPIC -I../../../../../include -o pubfield.so pubfield.c
++gcc -shared -fPIC -I"${OK_ROOT}/include" -o pubfield.so pubfield.c
+diff --git a/tests/e2e/tests/modules/native_state/build.sh b/tests/e2e/tests/modules/native_state/build.sh
+index d58126e..6ecf723 100644
+--- a/tests/e2e/tests/modules/native_state/build.sh
++++ b/tests/e2e/tests/modules/native_state/build.sh
+@@ -2,4 +2,4 @@
+ # the fixture's declared build: a raw gcc command (M12: whatever toolchain).
+ set -e
+ cd "$(dirname "$0")"
+-gcc -shared -fPIC -I../../../../../include -o state.so state.c
++gcc -shared -fPIC -I"${OK_ROOT}/include" -o state.so state.c
+diff --git a/tests/e2e/tests/modules/project_autobuild/.okbuild/adder.stamp b/tests/e2e/tests/modules/project_autobuild/.okbuild/adder.stamp
+index 0153e5a..3c6d24d 100644
+--- a/tests/e2e/tests/modules/project_autobuild/.okbuild/adder.stamp
++++ b/tests/e2e/tests/modules/project_autobuild/.okbuild/adder.stamp
+@@ -1,2 +1,2 @@
+ 3
+-gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c
+\ No newline at end of file
++gcc -shared -fPIC -I$OK_ROOT/include -o adder.so native/adder.c
+\ No newline at end of file
+diff --git a/tests/e2e/tests/modules/project_autobuild/project.ok b/tests/e2e/tests/modules/project_autobuild/project.ok
+index 35c75e5..ff0bdad 100644
+--- a/tests/e2e/tests/modules/project_autobuild/project.ok
++++ b/tests/e2e/tests/modules/project_autobuild/project.ok
+@@ -5,7 +5,7 @@ pub let project = {
+   "natives": {
+     "adder": {
+       "dir": "native",
+-      "build": "gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c",
++      "build": "gcc -shared -fPIC -I$OK_ROOT/include -o adder.so native/adder.c",
+       "artifact": "adder.so",
+     },
+   },
+diff --git a/tests/e2e/tests/modules/project_native/.okbuild/adder.stamp b/tests/e2e/tests/modules/project_native/.okbuild/adder.stamp
+index 0153e5a..3c6d24d 100644
+--- a/tests/e2e/tests/modules/project_native/.okbuild/adder.stamp
++++ b/tests/e2e/tests/modules/project_native/.okbuild/adder.stamp
+@@ -1,2 +1,2 @@
+ 3
+-gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c
+\ No newline at end of file
++gcc -shared -fPIC -I$OK_ROOT/include -o adder.so native/adder.c
+\ No newline at end of file
+diff --git a/tests/e2e/tests/modules/project_native/build.sh b/tests/e2e/tests/modules/project_native/build.sh
+index 017d0eb..091bc26 100755
+--- a/tests/e2e/tests/modules/project_native/build.sh
++++ b/tests/e2e/tests/modules/project_native/build.sh
+@@ -4,4 +4,5 @@
+ # is the runner's gift (the fixture-build contract).
+ set -e
+ cd "$(dirname "$0")"
+-"${OK_BIN:-../../../../../build-gcc/ok}" build --yes
++: "${OK_BIN:?the e2e runner sets OK_BIN; export it for a hand run}"
++"$OK_BIN" build --yes
+diff --git a/tests/e2e/tests/modules/project_native/project.ok b/tests/e2e/tests/modules/project_native/project.ok
+index 76e30b5..3a9f77a 100644
+--- a/tests/e2e/tests/modules/project_native/project.ok
++++ b/tests/e2e/tests/modules/project_native/project.ok
+@@ -6,7 +6,7 @@ pub let project = {
+   "natives": {
+     "adder": {
+       "dir": "native",
+-      "build": "gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c",
++      "build": "gcc -shared -fPIC -I$OK_ROOT/include -o adder.so native/adder.c",
+       "artifact": "adder.so",
+     },
+   },
+diff --git a/tests/e2e/tests/modules/project_nobuild/project.ok b/tests/e2e/tests/modules/project_nobuild/project.ok
+index 0a972b2..970e34d 100644
+--- a/tests/e2e/tests/modules/project_nobuild/project.ok
++++ b/tests/e2e/tests/modules/project_nobuild/project.ok
+@@ -5,7 +5,7 @@ pub let project = {
+   "natives": {
+     "adder": {
+       "dir": "native",
+-      "build": "gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c",
++      "build": "gcc -shared -fPIC -I$OK_ROOT/include -o adder.so native/adder.c",
+       "artifact": "adder.so",
+     },
+   },
+diff --git a/tests/e2e/tests/modules/project_restrict/project.ok b/tests/e2e/tests/modules/project_restrict/project.ok
+index e8fd250..0c8aaaf 100644
+--- a/tests/e2e/tests/modules/project_restrict/project.ok
++++ b/tests/e2e/tests/modules/project_restrict/project.ok
+@@ -6,7 +6,7 @@ pub let project = {
+   "natives": {
+     "adder": {
+       "dir": "native",
+-      "build": "gcc -shared -fPIC -I../../../../../include -o adder.so native/adder.c",
++      "build": "gcc -shared -fPIC -I$OK_ROOT/include -o adder.so native/adder.c",
+       "artifact": "adder.so",
+     },
+   },

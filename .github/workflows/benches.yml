@@ -59,7 +59,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER=g++-14
           cmake --build /tmp/oklang/build --parallel
-          /tmp/oklang/build/ok --version 2>/dev/null || true
+          /tmp/oklang/build/ok --version
 
       - name: build wren (optional column)
         run: |

@@ -983,3 +983,63 @@ rebuild message; badabi's 99 is now the newer-than-host lane.
 applies on modules-staging after 51. gates: the pair landed together -
 e2e 510x7, capi 324x5, unit + embed green, delta blue correct at
 1.40654e7.
+
+## 53 — P1, the honesty warmup (0.9.0 Reconciliation opens)
+
+the roadmap's P1, delivered as ruled: the version stamp, `ok create`,
+OK_ROOT, and the c99 -Werror gate with the warning backlog dead.
+
+the stamp (include/ok/ok_version.h, new): one header, the single
+source of truth - the three numbers, the lane ("rc.1" while the wave
+is in flight, "" on release day), and the composed string.
+`ok --version` / `ok -v` / `ok version` print one greppable line:
+`ok 0.9.0-rc.1 (abi 0.3)` - the abi rides ok_module.h's patch-52
+encoding; the truth stays where it lives. the capi harness re-composes
+the string from the numbers and compares (the 325th check): drift
+between them fails the gate. the bench workflow's `--version ... ||
+true` tolerance dropped the same patch.
+
+`ok create <name>`: the scaffold Q renamed ("in cli i like this, yes
+we should make it") - project.ok (name + version, the keys the CLI
+reads), src/main.ok, tests/, .gitignore (.okbuild/), standing on
+OR-4's discovery. refuses existing dirs, path separators, dotfiles;
+the scaffold runs (`ok src/main.ok` prints hello) and its manifest
+answers `ok where`.
+
+OK_ROOT (Q's flag, the test-path fix): the harnesses stop reaching
+for ../../ok. the CLI exports OK_ROOT to every declared-build child
+(an inherited OK_ROOT always wins; the compiled-in checkout prefix is
+the fallback - cmake and the sandbox build both bake it); the C++ e2e
+runner exports it for fixture builds and ok runs alike; every
+-I../../../../../include in the fixture farm is now
+-I$OK_ROOT/include. the relative reaches are dead.
+
+the gate + the sweep: -std=c99 -pedantic -Wall -Wextra -Werror
+(-Wno-missing-braces rides along - the flat-initializer idiom over
+the tagged index types, C23's {} is the eventual home; the two
+anonymous unions, okindex.h and lvalue, are the one chosen C11-ism,
+pragma-marked at their definitions with the ruling in the comment).
+the threaded lane keeps -Werror but drops -pedantic: labels-as-values
+is the documented extension (OK_PURE is the strict gate). 530
+warnings -> 0, among them: OK_CAP_ALL becomes a macro (enumerator
+values must fit int), the fused-condition width guard was dead
+(ok_index and the 2w operands are both 16-bit - the window is
+structural; the guard deleted with a note), the classic dispatch
+switch now spells out the four pre-patch NAME opcodes + OP__COUNT
+mirroring the threaded table's NOP aliasing (byte-identical by
+design; -Wswitch asked), a -O2 maybe-uninitialized in the seed switch
+got a refusing default arm, three %p casts in okgc's paranoid lane,
+and the dead code deleted: okparser's current/peek/get_precedence
+declarations, okstring's remove_flag, okvm's run_pending_defers
+wrapper, a never-jumped `fail:` label, six unused locals.
+
+tests: the new CLI lane (tests/cli/run.sh, 10 checks: the three
+version spellings' shape, -v's precedence, the scaffold's four
+pieces, the scaffolded run, the two refusals, discovery through the
+scaffold's manifest, the unknown-flag exit) wired into CI beside e2e;
+the capi composition check.
+
+applies on modules-staging after 52 (973bcd0; the commit is 257c189).
+gates: 9/9 build flavors under -Werror, e2e 510x7, unit x3 + embed
+x3, capi 325x5, cli 10/10, delta blue correct at 1.40654e7
+(1.96x/1.88x of wren - the standing 1.93x within run noise).
