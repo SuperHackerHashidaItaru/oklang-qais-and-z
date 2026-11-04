@@ -1168,3 +1168,75 @@ commit is f05445a, byte-identical to the deliverable. gates (run on
 f05445a): 9/9 flavors under -Werror, e2e 544x7 (530 + the 14), unit +
 embed 5x3, capi 325x5, cli 10/10, delta blue correct at 1.40654e7
 (1.94x/1.88x of wren - the standing 1.93x within run noise).
+
+## 56 — P3 complete: the str method toolkit + std.math + the deprecation windows
+
+the strings round closes: the ruled toolkit lands as methods on the str
+class (std.str stays dead, the class surface is the canonical surface),
+std.math opens with the deterministic cmath surface + the RULED idiv,
+and the 0.9.0 deprecation windows open in oklang's README (docs-side,
+the removals are v1.0.0's to schedule).
+
+the toolkit (12 methods, receiver-first, no free spellings, no hidden
+globals - the retier direction): trim (both ends, the six ASCII
+whitespaces), split (non-empty separator required, no implicit
+whitespace lane, n+1 pieces for n occurrences), join (the receiver is
+the separator; every member must already be a string - the `as str`
+lane is explicit, join never rides it implicitly), contains /
+starts_with / ends_with (byte-exact memcmp shapes, empty matches
+vacuous-true), index_of (CODEPOINT answers, the s[i] unit; absent is
+null, the get(m, k) convention - not a -1 that arithmetic would
+silently eat), upper / lower (the ASCII fold only - full case mapping
+wants tables the core will not carry; every other byte rides through),
+repeat (whole non-negative count, overflow-guarded), and the
+byte/codepoint pair: bytes() is the embedder's byte door surfaced at
+last, codepoints() is len's explicit spelling completing the pair.
+
+matching is byte-exact over the utf-8 payload - an occurrence of a
+well-formed needle always lands on codepoint boundaries, so no decode
+is needed to find and no piece can split a codepoint (multibyte split
+and index_of pins ride the fixtures).
+
+std.math: 20 members behind the module door only (hidden globals, the
+print_fn precedent - math is not any class's surface). the surface:
+abs floor ceil sqrt exp log log2 log10 sin cos tan asin acos atan sinh
+cosh tanh (one X-macro table, one body), plus pow, atan2, and the RULED
+idiv - trunc toward zero, a hard error on the zero divisor, no operator
+(the // slot is comments forever). "deterministic" is the ruling's word
+and it means finite in, finite out: every domain violation (sqrt(-1),
+log(0), asin(2)) and every overflow lane (pow(0, -1), exp(10000)) is a
+located hard error; no NaN or infinity ever crosses back into script,
+where the arithmetic lanes would coerce them silently. idiv's whole
+operands inside the safe range divide through int64 exactly; huge or
+fractional operands fall to trunc(a / b) with the f64 rounding carried
+and documented.
+
+the GC discipline for allocating natives (split builds an array of
+strings): the array is guarded across the whole loop, each piece is
+guarded between its creation and its append (LIFO pairs, the guard
+stack composes); the one-shot builders (join, upper, lower, repeat)
+follow the concat lane's shape - everything in C memory first, the
+string object is the final allocation. the aggressive lane (collect on
+every allocation) exercised all of it.
+
+tests: 16 new fixtures (544 -> 560): strings/toolkit.ok (the happy
+surface, multibyte pins, f-string interop), modules/std/math.ok (all 20
+members, both door spellings, from-import, the module print shape), and
+14 error lanes (split's empty separator + non-string separator, join's
+non-array + non-string member, repeat's negative/fraction/non-number,
+math's type error + the domain shapes + the result-range shapes + idiv's
+zero divisor). one superseded pin retired honestly: from_missing.ok
+expected std/math to lack floor - it has floor now; repurposed to pi,
+which also documents the no-constants state.
+
+applies on reconciliation at f05445a (patch 55's landing; the replay
+receipt: applies clean). gates: 9/9 flavors under -Werror, e2e 560x7,
+unit + embed 5x3, capi 325x5, cli 10/10, delta blue correct at 1.40654e7
+(1.92x/1.87x of wren - flat against the standing 1.93x; the toolkit
+adds no dispatch work, the numbers agree).
+
+OPEN for Q: (1) math constants (pi, e) need a registry lane for
+non-native members - worth one? (2) the toolkit's semantic calls are
+mine, documented above: split's required separator, join's strings-only
+membership, index_of's null-for-absent, the ASCII-only case fold. veto
+any and patch 57 amends.

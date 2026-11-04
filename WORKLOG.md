@@ -2401,3 +2401,36 @@ ROADMAP-0.9.0-draft) and the round summaries.]
   + idiv, the deprecation windows. then P4 (fs/env/clock behind
   OK_CAP_HOST), P5 (parser hardening + fuzz), P6 (optimization), P7
   (REPL + the GC attempt). the wave is 2.5/7.
+- later in the round (Q's "let's continue"): patch 56 delivered, P3
+  COMPLETE. the str method toolkit - 12 methods on the str class only
+  (trim, split, join, contains, starts_with, ends_with, index_of,
+  upper, lower, repeat, bytes, codepoints), no free spellings, no
+  hidden globals, the class-canonical ruling's direction made real.
+  std.math opened: 20 members, module door only (the deterministic
+  cmath surface through one X-macro table + pow, atan2, and the RULED
+  idiv - trunc toward zero, hard error on the zero divisor, no
+  operator), finite in finite out, every domain violation and overflow
+  lane a located hard error, no NaN or infinity crossing back into
+  script. the deprecation windows opened in oklang's README, docs-side
+  only: push/pop/remove -> the class methods canonical (len survives,
+  the hidden shapes lean on it), the print statement -> std.io.print,
+  %g -> std.io's shortest-exact formatting. the GC discipline for the
+  one allocating native (split): the array guarded across the loop,
+  each piece guarded between creation and append (LIFO pairs); the
+  one-shot builders (join/upper/lower/repeat) ride the concat lane's
+  scratch-then-final-allocation shape. receipts: e2e 544 -> 560 x7
+  (16 new fixtures: toolkit.ok, math.ok, 14 error lanes; one
+  superseded pin retired honestly - from_missing expected std/math to
+  lack floor, repurposed to pi), unit + embed 5x3, capi 325x5, cli
+  10/10, delta blue correct at 1.40654e7 and flat (1.92x/1.87x of
+  wren against the standing 1.93x - the toolkit adds no dispatch
+  work). the replay receipt: the patch applies clean on f05445a.
+  OPEN for Q (in the patches entry): math constants (pi, e) need a
+  registry lane for non-native members, and the toolkit's semantic
+  calls (split's required separator, join's strings-only membership,
+  index_of's null-for-absent, the ASCII-only case fold) are mine to
+  veto. delivered: patches/56-p3-str-toolkit-std-math-idiv-
+  deprecation-windows.patch (+ README entry), the roadmap's P3-complete
+  marker, this entry, the push. the wave is 3/7. next: P4 (fs/env/
+  clock behind OK_CAP_HOST), then P5 (parser hardening + fuzz), P6
+  (optimization), P7 (REPL + the GC attempt).

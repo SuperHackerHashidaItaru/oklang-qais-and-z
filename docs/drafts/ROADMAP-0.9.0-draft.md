@@ -488,3 +488,20 @@ rulings are pinned by substring on the reported line:col). gates: e2e
 544x7 (530 + the 14), unit 5x3, capi 325x5, cli 10/10, delta blue
 flat. P3 remainder - the str method toolkit + std.math + the
 deprecation windows - rides as patch 56.]
+
+[session 43, later: P3 COMPLETE as patch 56 - the str method toolkit
+(12 methods on the class: trim split join contains starts_with
+ends_with index_of upper lower repeat bytes codepoints; byte-exact
+matching, codepoint indexes, ASCII-only case fold, null-for-absent),
+std.math (20 members: the deterministic cmath surface + the RULED idiv,
+finite in finite out, every domain violation and overflow a located
+hard error), and the deprecation windows opened in oklang's README
+(push/pop/remove -> class canonical, the print statement ->
+std.io.print, %g -> std.io's shortest-exact; docs-only this wave, the
+removals are v1.0.0's). gates: e2e 560x7 (544 + 16), capi 325x5, cli
+10/10, delta blue flat at 1.92x/1.87x. P3's semantic calls (split's
+required separator, join's strings-only membership, index_of's
+null-for-absent, the ASCII-only folds) + the math-constants question
+(pi, e need a registry lane for non-native members) ride as OPEN items
+for Q in the patches entry. the wave is 3/7. P4 next: fs/env/clock
+behind OK_CAP_HOST.]
