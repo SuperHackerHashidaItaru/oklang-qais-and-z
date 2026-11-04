@@ -2347,3 +2347,57 @@ ROADMAP-0.9.0-draft) and the round summaries.]
   deprecation windows open. then P4 (fs/env/clock behind OK_CAP_HOST),
   P5 (parser hardening + fuzz), P6 (optimization), P7 (REPL + the GC
   attempt). the wave is 2/7.
+
+## session 43 (2026-11-04): P3 part one lands (55), the landing verified, the protocol debt paid
+
+- context: two halves. the first (cut short - the context died mid-handoff
+  and even the continuation summary truncated) delivered patch 55: f""
+  interpolation with the RULED ${} delimiter + m""/fm"" multiline, P3's
+  first chunk. Q hand-applied it and landed it himself; his note that
+  reopened the round: it is on reconciliation in the remote now, and the
+  collab repo still owed its half of the protocol. this round pays that
+  debt and verifies the landing.
+- the landing: f05445a "string interpolation" on reconciliation, 24 files
+  +864/-34. verified zero-drift: the sandbox draft tree (patch 55 over
+  057309c) diffs EMPTY against the landed commit - the hand-application
+  is byte-identical to the deliverable. the clone is reset onto the tip
+  and every gate re-ran there (on the landing, not the draft): 9/9
+  flavors under -Werror, e2e 544x7 (530 + the 14 new), unit + embed 5x3,
+  capi 325x5, cli 10/10, delta blue correct at 1.40654e7 and flat
+  (1.94x/1.88x of wren against the standing 1.93x).
+- the topology note (for future rounds): reconciliation is Q's
+  hand-applied integration branch - 057309c carries P1+P2 (the stamp,
+  the cli lane, okutf8.h, oktest_utf8), f05445a carries 55. the
+  257c189/c21c7e9 shas in entries 53/54's receipts were the sandbox's
+  local test commits, not codeberg's; reconciliation is the citable
+  history. also: the workspace's oklang-qais-and-z/ dir is a stale
+  pre-42 relic (its "ahead 3" is against a dead tracking ref, history
+  was reconstructed); collab/ is the live clone - never push from the
+  relic.
+- patch 55, the shape (full detail in the patches/ entry + the roadmap
+  marker): an f-string stays ONE token, its interpolation extents come
+  from ONE byte scanner both the lexer and the parser ride
+  (ok_fstring_region_end), the parser sub-parses each ${...} region
+  with a region-anchored lexer (the closing brace is the EOF wall,
+  positions stay absolute) and desugars the literal to string +
+  to_string(expr) chains over infix ADD - OP_TOSTRING/OP_TOSTRING_LONG
+  are the as str lane in opcode form (perform_to_string -> as_str;
+  allocates, never runs nested script, so no REFRESH_AFTER_NESTED),
+  constant operands included. the rulings all landed: \${ the literal
+  dollar-brace (f lanes only), $ without { just a dollar, braces
+  literal in bodies, no format-spec language, mf" stays the identifier,
+  unterminated errors name the opening line, newline-in-single-line
+  still dies. 14 new fixtures under strings/ (5 passing + 9 error
+  lanes; the m"" opening-line and line-anchoring rulings pinned by
+  substring on the reported line:col). the sandbox runner's expect-lane
+  sed fix (empty captures - printed blank lines - were vanishing under
+  grep -o; the C++ runner keeps them, now the mirror does too) rode
+  along.
+- the collab catch-up (the debt this round pays): patch 55 mirrored to
+  patches/ with its README entry, the roadmap draft's session-43
+  marker, Z-GUIDE's perishable section refreshed past its session-41
+  staleness, this entry, the push.
+- next: patch 56, the P3 remainder - the str method toolkit, std.math
+  + idiv, the deprecation windows. then P4 (fs/env/clock behind
+  OK_CAP_HOST), P5 (parser hardening + fuzz), P6 (optimization), P7
+  (REPL + the GC attempt). the wave is 2.5/7.

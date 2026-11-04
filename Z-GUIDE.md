@@ -52,20 +52,29 @@ source of truth: `https://codeberg.org/qais/oklang`, master at `9ad153c`,
 **tagged v0.1.0**. the `register` branch is history — deletion pending Q's
 confidence, don't touch it.
 
-current phase [perishable — refresh at round end] (nov 4, session 41):
-the climb through 0.8.0 is complete on the lanes (modules-staging at
-973bcd0, patches 43-52, e2e 510x7, capi 324x5; the whole review map is
-`docs/drafts/GUIDE-0.4.0-to-0.8.0.md`). master still sits at v0.4.0 ON
-PURPOSE: the ruled release plan (ROADMAP-0.9.0-draft) runs the 0.9.0
-wave (Reconciliation, P1-P7) to v1.0-rc, then the review + amend pass,
-then releases v0.5.0 → v1.0.0 as their own cuts — the git mechanics
-are `docs/drafts/RELEASE-RUNBOOK.md`. all six survivors RULED (round
-two): len = codepoints, Reconciliation, property tests post-v1, no
-perf target ("the best version of itself"), GC incremental in v1 /
-generational post-v1, the std door + sys.args/name/err + math.idiv.
-${} is the interpolation delimiter. next: P1 (patch 53). tree-sitter
-still owes the grammar catch-up (Q's flank). the bench workflow is
-live (automated runs pin oklang 0666651, a lane ref).
+current phase [perishable — refresh at round end] (nov 4, session 43):
+the 0.9.0 wave (Reconciliation, P1-P7) is in flight to v1.0-rc, landing
+on Q's hand-applied `reconciliation` branch on codeberg: P1+P2 (patches
+53-54) ride 057309c, P3 part one (patch 55, f"" interpolation +
+m""/fm"" multiline) landed as f05445a — zero drift, gates green on the
+landing (e2e 544x7). next: patch 56, the P3 remainder (the str method
+toolkit, std.math + idiv, the deprecation windows), then P4 (fs/env/
+clock behind OK_CAP_HOST), P5 (parser hardening + fuzz), P6
+(optimization), P7 (REPL + the GC attempt) — the wave is 2.5/7. master
+still sits at v0.4.0 ON PURPOSE: the ruled release plan
+(ROADMAP-0.9.0-draft) runs the wave to rc, then the review + amend
+pass, then releases v0.5.0 → v1.0.0 as their own cuts — the git
+mechanics are `docs/drafts/RELEASE-RUNBOOK.md` (round two folded the
+tidy correction: rel/ branches pin coros-family shas, tidy is in no
+command). all six survivors RULED (round two): len = codepoints,
+Reconciliation, property tests post-v1, no perf target ("the best
+version of itself"), GC incremental in v1 / generational post-v1, the
+std door + sys.args/name/err + math.idiv. ${} is the interpolation
+delimiter — landed. tree-sitter still owes the grammar catch-up (Q's
+flank — interpolation + multiline grammar now too). the bench workflow
+is live (automated runs pin oklang 0666651, a lane ref). workspace
+note: `oklang-qais-and-z/` at the root is a stale pre-42 relic —
+`collab/` is the live clone (PAT remote); never push from the relic.
 
 ## first 60 seconds of every round
 

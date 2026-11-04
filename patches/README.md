@@ -1122,3 +1122,49 @@ gates: 9/9 flavors under -Werror, e2e 530x7, unit 5x3 (54 checks) +
 embed x3, capi 325x5, cli 10/10, delta blue correct at 1.40654e7
 (1.91x/1.86x of wren - flat against the standing 1.93x; the codepoint
 cache is free).
+
+## 55 — P3 part one: f"" interpolation + m""/fm"" multiline
+
+the strings round opens with the ruled interpolation made real: f"" with
+${} regions, m"" multiline, fm"" both at once. LANDED by Q's hand on
+reconciliation as f05445a - verified zero-drift (the deliverable diffs
+empty against the landed commit), gates re-run on the landing itself.
+
+the shape: an f-string stays ONE token, and its interpolation extents
+come from ONE byte scanner both the lexer and the parser ride
+(ok_fstring_region_end) - braces nest, quoted strings and line comments
+hide theirs, and a quote riding an f/fm prefix inside a region takes
+the same scan recursively, so `f"${s("}")}"` and friends work and the
+extents can never drift from the token's own boundaries. the parser
+re-opens the token, chunk-splits the body, sub-parses each ${...}
+region with a region-anchored lexer (lexer_init_region: the closing
+brace is the sub-parse's EOF wall, positions stay absolute - errors
+point at real source), and desugars the whole literal to string +
+to_string(expr) chains over the existing infix ADD. OP_TOSTRING/
+OP_TOSTRING_LONG are exactly the `as str` builtin lane in opcode form
+(perform_to_string -> as_str: it allocates but never runs nested
+script, so the caller needs no REFRESH_AFTER_NESTED; every as_str arm
+makes its final allocation last), constant operands included -
+f"${1}" never materializes the 1.
+
+the rulings, all delivered as ruled: `\${` is the literal dollar-brace
+in the f lanes only (plain strings and m"" keep the P2 escape set and
+refuse `\$`), `$` without `{` is just a dollar, braces are literal in
+bodies, NO format-spec language - `:` after the expression is a located
+reserved error, not a mini-DSL - mf" stays the identifier mf, the
+unterminated errors name the opening line, and newline-in-single-line
+still dies. the m"" opening-line and line-anchoring rulings are pinned
+by substring on the reported line:col.
+
+tests: 14 new fixtures under strings/ - fstring (basics + escapes +
+nesting), mstring (multiline bodies), fmstring (both together), and 9
+error lanes (dollar_escape_refused, empty_interpolation,
+format_spec_reserved, junk_after_expression, mf_is_an_identifier,
+newline_in_single_line, unknown_chunk_escape,
+unterminated_interpolation, unterminated_mstring).
+
+applies on reconciliation after 057309c (P1+P2's landing); the landed
+commit is f05445a, byte-identical to the deliverable. gates (run on
+f05445a): 9/9 flavors under -Werror, e2e 544x7 (530 + the 14), unit +
+embed 5x3, capi 325x5, cli 10/10, delta blue correct at 1.40654e7
+(1.94x/1.88x of wren - the standing 1.93x within run noise).

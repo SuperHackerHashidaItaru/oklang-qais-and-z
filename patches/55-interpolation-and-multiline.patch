@@ -1,0 +1,1246 @@
+diff --git a/src/okast.c b/src/okast.c
+index 45f5417..9b18a74 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -36,6 +36,7 @@
+   X(AST_FUNCTION_EXPRESSION, ast_function_expression)                                                                  \
+   X(AST_SPREAD_EXPRESSION, ast_spread_expression)                                                                      \
+   X(AST_YIELD_EXPRESSION, ast_yield_expression)                                                                      \
++  X(AST_TO_STRING_EXPRESSION, ast_to_string_expression)                                                              \
+   X(AST_EMPTY_STATEMENT, ast_empty_statement)                                                                          \
+   X(AST_EXPRESSION_STATEMENT, ast_expression_statement)                                                                \
+   X(AST_PRINT_STATEMENT, ast_print_statement)                                                                          \
+@@ -397,6 +398,42 @@ string ast_string_expression_asprint(const ast_string_expression* p_string) {
+   return create_string_from_string_view(ast_string_expression_get_value(p_string), p_string->expression.node.alloc);
+ }
+ 
++// the P3 interpolation wrapper: one child, no surface syntax of its own
++// (only parse_fstring builds it, for each ${...} region).
++void ast_to_string_expression_init(ast_to_string_expression* p_to_string,
++                                   const token p_token,
++                                   ast_expression* p_right,
++                                   ast_specs* p_specs) {
++  ast_expression_init(&p_to_string->expression, AST_TO_STRING_EXPRESSION, p_token, p_specs);
++  p_to_string->right = p_right;
++}
++
++void ast_to_string_expression_deinit(ast_to_string_expression* p_to_string) {
++  if (p_to_string->right != NULL) {
++    ast_dispatch_deinit((ast_node*)p_to_string->right);
++    p_to_string->expression.node.alloc->release(p_to_string->expression.node.alloc, p_to_string->right);
++    p_to_string->right = NULL;
++  }
++  ast_expression_deinit(&p_to_string->expression);
++}
++
++bool ast_to_string_expression_print(const ast_to_string_expression* p_to_string) {
++  const bool head = printf("to_string(") > 0;
++  const bool body = ast_dispatch_print((ast_node*)p_to_string->right);
++  return head && body && printf(")") > 0;
++}
++
++string ast_to_string_expression_asprint(const ast_to_string_expression* p_to_string) {
++  string inner = ast_dispatch_asprint((ast_node*)p_to_string->right);
++  if (inner.chars == NULL) {
++    return inner;
++  }
++  allocators* alloc = p_to_string->expression.node.alloc;
++  string out = asprint(alloc, "to_string(%s)", inner.chars);
++  string_deinit(&inner, alloc);
++  return out;
++}
++
+ void ast_boolean_expression_init(ast_boolean_expression* p_boolean, token p_token, ast_specs* p_specs) {
+   ast_expression_init(&p_boolean->expression, AST_BOOLEAN_EXPRESSION, p_token, p_specs);
+ }
+diff --git a/src/okast.h b/src/okast.h
+index 2afca2b..627b53c 100644
+--- a/src/okast.h
++++ b/src/okast.h
+@@ -50,7 +50,9 @@ typedef enum {
+   AST_FUNCTION_EXPRESSION,
+   AST_SPREAD_EXPRESSION,
+   AST_YIELD_EXPRESSION,
+-  AST_RANGE_EXPRESSION_END = AST_YIELD_EXPRESSION,
++  AST_TO_STRING_EXPRESSION, // the P3 interpolation wrapper: one child, compiled to
++                            // OP_TOSTRING. only parse_fstring builds it.
++  AST_RANGE_EXPRESSION_END = AST_TO_STRING_EXPRESSION,
+ 
+   AST_RANGE_STATEMENT_BEGIN,
+   AST_RANGE_PURE_STATEMENT_BEGIN,
+@@ -223,6 +225,19 @@ ok_string_view ast_string_expression_get_value(const ast_string_expression* p_st
+ bool ast_string_expression_print(const ast_string_expression* p_string);
+ string ast_string_expression_asprint(const ast_string_expression* p_string);
+ 
++typedef struct {
++  ast_expression expression;
++  ast_expression* right;
++} ast_to_string_expression;
++
++void ast_to_string_expression_init(ast_to_string_expression* p_to_string,
++                                   const token p_token,
++                                   ast_expression* p_right,
++                                   ast_specs* p_specs);
++void ast_to_string_expression_deinit(ast_to_string_expression* p_to_string);
++bool ast_to_string_expression_print(const ast_to_string_expression* p_to_string);
++string ast_to_string_expression_asprint(const ast_to_string_expression* p_to_string);
++
+ typedef struct {
+   ast_expression expression;
+ } ast_boolean_expression;
+diff --git a/src/okchunk.h b/src/okchunk.h
+index ca8ec71..8fa317f 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -210,6 +210,9 @@ typedef enum {
+   OP_NOT_LONG,           // 2w:   (p, A, B)       -> r[A] = p == 0 then !r[B] otherwise !k[B]
+   OP_NEGATE,             // w:    (p, a', b')     -> r[a'] = p == 0 then -r[b'] otherwise -k[b']
+   OP_NEGATE_LONG,        // 2w:   (p, A, B)       -> r[A] = p == 0 then -r[B] otherwise -k[B]
++  OP_TOSTRING,           // w:    (p, a', b')     -> r[a'] = (p == 0 then r[b'] otherwise k[b']) as str; the P3
++                         //                     f-string interpolation wrapper's opcode
++  OP_TOSTRING_LONG,      // 2w:   (p, A, B)       -> r[A] = (p == 0 then r[B] otherwise k[B]) as str
+   OP_ADD,                // w:    (p, a, b, c)    -> r[a] = r[b] + p then k[c] otherwise r[c]
+   OP_ADD_LONG,           // 2w:   (p, A, B, C, q) -> r[A] = q then k[B] otherwise r[B] + p then k[C] otherwise r[C];
+   OP_SUBTRACT,           // w:    (p, a, b, c)    -> r[a] = r[b] - (p then k[c] otherwise r[c])
+@@ -669,6 +672,7 @@ static inline uint32_t opcode_word_count(opcode p_op) {
+   case OP_CLOSURE_LONG:
+   case OP_NOT_LONG:
+   case OP_NEGATE_LONG:
++  case OP_TOSTRING_LONG:
+   case OP_ADD_LONG:
+   case OP_SUBTRACT_LONG:
+   case OP_MULTIPLY_LONG:
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 3d9937e..4f9d65d 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -568,6 +568,11 @@ static bool compile_string_expression(compiler* p_compiler,
+                                       _register p_dest,
+                                       uint32_t p_requested_count,
+                                       expression_result* p_out);
++static bool compile_to_string_expression(compiler* p_compiler,
++                                         ast_to_string_expression* p_to_string,
++                                         _register p_dest,
++                                         uint32_t p_requested_count,
++                                         expression_result* p_out);
+ static bool compile_prefix_unary_expression(compiler* p_compiler,
+                                             ast_prefix_unary_expression* p_prefix,
+                                             _register p_dest,
+@@ -1068,6 +1073,10 @@ static bool compile_expression(compiler* p_compiler,
+     result =
+         compile_string_expression(p_compiler, (ast_string_expression*)p_expression, p_dest, p_requested_count, p_out);
+     break;
++  case AST_TO_STRING_EXPRESSION:
++    result = compile_to_string_expression(
++        p_compiler, (ast_to_string_expression*)p_expression, p_dest, p_requested_count, p_out);
++    break;
+   case AST_PREFIX_UNARY_EXPRESSION:
+     result = compile_prefix_unary_expression(
+         p_compiler, (ast_prefix_unary_expression*)p_expression, p_dest, p_requested_count, p_out);
+@@ -3799,6 +3808,47 @@ static bool compile_string_expression(compiler* p_compiler,
+   return true;
+ }
+ 
++// the P3 interpolation wrapper: compile the child, then OP_TOSTRING over the
++// result - the same conversion `x as str` rides, in place. the operand may
++// stay a constant (the p flag carries it; `f"${1}"` never materializes the 1).
++static bool compile_to_string_expression(compiler* p_compiler,
++                                         ast_to_string_expression* p_expression,
++                                         _register p_dest,
++                                         uint32_t p_requested_count,
++                                         expression_result* p_out) {
++  ASSERT(p_requested_count <= 1);
++  expression_result rhs;
++  if (!compile_expression(p_compiler, p_expression->right, p_dest, 1, &rhs)) {
++    return false;
++  }
++  bool is_constant = false;
++  if (!materialize_into_if_not_common(
++          p_compiler, &is_constant, LOCATION_KIND_CONSTANT, &rhs.value, p_dest, (ast_node*)p_expression)) {
++    return false;
++  }
++  if (p_dest.index > aprime_MAX || rhs.value.index > bprime_MAX) {
++    if (!emit_word2(p_compiler,
++                    encode_OPPABCQ(OP_TOSTRING_LONG, is_constant, p_dest.index, rhs.value.index, 0, 0),
++                    (ast_node*)p_expression)) {
++      report_oom(p_compiler, (ast_node*)p_expression);
++      return false;
++    }
++  } else {
++    if (!emit_word(p_compiler,
++                   encode_oppabprime(OP_TOSTRING, is_constant, p_dest.index, rhs.value.index),
++                   (ast_node*)p_expression)) {
++      report_oom(p_compiler, (ast_node*)p_expression);
++      return false;
++    }
++  }
++
++  p_out->type = EXPRESSION_VALUE;
++  p_out->value = (location){p_dest.index, LOCATION_KIND_REGISTER, LOCATION_OK};
++  p_out->lvalue = (lvalue){LVALUE_VARIABLE, (location){0, LOCATION_KIND_INVALID, LOCATION_OK}};
++  p_out->count = 1;
++  return true;
++}
++
+ static bool compile_prefix_unary_expression(compiler* p_compiler,
+                                             ast_prefix_unary_expression* p_expression,
+                                             _register p_dest,
+diff --git a/src/okdebug.c b/src/okdebug.c
+index e4cf21c..8273a0f 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -42,6 +42,8 @@ static const char* const OPCODE_NAMES[] = {
+     "NOT_LONG",
+     "NEGATE",
+     "NEGATE_LONG",
++    "TOSTRING",
++    "TOSTRING_LONG",
+     "ADD",
+     "ADD_LONG",
+     "SUBTRACT",
+@@ -556,6 +558,22 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+       printf("%u", B);
+     }
+     break;
++  case OP_TOSTRING:
++    printf("r%u = to_string %s", ap, p ? "k" : "r");
++    if (p) {
++      print_constant_inline(chunk, bp);
++    } else {
++      printf("%u", bp);
++    }
++    break;
++  case OP_TOSTRING_LONG:
++    printf("r%u = to_string %s", A, p ? "k" : "r");
++    if (p) {
++      print_constant_inline(chunk, B);
++    } else {
++      printf("%u", B);
++    }
++    break;
+   case OP_ARRAY_NEW:
+     if (c == 0) {
+       printf("r%u = []", a);
+diff --git a/src/oklexer.c b/src/oklexer.c
+index 4d46e8e..c7c3586 100644
+--- a/src/oklexer.c
++++ b/src/oklexer.c
+@@ -10,22 +10,43 @@ void lexer_init(lexer* p_lexer, const char* p_src) {
+   p_lexer->start = p_src;
+   p_lexer->current = p_src;
+   p_lexer->line_start = p_src;
++  p_lexer->end = NULL; // whole-source mode: the NUL is the end
+   p_lexer->line_info.line = 1;
+   p_lexer->line_info.offset = 0;
+   p_lexer->line_info.column = 1;
+ }
+ 
++void lexer_init_region(lexer* p_lexer,
++                       const char* p_src_base,
++                       const char* p_region_start,
++                       const char* p_region_end,
++                       const char* p_line_start,
++                       uint32_t p_line) {
++  p_lexer->src = p_src_base;
++  p_lexer->start = p_region_start;
++  p_lexer->current = p_region_start;
++  p_lexer->line_start = p_line_start;
++  p_lexer->end = p_region_end;
++  p_lexer->line_info.line = p_line;
++  p_lexer->line_info.offset = (uint32_t)(p_region_start - p_src_base);
++  p_lexer->line_info.column = (uint32_t)(p_region_start - p_line_start) + 1;
++}
++
+ void lexer_deinit(lexer* p_lexer) {
+   p_lexer->src = NULL;
+   p_lexer->start = NULL;
+   p_lexer->current = NULL;
+   p_lexer->line_start = NULL;
++  p_lexer->end = NULL;
+   p_lexer->line_info.line = 0;
+   p_lexer->line_info.offset = 0;
+   p_lexer->line_info.column = 0;
+ }
+ 
+ static bool at_end(lexer* p_lexer) {
++  if (p_lexer->end != NULL && p_lexer->current >= p_lexer->end) {
++    return true; // region mode: the closing brace is the wall
++  }
+   return *p_lexer->current == '\0';
+ }
+ 
+@@ -73,44 +94,182 @@ static char peek1(lexer* p_lexer) {
+   return p_lexer->current[1];
+ }
+ 
+-static token string(lexer* p_lexer, char p_start, bool p_multiline) {
+-  while (peek(p_lexer) != p_start && !at_end(p_lexer)) {
+-    if (peek(p_lexer) == '\\') {
+-      // the P2 string rework: an escape never terminates the string. the
+-      // raw bytes ride through here; the parser's unescape lane owns the
+-      // meaning (and its errors).
+-      advance(p_lexer);
+-      if (at_end(p_lexer)) {
+-        break;
++static bool is_allowed_identifier(char c);
++
++// ---------------------------------------------------------------------------
++// the P3 byte scanners: one extent algorithm, two riders.
++//
++// an f-string is ONE token, so the lexer must know where its interpolations
++// end (a region's strings may quote the body's own quote char), and the
++// parser must later re-derive the same extents when it re-opens the token.
++// both ride these scanners - one source of truth, no drift. they are pure
++// byte walks: extents only, no line counting (the lexer catches its own
++// position up afterwards; the parser only ever wanted the span).
++//
++// p_wall semantics: NULL means the source's NUL is the wall (whole-source
++// lexing); otherwise a hard stop (region lexing stops at the interpolation's
++// closing brace, the parser's re-scan at the token's closing quote).
++static bool at_wall(const char* p, const char* p_wall) {
++  if (p_wall != NULL) {
++    return p >= p_wall;
++  }
++  return *p == '\0';
++}
++
++static const char* scan_region(const char* p, const char* p_wall, const char** p_died);
++
++// scan a string body (from just past its opening quote) to its closing
++// quote. an escape never closes anything (the P2 ruling: `\` + newline
++// rides multiline only); p_interpolate skips ${...} regions, which may
++// quote the body's own quote char. returns the closing quote's position,
++// or NULL with *p_died at the byte the wall was found on.
++static const char* scan_body(const char* p,
++                             const char* p_wall,
++                             char p_quote,
++                             bool p_multiline,
++                             bool p_interpolate,
++                             const char** p_died) {
++  for (;;) {
++    if (at_wall(p, p_wall)) {
++      *p_died = p;
++      return NULL;
++    }
++    const char c = *p;
++    if (c == '\\') {
++      ++p; // the escape byte never closes anything
++      if (at_wall(p, p_wall)) {
++        *p_died = p;
++        return NULL; // a dangling escape at the wall
+       }
+-      if (peek(p_lexer) == '\n') {
+-        if (!p_multiline) {
+-          return create_error_token(p_lexer, "unterminated string.");
+-        }
++      if (*p == '\n' && !p_multiline) {
++        *p_died = p;
++        return NULL; // a single-line string dies at its newline
++      }
++      ++p;
++      continue;
++    }
++    if (c == '\n' && !p_multiline) {
++      *p_died = p;
++      return NULL;
++    }
++    if (p_interpolate && c == '$' && !at_wall(p + 1, p_wall) && p[1] == '{') {
++      const char* close = scan_region(p + 2, p_wall, p_died);
++      if (close == NULL) {
++        return NULL;
++      }
++      p = close + 1;
++      continue;
++    }
++    if (c == p_quote) {
++      return p;
++    }
++    ++p;
++  }
++}
++
++// scan a ${...} region (from just past its '${') to its matching brace.
++// braces nest (map literals); line comments hide theirs to the newline; a
++// quoted string hides its own - and one riding an f/fm prefix is an f-string
++// itself, whose regions may in turn quote this region's quote char, so its
++// body takes the same scan one level down. (the prefix test mirrors the
++// lexer's own token start: an f before the quote only counts when the byte
++// before IT cannot continue an identifier - `xf"` is the identifier `xf`
++// then a plain string. `2f"` disagrees only in garbage source, where a
++// number glued to an f-string is not a program either side accepts.)
++static const char* scan_region(const char* p, const char* p_wall, const char** p_died) {
++  uint32_t depth = 1;
++  for (;;) {
++    if (at_wall(p, p_wall)) {
++      *p_died = p;
++      return NULL;
++    }
++    const char c = *p;
++    if (c == '/' && !at_wall(p + 1, p_wall) && p[1] == '/') {
++      p += 2; // a line comment hides braces to its newline
++      while (!at_wall(p, p_wall) && *p != '\n') {
++        ++p;
++      }
++      continue;
++    }
++    if (c == '\'' || c == '"') {
++      const bool f_prefix = p[-1] == 'f' && !is_allowed_identifier(p[-2]);
++      const bool m_prefix = p[-1] == 'm' && !is_allowed_identifier(p[-2]);
++      const bool fm_prefix = p[-1] == 'm' && p[-2] == 'f' && !is_allowed_identifier(p[-3]);
++      ++p; // the quote
++      const char* close = scan_body(p, p_wall, c, m_prefix || fm_prefix, f_prefix || fm_prefix, p_died);
++      if (close == NULL) {
++        return NULL;
++      }
++      p = close + 1;
++      continue;
++    }
++    if (c == '{') {
++      ++depth;
++    } else if (c == '}') {
++      if (--depth == 0) {
++        return p;
++      }
++    }
++    ++p;
++  }
++}
++
++// the P3 prefixed strings ride the same scan: f"..." interpolates, m"..."
++// spans lines, fm"..." stacks both (the prefix lives in the token bytes; the
++// parser's slice arithmetic knows each type's prefix length). a successful
++// token reports its OPENING line and column - a multiline body crosses
++// newlines, and the unterminated error especially must name the opening line
++// (the m"" ruling), not whatever line the wall was found on.
++static token string(lexer* p_lexer, char p_start, bool p_multiline, bool p_interpolate) {
++  const uint32_t opening_line = p_lexer->line_info.line;
++  const char* opening_line_start = p_lexer->line_start;
++  // the body scan is a pure byte walk; the wall is the region's hard end
++  // when lexing inside an interpolation, else the source's NUL.
++  const char* const wall = p_lexer->end;
++  const char* const body = p_lexer->current; // just past the opening quote
++  const char* died = body;
++  const char* close = scan_body(body, wall, p_start, p_multiline, p_interpolate, &died);
++  if (close == NULL) {
++    // catch up to where the scan died, counting lines honestly (the error
++    // span and every token after it keep real positions)
++    while (p_lexer->current < died) {
++      if (*p_lexer->current == '\n') {
+         p_lexer->line_info.line++;
+-        advance(p_lexer);
+-        p_lexer->line_start = p_lexer->current;
+-        continue;
++        p_lexer->line_start = p_lexer->current + 1;
+       }
+       advance(p_lexer);
+-      continue;
+     }
+-    if (peek(p_lexer) == '\n' && !p_multiline) {
+-      token error = create_error_token(p_lexer, "unterminated string.");
+-      return error;
+-    } else if (peek(p_lexer) == '\n') {
++    token error = create_error_token(p_lexer, "unterminated string.");
++    error.line_info.line = opening_line;
++    error.line_info.column = (uint32_t)(p_lexer->start - opening_line_start) + 1;
++    return error;
++  }
++  // catch up to the closing quote, counting lines honestly (a multiline
++  // body crosses newlines; every later token anchors to its real line)
++  while (p_lexer->current < close) {
++    if (*p_lexer->current == '\n') {
+       p_lexer->line_info.line++;
+-      advance(p_lexer);
+-      p_lexer->line_start = p_lexer->current;
+-      continue;
++      p_lexer->line_start = p_lexer->current + 1;
+     }
+     advance(p_lexer);
+   }
+-  if (at_end(p_lexer)) {
+-    return create_error_token(p_lexer, "unterminated string.");
+-  }
+-  advance(p_lexer);
+-  return create_token(p_lexer, TOKEN_STRING);
++  advance(p_lexer); // the closing quote
++  const token_type type = p_multiline ? (p_interpolate ? TOKEN_FMSTRING : TOKEN_MSTRING)
++                                      : (p_interpolate ? TOKEN_FSTRING : TOKEN_STRING);
++  token out = create_token(p_lexer, type);
++  out.line_info.line = opening_line;
++  out.line_info.column = (uint32_t)(p_lexer->start - opening_line_start) + 1;
++  return out;
++}
++
++// the parser's f-string re-scan: where does the ${...} region starting at
++// p_start end? the same scanner the lexer rode to close the token - one
++// source of truth for the interpolation extents, so they can never drift
++// from the token's own boundaries. p_wall is the token body's end (its
++// closing quote). returns the matching '}', or NULL when the wall wins.
++const char* ok_fstring_region_end(const char* p_start, const char* p_wall) {
++  const char* died = p_start;
++  return scan_region(p_start, p_wall, &died);
+ }
+ 
+ static token number(lexer* p_lexer) {
+@@ -438,13 +597,31 @@ start:
+   case '\r':
+     goto start;
+   case '\'':
+-    return string(p_lexer, '\'', false);
++    return string(p_lexer, '\'', false, false);
+   case '"':
+-    return string(p_lexer, '"', false);
++    return string(p_lexer, '"', false, false);
+   default: {
+     if (isdigit(c)) {
+       return number(p_lexer);
+     }
++    // the P3 string prefixes: f" m" fm" (either quote char). only immediate
++    // adjacency counts - `f "x"` is an identifier then a separate string,
++    // and `mf"` stays the identifier `mf` (fm is the ruled stacking order).
++    // anything else falls through to the identifier scan unchanged.
++    if (c == 'f' || c == 'm') {
++      const bool interpolate = (c == 'f');
++      if (peek(p_lexer) == '\'' || peek(p_lexer) == '"') {
++        const char quote = advance(p_lexer);
++        // f" interpolates without spanning; m" spans without interpolating
++        return string(p_lexer, quote, !interpolate, interpolate);
++      }
++      if (interpolate && peek(p_lexer) == 'm' &&
++          (peek1(p_lexer) == '\'' || peek1(p_lexer) == '"')) {
++        advance(p_lexer); // the m
++        const char quote = advance(p_lexer);
++        return string(p_lexer, quote, true, true);
++      }
++    }
+     if (is_allowed_identifier(c)) {
+       return identifier(p_lexer);
+     }
+diff --git a/src/oklexer.h b/src/oklexer.h
+index d64f5e4..3d1dabe 100644
+--- a/src/oklexer.h
++++ b/src/oklexer.h
+@@ -11,11 +11,31 @@ typedef struct {
+   const char* start;
+   const char* current;
+   const char* line_start; // first byte of the current line: columns are (start - line_start + 1)
++  const char* end; // NULL for whole-source lexing (the NUL is the end); otherwise a hard
++                   // stop for region lexing (the f-string interpolation sub-parse, P3):
++                   // at_end also answers true at the region's closing brace
+   ok_line_info line_info;
+ } lexer;
+ 
+ void lexer_init(lexer* p_lexer, const char* p_src);
++// region lexing (P3): lex the bytes [p_region_start, p_region_end) as a token
++// stream, with offsets anchored at p_src_base (the WHOLE source's first byte,
++// so diagnostics carry absolute positions) and columns anchored at p_line_start
++// (the real first byte of the line the region starts on), starting from the
++// real line number. used for ${...} interpolations inside f-strings.
++void lexer_init_region(lexer* p_lexer,
++                       const char* p_src_base,
++                       const char* p_region_start,
++                       const char* p_region_end,
++                       const char* p_line_start,
++                       uint32_t p_line);
+ void lexer_deinit(lexer* p_lexer);
+ token lexer_lex(lexer* p_lexer);
+ 
++// the parser's f-string re-scan: where does the ${...} region starting at
++// p_start end? the same byte scanner the lexer rode to close the token - one
++// source of truth for the interpolation extents. p_wall is the token body's
++// end (its closing quote). returns the matching '}', or NULL at the wall.
++const char* ok_fstring_region_end(const char* p_start, const char* p_wall);
++
+ #endif // OK_LEXER_H
+diff --git a/src/okparser.c b/src/okparser.c
+index 4e12868..19caffa 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -73,6 +73,7 @@ static ast_expression* parse_access(
+ static ast_expression* parse_this(parser* p_parser, token p_trigger);
+ static ast_expression* parse_super(parser* p_parser, token p_trigger);
+ static ast_expression* parse_string(parser* p_parser, token p_trigger);
++static ast_expression* parse_fstring(parser* p_parser, token p_trigger);
+ static ast_expression* parse_number(parser* p_parser, token p_trigger);
+ static ast_expression* parse_boolean(parser* p_parser, token p_trigger);
+ static ast_expression* parse_null(parser* p_parser, token p_trigger);
+@@ -148,6 +149,9 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_IDENTIFIER] = {parse_identifier, NULL, PREC_NONE},
+     [TOKEN_NUMBER] = {parse_number, NULL, PREC_NONE},
+     [TOKEN_STRING] = {parse_string, NULL, PREC_NONE},
++    [TOKEN_FSTRING] = {parse_fstring, NULL, PREC_NONE},
++    [TOKEN_MSTRING] = {parse_fstring, NULL, PREC_NONE},
++    [TOKEN_FMSTRING] = {parse_fstring, NULL, PREC_NONE},
+     [TOKEN_PRINT] = {NULL, NULL, PREC_NONE},
+     [TOKEN_IMPORT] = {NULL, NULL, PREC_NONE},
+     [TOKEN_AS] = {NULL, parse_binary_infix, PREC_AS},
+@@ -491,7 +495,15 @@ ast_expression* parse_identifier(parser* p_parser, token p_trigger) {
+ // and \u{HEX} (1-6 digits, <= U+10FFFF, no surrogates). anything else
+ // after a backslash is a located compile error - unknown escapes never
+ // pass silently. returns false with the error already reported.
+-static bool unescape_string_literal(parser* p_parser, token p_token, ast_string_expression* p_out) {
++// p_dollar_escape is the P3 f-string lane: `\${` writes the literal
++// dollar-brace (the ruling - the only way an interpolation can be kept out
++// of a body's reach), and a `\$` in an f-string can only mean a plain
++// dollar. plain strings keep the fixed escape set and refuse `\$` like any
++// unknown.
++static bool unescape_string_literal(parser* p_parser,
++                                    token p_token,
++                                    ast_string_expression* p_out,
++                                    bool p_dollar_escape) {
+   allocators* alloc = p_parser->alloc;
+   const char* raw = p_token.start + 1;
+   const uint32_t raw_length = p_token.length >= 2 ? p_token.length - 2 : 0;
+@@ -542,6 +554,23 @@ static bool unescape_string_literal(parser* p_parser, token p_token, ast_string_
+       out[written++] = e;
+       ++i;
+       break;
++    case '$':
++      if (!p_dollar_escape) {
++        char message[48];
++        const int printed = snprintf(message, sizeof(message), "unknown escape '\\%c'.", e);
++        if (printed > 0 && (size_t)printed < sizeof(message)) {
++          error_at(p_parser, p_token, ok_create_string_view(message, (uint32_t)printed, false));
++        } else {
++          error_at(p_parser,
++                   p_token,
++                   ok_create_string_view("unknown escape.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++        }
++        ok = false;
++        break;
++      }
++      out[written++] = '$';
++      ++i;
++      break;
+     case 'u': {
+       ++i; // consume the u
+       if (i >= raw_length || raw[i] != '{') {
+@@ -655,7 +684,7 @@ ast_expression* parse_string(parser* p_parser, token p_trigger) {
+     const uint32_t raw_length = p_trigger.length >= 2 ? p_trigger.length - 2 : 0;
+     for (uint32_t i = 0; i < raw_length; ++i) {
+       if (raw[i] == '\\') {
+-        if (!unescape_string_literal(p_parser, p_trigger, string)) {
++        if (!unescape_string_literal(p_parser, p_trigger, string, false)) {
+           ast_string_expression_deinit(string);
+           alloc->release(alloc, string);
+           return NULL;
+@@ -667,6 +696,289 @@ ast_expression* parse_string(parser* p_parser, token p_trigger) {
+   return (ast_expression*)string;
+ }
+ 
++// a synthetic token over a slice of the f-string's body: the chunk and
++// region positions carry honest line/column/offset (walked from the
++// f-string token itself), so diagnostics inside multiline bodies land on
++// the real bytes.
++static token fstring_part_token(const token* p_base, const char* p_start, uint32_t p_length) {
++  token out;
++  out.type = TOKEN_STRING;
++  out.start = p_start;
++  out.length = p_length;
++  uint32_t line = p_base->line_info.line;
++  const char* last_newline = NULL;
++  for (const char* p = p_base->start; p < p_start; ++p) {
++    if (*p == '\n') {
++      ++line;
++      last_newline = p;
++    }
++  }
++  out.line_info.line = line;
++  out.line_info.column = last_newline != NULL
++                             ? (uint32_t)(p_start - last_newline)
++                             : p_base->line_info.column + (uint32_t)(p_start - p_base->start);
++  out.line_info.offset = p_base->line_info.offset + (uint32_t)(p_start - p_base->start);
++  return out;
++}
++
++// the real line start + number for a position inside the f-string token:
++// forward from the token for the count, then back to the previous newline
++// for the line's first byte (the region lexer anchors columns there, so
++// every token the interpolation mints carries a true column).
++static void fstring_line_of(const char* p_src_base,
++                            const token* p_base,
++                            const char* p_pos,
++                            const char** p_line_start,
++                            uint32_t* p_line) {
++  uint32_t line = p_base->line_info.line;
++  for (const char* p = p_base->start; p < p_pos; ++p) {
++    if (*p == '\n') {
++      ++line;
++    }
++  }
++  const char* line_start = p_pos;
++  while (line_start > p_src_base && line_start[-1] != '\n') {
++    --line_start;
++  }
++  *p_line_start = line_start;
++  *p_line = line;
++}
++
++// one literal chunk of an f-string body: a plain string node. the token is
++// synthetic - one byte left of the chunk, so the string slicing arithmetic
++// (start+1 / length-2) lands on the chunk exactly - and a chunk carrying a
++// backslash rides the shared unescape lane (the `\${` ruling on for the
++// interpolating lanes; plain strings keep the fixed escape set).
++static ast_expression* parse_fstring_chunk(parser* p_parser,
++                                           const token* p_base,
++                                           const char* p_start,
++                                           uint32_t p_length,
++                                           bool p_dollar_escape) {
++  allocators* alloc = p_parser->alloc;
++  ast_string_expression* string = (ast_string_expression*)alloc->allocate(alloc, sizeof(ast_string_expression));
++  if (string == NULL) {
++    error_at(p_parser,
++             *p_base,
++             ok_create_string_view("failed to allocate memory for string node.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL;
++  }
++  ast_specs s = {alloc};
++  const token slice = fstring_part_token(p_base, p_start - 1, p_length + 2u);
++  ast_string_expression_init(string, slice, &s);
++  for (uint32_t i = 0; i < p_length; ++i) {
++    if (p_start[i] == '\\') {
++      if (!unescape_string_literal(p_parser, slice, string, p_dollar_escape)) {
++        ast_string_expression_deinit(string);
++        alloc->release(alloc, string);
++        return NULL;
++      }
++      break;
++    }
++  }
++  return (ast_expression*)string;
++}
++
++// fold one more part onto the desugar chain: infix ADD, the same operator
++// two string operands already concatenate through (the VM's both-strings
++// lane). on failure p_next is released and p_acc stays alive for the caller.
++static ast_expression* parse_fstring_fold(parser* p_parser,
++                                          const token* p_base,
++                                          ast_expression* p_acc,
++                                          ast_expression* p_next) {
++  if (p_acc == NULL) {
++    return p_next;
++  }
++  allocators* alloc = p_parser->alloc;
++  token plus = fstring_part_token(p_base, p_base->start, p_base->length);
++  plus.type = TOKEN_PLUS;
++  ast_infix_binary_expression* infix =
++      (ast_infix_binary_expression*)alloc->allocate(alloc, sizeof(ast_infix_binary_expression));
++  if (infix == NULL) {
++    error_at(p_parser,
++             *p_base,
++             ok_create_string_view("failed to allocate memory for the f-string's fold node.",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    ast_dispatch_deinit((ast_node*)p_next);
++    alloc->release(alloc, p_next);
++    return NULL;
++  }
++  ast_specs s = {alloc};
++  ast_infix_binary_expression_init(
++      infix, plus, operator_type_from_token_type(TOKEN_PLUS, false), p_acc, p_next, &s);
++  return (ast_expression*)infix;
++}
++
++// one ${...} region: a sub-parser over the region's bytes. the region lexer
++// stops AT the closing brace (it mints the sub-parse's EOF wall), so nothing
++// inside can run past the interpolation; positions stay absolute, so the
++// region's diagnostics print the real source lines. the parsed expression
++// keeps its own nodes and rides into the parent tree untouched, through the
++// to_string wrapper.
++static ast_expression* parse_interpolation_region(parser* p_parser,
++                                                  const token* p_base,
++                                                  const char* p_start,
++                                                  const char* p_end) {
++  const char* line_start;
++  uint32_t line;
++  fstring_line_of(p_parser->source->code, p_base, p_start, &line_start, &line);
++  parser sub;
++  sub.panic = false;
++  sub.had_error = false;
++  sub.defer_serial = 0;
++  sub.source = p_parser->source;
++  sub.alloc = p_parser->alloc;
++  sub.current.type = TOKEN_EOF;
++  sub.current.start = p_start;
++  sub.current.length = 0;
++  sub.current.line_info.offset = (uint32_t)(p_start - p_parser->source->code);
++  sub.current.line_info.line = line;
++  sub.current.line_info.column = (uint32_t)(p_start - line_start) + 1;
++  sub.previous = sub.current;
++  lexer_init_region(&sub.lexer, p_parser->source->code, p_start, p_end, line_start, line);
++  ast_expression* inner = NULL;
++  if (advance(&sub)) {
++    if (sub.current.type == TOKEN_EOF) {
++      error_at(&sub,
++               sub.current,
++               ok_create_string_view("an interpolation wants an expression - '${}' is empty.",
++                                     OK_STRING_VIEW_CALCULATE_LENGTH,
++                                     true));
++    } else if (advance(&sub)) {
++      inner = parse_expression(&sub, PREC_NONE);
++      if (inner != NULL && sub.current.type == TOKEN_COLON) {
++        // the format-spec ruling: ':' after the expression is reserved so a
++        // later spec addition breaks nobody - for now it is a located error.
++        error_at(&sub,
++                 sub.current,
++                 ok_create_string_view("a ':' after the interpolation's expression is reserved (format specs are not supported yet).",
++                                       OK_STRING_VIEW_CALCULATE_LENGTH,
++                                       true));
++        inner = NULL;
++      } else if (inner != NULL && sub.current.type != TOKEN_EOF) {
++        error_at(&sub,
++                 sub.current,
++                 ok_create_string_view("expected the interpolation to end with its '}'.",
++                                       OK_STRING_VIEW_CALCULATE_LENGTH,
++                                       true));
++        inner = NULL;
++      }
++    }
++  }
++  lexer_deinit(&sub.lexer);
++  p_parser->had_error = p_parser->had_error || sub.had_error;
++  p_parser->panic = p_parser->panic || sub.panic;
++  if (inner == NULL) {
++    return NULL;
++  }
++  return inner;
++}
++
++// the P3 f-string, re-opened. an f"..."/fm"..."/m"..." is ONE lexer token;
++// this walks its body for ${...} regions (escapes never open one - `\${` is
++// the ruled literal dollar-brace), parses each region with the region
++// sub-parser, and desugars the whole literal to a left-leaning chain of
++// string + to_string(expr) + string ... over the same infix ADD two plain
++// string operands already ride. m"..." takes the same road with regions
++// off: no ${ in its body, the desugar is a single plain string node, so a
++// multiline literal is just a string that happens to hold newlines. (fm""
++// is the ruled stacking order; mf"" stays the identifier `mf` next to a
++// plain string - the lexer's call, not ours.)
++ast_expression* parse_fstring(parser* p_parser, token p_trigger) {
++  allocators* alloc = p_parser->alloc;
++  const bool interpolate = p_trigger.type != TOKEN_MSTRING;
++  const uint32_t prefix = (p_trigger.type == TOKEN_FMSTRING) ? 2u : 1u;
++  const char* body = p_trigger.start + prefix + 1u;
++  const uint32_t body_length = p_trigger.length >= prefix + 2u ? p_trigger.length - (prefix + 2u) : 0u;
++  const char* const body_end = body + body_length;
++
++  ast_expression* acc = NULL;
++  const char* chunk = body;
++  uint32_t i = 0;
++  while (i < body_length) {
++    if (body[i] == '\\') {
++      i += 2u; // an escape never opens a region (the `\${` ruling)
++      continue;
++    }
++    if (!(interpolate && body[i] == '$' && i + 1u < body_length && body[i + 1u] == '{')) {
++      ++i;
++      continue;
++    }
++    const char* const region = body + i + 2u;
++    const char* const close = ok_fstring_region_end(region, body_end);
++    if (close == NULL) {
++      error_at(p_parser,
++               p_trigger,
++               ok_create_string_view("unterminated interpolation - a '${' wants its matching '}'.",
++                                     OK_STRING_VIEW_CALCULATE_LENGTH,
++                                     true));
++      ast_dispatch_deinit((ast_node*)acc);
++      alloc->release(alloc, acc);
++      return NULL;
++    }
++    if (region - 2u > chunk) {
++      ast_expression* part =
++          parse_fstring_chunk(p_parser, &p_trigger, chunk, (uint32_t)(region - 2u - chunk), interpolate);
++      if (part != NULL) {
++        part = parse_fstring_fold(p_parser, &p_trigger, acc, part);
++      }
++      if (part == NULL) {
++        ast_dispatch_deinit((ast_node*)acc);
++        alloc->release(alloc, acc);
++        return NULL;
++      }
++      acc = part;
++    }
++    ast_expression* inner = parse_interpolation_region(p_parser, &p_trigger, region, close);
++    if (inner == NULL) {
++      ast_dispatch_deinit((ast_node*)acc);
++      alloc->release(alloc, acc);
++      return NULL;
++    }
++    ast_to_string_expression* wrap =
++        (ast_to_string_expression*)alloc->allocate(alloc, sizeof(ast_to_string_expression));
++    if (wrap == NULL) {
++      error_at(p_parser,
++               p_trigger,
++               ok_create_string_view("failed to allocate memory for the interpolation's node.",
++                                     OK_STRING_VIEW_CALCULATE_LENGTH,
++                                     true));
++      ast_dispatch_deinit((ast_node*)inner);
++      alloc->release(alloc, inner);
++      ast_dispatch_deinit((ast_node*)acc);
++      alloc->release(alloc, acc);
++      return NULL;
++    }
++    ast_specs s = {alloc};
++    token region_token = fstring_part_token(&p_trigger, body + i, 2u); // the '${' itself
++    ast_to_string_expression_init(wrap, region_token, inner, &s);
++    ast_expression* folded = parse_fstring_fold(p_parser, &p_trigger, acc, (ast_expression*)wrap);
++    if (folded == NULL) {
++      ast_dispatch_deinit((ast_node*)acc);
++      alloc->release(alloc, acc);
++      return NULL;
++    }
++    acc = folded;
++    chunk = close + 1u;
++    i = (uint32_t)(close + 1u - body);
++  }
++  // the tail chunk (or the whole body, when nothing interpolated: an m" or
++  // an f" with no regions desugars to a single plain string node)
++  if (chunk < body_end || acc == NULL) {
++    ast_expression* part = parse_fstring_chunk(p_parser, &p_trigger, chunk, (uint32_t)(body_end - chunk), interpolate);
++    if (part != NULL) {
++      part = parse_fstring_fold(p_parser, &p_trigger, acc, part);
++    }
++    if (part == NULL) {
++      ast_dispatch_deinit((ast_node*)acc);
++      alloc->release(alloc, acc);
++      return NULL;
++    }
++    acc = part;
++  }
++  return acc;
++}
++
+ ast_expression* parse_number(parser* p_parser, token p_trigger) {
+   allocators* alloc = p_parser->alloc;
+   ast_number_expression* number = (ast_number_expression*)alloc->allocate(alloc, sizeof(ast_number_expression));
+@@ -719,6 +1031,9 @@ static bool token_starts_expression(token_type p_type) {
+   case TOKEN_IDENTIFIER:
+   case TOKEN_NUMBER:
+   case TOKEN_STRING:
++  case TOKEN_FSTRING:
++  case TOKEN_MSTRING:
++  case TOKEN_FMSTRING:
+   case TOKEN_LEFT_PAREN:
+   case TOKEN_LEFT_BRACE:
+   case TOKEN_LEFT_BRACKET:
+diff --git a/src/oktoken.h b/src/oktoken.h
+index b4907dd..f06723e 100644
+--- a/src/oktoken.h
++++ b/src/oktoken.h
+@@ -55,6 +55,9 @@
+   X(TOKEN_IDENTIFIER, "identifier")                                                                                    \
+   X(TOKEN_NUMBER, "number")                                                                                            \
+   X(TOKEN_STRING, "string")                                                                                            \
++  X(TOKEN_FSTRING, "f-string")                                                                                         \
++  X(TOKEN_MSTRING, "multiline string")                                                                                 \
++  X(TOKEN_FMSTRING, "multiline f-string")                                                                              \
+   X(TOKEN_PRINT, "print")                                                                                              \
+   X(TOKEN_IMPORT, "import")                                                                                            \
+   X(TOKEN_FROM, "from")                                                                                                \
+@@ -143,6 +146,9 @@ typedef enum {
+   TOKEN_IDENTIFIER,
+   TOKEN_NUMBER,
+   TOKEN_STRING,
++  TOKEN_FSTRING,
++  TOKEN_MSTRING,
++  TOKEN_FMSTRING,
+ 
+   TOKEN_PRINT,
+   TOKEN_IMPORT,
+diff --git a/src/okvm.c b/src/okvm.c
+index c721324..83a82a6 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -1115,6 +1115,25 @@ perform_negate(vm* p_vm, register_file* p_reg, call_frame* p_frame, uint16_t p_d
+   return res;
+ }
+ 
++// the P3 interpolation conversion: exactly the `as str` builtin lane (as_str),
++// reached from OP_TOSTRING. the conversion allocates but never runs nested
++// script, so the caller needs no REFRESH_AFTER_NESTED; every as_str arm makes
++// its final allocation last (the C buffer first, the string object second), so
++// no collect can land between the object's creation and the register write.
++static inline bool as_str(vm* p_vm, value p_value, value* p_result);
++static interpret_result perform_to_string(vm* p_vm,
++                                          register_file* p_reg,
++                                          call_frame* p_frame,
++                                          uint16_t p_dest,
++                                          value p_on) {
++  value out;
++  if (!as_str(p_vm, p_on, &out)) {
++    return (interpret_result){.status = RUNTIME_ERROR, .top_level_return = NULL_AS_VALUE()};
++  }
++  p_reg->array.data[p_frame->registers_base + p_dest] = out;
++  return (interpret_result){.status = RUNTIME_OK, .top_level_return = NULL_AS_VALUE()};
++}
++
+ // the numeric union: doubles and the int48 lane, one comparison point. the
+ // int48 payload converts to double exactly (2^48 < 2^53), so mixed compares
+ // through f64 lose nothing.
+@@ -3468,6 +3487,8 @@ static void* ok_dispatch_table[OP__COUNT] = {
+   [OP_NOT_LONG] = &&L_OP_NOT_LONG,
+   [OP_NEGATE] = &&L_OP_NEGATE,
+   [OP_NEGATE_LONG] = &&L_OP_NEGATE_LONG,
++  [OP_TOSTRING] = &&L_OP_TOSTRING,
++  [OP_TOSTRING_LONG] = &&L_OP_TOSTRING_LONG,
+   [OP_ADD] = &&L_OP_ADD,
+   [OP_ADD_LONG] = &&L_OP_ADD_LONG,
+   [OP_SUBTRACT] = &&L_OP_SUBTRACT,
+@@ -4044,6 +4065,27 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       REFRESH_AFTER_NESTED();
+       DISPATCH();
+     }
++    CASE(OP_TOSTRING): {
++      const bool p = p_of(instruction);
++      const uint16_t ap = aprime_of(instruction);
++      const uint16_t bp = bprime_of(instruction);
++      interpret_result res = perform_to_string(p_vm, reg, frame, ap, resolve_operand(frame, reg, bp, p));
++      if (res.status != RUNTIME_OK) {
++        FAIL_PATH();
++      }
++      DISPATCH();
++    }
++    CASE(OP_TOSTRING_LONG): {
++      const word2 words = JOIN_WORD(instruction);
++      const bool p = p_of(instruction);
++      const uint16_t A = A_of(words);
++      const uint16_t B = B_of(words);
++      interpret_result res = perform_to_string(p_vm, reg, frame, A, resolve_operand(frame, reg, B, p));
++      if (res.status != RUNTIME_OK) {
++        FAIL_PATH();
++      }
++      DISPATCH();
++    }
+     CASE(OP_ADD): {
+       const bool p = p_of(instruction);
+       const uint8_t a = a_of(instruction);
+diff --git a/tests/e2e/tests/strings/errors/dollar_escape_refused.ok b/tests/e2e/tests/strings/errors/dollar_escape_refused.ok
+new file mode 100644
+index 0000000..799942e
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/dollar_escape_refused.ok
+@@ -0,0 +1,4 @@
++// the escape set is fixed: `\$` is refused in plain strings AND in m""
++// (same set as normal strings for predictability). only the interpolating
++// lanes take it - see strings/fstring_escapes.ok.
++print "\$"; // expect error: unknown escape '\$'.
+diff --git a/tests/e2e/tests/strings/errors/empty_interpolation.ok b/tests/e2e/tests/strings/errors/empty_interpolation.ok
+new file mode 100644
+index 0000000..384ee67
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/empty_interpolation.ok
+@@ -0,0 +1 @@
++print f"${}"; // expect error: an interpolation wants an expression - '${}' is empty.
+diff --git a/tests/e2e/tests/strings/errors/format_spec_reserved.ok b/tests/e2e/tests/strings/errors/format_spec_reserved.ok
+new file mode 100644
+index 0000000..557c019
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/format_spec_reserved.ok
+@@ -0,0 +1,4 @@
++// no format-spec mini-language: ':' after the expression is reserved and
++// errors for now, so a later spec addition breaks nobody.
++let n = 5;
++print f"${n:03d}"; // expect error: a ':' after the interpolation's expression is reserved
+diff --git a/tests/e2e/tests/strings/errors/junk_after_expression.ok b/tests/e2e/tests/strings/errors/junk_after_expression.ok
+new file mode 100644
+index 0000000..225e94b
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/junk_after_expression.ok
+@@ -0,0 +1,2 @@
++let a = 1;
++print f"${a b}"; // expect error: expected the interpolation to end with its '}'.
+diff --git a/tests/e2e/tests/strings/errors/mf_is_an_identifier.ok b/tests/e2e/tests/strings/errors/mf_is_an_identifier.ok
+new file mode 100644
+index 0000000..5f45f00
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/mf_is_an_identifier.ok
+@@ -0,0 +1,4 @@
++// the P3 prefix scan: only immediate adjacency counts, and fm is the ruled
++// stacking order - mf"..." stays the identifier `mf` beside a plain string,
++// which is not a program.
++let x = mf"hi"; // expect error: expected ';' after let declaration.
+diff --git a/tests/e2e/tests/strings/errors/newline_in_single_line.ok b/tests/e2e/tests/strings/errors/newline_in_single_line.ok
+new file mode 100644
+index 0000000..2cc3a17
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/newline_in_single_line.ok
+@@ -0,0 +1,6 @@
++// a single-line string (f" or plain ") dies at its raw newline; the error
++// names the opening line (line 5 here), not the line the newline was
++// found on.
++print "before";
++print f"crosses
++a line"; // expect error: 5:7: error: unterminated string.
+diff --git a/tests/e2e/tests/strings/errors/unknown_chunk_escape.ok b/tests/e2e/tests/strings/errors/unknown_chunk_escape.ok
+new file mode 100644
+index 0000000..f6ee4cb
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/unknown_chunk_escape.ok
+@@ -0,0 +1,3 @@
++// a chunk with a backslash rides the shared unescape lane; unknown escapes
++// never pass silently on any lane.
++print f"bad \q escape"; // expect error: unknown escape '\q'.
+diff --git a/tests/e2e/tests/strings/errors/unterminated_interpolation.ok b/tests/e2e/tests/strings/errors/unterminated_interpolation.ok
+new file mode 100644
+index 0000000..701c798
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/unterminated_interpolation.ok
+@@ -0,0 +1,4 @@
++// the region never closed, so the string never closed either - the lexer's
++// wall is the source's end, and the error names the string's opening.
++print f"before";
++print f"a${x"; // expect error: 2:7: error: unterminated string.
+diff --git a/tests/e2e/tests/strings/errors/unterminated_mstring.ok b/tests/e2e/tests/strings/errors/unterminated_mstring.ok
+new file mode 100644
+index 0000000..9f4b08a
+--- /dev/null
++++ b/tests/e2e/tests/strings/errors/unterminated_mstring.ok
+@@ -0,0 +1,7 @@
++// the m"" ruling: the unterminated error names the OPENING line (line 4
++// here), not whatever line the wall was found on.
++print "before";
++print m"starts here
++and runs
++and never
++ends // expect error: 4:7: error: unterminated string.
+diff --git a/tests/e2e/tests/strings/fmstring.ok b/tests/e2e/tests/strings/fmstring.ok
+new file mode 100644
+index 0000000..3890c33
+--- /dev/null
++++ b/tests/e2e/tests/strings/fmstring.ok
+@@ -0,0 +1,23 @@
++// fm"" stacks both rulings: the m"" multiline body (literal newlines, no
++// dedent) with the f"" interpolation (regions may span the newlines, and
++// the tokens after the literal anchor to their real lines). fm is the
++// ruled stacking order; mf"..." is the identifier `mf` beside a plain
++// string (see errors/mf_is_an_identifier.ok).
++let n = 7;
++print fm"first ${n}
++second ${n + 1}
++third"; // expect: first 7
++// expect: second 8
++// expect: third
++let block = fm"
++  header: ${n}
++  footer
++";
++print len(block); // expect: 22
++print fm'quotes ${"both"} ways'; // expect: quotes both ways
++print fm"a region can
++span ${1 +
++2} lines"; // expect: a region can
++// expect: span 3 lines
++print fm"deep ${ f"x${ fm"y${n}" }" } end"; // expect: deep xy7 end
++print "line anchoring after"; // expect: line anchoring after
+diff --git a/tests/e2e/tests/strings/fstring.ok b/tests/e2e/tests/strings/fstring.ok
+new file mode 100644
+index 0000000..e72b80d
+--- /dev/null
++++ b/tests/e2e/tests/strings/fstring.ok
+@@ -0,0 +1,27 @@
++// the P3 basics: ${} interpolates, everything else is literal. a $ not
++// followed by { is just a dollar, plain chunks stay plain, and the whole
++// literal desugars to string + to_string(expr) chains.
++let name = "ok";
++let n = 42;
++print f"hello ${name}!"; // expect: hello ok!
++print f"n = ${n}, doubled = ${n * 2}"; // expect: n = 42, doubled = 84
++print f"sum: ${1 + 2}"; // expect: sum: 3
++print f"arithmetic rides any expression: ${n > 40}"; // expect: arithmetic rides any expression: true
++print f"no interpolation here"; // expect: no interpolation here
++print f""; // expect:
++print f"$"; // expect: $
++print f"a$ b"; // expect: a$ b
++print f"${n}${n + 1}"; // expect: 4243
++print f"${"a literal region"}"; // expect: a literal region
++print f"leading ${n}"; // expect: leading 42
++print f"${n} trailing"; // expect: 42 trailing
++print f"a${n}b${n}c"; // expect: a42b42c
++print f"null is ${null}"; // expect: null is null
++print f"bools ${true} ${false}"; // expect: bools true false
++print f"doubles ${1.5} ${0.1 + 0.2}"; // expect: doubles 1.5 0.3
++print f"array: ${[1, 2, 3]}"; // expect: array: [1, 2, 3]
++let m = {"key": "value"};
++print f"map: ${m}"; // expect: map: {key: value}
++print f"member: ${m["key"]}"; // expect: member: value
++let outer = f"outer ${f"inner ${1 + 1}"} rest";
++print outer; // expect: outer inner 2 rest
+diff --git a/tests/e2e/tests/strings/fstring_escapes.ok b/tests/e2e/tests/strings/fstring_escapes.ok
+new file mode 100644
+index 0000000..b73e3af
+--- /dev/null
++++ b/tests/e2e/tests/strings/fstring_escapes.ok
+@@ -0,0 +1,17 @@
++// full escaping at string level only, never any lower layer's. the f lane
++// adds exactly one form to the set: `\${` writes the literal dollar-brace
++// (and a `\$` can only mean a plain dollar); everything else is the fixed
++// set plain strings already keep.
++print f"literal \${not a region}"; // expect: literal ${not a region}
++print f"escaped dollar \$5"; // expect: escaped dollar $5
++print f"tab\there"; // expect: tab	here
++print f"nl${1}"; // expect: nl1
++print len(f"a\nb"); // expect: 3
++print len(f"\t${1}"); // expect: 2
++print f"\u{1F600} ok"; // expect: 😀 ok
++print len(f"\u{1F600}!"); // expect: 2
++print f"quotes \" and ' inside"; // expect: quotes " and ' inside
++print f"back\\slash ${1}"; // expect: back\slash 1
++print f"\${1} is not an interpolation"; // expect: ${1} is not an interpolation
++let key = "k";
++print f"\$${key}"; // expect: $k
+diff --git a/tests/e2e/tests/strings/fstring_nesting.ok b/tests/e2e/tests/strings/fstring_nesting.ok
+new file mode 100644
+index 0000000..f1b9212
+--- /dev/null
++++ b/tests/e2e/tests/strings/fstring_nesting.ok
+@@ -0,0 +1,20 @@
++// the nesting rulings: expressions nest with brace tracking, so quoted
++// strings inside interpolations work - a brace hidden in a region's string
++// never closes the region, braces nest (map literals), comments hide theirs
++// to the newline, and an f-string inside a region takes the whole ride one
++// level down.
++fu first(s) {
++    return s;
++}
++
++print f"${first("}")}abc"; // expect: }abc
++print f"${first('{')}"; // expect: {
++let m = {"a": 1};
++print f"map literal nests: ${ {"a": 1} }"; // expect: map literal nests: {a: 1}
++print f"subscript rides it: ${m["a"]}"; // expect: subscript rides it: 1
++print f"deep ${ f"a${ f"b${ 3 }c" }d" } e"; // expect: deep ab3cd e
++print fm"comment ${1 // a comment hides the brace on this line
+++ 2} tail"; // expect: comment 3 tail
++print f"quotes either way: ${first(' "') }"; // expect: quotes either way:  "
++print f"${[1, [2, 3]]}"; // expect: [1, [2, 3]]
++print f"${ {"in": {"out": true}} }"; // expect: {in: {out: true}}
+diff --git a/tests/e2e/tests/strings/mstring.ok b/tests/e2e/tests/strings/mstring.ok
+new file mode 100644
+index 0000000..8a78bf4
+--- /dev/null
++++ b/tests/e2e/tests/strings/mstring.ok
+@@ -0,0 +1,24 @@
++// the m"" ruling: same escape set as normal strings for predictability
++// (so `\$` stays refused - see errors/dollar_escape_refused.ok), literal
++// newlines, no dedent magic, either quote char. an m"" with no ${} in its
++// body is just a string that happens to hold newlines.
++let ml = m"line one
++line two";
++print ml; // expect: line one
++// expect: line two
++print len(ml); // expect: 17
++let indented = m"
++  no dedent magic
++";
++print len(indented); // expect: 19
++print m'also single
++quoted'; // expect: also single
++// expect: quoted
++print m"escapes\nride\tthe same set"; // expect: escapes
++// expect: ride	the same set
++print m"braces { } are literal bytes"; // expect: braces { } are literal bytes
++print m"dollars $ stay dollars"; // expect: dollars $ stay dollars
++let with_quote = m"a \"quoted\" word";
++print with_quote; // expect: a "quoted" word
++print m"\u{1F600}"; // expect: 😀
++print "after"; // expect: after

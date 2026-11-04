@@ -463,3 +463,28 @@ codepoint-first iteration/index, len = codepoints cached on the interned
 header, the string-scanner rework + \u{} escapes, and the for-slot
 call-window fix the conformance check exposed. gates: e2e 530x7, unit
 54-check oktest_utf8, capi 325x5, delta blue flat. P3 next.]
+
+[session 43: P3 part one DELIVERED as patch 55 - f"" interpolation +
+m""/fm"" multiline. the shape: an f-string stays ONE token, and its
+interpolation extents come from ONE byte scanner both the lexer and the
+parser ride (ok_fstring_region_end) - braces nest, quoted strings and
+line comments hide theirs, and a quote riding an f/fm prefix inside a
+region takes the same scan recursively, so `f"${s("}")}"` and friends
+work and the extents can never drift from the token's own boundaries.
+the parser re-opens the token, chunk-splits the body, sub-parses each
+${...} region with a region-anchored lexer (the closing brace is the
+sub-parse's EOF wall, positions stay absolute), and desugars the whole
+literal to string + to_string(expr) chains over the existing infix ADD -
+OP_TOSTRING/OP_TOSTRING_LONG are exactly the as str lane in opcode form,
+constant operands included (f"${1}" never materializes the 1). the
+rulings all landed: `\${` the literal dollar-brace (f lanes only - plain
+strings and m"" keep the fixed escape set and refuse `\$`), `$` without
+`{` just a dollar, braces literal in bodies, NO format-spec language
+(`:` after the expression is a located reserved error), mf" stays the
+identifier `mf`, the unterminated errors name the opening line, and
+newline-in-single-line still dies. 14 new fixtures under strings/
+(incl. 9 error lanes; the m"" opening-line and the line-anchoring
+rulings are pinned by substring on the reported line:col). gates: e2e
+544x7 (530 + the 14), unit 5x3, capi 325x5, cli 10/10, delta blue
+flat. P3 remainder - the str method toolkit + std.math + the
+deprecation windows - rides as patch 56.]
