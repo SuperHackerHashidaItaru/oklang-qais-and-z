@@ -1240,3 +1240,92 @@ non-native members - worth one? (2) the toolkit's semantic calls are
 mine, documented above: split's required separator, join's strings-only
 membership, index_of's null-for-absent, the ASCII-only case fold. veto
 any and patch 57 amends.
+
+## 57 — the math constants lane (pi, e join the registry)
+
+Q's answer came back same-day: worth it before v1 "if it is not very
+complex to make". it was not complex, because the registry turned out
+to be value-blind: build_namespace harvests hidden globals into the
+namespace's field slots without ever asking what a value IS, so the
+"registry lane for non-native members" needed no new machinery - two
+table rows pointing at hidden NUMBER globals, the same leading-space
+lane the natives ride (the print_fn precedent holds: no flat pi, no
+pi(), the module door only).
+
+the constants themselves are spelled to full precision in ok.c
+(OK_MATH_PI, OK_MATH_E) because the C library's M_PI family is POSIX,
+not c99, and the strict gate hides it - and both literals were verified
+against the library's own doubles at patch time (both round to the
+correctly-rounded values). ok_define_math_natives grew the two numbers
+and got the honest rename: ok_define_math_members. the struct comment
+in okmodules.c now says the truth it always lived: "a member is a
+value, native or not."
+
+the OPEN pin resolved honestly: from_missing.ok expected std/math to
+lack pi (the 56 marker). pi exists now, so the pin moved to nan - and
+nan is the PERMANENT spelling: the no-NaN doctrine (finite in, finite
+out, nothing crosses back into script) means std/math can never export
+it. the pin can never go stale again.
+
+math.ok grows 13 pins: the values, arithmetic on them, comparisons,
+floor/sin/log compositions (sin(pi) pinned at its honest 1.22465e-16 -
+the double's own rounding, no fake zero; log(e) exact), both door
+spellings, and the from-import door carrying them like any member.
+
+Q's other ruling this round: the P3 semantic calls STAND as documented
+(split's required separator, join's strings-only membership, index_of's
+null-for-absent, the ASCII-only case fold) - "yes i agree for your
+rulings for now".
+
+receipts: e2e 560x7 (count unchanged - the pins ride the existing
+fixture), unit + embed 5x3, capi 325x5, cli 10/10, delta blue correct
+at 1.40654e7 and flat (1.92x/1.87x of the standing 1.93x). applies on
+reconciliation at 54fd30f (patch 56's landing; replay clean).
+
+## 58 — the complete escape set (\a \b \e \f \v \0 \xNN)
+
+Q's question: "support for all ansi escapes like the color commands \x
+and all those, shouldnt we do it all?" - yes, and it landed as one
+parser-side switch extension. the scanner needed nothing: it has been
+meaning-free since the P2 rework (a backslash never closes anything),
+so the token shape is unchanged and the tree-sitter grammar is
+untouched.
+
+the set: \a \b \e \f \v (the C controls plus \e - 0x1B, the terminal
+escape byte; the front door keeps raw control bytes out of source, so
+the escape is the only door in, and the ANSI color spellings ride it:
+"\x1B[31m" and "\e[31m" are both now spellable), \0 (exactly the nul
+byte), and \xNN (one or two hex digits - the same bounded-count shape
+as \u{}'s 1-6, the house style).
+
+the two honest limits, both located errors: (1) \x stops at ascii
+(0x7F) - a literal only ever produces valid utf-8, and a high \x byte
+would build exactly the malformed utf-8 the front door refuses as raw
+source; \u{} is the codepoint escape, the message says so. (2) no
+octal - a digit after \0 is refused ("C's \01 silent trap"; \x01 spells
+such bytes). \? stays refused like any unknown: the trigraph fossil has
+no use here, and accepting GNU's \e while refusing \? is deliberate -
+\e earns its keep, \? has none.
+
+one subtlety earned its own rule: a hex-looking byte after two digits
+("\x123") is exactly the ambiguity the \u{} braces exist to kill, so
+\x refuses it the same way ("takes at most two hex digits" - the "at
+most six" precedent), with the check ordered last so "\xC0ffee"
+reports its real error (the ascii ceiling) and not the trailing-hex
+coincidence.
+
+fixtures: escapes.ok +15 (every new escape pinned against its \u{}
+spelling - the \r precedent: control bytes never ride the expect lane
+raw - plus the ANSI receipt itself, and len() over the whole set),
+fstring_escapes.ok +2 (the chunk lane shares the unescape, so the new
+escapes ride inside interpolations too), and four error lanes
+(x_no_hex, x_above_ascii, x_three_digits, octal_refused).
+
+receipts: e2e 564x7 (560 + 4), unit + embed 5x3, capi 325x5, cli
+10/10, delta blue correct at 1.40654e7 and flat (1.93x/1.88x of the
+standing 1.93x). applies on 57 (which applies on 54fd30f); the stacked
+replay is clean.
+
+a note for future rounds: the tool-result display strips SGR-looking
+sequences ("\x1B[31m" vanishes from view, files untouched) - verify
+ANSI fixture content with grep -cF, never by eye.

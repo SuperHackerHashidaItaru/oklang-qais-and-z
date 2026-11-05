@@ -2434,3 +2434,79 @@ ROADMAP-0.9.0-draft) and the round summaries.]
   marker, this entry, the push. the wave is 3/7. next: P4 (fs/env/
   clock behind OK_CAP_HOST), then P5 (parser hardening + fuzz), P6
   (optimization), P7 (REPL + the GC attempt).
+
+## session 44 (2026-11-05): the two loose ends tied (57, 58)
+
+- context: Q's round approved both OPEN items - the math constants
+  ("worth it before v1 if it is not very complex to make") and the P3
+  semantic calls ("yes i agree for your rulings for now") - and asked
+  the escape question: "support for all ansi escapes like the color
+  commands \x and all those, shouldnt we do it all?" plus "why the \u
+  requires {}". patch 56's landing was confirmed on reconciliation
+  (54fd30f "string methods and math, and deprecation").
+- the landing verified first, per protocol: zero drift (the sandbox
+  tree over f05445a diffs EMPTY against 54fd30f - the hand-application
+  byte-identical again), the clone reset onto the tip, every gate
+  re-run on the landing: 9/9 flavors, e2e 560x7, unit + embed 5x3,
+  capi 325x5, cli 10/10, delta blue correct at 1.40654e7 and flat
+  (1.92x/1.87x of the standing 1.93x).
+- patch 57, the constants: the registry was value-blind all along -
+  build_namespace harvests hidden globals into field slots without
+  asking what the value IS, so the "non-native member lane" was two
+  table rows + two hidden NUMBER globals (ok_global_define, immutable,
+  leading-space names, no flat spelling - the print_fn precedent).
+  OK_MATH_PI / OK_MATH_E spelled to full precision because M_PI is
+  POSIX not c99 and the strict gate hides it; both literals verified
+  against the library's own doubles (correctly rounded). the honest
+  rename rode along: ok_define_math_natives -> ok_define_math_members.
+  from_missing.ok's pin moved pi -> nan, and nan is PERMANENT: the
+  no-NaN doctrine means std/math can never export it, the pin can
+  never go stale again. math.ok +13 pins (sin(pi) honestly 1.22465e-16
+  - the double's own rounding, no fake zero; log(e) exact; from-import
+  carries them). receipts: e2e 560x7, all lanes green, replay clean on
+  54fd30f.
+- patch 58, the escape set (Q's "do it all"): \a \b \e \f \v \0 \xNN
+  in the parser's unescape switch - one switch, all four quote flavors
+  and the f-string chunk lane share it, the scanner untouched
+  (meaning-free since P2: a backslash never closes anything, so the
+  token shape is unchanged and tree-sitter is untouched). \e is 0x1B -
+  the terminal escape byte, the ANSI color spellings ride it
+  ("\x1B[31mred\x1B[0m" and "\e[31mred\e[0m" both pinned against
+  their \u{1B} spellings). the honest limits, both located errors: \x
+  stops at ascii 0x7F (literals only ever produce valid utf-8 - a high
+  byte would build the malformed utf-8 the front door refuses as raw
+  source; \u{} is the codepoint door, the error says so), and no octal
+  (a digit after \0 refused - C's "\01" silent trap; \x01 spells such
+  bytes). \? refused like any unknown: the trigraph fossil has no use,
+  and accepting GNU's \e while refusing \? is deliberate (\e earns its
+  keep). the subtlety that earned its own rule: a hex-looking byte
+  after two digits ("\x123") is the ambiguity the \u{} braces kill, so
+  \x refuses it ("takes at most two", the "at most six" precedent),
+  check ordered LAST so "\xC0ffee" reports its real error (the ascii
+  ceiling) and not the trailing-hex coincidence. fixtures: escapes.ok
+  +15 (the \r precedent: control bytes never ride the expect lane raw,
+  every new escape pinned against its \u{} spelling), fstring_escapes
+  +2 (the chunk lane shares the unescape), 4 error lanes (x_no_hex,
+  x_above_ascii, x_three_digits, octal_refused). receipts: e2e 564x7
+  (560 + 4), all lanes green, the stacked replay (57 then 58 on
+  54fd30f) clean, delta blue flat (1.93x/1.88x).
+- the \u{} answer (Q's question, recorded for the docs): braces are
+  REASON not preference. (1) fixed-width \uXXXX cannot reach above the
+  BMP without surrogate pairs - which the language bans at the gate.
+  (2) unbraced variable-length is the greedy-eat trap ("\u1F600abc" -
+  where does the codepoint end?), and the brace is the explicit
+  terminator. (3) the house symmetry: ${} is the interpolation
+  delimiter, braces as content-delimiter is the language's shape; ES6
+  and Rust both chose \u{...} for the same reasons.
+- the transport lesson (this round's find): the tool-result DISPLAY
+  strips SGR-looking sequences - "\x1B[31m" vanishes from view while
+  the files stay intact. verify ANSI fixture content with grep -cF,
+  never by eye. cost me one false-alarm repair detour; the pins were
+  never mangled.
+- delivered: patches/57-math-constants-registry-lane.patch,
+  patches/58-the-complete-escape-set.patch (+ README entries), the
+  roadmap's session-44 marker, Z-GUIDE's perishable section refreshed,
+  this entry. language side: 3fba974 (57) and e769e9c (58) on the
+  sandbox clone. the wave is 3/7 with P3's tail tied.
+- next: P4 (fs/env/clock behind OK_CAP_HOST), then P5 (parser
+  hardening + fuzz), P6 (optimization), P7 (REPL + the GC attempt).

@@ -52,19 +52,20 @@ source of truth: `https://codeberg.org/qais/oklang`, master at `9ad153c`,
 **tagged v0.1.0**. the `register` branch is history — deletion pending Q's
 confidence, don't touch it.
 
-current phase [perishable — refresh at round end] (nov 4, session 43):
+current phase [perishable — refresh at round end] (nov 5, session 44):
 the 0.9.0 wave (Reconciliation, P1-P7) is in flight to v1.0-rc, landing
 on Q's hand-applied `reconciliation` branch on codeberg: P1+P2 (patches
-53-54) ride 057309c, P3 part one (patch 55, f"" interpolation +
-m""/fm"" multiline) landed as f05445a — zero drift, gates green on the
-landing (e2e 544x7). patch 56 (P3 complete: the str method toolkit +
-std.math + the deprecation windows) is DELIVERED, awaiting Q's hand —
-two OPEN items ride it (math constants want a registry lane; the
-toolkit's semantic calls: split's required separator, join's
-strings-only membership, index_of's null-for-absent, the ASCII-only
-case fold). the wave is 3/7 when it lands. next: P4 (fs/env/clock
-behind OK_CAP_HOST), P5 (parser hardening + fuzz), P6 (optimization),
-P7 (REPL + the GC attempt). master still sits at v0.4.0 ON PURPOSE: the
+53-54) ride 057309c, patch 55 (f"" interpolation + m""/fm"" multiline)
+landed as f05445a, patch 56 (P3 complete: the str method toolkit +
+std.math + the deprecation windows) landed as 54fd30f — both zero
+drift, gates green on the landings (544x7, then 560x7). patches 57
+(the math constants lane: pi + e, the registry was value-blind so it
+was two table rows + hidden number globals) and 58 (the complete escape
+set: \a \b \e \f \v \0 \xNN, \x ascii-capped, no octal) are
+DELIVERED, stack clean on 54fd30f, awaiting Q's hand. P3's semantic
+calls STAND (Q agreed). the wave is 3/7 with P3's tail tied. next: P4
+(fs/env/clock behind OK_CAP_HOST), P5 (parser hardening + fuzz), P6
+(optimization), P7 (REPL + the GC attempt). master still sits at v0.4.0 ON PURPOSE: the
 ruled release plan (ROADMAP-0.9.0-draft) runs the wave to rc, then the
 review + amend pass, then releases v0.5.0 → v1.0.0 as their own cuts —
 the git mechanics are `docs/drafts/RELEASE-RUNBOOK.md` (round two

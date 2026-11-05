@@ -1,0 +1,136 @@
+diff --git a/src/ok.c b/src/ok.c
+index e59d65a..b1acd99 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -866,9 +866,19 @@ static ok_value native_math_idiv(ok* p_ok, uint8_t p_argc, const ok_value* p_arg
+   return NUMBER_AS_VALUE(trunc(a / b));
+ }
+ 
+-// the hidden globals std.math's registry rows harvest. never seeded flat:
+-// the module is the only door (the print_fn precedent).
+-static bool ok_define_math_natives(ok* p_ok) {
++// the constants (the registry's non-native lane, Q-approved for v1):
++// std.math's pi and e. spelled to full precision - the C library's M_PI
++// family is POSIX, not c99, and the strict gate hides it - and both
++// literals round to the correctly-rounded doubles (verified against the
++// library's own values at patch time).
++#define OK_MATH_PI 3.14159265358979323846
++#define OK_MATH_E 2.71828182845904523536
++
++// the hidden globals std.math's registry rows harvest - the functions,
++// and since the constants lane the numbers too (the harvest never cared
++// what a hidden global holds; only the table rows say). never seeded
++// flat: the module is the only door (the print_fn precedent).
++static bool ok_define_math_members(ok* p_ok) {
+   bool status = true;
+ #define MATH_GLOBAL(id, ...)                                                                                           \
+   status &= ok_global_define_native_function(                                                                          \
+@@ -880,6 +890,16 @@ static bool ok_define_math_natives(ok* p_ok) {
+       p_ok, ok_create_string_view(" atan2", OK_STRING_VIEW_CALCULATE_LENGTH, true), 2, native_math_atan2);
+   status &= ok_global_define_native_function(
+       p_ok, ok_create_string_view(" idiv", OK_STRING_VIEW_CALCULATE_LENGTH, true), 2, native_math_idiv);
++  // the constants ride the same hidden lane: plain immutable numbers,
++  // unreachable flat (the leading space), harvested by the std table.
++  status &= ok_global_define(p_ok,
++                             ok_create_string_view(" pi", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                             NUMBER_AS_VALUE(OK_MATH_PI),
++                             false);
++  status &= ok_global_define(p_ok,
++                             ok_create_string_view(" e", OK_STRING_VIEW_CALCULATE_LENGTH, true),
++                             NUMBER_AS_VALUE(OK_MATH_E),
++                             false);
+   return status;
+ }
+ 
+@@ -1102,7 +1122,7 @@ ok* ok_create(ok_specs p_specs) {
+     ok_free(okay);
+     return NULL;
+   }
+-  if (!ok_define_math_natives(okay)) { // std.math's hidden globals (P3)
++  if (!ok_define_math_members(okay)) { // std.math's hidden globals: the natives (P3), the constants (57)
+     ok_free(okay);
+     return NULL;
+   }
+diff --git a/src/okmodules.c b/src/okmodules.c
+index 2fb5e0c..a7565c9 100644
+--- a/src/okmodules.c
++++ b/src/okmodules.c
+@@ -1296,12 +1296,14 @@ static ok_result load_module(module_system* p_modules,
+ 
+ // the built-in std registry. the std root resolves against this table ONLY
+ // (M8): never the filesystem, never OKPATH, nothing can shadow it. the
+-// members are the same native function objects the flat spellings use,
+-// harvested from their hidden globals into the same sealed-namespace shape
++// members are values harvested from their hidden globals into the same
++// sealed-namespace shape
+ // file modules get, so a std module value IS a module value: same freezes,
+ // same print shape, same from-import probe. math filled with P3 (the
+-// deterministic cmath surface + idiv); str stays empty forever - the ruling
+-// killed it, the toolkit lives on the class.
++// deterministic cmath surface + idiv) and carries the constants lane since
++// 57: pi and e are hidden number globals, harvested exactly like the
++// functions - a member is a value, native or not. str stays empty forever
++// - the ruling killed it, the toolkit lives on the class.
+ typedef struct {
+   const char* export_name;
+   const char* hidden_global;
+@@ -1327,9 +1329,13 @@ static const std_member_def std_map_members[] = {
+ static const std_member_def std_io_members[] = {
+     {"print", " print"},
+ };
+-// std.math (P3): the deterministic cmath surface + the ruled idiv. order
+-// mirrors the X table in ok.c, the three two-argument members last.
++// std.math (P3): the deterministic cmath surface + the ruled idiv. the
++// constants lead (57, the registry's non-native lane): hidden number
++// globals, harvested like the functions. the rest mirrors the X table in
++// ok.c, the three two-argument members last.
+ static const std_member_def std_math_members[] = {
++    {"pi", " pi"},
++    {"e", " e"},
+     {"abs", " abs"},
+     {"floor", " floor"},
+     {"ceil", " ceil"},
+diff --git a/tests/e2e/tests/modules/std/from_missing.ok b/tests/e2e/tests/modules/std/from_missing.ok
+index dd12ae2..4bf15ac 100644
+--- a/tests/e2e/tests/modules/std/from_missing.ok
++++ b/tests/e2e/tests/modules/std/from_missing.ok
+@@ -1,6 +1,7 @@
+-// from-import's missing-export error, pinned against std/math. the P3
+-// fill superseded the old pin (floor exists now): pi is the new missing
+-// name, and that is the honest state - the registry carries natives only,
+-// no constants lane exists (OPEN for Q, not snuck in).
+-from "std/math" import pi;
+-// expect error: module 'std/math' has no pub export 'pi'
++// from-import's missing-export error, pinned against std/math. the pin's
++// own history: floor (until P3 filled it), then pi (the constants lane's
++// OPEN marker, 56), now nan - and nan is the permanent spelling: the
++// no-NaN doctrine (finite in, finite out, nothing crosses back) means
++// std/math can never export it. the pin can never go stale again.
++from "std/math" import nan;
++// expect error: module 'std/math' has no pub export 'nan'
+diff --git a/tests/e2e/tests/modules/std/math.ok b/tests/e2e/tests/modules/std/math.ok
+index 74233af..828237e 100644
+--- a/tests/e2e/tests/modules/std/math.ok
++++ b/tests/e2e/tests/modules/std/math.ok
+@@ -58,3 +58,21 @@ from "std/math" import sqrt;
+ print sqrt(25); // expect: 5
+ from "std/math" import idiv as div;
+ print div(9, 2); // expect: 4
++
++// the constants (57, the registry's non-native lane): plain numbers on the
++// namespace, the module door still the only door - no flat pi, no pi().
++print math.pi; // expect: 3.14159
++print math.e; // expect: 2.71828
++print math.pi * 2; // expect: 6.28319
++print math.pi + math.e; // expect: 5.85987
++print math.e > 2.7; // expect: true
++print math.pi < 3.15; // expect: true
++print math.floor(math.pi); // expect: 3
++// the constants compose with the surface. sin(pi) is honestly ~1.22e-16
++// (the double's own rounding, pinned as-is - no fake zero), log(e) exact
++print math.sin(math.pi); // expect: 1.22465e-16
++print math.log(math.e); // expect: 1
++print std.math.pi == math.pi; // expect: true
++// the from-import door carries them like any member
++from "std/math" import pi, e;
++print pi + e; // expect: 5.85987

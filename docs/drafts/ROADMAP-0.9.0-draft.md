@@ -505,3 +505,22 @@ null-for-absent, the ASCII-only folds) + the math-constants question
 (pi, e need a registry lane for non-native members) ride as OPEN items
 for Q in the patches entry. the wave is 3/7. P4 next: fs/env/clock
 behind OK_CAP_HOST.]
+
+[session 44: the two P3 loose ends TIED (patches 57 + 58, both
+delivered). Q's round: the math constants approved ("worth it before
+v1 if it is not very complex") - and it was not, because the registry
+was value-blind all along: pi and e are hidden NUMBER globals harvested
+by two table rows, no new machinery, no flat spelling, the module door
+only (from_missing's pin moved to nan, permanent under the no-NaN
+doctrine). the P3 semantic calls stand (Q agreed "for now"). the
+escape-set question ("all ansi escapes... shouldnt we do it all?")
+answered with the full set: \a \b \e \f \v \0 \xNN in the parser's
+unescape switch, the scanner untouched (meaning-free by design), with
+the two honest limits - \x stops at ascii (literals produce valid
+utf-8 only, \u{} is the codepoint door) and no octal (\0 is exactly
+nul, digits after it refused). \e is 0x1B: the ANSI color spellings
+ride it. both patches stack clean on 54fd30f (patch 56's landing,
+verified zero-drift this round). gates: e2e 560x7 then 564x7 (4 new
+error lanes), unit + embed 5x3, capi 325x5, cli 10/10, delta blue flat
+(1.92x/1.87x, then 1.93x/1.88x). the wave is 3/7 with P3's tail tied.
+P4 next: fs/env/clock behind OK_CAP_HOST.]
