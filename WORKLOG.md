@@ -2581,3 +2581,100 @@ session holds. the roadmap's series section is re-densed accordingly
   compare+jump fusion, allocation shaving, OP_TAILCALL, the bench
   bridge + baseline column, the incremental GC attempt behind its
   bar). Q applies 59 by hand to reconciliation per the protocol.
+
+## session 46 (2026-11-05): P5 lands - the front door, and the fuzzer earns its keep (60)
+
+- context: the harness cut session 45's tail mid-delivery; this round
+  re-grounded from the reflog + receipts first (the protocol's third
+  save this wave). Q confirmed 59's landing ("alright applied and
+  pushed") and ruled the standing note: "later we have to refine this
+  and all the posix touching things to allow for full pure c99 builds
+  (lowest common denominator) at compile time, but not now, it can be
+  done in isolation so it is ok to push it later, just keep it
+  recorded (something like what lua does to stay complient)" - recorded
+  below as the portability lane, deliberately untouched this round.
+- the bb740c0 receipt: fetch + reset onto Q's "fs/sys/en"; zero drift
+  (git diff 65d8885 bb740c0 is EMPTY - the hand-application
+  byte-identical again, the fourth landing in a row); the session-45
+  matrix on 65d8885 therefore IS the landed tree's receipt (585x7,
+  capi 334x5, delta flat). the mid-work the cutoff swallowed (the
+  arena + lexer scan cap + parser recovery, ~213 lines with fixtures
+  drafted) survived in the tree and was the round's starting point.
+- patch 60, P5 whole (the condensation ruling's second fruit - four
+  deliveries, one patch, one session):
+  - the hardening: the parse arena (okarena.c/h - the whole AST rides
+    chained 16 KiB blocks, release is a no-op, parse_result_deinit is
+    a block walk: failed parses cannot leak, deep trees exit
+    iteratively, no lifetimes moved); the shared depth funnel (200,
+    the lua number) over expressions + statements + f-string regions,
+    with the byte scanner's own nesting cap; the report cap (25 + one
+    closing line, then silent unwind); nesting-aware statement-
+    boundary recovery (sync stops AT the closing brace inside blocks,
+    lex errors recover - the offending byte is consumed before the
+    error token, so the loops cannot spin). the fourth class (bounded
+    peek/eat) closed by audit: streaming one-lookahead, one advance()
+    helper, no raw indexes exist to bound.
+  - the fuzzer: tests/fuzz, zero-dep, deterministic splitmix64, byte
+    mutations over the committed 16-seed corpus + synthesized soup,
+    lexer/parser/compiler only (never the vm), instance recycled
+    every 256 inputs, the location bar validated through a new
+    internal okdiag sink. standing gate lane: 20k x gcc+asan,
+    byte-identical summaries.
+  - FOUR REAL FINDS, all pre-existing on the landed tree, all found
+    day one: (1) `f"${}"` segfaults (parse_fstring's NULL acc into
+    ast_dispatch_deinit); (2) `let x st;` walks uninitialized bytes
+    as a node (the deferred null-initializer in parse_let_declaration
+    - a failed ';' check deinit'd a let holding an uninit'd null
+    node); (3) the same disease in build_let_init_from_expression
+    (the for-init lane); (4) `print(+5);` ABORTS - unary plus
+    promised by the tables since the beginning, never compiled; it is
+    the identity now, numeric coercion stays OPEN for Q. the class
+    fixes: dispatch NULL-tolerates, nodes born initialized.
+  - the cross-check lane: --crosscheck writes the committed
+    tests/fuzz/crosscheck-manifest.txt (698 lines, 611 accepts, the
+    native parser's parse-only verdict over both corpora), regen by
+    tests/fuzz/crosscheck.sh; the tree-sitter sweep diffs against it
+    (the patch-16 discipline, grown with the fuzz findings).
+  - the REPL: term.c the posix isolation zone (termios raw editing -
+    arrows, ctrl-left/right word jumps, utf-8 backspace, history
+    capped at 100; non-tty degrades to promptless fgets, which is the
+    e2e lane - the `// repl:` directive in both runners, 8 fixtures);
+    repl.c pure c99 (the walker: brackets, m-strings, regions;
+    auto-print via the silenced trial wrap `print((\n<buf>\n));` -
+    the language's print is the one renderer, runtime errors report
+    one line lower, pinned; ';' suppresses; assignments auto-print
+    their value - they are expressions, pinned). the PERSISTENCE
+    RULING: the repl invents nothing - glob survives the entry (the
+    store already handled multi-run; a tempting compiler-side
+    declarations change was built, found value-corrupting, and
+    reverted - resolution reads the store directly, nothing was
+    needed), plain let is per-entry, imports are per-entry (bindings
+    are spent with their TU - the exit fixture shows the one-liner).
+    sys.exit breaks the loop, the instance still frees, the process
+    answers the code (the stub's exit() leak fixed with it).
+- receipts: builds 9/9, e2e 603/603 x7 (585 -> 603: +9 parser, +1
+  unary plus, +8 repl), unit + embed 5x3, capi 334x5, cli 10/10,
+  fuzz x2 (47702 diagnostics, 0 unlocated, gcc == asan), delta blue
+  correct 1.40654e7 at 1.92x/1.87x - flat. replay: clean on bb740c0,
+  byte-identical (diff empty). language side: 36c0b75 on the sandbox
+  clone's reconciliation, one commit over bb740c0, awaiting Q's hand.
+- THE PORTABILITY LANE (recorded per Q's ruling, deliberately NOT
+  started): refine patch 59's posix surface and ALL posix-touching
+  things for full pure c99 builds at compile time - the lowest common
+  denominator - modeled on lua's compliance approach (platform
+  isolation through one config-shaped header, luaconf-style; posix
+  doors behind feature macros with c99 fallbacks or clean refusals).
+  the known surface today: ok_posix.h + ok_fs/ok_time/ok_env (P4's
+  layers), the loader's dlopen lane, okdiag's stderr, the CLI's
+  posix-isms (term.c is NOW the deliberate isolation zone for the
+  repl's termios - built that way for exactly this lane), build_ok's
+  -pedantic flavors already proving the c99 spelling compiles. to be
+  done in isolation, pushed later, never mid-workstream.
+- delivered: patches/60-p5-the-front-door-hardening-fuzz-crosscheck-
+  and-the-repl.patch (mirrored in download/), its README entry, the
+  roadmap's P5-landed marker, Z-GUIDE's perishable section refreshed,
+  this entry. the wave is 5/7.
+- next: P6 the measurement patch (delta blue's pub-fields rewrite +
+  re-baseline, compare+jump fusion, allocation shaving, OP_TAILCALL,
+  the bench bridge + baseline column, the incremental GC attempt
+  behind its bar). sys.args/name/err remain ruled-in-unscheduled.

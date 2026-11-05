@@ -1375,3 +1375,103 @@ applies on reconciliation after d48edf4. gates: e2e 585/585 x7 (564 ->
 585), capi 334 x5 (325 -> 334), unit + embed x3, cli lane, delta blue
 correct 1.40654e7, 1.95x/1.87x of wren - flat, the hot paths
 untouched.
+
+## 60-p5-the-front-door-hardening-fuzz-crosscheck-and-the-repl.patch
+
+P5, the front-door patch — the wave's biggest, and the fuzzer's
+coming-out party. four deliveries in one workstream:
+
+the hardening (the four classes): the PARSE ARENA — okarena.c/h, a
+region allocator the whole AST rides; parse nodes, list buffers and
+diagnostic temporaries bump out of chained 16 KiB blocks, release is
+a no-op, and parse_result_deinit frees the world in one walk (a
+failed parse can never leak a half-built statement, and a deep tree
+can never overflow the C stack on its way OUT — the depth guard
+bounds the way in, the arena the way out; no lifetimes moved, only
+the shape of the free). the DEPTH GUARDS: one shared counter funnels
+every recursive descent — parse_expression and parse_statement each
+wrap an inner, OK_PARSER_MAX_DEPTH 200 (the lua-shaped
+LUAI_MAXCCALLS number), f-string regions inherit the parent depth,
+and the byte scanner caps its own nesting at the same 200 (a hostile
+f"${f"${f"... chain lands as the clean unterminated-string error).
+the REPORT CAP: 25 diagnostics then one closing line, then the parse
+goes silent and unwinds (counted are rendered reports only). the
+RECOVERY: statement-boundary syncs, nesting-aware — inside a block
+the sync stops AT the closing brace so the structure closes cleanly;
+a lex error mid-stream no longer kills the walk (the byte is
+consumed before the error token, so progress is structural, the
+loops cannot spin); parse_root and compound bodies keep collecting
+diagnostics (and statements) past a bad one. the fourth class —
+bounded peek/eat — closed by design audit: the parser is a streaming
+one-lookahead shape, every consume goes through the one advance()
+helper, tokens are bounded views, no raw index arithmetic exists.
+
+the zero-dep fuzzer (tests/fuzz): corpus-driven, deterministic
+splitmix64 seed loop, byte mutations (flip/insert/delete/
+span-dup/corpus-splice/fragment-splice) over the committed 16-file
+corpus + synthesized token soup, feeding lexer/parser/compiler —
+NEVER the vm (hostile bytes must never become a running program).
+the ok instance recycles every 256 inputs (bounded state bleed).
+the bar rides a new internal okdiag sink: every rendered diagnostic
+must carry a real span (line, column, in-bounds offset) — validated
+in-process, not by scanning stderr. standing gate lane: 20k inputs,
+default seed, gcc + asan, deterministic (identical summary lines).
+it found FOUR real bugs on its first day, all pre-existing on the
+landed tree: (1) `f"${}"` NULL-derefs — parse_fstring passed its
+NULL acc to ast_dispatch_deinit; (2) `let x st;` walks uninitialized
+arena/heap bytes as a node — the deferred null-initializer disease
+(parse_let_declaration passed an uninit'd null node into the let,
+a failed semicolon check deinit'd it); (3) the same disease in
+build_let_init_from_expression (the for-initializer lane); (4)
+`print(+5);` ABORTS — unary plus was promised by the parse rules and
+the operator table since the beginning but never compiled; it is the
+identity now (numeric coercion stays an open ruling). the class
+fixes: ast_dispatch_deinit NULL-tolerates (half-built trees release
+their nulls quietly), and every parser node is born initialized.
+
+the cross-check lane: okfuzz --crosscheck walks the e2e corpus + the
+fuzz corpus and writes the native parser's verdict per file (parse-
+only — the apples-to-apples with a grammar) into the committed
+tests/fuzz/crosscheck-manifest.txt (698 lines, 611 accepts), regen
+by tests/fuzz/crosscheck.sh. the tree-sitter sweep diffs against it;
+drift in either direction is a bug (the patch-16 discipline, grown).
+
+the REPL round: cli/src/term.c is the posix isolation zone (termios
+raw mode, isatty, read — EVERYTHING posix in the cli lives there so
+the eventual pure-c99 lane swaps one file); cli/src/repl.c is the
+pure-c99 semantics. raw-mode editing with arrows, ctrl-left/right
+word jumps (word-run or punctuation-run), utf-8-aware backspace,
+home/end/ctrl-u, ctrl-c (clears a draft, leaves on empty), ctrl-d,
+history ring capped at 100. non-tty stdin degrades to fgets with no
+prompts — the e2e lane pipes fixtures through a bare `ok` (the `//
+repl:` directive, both runners). AUTO-PRINT: a completed buffer not
+ending in ';' is trial-parsed as `print((\n<buffer>\n));` with
+diagnostics silenced (the okdiag sink's second consumer); parses ->
+the wrapped form runs (the language's own print renders the value —
+one renderer, no host-side drift; runtime errors report one line
+lower, the wrapper's own first line — noted, accepted, honest);
+doesn't parse -> the raw buffer runs with its real diagnostics.
+CONTINUATION: a nesting-aware walker (brackets, m-strings,
+interpolation regions, comments — the scanner's rules mirrored)
+keeps the buffer open; a plain string meeting its newline is
+complete (the unterminated error is the honest answer). the
+PERSISTENCE RULING: the repl invents nothing — `glob let x = 10;`
+survives the entry (the store + resolution already handled
+multi-run), plain `let` is a per-entry local of that run's main,
+and imports are per-entry (bindings are TU constants, spent with
+their entry — the fixture shows the import+exit one-liner). the
+exit contract: std.sys's exit breaks the loop, the instance is
+still freed, the process answers with the code.
+
+one honest limit: an assignment is an expression, so a bare
+`count = count + x` auto-prints the assigned value (pinned). and
+the non-tty read is line-capped at 4 KiB — a program wants a file.
+
+applies on reconciliation after bb740c0 (patch 59 landed as Q's
+"fs/sys/en"). gates on its head: builds 9/9 under -Werror, e2e
+603/603 x7 (585 -> 603: +9 parser fixtures, +1 unary plus, +8
+repl), unit + embed 5x3, capi 334x5, cli 10/10, the new fuzz lane
+x2 (20k inputs, 47702 diagnostics, 0 unlocated, gcc == asan
+byte-identical), delta blue correct 1.40654e7 at 1.92x/1.87x —
+flat, the hot paths untouched. replay: applies clean on bb740c0
+and the result is byte-identical (diff empty).

@@ -1,0 +1,4328 @@
+From 36c0b752029e89aeae5c7a3ea1607c48033179e6 Mon Sep 17 00:00:00 2001
+From: z <z@localhost>
+Date: Thu, 5 Nov 2026 04:23:32 +0000
+Subject: [PATCH] P5 the front door: parser hardening (the parse arena, depth
+ guards, report cap, statement-boundary recovery), the zero-dep fuzzer +
+ corpus (four finds fixed: the f-string NULL deinit, two deferred-init walks,
+ unary plus), the cross-check manifest, and the REPL round (termios editing,
+ history, auto-print with ';' suppression, nesting-aware continuation, glob
+ persistence)
+
+---
+ .gitignore                                    |   2 +
+ CMakeLists.txt                                |   1 +
+ README.md                                     |   7 +
+ cli/CMakeLists.txt                            |   2 +
+ cli/src/main.c                                |  39 +-
+ cli/src/repl.c                                | 370 ++++++++++
+ cli/src/repl.h                                |  14 +
+ cli/src/term.c                                | 328 ++++++++
+ cli/src/term.h                                |  39 +
+ src/okarena.c                                 | 111 +++
+ src/okarena.h                                 |  55 ++
+ src/okast.c                                   |   8 +
+ src/okcompiler.c                              |  14 +
+ src/okdiag.c                                  |  22 +
+ src/okdiag.h                                  |  18 +
+ src/oklexer.c                                 |  28 +-
+ src/okmm.c                                    |   2 +
+ src/okmm.h                                    |   3 +
+ src/okparser.c                                | 222 +++++-
+ src/okparser.h                                |  26 +-
+ tests/CMakeLists.txt                          |   1 +
+ tests/e2e/src/main.cpp                        |  26 +-
+ tests/e2e/tests/numbers/unary_plus.ok         |   8 +
+ .../e2e/tests/parser/block_depth_exceeded.ok  | 603 +++++++++++++++
+ tests/e2e/tests/parser/depth_exceeded.ok      |   3 +
+ tests/e2e/tests/parser/depth_within.ok        |   2 +
+ tests/e2e/tests/parser/error_cap.ok           |  42 ++
+ .../e2e/tests/parser/fstring_nest_exceeded.ok |   3 +
+ tests/e2e/tests/parser/lex_error_recovery.ok  |   5 +
+ tests/e2e/tests/parser/recovery_in_block.ok   |   9 +
+ tests/e2e/tests/parser/recovery_two_errors.ok |   6 +
+ .../e2e/tests/parser/unterminated_recovery.ok |   4 +
+ tests/e2e/tests/repl/autoprint_shapes.ok      |  19 +
+ tests/e2e/tests/repl/basic.ok                 |  14 +
+ tests/e2e/tests/repl/empty_entries.ok         |   7 +
+ tests/e2e/tests/repl/errors_breathe.ok        |   9 +
+ tests/e2e/tests/repl/exit.ok                  |   9 +
+ tests/e2e/tests/repl/multiline.ok             |  16 +
+ tests/e2e/tests/repl/persistence.ok           |  15 +
+ tests/e2e/tests/repl/suppression.ok           |   7 +
+ tests/fuzz/CMakeLists.txt                     |  30 +
+ tests/fuzz/corpus/class_shapes.ok             |   9 +
+ tests/fuzz/corpus/comments_only.ok            |   2 +
+ tests/fuzz/corpus/coroutines.ok               |   3 +
+ tests/fuzz/corpus/deep_blocks.ok              |   1 +
+ tests/fuzz/corpus/deep_parens.ok              |   1 +
+ tests/fuzz/corpus/empty.ok                    |   4 +
+ tests/fuzz/corpus/escapes.ok                  |   3 +
+ tests/fuzz/corpus/for_shapes.ok               |   4 +
+ tests/fuzz/corpus/fstring_chain.ok            |   1 +
+ tests/fuzz/corpus/invalid_utf8.bin            |   2 +
+ tests/fuzz/corpus/modules.ok                  |   5 +
+ tests/fuzz/corpus/numbers.ok                  |   4 +
+ tests/fuzz/corpus/operators.ok                |   6 +
+ tests/fuzz/corpus/strings_multiline.ok        |   5 +
+ tests/fuzz/corpus/unterminated.ok             |   3 +
+ tests/fuzz/corpus/utf8.ok                     |   3 +
+ tests/fuzz/crosscheck-manifest.txt            | 698 ++++++++++++++++++
+ tests/fuzz/crosscheck.sh                      |  22 +
+ tests/fuzz/src/fuzz.c                         | 536 ++++++++++++++
+ 60 files changed, 3385 insertions(+), 76 deletions(-)
+ create mode 100644 cli/src/repl.c
+ create mode 100644 cli/src/repl.h
+ create mode 100644 cli/src/term.c
+ create mode 100644 cli/src/term.h
+ create mode 100644 src/okarena.c
+ create mode 100644 src/okarena.h
+ create mode 100644 tests/e2e/tests/numbers/unary_plus.ok
+ create mode 100644 tests/e2e/tests/parser/block_depth_exceeded.ok
+ create mode 100644 tests/e2e/tests/parser/depth_exceeded.ok
+ create mode 100644 tests/e2e/tests/parser/depth_within.ok
+ create mode 100644 tests/e2e/tests/parser/error_cap.ok
+ create mode 100644 tests/e2e/tests/parser/fstring_nest_exceeded.ok
+ create mode 100644 tests/e2e/tests/parser/lex_error_recovery.ok
+ create mode 100644 tests/e2e/tests/parser/recovery_in_block.ok
+ create mode 100644 tests/e2e/tests/parser/recovery_two_errors.ok
+ create mode 100644 tests/e2e/tests/parser/unterminated_recovery.ok
+ create mode 100644 tests/e2e/tests/repl/autoprint_shapes.ok
+ create mode 100644 tests/e2e/tests/repl/basic.ok
+ create mode 100644 tests/e2e/tests/repl/empty_entries.ok
+ create mode 100644 tests/e2e/tests/repl/errors_breathe.ok
+ create mode 100644 tests/e2e/tests/repl/exit.ok
+ create mode 100644 tests/e2e/tests/repl/multiline.ok
+ create mode 100644 tests/e2e/tests/repl/persistence.ok
+ create mode 100644 tests/e2e/tests/repl/suppression.ok
+ create mode 100644 tests/fuzz/CMakeLists.txt
+ create mode 100644 tests/fuzz/corpus/class_shapes.ok
+ create mode 100644 tests/fuzz/corpus/comments_only.ok
+ create mode 100644 tests/fuzz/corpus/coroutines.ok
+ create mode 100644 tests/fuzz/corpus/deep_blocks.ok
+ create mode 100644 tests/fuzz/corpus/deep_parens.ok
+ create mode 100644 tests/fuzz/corpus/empty.ok
+ create mode 100644 tests/fuzz/corpus/escapes.ok
+ create mode 100644 tests/fuzz/corpus/for_shapes.ok
+ create mode 100644 tests/fuzz/corpus/fstring_chain.ok
+ create mode 100644 tests/fuzz/corpus/invalid_utf8.bin
+ create mode 100644 tests/fuzz/corpus/modules.ok
+ create mode 100644 tests/fuzz/corpus/numbers.ok
+ create mode 100644 tests/fuzz/corpus/operators.ok
+ create mode 100644 tests/fuzz/corpus/strings_multiline.ok
+ create mode 100644 tests/fuzz/corpus/unterminated.ok
+ create mode 100644 tests/fuzz/corpus/utf8.ok
+ create mode 100644 tests/fuzz/crosscheck-manifest.txt
+ create mode 100644 tests/fuzz/crosscheck.sh
+ create mode 100644 tests/fuzz/src/fuzz.c
+
+diff --git a/.gitignore b/.gitignore
+index db0402d..97d07f6 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,3 +6,5 @@ err.log
+ 
+ # OR-3 native fixture artifacts: build.sh builds them, never ship them
+ tests/e2e/tests/modules/*/*.so
++e2e_fs_err_file.txt
++e2e_fs_full_dir/
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f8b6a18..c1993e7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -51,6 +51,7 @@ endif()
+ 
+ target_sources(ok PRIVATE
+   src/ok.c
++  src/okarena.c
+   src/okast.c
+   src/okchunk.c
+   src/okcompiler.c
+diff --git a/README.md b/README.md
+index 54eb781..7f92e9b 100644
+--- a/README.md
++++ b/README.md
+@@ -120,6 +120,13 @@ or run the REPL:
+ ./ok
+ ```
+ 
++The REPL edits raw-mode (arrows, ctrl-left/right word jumps, history) and
++auto-prints a lone expression's value - end the line with `;` to suppress.
++Continuation is nesting-aware: an open brace, an `m"..."` string, or an
++interpolation region keeps reading. Persistence is the language's own lane:
++`glob let x = 10;` survives the entry, plain `let` is local to it, and every
++entry imports what it uses.
++
+ ## Embedding
+ 
+ OKLang can be embedded into C or C++ through a simple C API `#include <ok/ok.h>`.
+diff --git a/cli/CMakeLists.txt b/cli/CMakeLists.txt
+index 44a4037..2e1c6c9 100644
+--- a/cli/CMakeLists.txt
++++ b/cli/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ add_executable(ok_cli
+   src/main.c
+   src/project.c
++  src/repl.c
++  src/term.c
+ )
+ 
+ target_link_libraries(ok_cli
+diff --git a/cli/src/main.c b/cli/src/main.c
+index b5b1358..d963d89 100644
+--- a/cli/src/main.c
++++ b/cli/src/main.c
+@@ -12,6 +12,7 @@
+ #include "ok/ok_version.h"
+ 
+ #include "project.h"
++#include "repl.h"
+ 
+ // the compiled-in OK_ROOT fallback (P1): the checkout the binary was built
+ // from. the sandbox's build script and cmake both pass it; an unset prefix
+@@ -21,7 +22,6 @@
+ #define OK_ROOT_PREFIX ""
+ #endif
+ 
+-static void repl(ok* p_ok);
+ static void run_file(ok* p_ok, const char* p_path);
+ static char* read_file(const char* p_path);
+ 
+@@ -434,7 +434,13 @@ int main(int argc, char** argv) {
+   }
+ 
+   if (path == NULL && natives_count == 0) {
+-    repl(ok);
++    // the REPL (P5): termios editing, history, auto-print, multi-line -
++    // the session's exit code is the process's (std.sys's exit, or 0)
++    int32_t repl_code = 0;
++    repl_run(ok, &repl_code);
++    ok_free(ok);
++    cli_graph_free(graph);
++    return repl_code;
+   } else if (path != NULL) {
+     run_file(ok, path);
+   } else {
+@@ -447,35 +453,6 @@ int main(int argc, char** argv) {
+   cli_graph_free(graph);
+ }
+ 
+-void repl(ok* p_ok) {
+-  char line[1024];
+-  ok_retain_source(p_ok, true);
+-  for (;;) {
+-    printf("> ");
+-    if (!fgets(line, sizeof(line), stdin)) {
+-      printf("\n");
+-      break;
+-    }
+-    ok_source source;
+-    source.code = line;
+-    source.path = "stdin";
+-    ok_result result = ok_run(p_ok, source);
+-    if (result == OK_PARSE_ERROR) {
+-      fprintf(stderr, "parse error occurred.\n");
+-    } else if (result == OK_COMPILE_ERROR) {
+-      fprintf(stderr, "compiler error occurred.\n");
+-    } else if (result == OK_RUNTIME_ERROR) {
+-      fprintf(stderr, "runtime error occurred.\n");
+-    } else if (result == OK_INIT_ERROR) {
+-      fprintf(stderr, "init error occurred.\n");
+-    } else if (result == OK_EXITED) {
+-      // the script asked to stop (std.sys's exit): the process answers with
+-      // the requested code. a REPL host would instead break its loop here.
+-      exit(ok_exit_code(p_ok));
+-    }
+-  }
+-}
+-
+ void run_file(ok* p_ok, const char* p_path) {
+   char* src = read_file(p_path);
+   if (src == NULL) {
+diff --git a/cli/src/repl.c b/cli/src/repl.c
+new file mode 100644
+index 0000000..c41b06d
+--- /dev/null
++++ b/cli/src/repl.c
+@@ -0,0 +1,370 @@
++// the REPL (P5, the front-door patch's last round): buffer accumulation
++// with nesting-aware continuation, auto-print of lone expressions with ';'
++// suppression, and the exit contract. the tty editor (raw mode, history,
++// word jumps) lives in term.c - this file is the semantics, and it stays
++// pure c99 so the eventual portability lane never touches it.
++//
++// the auto-print trick: a completed buffer that does not end in ';' is
++// trial-parsed as `print((\n<buffer>\n));` with the diagnostics silenced;
++// if that parses, the wrapped form RUNS (the language's own print renders
++// the value - one renderer, no host-side formatting drift). anything else
++// runs raw. a wrapped parse failure falls back to the raw buffer, whose
++// diagnostics are the real ones. the cost: runtime errors inside an
++// auto-printed expression report one line lower than the input (the
++// wrapper's own first line). noted, accepted, pinned by fixture.
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "ok/ok.h"
++#include "okdiag.h"
++#include "okparser.h"
++#include "okstate.h"
++
++#include "term.h"
++
++// the accumulation cap: a paste the size of a program is a file's job
++#define REPL_BUFFER_MAX (1024u * 1024u)
++
++// ---------------------------------------------------------------- the continuation walker
++
++// does the buffer want another line? mirrors the scanner's rules: line
++// comments die at newline; an escape never closes anything; a plain string
++// cannot span lines (an unterminated one is a COMPLETE buffer - its error
++// is honest); an m-string can; a ${} region nests and can hold strings of
++// its own; brackets outside all of that count.
++typedef enum {
++  WALK_CODE,
++  WALK_LINE_COMMENT,
++  WALK_STRING,
++  WALK_REGION, // inside a ${...}: brackets count, strings open
++} walk_state;
++
++typedef struct {
++  walk_state state;
++  char quote;        // the string's own quote byte
++  bool multiline;    // m or fm prefix
++  bool interpolate;  // f or fm prefix
++  bool escaped;      // the previous byte was a backslash
++  uint32_t region_depth;
++  int32_t brackets;  // () [] {} in code, {} in regions
++} walker;
++
++static bool is_ident_byte(char p_c) {
++  const unsigned char u = (unsigned char)p_c;
++  return (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9') || u == '_';
++}
++
++// the quote's prefix rules, mirrored from the lexer: f/m stick to the quote
++// when the byte before THEM is not an identifier byte (so `xf"` is the
++// identifier `xf` then a PLAIN string - still a string, just not prefixed).
++static void string_prefixes(const char* p_text, size_t p_at, bool* p_multiline, bool* p_interpolate) {
++  *p_multiline = false;
++  *p_interpolate = false;
++  if (p_at == 0) {
++    return;
++  }
++  const char prev = p_text[p_at - 1];
++  if (prev == 'f' && (p_at < 2 || !is_ident_byte(p_text[p_at - 2]))) {
++    *p_interpolate = true;
++  }
++  if (prev == 'm' && (p_at < 2 || !is_ident_byte(p_text[p_at - 2]))) {
++    *p_multiline = true;
++  }
++  if (prev == 'm' && p_at >= 2 && p_text[p_at - 2] == 'f' && (p_at < 3 || !is_ident_byte(p_text[p_at - 3]))) {
++    *p_interpolate = true; // fm": both flags
++  }
++}
++
++static void walker_init(walker* p_walker) {
++  p_walker->state = WALK_CODE;
++  p_walker->quote = 0;
++  p_walker->multiline = false;
++  p_walker->interpolate = false;
++  p_walker->escaped = false;
++  p_walker->region_depth = 0;
++  p_walker->brackets = 0;
++}
++
++// one byte. returns false the moment the buffer is known-incomplete-in-a-
++// way-only-a-newline-can-fix... which never happens mid-line; the answer
++// is only meaningful at end-of-buffer. (kept a function for shape.)
++static void walker_step(walker* p_walker, const char* p_text, size_t p_at, char p_c) {
++  switch (p_walker->state) {
++  case WALK_LINE_COMMENT:
++    if (p_c == '\n') {
++      p_walker->state = p_walker->region_depth > 0 ? WALK_REGION : WALK_CODE;
++    }
++    return;
++  case WALK_STRING:
++    if (p_walker->escaped) {
++      p_walker->escaped = false; // the escaped byte never closes, never opens
++      return;
++    }
++    if (p_c == '\\') {
++      p_walker->escaped = true;
++      return;
++    }
++    if (p_c == p_walker->quote) {
++      p_walker->state = p_walker->region_depth > 0 ? WALK_REGION : WALK_CODE;
++      return;
++    }
++    if (p_walker->interpolate && p_c == '$' && p_text[p_at + 1] == '{') {
++      p_walker->state = WALK_REGION;
++      p_walker->region_depth = 1; // the '${' itself opened one
++      p_walker->escaped = false;
++    }
++    return;
++  case WALK_REGION:
++    if (p_c == '{') {
++      p_walker->brackets++;
++      return;
++    }
++    if (p_c == '}') {
++      if (p_walker->brackets > 0) {
++        p_walker->brackets--;
++        return;
++      }
++      // the region's own closer
++      p_walker->region_depth--;
++      if (p_walker->region_depth == 0) {
++        p_walker->state = WALK_STRING;
++      }
++      return;
++    }
++    if (p_c == '"' || p_c == '\'') {
++      string_prefixes(p_text, p_at, &p_walker->multiline, &p_walker->interpolate);
++      p_walker->quote = p_c;
++      p_walker->escaped = false;
++      p_walker->state = WALK_STRING;
++      return;
++    }
++    if (p_c == '/' && p_text[p_at + 1] == '/') {
++      p_walker->state = WALK_LINE_COMMENT;
++      return;
++    }
++    return;
++  case WALK_CODE:
++    if (p_c == '/' && p_text[p_at + 1] == '/') {
++      p_walker->state = WALK_LINE_COMMENT;
++      return;
++    }
++    if (p_c == '"' || p_c == '\'') {
++      string_prefixes(p_text, p_at, &p_walker->multiline, &p_walker->interpolate);
++      p_walker->quote = p_c;
++      p_walker->escaped = false;
++      p_walker->state = WALK_STRING;
++      return;
++    }
++    if (p_c == '(' || p_c == '[' || p_c == '{') {
++      p_walker->brackets++;
++      return;
++    }
++    if (p_c == ')' || p_c == ']' || p_c == '}') {
++      p_walker->brackets--;
++      return;
++    }
++    return;
++  }
++}
++
++// the buffer's completeness at end-of-input for this round: a plain string
++// meeting its newline is complete (the parse will say unterminated,
++// honestly); a multiline one, an open region, or open brackets want more.
++static bool buffer_complete(const char* p_buffer, size_t p_length) {
++  walker walk;
++  walker_init(&walk);
++  for (size_t i = 0; i < p_length; ++i) {
++    walker_step(&walk, p_buffer, i, p_buffer[i]);
++  }
++  if (walk.state == WALK_STRING && !walk.multiline) {
++    return true; // the unterminated-string error is the honest answer
++  }
++  if (walk.state == WALK_STRING || walk.state == WALK_REGION || walk.brackets > 0) {
++    return false; // the m-string, the region, the brackets: keep reading
++  }
++  return true;
++}
++
++// the last meaningful byte: whitespace and whole trailing comments do not
++// count (a ';' inside a comment never suppresses anything). the walker is
++// the judge - the same rules the scanner lives by.
++static char last_meaningful(const char* p_buffer, size_t p_length) {
++  walker walk;
++  walker_init(&walk);
++  char last = '\0';
++  for (size_t i = 0; i < p_length; ++i) {
++    const char c = p_buffer[i];
++    const bool in_code = walk.state == WALK_CODE || walk.state == WALK_REGION;
++    if (in_code && c != ' ' && c != '\t' && c != '\n' && c != '\r') {
++      last = c;
++    }
++    walker_step(&walk, p_buffer, i, c);
++  }
++  return last;
++}
++
++// ---------------------------------------------------------------- the shape sniff
++
++// the silence: the trial parse reports nowhere (the real diagnostics come
++// from whichever buffer actually runs)
++static report_status quiet_sink(bool* p_panic,
++                                bool* p_had_error,
++                                const char* p_path,
++                                const char* p_source,
++                                const ok_span* p_span,
++                                bool p_is_eof,
++                                report_severity p_severity,
++                                const ok_string_view p_message,
++                                const ok_note* p_note) {
++  (void)p_path;
++  (void)p_source;
++  (void)p_span;
++  (void)p_is_eof;
++  (void)p_severity;
++  (void)p_message;
++  (void)p_note;
++  *p_panic = true;
++  *p_had_error = true;
++  return REPORT_STATUS_OK;
++}
++
++// does the wrapped form parse? (the wrap tolerates the missing ';' the raw
++// buffer would refuse - that tolerance IS the auto-print lane)
++static bool parses_wrapped(ok* p_ok, const char* p_wrapped) {
++  ok_source source;
++  source.code = (char*)p_wrapped;
++  source.path = "stdin";
++  parser parser;
++  parser_specs specs;
++  specs.alloc = &p_ok->alloc;
++  specs.source = &source;
++  okdiag_install_sink(quiet_sink);
++  parser_init(&parser, specs);
++  parse_result parsed = parser_parse(&parser);
++  const bool ok_shape = parsed.status == PARSE_OK;
++  parse_result_deinit(&parsed);
++  okdiag_install_sink(NULL);
++  return ok_shape;
++}
++
++// ---------------------------------------------------------------- the loop
++
++static void run_buffer(ok* p_ok, const char* p_code, int32_t* p_exit_code, bool* p_exited) {
++  ok_source source;
++  source.code = (char*)p_code;
++  source.path = "stdin";
++  const ok_result result = ok_run(p_ok, source);
++  if (result == OK_EXITED) {
++    // the script asked to stop: the session ends with its code, the
++    // instance still freed by the caller (the stub's exit() leaked it)
++    *p_exit_code = ok_exit_code(p_ok);
++    *p_exited = true;
++  }
++  // every other outcome already spoke through the diagnostics renderer;
++  // the repl's job is to keep breathing
++}
++
++void repl_run(ok* p_ok, int32_t* p_exit_code) {
++  *p_exit_code = 0;
++  ok_retain_source(p_ok, true); // runtime reports keep their text across runs
++
++  term_session term;
++  term_init(&term);
++
++  char line[4096];
++  char* buffer = (char*)malloc(8192);
++  size_t buffer_capacity = 8192;
++  size_t buffer_length = 0;
++  if (buffer == NULL) {
++    fprintf(stderr, "repl: out of memory.\n");
++    term_deinit(&term);
++    return;
++  }
++
++  for (;;) {
++    const char* prompt = buffer_length == 0 ? "> " : "... ";
++    if (!term_read_line(&term, prompt, line, sizeof(line))) {
++      // the stream ended, or the user asked to leave. a pending incomplete
++      // buffer dies with the session - running it would be a guess
++      if (term.raw) {
++        fputs("\n", stdout); // a tty goodbye; the pipe never wanted one
++      }
++      break;
++    }
++    const size_t line_length = strlen(line);
++    if (buffer_length + line_length + 2 > buffer_capacity) {
++      const size_t fresh_capacity = buffer_capacity * 2;
++      if (fresh_capacity > REPL_BUFFER_MAX) {
++        fprintf(stderr, "repl: the buffer is full - a program this size wants a file.\n");
++        buffer_length = 0;
++        buffer[0] = '\0';
++        continue;
++      }
++      char* fresh = (char*)realloc(buffer, fresh_capacity);
++      if (fresh == NULL) {
++        fprintf(stderr, "repl: out of memory.\n");
++        break;
++      }
++      buffer = fresh;
++      buffer_capacity = fresh_capacity;
++    }
++    memcpy(buffer + buffer_length, line, line_length);
++    buffer_length += line_length;
++    buffer[buffer_length++] = '\n';
++    buffer[buffer_length] = '\0';
++
++    if (!buffer_complete(buffer, buffer_length)) {
++      continue; // the continuation prompt takes the next line
++    }
++
++    // nothing-but-air buffers (comments included) never run
++    if (last_meaningful(buffer, buffer_length) == '\0') {
++      buffer_length = 0;
++      buffer[0] = '\0';
++      continue;
++    }
++
++    // the evaluation: ';' suppresses the auto-print; everything else gets
++    // the trial wrap
++    if (last_meaningful(buffer, buffer_length) == ';') {
++      bool exited = false;
++      run_buffer(p_ok, buffer, p_exit_code, &exited);
++      if (exited) {
++        break;
++      }
++    } else {
++      const size_t wrapped_capacity = buffer_length + 32;
++      char* wrapped = (char*)malloc(wrapped_capacity);
++      if (wrapped == NULL) {
++        fprintf(stderr, "repl: out of memory.\n");
++        break;
++      }
++      snprintf(wrapped, wrapped_capacity, "print((\n%s\n));", buffer);
++      if (parses_wrapped(p_ok, wrapped)) {
++        bool exited = false;
++        run_buffer(p_ok, wrapped, p_exit_code, &exited);
++        free(wrapped);
++        if (exited) {
++          break;
++        }
++      } else {
++        free(wrapped);
++        bool exited = false;
++        run_buffer(p_ok, buffer, p_exit_code, &exited);
++        if (exited) {
++          break;
++        }
++      }
++    }
++    buffer_length = 0;
++    buffer[0] = '\0';
++  }
++
++  free(buffer);
++  term_deinit(&term);
++}
+diff --git a/cli/src/repl.h b/cli/src/repl.h
+new file mode 100644
+index 0000000..881f6ed
+--- /dev/null
++++ b/cli/src/repl.h
+@@ -0,0 +1,14 @@
++#ifndef OK_REPL_H
++#define OK_REPL_H
++
++// the REPL engine (P5): cli/src/repl.c. semantics only - the posix tty
++// editor lives in term.c. the session's exit code lands in *p_exit_code
++// (std.sys's exit request, or 0 for a clean leave).
++
++#include <stdint.h>
++
++struct ok;
++
++void repl_run(struct ok* p_ok, int32_t* p_exit_code);
++
++#endif // OK_REPL_H
+diff --git a/cli/src/term.c b/cli/src/term.c
+new file mode 100644
+index 0000000..4d85d9b
+--- /dev/null
++++ b/cli/src/term.c
+@@ -0,0 +1,328 @@
++// the terminal layer (P5, the REPL round): raw-mode line editing with
++// history, arrows, ctrl-left/right word jumps, and utf-8-aware editing.
++// the whole file is the posix isolation zone - see term.h. on a non-tty
++// stdin every read is a plain fgets, and none of this machinery runs.
++
++#define _POSIX_C_SOURCE 200809L // termios, isatty, read
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <termios.h>
++
++#include "term.h"
++
++// ---------------------------------------------------------------- state
++
++static bool tty_is_interactive(void) {
++  return isatty(STDIN_FILENO) == 1;
++}
++
++static struct termios g_cooked; // the terminal we owe back
++static bool g_raw = false;
++
++static void enter_raw(void) {
++  if (!tty_is_interactive()) {
++    return;
++  }
++  struct termios raw;
++  if (tcgetattr(STDIN_FILENO, &g_cooked) != 0) {
++    return;
++  }
++  raw = g_cooked;
++  raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | ISIG); // we echo, we edit, we take ctrl-c
++  raw.c_iflag &= (tcflag_t)~(IXON);                  // ctrl-s/q are ours while editing
++  raw.c_cc[VMIN] = 1;
++  raw.c_cc[VTIME] = 0;
++  if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
++    g_raw = true;
++  }
++}
++
++static void leave_raw(void) {
++  if (g_raw) {
++    tcsetattr(STDIN_FILENO, TCSANOW, &g_cooked);
++    g_raw = false;
++  }
++}
++
++// ---------------------------------------------------------------- history
++
++static void history_push(term_session* p_term, const char* p_line) {
++  if (p_line[0] == '\0') {
++    return; // empty lines are not worth remembering
++  }
++  if (p_term->history_count > 0) {
++    const uint32_t last = p_term->history_count - 1;
++    if (p_term->history_count <= TERM_HISTORY_CAP && strcmp(p_term->history[last], p_line) == 0) {
++      return; // an immediate repeat is one entry
++    }
++  }
++  char* copy = strdup(p_line);
++  if (copy == NULL) {
++    return; // history is a nicety, never a wall
++  }
++  if (p_term->history_count == TERM_HISTORY_CAP) {
++    free(p_term->history[0]);
++    memmove(&p_term->history[0], &p_term->history[1], sizeof(char*) * (TERM_HISTORY_CAP - 1));
++    p_term->history_count--;
++  }
++  p_term->history[p_term->history_count++] = copy;
++}
++
++// ---------------------------------------------------------------- rendering
++
++// one codepoint == one column for editing purposes (combining marks are
++// beyond this layer's contract). the caret math walks codepoints.
++static size_t cp_count(const char* p_text, size_t p_bytes) {
++  size_t count = 0;
++  for (size_t i = 0; i < p_bytes;) {
++    if (((unsigned char)p_text[i] & 0xC0) != 0x80) {
++      count++;
++    }
++    i++;
++  }
++  return count;
++}
++
++// full redraw: prompt + buffer, then park the cursor. simple, robust to any
++// edit; the buffer is human-sized, the terminal can take it.
++static void redraw(const char* p_prompt, const char* p_buffer, size_t p_cursor) {
++  fputs("\r", stdout);
++  fputs(p_prompt, stdout);
++  fputs(p_buffer, stdout);
++  fputs("\x1B[K", stdout); // clear whatever the deleted tail left behind
++  const size_t total = cp_count(p_buffer, strlen(p_buffer));
++  const size_t cursor = cp_count(p_buffer, p_cursor);
++  if (cursor < total) {
++    // walk the caret left to its column (the redraw left it at the end)
++    printf("\x1B[%zuD", total - cursor);
++  }
++  fflush(stdout);
++}
++
++// ---------------------------------------------------------------- the editor
++
++// the word jump's word: a run of identifier bytes, or a run of anything
++// else - the caret lands at the far side of whatever it is standing on.
++static bool is_word_byte(char p_c) {
++  const unsigned char u = (unsigned char)p_c;
++  return (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9') || u == '_' || u >= 0x80;
++}
++
++static size_t step_left(const char* p_buffer, size_t p_cursor) {
++  if (p_cursor == 0) {
++    return 0;
++  }
++  size_t at = p_cursor - 1;
++  while (at > 0 && ((unsigned char)p_buffer[at] & 0xC0) == 0x80) {
++    at--; // walk the continuation bytes back to the lead
++  }
++  return at;
++}
++
++static size_t step_right(const char* p_buffer, size_t p_cursor) {
++  if (p_buffer[p_cursor] == '\0') {
++    return p_cursor;
++  }
++  size_t at = p_cursor + 1;
++  while (p_buffer[at] != '\0' && ((unsigned char)p_buffer[at] & 0xC0) == 0x80) {
++    at++;
++  }
++  return at;
++}
++
++static bool read_edit(term_session* p_term, const char* p_prompt, char* p_buffer, size_t p_capacity) {
++  p_buffer[0] = '\0';
++  size_t length = 0;
++  size_t cursor = 0;
++  bool have_history = p_term->history_count > 0;
++  for (;;) {
++    redraw(p_prompt, p_buffer, cursor);
++    char c;
++    if (read(STDIN_FILENO, &c, 1) != 1) {
++      p_term->exit_requested = true;
++      return false;
++    }
++    if (c == '\r' || c == '\n') {
++      fputs("\n", stdout);
++      fflush(stdout);
++      p_term->history_cursor = 0;
++      free(p_term->saved_edit);
++      p_term->saved_edit = NULL;
++      history_push(p_term, p_buffer);
++      return true;
++    }
++    if (c == 0x7F || c == '\b') { // backspace: a whole codepoint goes
++      if (cursor > 0) {
++        const size_t start = step_left(p_buffer, cursor);
++        memmove(p_buffer + start, p_buffer + cursor, length - cursor + 1);
++        length -= cursor - start;
++        cursor = start;
++      }
++      continue;
++    }
++    if (c == 0x03) { // ctrl-c: empty line leaves, a draft clears
++      if (length == 0) {
++        fputs("^C\n", stdout);
++        fflush(stdout);
++        p_term->exit_requested = true;
++        return false;
++      }
++      p_buffer[0] = '\0';
++      length = 0;
++      cursor = 0;
++      continue;
++    }
++    if (c == 0x04) { // ctrl-d: leaves on an empty line, ignored mid-draft
++      if (length == 0) {
++        fputs("\n", stdout);
++        fflush(stdout);
++        p_term->exit_requested = true;
++        return false;
++      }
++      continue;
++    }
++    if (c == 0x01) { // ctrl-a: home
++      cursor = 0;
++      continue;
++    }
++    if (c == 0x05) { // ctrl-e: end
++      cursor = length;
++      continue;
++    }
++    if (c == 0x17) { // ctrl-u: clear the draft
++      p_buffer[0] = '\0';
++      length = 0;
++      cursor = 0;
++      continue;
++    }
++    if (c == '\x1B') { // an escape sequence
++      char seq[5];
++      seq[0] = '\0';
++      if (read(STDIN_FILENO, &seq[0], 1) != 1) {
++        continue;
++      }
++      bool ctrl = false;
++      if (seq[0] == '[') {
++        if (read(STDIN_FILENO, &seq[1], 1) != 1) {
++          continue;
++        }
++        if (seq[1] == '1' && read(STDIN_FILENO, &seq[2], 1) == 1 && seq[2] == ';') {
++          // ctrl-modified: "[1;5" then the letter
++          char skip;
++          ctrl = true;
++          if (read(STDIN_FILENO, &skip, 1) != 1) {
++            continue;
++          }
++          if (read(STDIN_FILENO, &seq[1], 1) != 1) {
++            continue;
++          }
++        }
++      }
++      const char key = seq[1];
++      if (key == 'D') { // left (ctrl = the word jump)
++        if (ctrl) {
++          size_t at = step_left(p_buffer, cursor);
++          if (at > 0 && is_word_byte(p_buffer[at])) {
++            // a word run: land on its first byte
++            while (at > 0 && is_word_byte(p_buffer[step_left(p_buffer, at)])) {
++              at = step_left(p_buffer, at);
++            }
++          } else {
++            // a non-word run (punctuation, spaces): land on its first byte
++            while (at > 0 && !is_word_byte(p_buffer[step_left(p_buffer, at)])) {
++              at = step_left(p_buffer, at);
++            }
++          }
++          cursor = at;
++        } else {
++          cursor = step_left(p_buffer, cursor);
++        }
++      } else if (key == 'C') { // right
++        cursor = step_right(p_buffer, cursor);
++      } else if (key == 'A') { // up: back through history
++        if (have_history && p_term->history_cursor < p_term->history_count) {
++          if (p_term->history_cursor == 0) {
++            free(p_term->saved_edit);
++            p_term->saved_edit = strdup(p_buffer);
++          }
++          p_term->history_cursor++;
++          const char* line = p_term->history[p_term->history_count - p_term->history_cursor];
++          strncpy(p_buffer, line, p_capacity - 1);
++          p_buffer[p_capacity - 1] = '\0';
++          length = strlen(p_buffer);
++          cursor = length;
++        }
++      } else if (key == 'B') { // down: forward through history
++        if (p_term->history_cursor > 0) {
++          p_term->history_cursor--;
++          const char* line = p_term->history_cursor == 0 ? (p_term->saved_edit != NULL ? p_term->saved_edit : "")
++                                                         : p_term->history[p_term->history_count - p_term->history_cursor];
++          strncpy(p_buffer, line, p_capacity - 1);
++          p_buffer[p_capacity - 1] = '\0';
++          length = strlen(p_buffer);
++          cursor = length;
++        }
++      }
++      // everything else (home/end/delete/whatever) is politely ignored
++      continue;
++    }
++    if ((unsigned char)c < 0x20) {
++      continue; // the unassigned control bytes have no business here
++    }
++    if (length + 1 < p_capacity) {
++      memmove(p_buffer + cursor + 1, p_buffer + cursor, length - cursor + 1);
++      p_buffer[cursor] = c;
++      cursor++;
++      length++;
++    }
++  }
++}
++
++// ---------------------------------------------------------------- the door
++
++void term_init(term_session* p_term) {
++  p_term->raw = tty_is_interactive();
++  p_term->exit_requested = false;
++  memset(p_term->history, 0, sizeof(p_term->history));
++  p_term->history_count = 0;
++  p_term->history_cursor = 0;
++  p_term->saved_edit = NULL;
++  enter_raw();
++}
++
++void term_deinit(term_session* p_term) {
++  leave_raw();
++  for (uint32_t i = 0; i < p_term->history_count; ++i) {
++    free(p_term->history[i]);
++  }
++  free(p_term->saved_edit);
++  p_term->saved_edit = NULL;
++  p_term->history_count = 0;
++}
++
++bool term_read_line(term_session* p_term, const char* p_prompt, char* p_buffer, size_t p_capacity) {
++  if (!p_term->raw || !g_raw) {
++    // the piped/degraded lane: fgets, no prompt, no echo (the pipe's writer
++    // owns the bytes; a prompt would corrupt every comparison)
++    for (;;) {
++      if (fgets(p_buffer, (int)p_capacity, stdin) == NULL) {
++        p_term->exit_requested = true;
++        return false;
++      }
++      const size_t length = strlen(p_buffer);
++      if (length == 0 || p_buffer[length - 1] != '\n') {
++        return true; // a last line without its newline, or a quiet empty
++      }
++      p_buffer[length - 1] = '\0';
++      if (length >= 2 && p_buffer[length - 2] == '\r') {
++        p_buffer[length - 2] = '\0';
++      }
++      return true;
++    }
++  }
++  return read_edit(p_term, p_prompt, p_buffer, p_capacity);
++}
+diff --git a/cli/src/term.h b/cli/src/term.h
+new file mode 100644
+index 0000000..ecd5682
+--- /dev/null
++++ b/cli/src/term.h
+@@ -0,0 +1,39 @@
++#ifndef OK_TERM_H
++#define OK_TERM_H
++
++// the terminal layer (P5, the REPL round). EVERYTHING posix lives here and
++// only here - termios raw mode, isatty - so the eventual pure-c99 lane
++// swaps this one file (or its callers degrade to fgets) and nothing else
++// moves. the CLI is a host, not the library: this file never links into
++// libok.
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++
++#define TERM_HISTORY_CAP 100
++
++typedef struct {
++  bool raw;                 // raw mode was entered (a tty owns us)
++  bool exit_requested;      // ctrl-c on an empty line, or ctrl-d
++  char* history[TERM_HISTORY_CAP]; // the ring, strdup'd lines
++  uint32_t history_count;
++  uint32_t history_cursor;  // 0 == "the live edit", N == history[N-1]
++  char* saved_edit;         // the in-progress line parked while browsing
++} term_session;
++
++// enters the session. if stdin is not a tty (or termios refuses), the
++// session degrades: reads fall back to plain fgets and none of the editing
++// exists. prompts are the caller's business either way.
++void term_init(term_session* p_term);
++// restores the cooked terminal (if raw was entered) and frees the history.
++void term_deinit(term_session* p_term);
++
++// reads one line into p_buffer (nul-terminated, newline stripped).
++// returns false when the stream ends or the user asked to leave
++// (p_term->exit_requested says which). the prompt renders on the tty path
++// only; the piped path stays byte-clean for comparisons.
++bool term_read_line(term_session* p_term, const char* p_prompt, char* p_buffer, size_t p_capacity);
++
++#endif // OK_TERM_H
+diff --git a/src/okarena.c b/src/okarena.c
+new file mode 100644
+index 0000000..68a9ff5
+--- /dev/null
++++ b/src/okarena.c
+@@ -0,0 +1,111 @@
++#include <string.h>
++
++#include "okarena.h"
++
++// block sizing: 16 KiB covers a few hundred nodes, so ordinary statements
++// ride one block; a pathological file just chains more. anything larger
++// than the standard block gets a private one.
++#define OK_ARENA_BLOCK_SIZE ((size_t)16384)
++
++// alignment: twice the pointer width (16 on every host we build for today)
++// is enough for the AST's structs and the lists' element arrays.
++#define OK_ARENA_ALIGN ((size_t)(sizeof(void*) * 2))
++
++struct ok_arena_block {
++  ok_arena_block* next;
++  size_t used; // payload bytes consumed (always kept aligned)
++  size_t cap;  // payload bytes available
++  // the payload rides the struct's tail: (char*)(block + 1)
++};
++
++static size_t arena_align(size_t p_size) {
++  return (p_size + (OK_ARENA_ALIGN - 1)) & ~(OK_ARENA_ALIGN - 1);
++}
++
++void ok_arena_init(ok_arena* p_arena, allocators* p_source) {
++  p_arena->head = NULL;
++  p_arena->source = p_source;
++  p_arena->total = 0;
++}
++
++void ok_arena_move(ok_arena* p_to, ok_arena* p_from) {
++  p_to->head = p_from->head;
++  p_to->source = p_from->source;
++  p_to->total = p_from->total;
++  p_from->head = NULL;
++  p_from->total = 0;
++}
++
++static ok_arena_block* arena_new_block(ok_arena* p_arena, size_t p_payload) {
++  const size_t cap = p_payload > OK_ARENA_BLOCK_SIZE ? arena_align(p_payload) : OK_ARENA_BLOCK_SIZE;
++  ok_arena_block* block = (ok_arena_block*)p_arena->source->allocate(p_arena->source, sizeof(ok_arena_block) + cap);
++  if (block == NULL) {
++    return NULL;
++  }
++  block->next = p_arena->head;
++  block->used = 0;
++  block->cap = cap;
++  return block;
++}
++
++void* ok_arena_allocate(allocators* p_alloc, size_t p_size) {
++  ok_arena* arena = (ok_arena*)p_alloc->impl;
++  size_t need = arena_align(p_size);
++  if (need == 0) {
++    need = OK_ARENA_ALIGN; // a zero-size ask still deserves a real pointer
++  }
++  if (arena->head == NULL || arena->head->cap - arena->head->used < need) {
++    ok_arena_block* fresh = arena_new_block(arena, need);
++    if (fresh == NULL) {
++      return NULL;
++    }
++    arena->head = fresh;
++  }
++  void* out = (char*)(arena->head + 1) + arena->head->used;
++  arena->head->used += need;
++  arena->total += need;
++  return out;
++}
++
++void* ok_arena_reallocate(allocators* p_alloc, void* p_ptr, size_t p_old_size, size_t p_new_size) {
++  if (p_new_size == 0) {
++    ok_arena_release(p_alloc, p_ptr);
++    return NULL;
++  }
++  if (p_ptr == NULL) {
++    return ok_arena_allocate(p_alloc, p_new_size);
++  }
++  void* fresh = ok_arena_allocate(p_alloc, p_new_size);
++  if (fresh == NULL) {
++    return NULL;
++  }
++  memcpy(fresh, p_ptr, p_old_size < p_new_size ? p_old_size : p_new_size);
++  return fresh;
++}
++
++void ok_arena_release(allocators* p_alloc, void* p_ptr) {
++  (void)p_alloc;
++  (void)p_ptr; // the bulk free owns everything
++}
++
++void ok_arena_deinit(ok_arena* p_arena) {
++  ok_arena_block* block = p_arena->head;
++  while (block != NULL) {
++    ok_arena_block* next = block->next;
++    p_arena->source->release(p_arena->source, block);
++    block = next;
++  }
++  p_arena->head = NULL;
++  p_arena->total = 0;
++}
++
++allocators ok_arena_allocators(ok_arena* p_arena) {
++  allocators alloc;
++  alloc.reallocate = ok_arena_reallocate;
++  alloc.allocate = ok_arena_allocate;
++  alloc.release = ok_arena_release;
++  alloc.gc = NULL;
++  alloc.raw_allocators = p_arena->source != NULL ? p_arena->source->raw_allocators : NULL;
++  alloc.impl = p_arena;
++  return alloc;
++}
+diff --git a/src/okarena.h b/src/okarena.h
+new file mode 100644
+index 0000000..38d5080
+--- /dev/null
++++ b/src/okarena.h
+@@ -0,0 +1,55 @@
++#ifndef OK_ARENA_H
++#define OK_ARENA_H
++
++#include <stddef.h>
++
++#include "okfwd.h"
++#include "okmm.h"
++
++// the parse arena (P5, the front-door patch): a region allocator the whole
++// AST rides. parse-time nodes, list buffers and diagnostic temporaries
++// bump-allocate out of chained blocks; release is a no-op; one deinit frees
++// the world. two hardening classes die here at once: a failed parse can
++// never leak a half-built statement (the orphan nodes die with the arena
++// whenever the caller drops the result), and teardown is a block walk, not
++// a recursive one (a deep tree can never overflow the C stack on its way
++// OUT either - the depth guard bounds the way in, the arena the way out).
++//
++// what keeps this honest: nothing the compiler keeps survives the parse.
++// string literals intern into copies (D20), names ride interned constants,
++// locals are compile-time views into the source (which outlives the AST in
++// every driver). the arena frees exactly where the per-node deinits freed
++// before - at parse_result_deinit - so no lifetime moves, only the shape of
++// the free changes.
++typedef struct ok_arena_block ok_arena_block;
++
++typedef struct {
++  ok_arena_block* head; // the newest block; allocations bump down its payload
++  allocators* source;   // where blocks come from (the caller's allocators)
++  size_t total;         // bytes handed out (telemetry; blocks free by walk)
++} ok_arena;
++
++void ok_arena_init(ok_arena* p_arena, allocators* p_source);
++
++// ownership handoff: p_from's blocks become p_to's, p_from restarts empty.
++// the parse hands its arena to the result this way - the parser itself is
++// stack-scoped in every caller, the result outlives it.
++void ok_arena_move(ok_arena* p_to, ok_arena* p_from);
++
++// frees every block. the struct is init-shaped afterwards (empty, reusable).
++void ok_arena_deinit(ok_arena* p_arena);
++
++// the allocators vtable over an arena. allocate bumps; reallocate bumps and
++// copies (the old bytes stay behind until the bulk free - growth wastes a
++// little, parse-time never minds); release is a no-op. the arena is reached
++// through p_alloc->impl.
++void* ok_arena_allocate(allocators* p_alloc, size_t p_size);
++void* ok_arena_reallocate(allocators* p_alloc, void* p_ptr, size_t p_old_size, size_t p_new_size);
++void ok_arena_release(allocators* p_alloc, void* p_ptr);
++
++// build the vtable. the returned allocators carry no gc hook (arena bytes
++// are raw AST memory, not collector objects; the BLOCK allocations tickle
++// the source's hook on their own).
++allocators ok_arena_allocators(ok_arena* p_arena);
++
++#endif // OK_ARENA_H
+diff --git a/src/okast.c b/src/okast.c
+index 9b18a74..84b72fb 100644
+--- a/src/okast.c
++++ b/src/okast.c
+@@ -2019,6 +2019,14 @@ string ast_class_declaration_asprint(const ast_class_declaration* p_class) {
+ }
+ 
+ void ast_dispatch_deinit(ast_node* p_node) {
++  // P5 (the fuzzer's first find): half-built trees deinit their nulls. a
++  // failed f-string region with no folded chunk yet handed its NULL acc
++  // straight here and crashed - and the infix deinit passes NULL children
++  // on every failed right-hand side. the arena owns the bytes either way;
++  // a NULL node releases quietly.
++  if (p_node == NULL) {
++    return;
++  }
+ #define X(type, klass)                                                                                                 \
+   case type:                                                                                                           \
+     klass##_deinit((klass*)p_node);                                                                                    \
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 4f9d65d..6e8dc57 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -3865,6 +3865,20 @@ static bool compile_prefix_unary_expression(compiler* p_compiler,
+     return false;
+   }
+ 
++  // unary plus is the identity (the fuzzer's fourth find): the parse rules
++  // and the operator table have promised it since the beginning, but the
++  // compiler never implemented it - `print(+5);` crashed the internal-bug
++  // lane. the operand evaluates into the destination and passes through
++  // unchanged. numeric coercion (python's lane) stays an open ruling; today
++  // plus is what the tables said it is.
++  if (p_expression->_operator == OPERATOR_PRE_PLUS) {
++    p_out->type = EXPRESSION_VALUE;
++    p_out->value = rhs.value;
++    p_out->lvalue = (lvalue){LVALUE_VARIABLE, (location){0, LOCATION_KIND_INVALID, LOCATION_OK}};
++    p_out->count = 1;
++    return true;
++  }
++
+   opcode op;
+   opcode op_long;
+   switch (p_expression->_operator) {
+diff --git a/src/okdiag.c b/src/okdiag.c
+index ceb11e3..d6a8486 100644
+--- a/src/okdiag.c
++++ b/src/okdiag.c
+@@ -4,6 +4,13 @@
+ 
+ #include "okdiag.h"
+ 
++// the installed sink, or NULL for the real renderer. see okdiag.h.
++static okdiag_sink okdiag_sink_fn = NULL;
++
++void okdiag_install_sink(okdiag_sink p_sink) {
++  okdiag_sink_fn = p_sink;
++}
++
+ // the source line containing p_offset. returns the line's bounds; the caret
+ // column comes from the span (precomputed by the lexer).
+ static void line_bounds_of(const char* p_source, const ok_span* p_span, uint32_t* p_line_start, uint32_t* p_line_end) {
+@@ -100,6 +107,21 @@ report_status okdiag_report(bool* p_panic,
+   if (*p_panic) {
+     return REPORT_STATUS_SKIPPED;
+   }
++  // the sink lane (P5): an installed sink replaces the rendering entirely.
++  // the fuzz harness validates the location contract here; the REPL's
++  // shape-sniff runs silenced through it. the sink owns the panic/had_error
++  // semantics from here (the flags the renderer sets below are its contract).
++  if (okdiag_sink_fn != NULL) {
++    return okdiag_sink_fn(p_panic,
++                          p_had_error,
++                          p_path,
++                          p_source,
++                          p_span,
++                          p_is_eof,
++                          p_severity,
++                          p_message,
++                          p_note);
++  }
+   bool printf_fail = false;
+   *p_panic = true;
+   *p_had_error = true;
+diff --git a/src/okdiag.h b/src/okdiag.h
+index 3d70d63..4aa4810 100644
+--- a/src/okdiag.h
++++ b/src/okdiag.h
+@@ -63,6 +63,24 @@ report_status okdiag_report(bool* p_panic,
+                             const ok_string_view p_message,
+                             const ok_note* p_note);
+ 
++// the diagnostics sink (P5): when installed, every rendered diagnostic
++// routes here INSTEAD of stderr - the rendering is replaced, not merely
++// forwarded. the sink owns the panic/had_error contract (set both, the
++// first report wins otherwise). consumers today: the fuzz harness (validates
++// the every-diagnostic-carries-a-location bar over hostile input) and the
++// REPL's shape-sniff (runs its trial parse silenced). internal lane, not
++// public api - hosts keep stderr.
++typedef report_status (*okdiag_sink)(bool* p_panic,
++                                     bool* p_had_error,
++                                     const char* p_path,
++                                     const char* p_source,
++                                     const ok_span* p_span,
++                                     bool p_is_eof,
++                                     report_severity p_severity,
++                                     const ok_string_view p_message,
++                                     const ok_note* p_note);
++void okdiag_install_sink(okdiag_sink p_sink);
++
+ // the (path, line, column) header every diagnostic starts with, exposed for
+ // the runtime report's stack trace lines.
+ void okdiag_print_header(
+diff --git a/src/oklexer.c b/src/oklexer.c
+index c7c3586..82c80c8 100644
+--- a/src/oklexer.c
++++ b/src/oklexer.c
+@@ -116,7 +116,15 @@ static bool at_wall(const char* p, const char* p_wall) {
+   return *p == '\0';
+ }
+ 
+-static const char* scan_region(const char* p, const char* p_wall, const char** p_died);
++// P5: the byte scanners recurse one level per nested quoted string inside
++// an interpolation (a quoted body may ride an f-prefix whose regions may
++// quote again, ...). the cap turns a hostile `f"${f"${f"${...` chain into
++// the clean unterminated-string error instead of a stack overflow. it
++// matches the parser's own OK_PARSER_MAX_DEPTH (the token can never be
++// deeper than the tree it would build).
++#define OK_SCAN_MAX_DEPTH 200u
++
++static const char* scan_region(const char* p, const char* p_wall, const char** p_died, uint32_t p_depth);
+ 
+ // scan a string body (from just past its opening quote) to its closing
+ // quote. an escape never closes anything (the P2 ruling: `\` + newline
+@@ -128,7 +136,8 @@ static const char* scan_body(const char* p,
+                              char p_quote,
+                              bool p_multiline,
+                              bool p_interpolate,
+-                             const char** p_died) {
++                             const char** p_died,
++                             uint32_t p_depth) {
+   for (;;) {
+     if (at_wall(p, p_wall)) {
+       *p_died = p;
+@@ -153,7 +162,11 @@ static const char* scan_body(const char* p,
+       return NULL;
+     }
+     if (p_interpolate && c == '$' && !at_wall(p + 1, p_wall) && p[1] == '{') {
+-      const char* close = scan_region(p + 2, p_wall, p_died);
++      if (p_depth >= OK_SCAN_MAX_DEPTH) {
++        *p_died = p; // the nesting cap: report it as the wall winning
++        return NULL;
++      }
++      const char* close = scan_region(p + 2, p_wall, p_died, p_depth + 1);
+       if (close == NULL) {
+         return NULL;
+       }
+@@ -176,7 +189,7 @@ static const char* scan_body(const char* p,
+ // before IT cannot continue an identifier - `xf"` is the identifier `xf`
+ // then a plain string. `2f"` disagrees only in garbage source, where a
+ // number glued to an f-string is not a program either side accepts.)
+-static const char* scan_region(const char* p, const char* p_wall, const char** p_died) {
++static const char* scan_region(const char* p, const char* p_wall, const char** p_died, uint32_t p_depth) {
+   uint32_t depth = 1;
+   for (;;) {
+     if (at_wall(p, p_wall)) {
+@@ -196,7 +209,8 @@ static const char* scan_region(const char* p, const char* p_wall, const char** p
+       const bool m_prefix = p[-1] == 'm' && !is_allowed_identifier(p[-2]);
+       const bool fm_prefix = p[-1] == 'm' && p[-2] == 'f' && !is_allowed_identifier(p[-3]);
+       ++p; // the quote
+-      const char* close = scan_body(p, p_wall, c, m_prefix || fm_prefix, f_prefix || fm_prefix, p_died);
++      const char* close =
++          scan_body(p, p_wall, c, m_prefix || fm_prefix, f_prefix || fm_prefix, p_died, p_depth);
+       if (close == NULL) {
+         return NULL;
+       }
+@@ -228,7 +242,7 @@ static token string(lexer* p_lexer, char p_start, bool p_multiline, bool p_inter
+   const char* const wall = p_lexer->end;
+   const char* const body = p_lexer->current; // just past the opening quote
+   const char* died = body;
+-  const char* close = scan_body(body, wall, p_start, p_multiline, p_interpolate, &died);
++  const char* close = scan_body(body, wall, p_start, p_multiline, p_interpolate, &died, 0);
+   if (close == NULL) {
+     // catch up to where the scan died, counting lines honestly (the error
+     // span and every token after it keep real positions)
+@@ -269,7 +283,7 @@ static token string(lexer* p_lexer, char p_start, bool p_multiline, bool p_inter
+ // closing quote). returns the matching '}', or NULL when the wall wins.
+ const char* ok_fstring_region_end(const char* p_start, const char* p_wall) {
+   const char* died = p_start;
+-  return scan_region(p_start, p_wall, &died);
++  return scan_region(p_start, p_wall, &died, 0);
+ }
+ 
+ static token number(lexer* p_lexer) {
+diff --git a/src/okmm.c b/src/okmm.c
+index 3726967..d60f795 100644
+--- a/src/okmm.c
++++ b/src/okmm.c
+@@ -36,6 +36,7 @@ allocators create_allocators(ok_allocators* p_alloc) {
+   alloc.allocate = allocate_impl;
+   alloc.release = release_impl;
+   alloc.gc = NULL;
++  alloc.impl = NULL;
+   return alloc;
+ }
+ 
+@@ -64,5 +65,6 @@ allocators create_raw_allocators_wrapper(ok_allocators* p_alloc) {
+   alloc.allocate = allocate_wrapper_impl;
+   alloc.release = release_wrapper_impl;
+   alloc.gc = NULL;
++  alloc.impl = NULL;
+   return alloc;
+ }
+diff --git a/src/okmm.h b/src/okmm.h
+index 9e4033a..52fb034 100644
+--- a/src/okmm.h
++++ b/src/okmm.h
+@@ -16,6 +16,9 @@ struct allocators {
+   release release;
+   gc* gc;
+   ok_allocators* raw_allocators;
++  // the impl lane (P5): allocator vtables with their own backing store -
++  // the parse arena - reach it through here. NULL on the plain wrappers.
++  void* impl;
+ };
+ 
+ allocators create_allocators(ok_allocators* p_alloc);
+diff --git a/src/okparser.c b/src/okparser.c
+index e48371b..c33a825 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -10,7 +10,9 @@
+ 
+ static ast_root* parse_root(parser* p_parser);
+ static ast_expression* parse_expression(parser* p_parser, precedence p_precedence);
++static ast_expression* parse_expression_inner(parser* p_parser, precedence p_precedence);
+ static ast_statement* parse_statement(parser* p_parser);
++static ast_statement* parse_statement_inner(parser* p_parser);
+ static ast_statement* try_parse_declaration(parser* p_parser);
+ static ast_let_declaration* parse_let_declaration(parser* p_parser,
+                                                 ast_declaration_modifiers_t p_modifiers,
+@@ -55,7 +57,7 @@ error_at_noted(parser* p_parser, token p_token, const ok_string_view p_message,
+ 
+ static bool advance(parser* p_parser);
+ static bool expect(parser* p_parser, token_type p_type, const ok_string_view p_message);
+-static void sync_state(parser* p_parser);
++static void sync_state(parser* p_parser, bool p_stop_at_brace);
+ 
+ static ast_expression* parse_unary_prefix(parser* p_parser, token p_trigger);
+ static ast_expression* parse_grouping(parser* p_parser, token p_trigger);
+@@ -191,14 +193,32 @@ static const parse_rule parse_rules[] = {
+ void parser_init(parser* p_parser, parser_specs p_specs) {
+   p_parser->panic = false;
+   p_parser->had_error = false;
++  p_parser->bail = false;
++  p_parser->depth = 0;
++  p_parser->report_count = 0;
+   p_parser->defer_serial = 0;
+   p_parser->source = p_specs.source;
+-  p_parser->alloc = p_specs.alloc;
++  // P5: the AST rides an arena. every node, list buffer and diagnostic
++  // temporary bumps out of chained blocks; release is a no-op; the whole
++  // tree dies in one walk at parse_result_deinit. a failed statement can
++  // no longer leak its half-built nodes, and teardown stopped recursing
++  // (the depth guard bounds the way in, the arena the way out).
++  ok_arena_init(&p_parser->arena, p_specs.alloc);
++  p_parser->arena_view = ok_arena_allocators(&p_parser->arena);
++  p_parser->alloc = &p_parser->arena_view;
++  // the first advance copies current into previous, and current is
++  // stack garbage until the lexer fills it - zero it so a first-byte lex
++  // error leaves a defined previous instead of an uninitialized read
++  // (P5's recovery paths look at previous where the old code never did).
++  memset(&p_parser->current, 0, sizeof(p_parser->current));
+   lexer_init(&p_parser->lexer, p_parser->source->code);
+   advance(p_parser);
+ }
+ 
+ void parser_deinit(parser* p_parser) {
++  // the arena is NOT touched here: parser_parse moved it into the result
++  // (or it dies with the parser for the callers that never parse). the
++  // lexer is the only field with its own state left.
+   lexer_deinit(&p_parser->lexer);
+   p_parser->source = NULL;
+ }
+@@ -239,26 +259,26 @@ parse_result parser_parse(parser* p_parser) {
+                      ok_create_string_view("the source is not acceptable utf-8.", OK_STRING_VIEW_CALCULATE_LENGTH, true),
+                      ok_create_string_view(ok_utf8_rejection_text(why), OK_STRING_VIEW_CALCULATE_LENGTH, true));
+       parse_result result;
+-      result.alloc = p_parser->alloc;
+       result.status = PARSE_ERROR;
+       result.root = NULL;
++      ok_arena_move(&result.arena, &p_parser->arena);
+       return result;
+     }
+   }
+   ast_root* root = parse_root(p_parser);
+   parse_result result;
+-  result.alloc = p_parser->alloc;
+   result.status = (root == NULL || p_parser->had_error) ? PARSE_ERROR : PARSE_OK;
+   result.root = root;
++  ok_arena_move(&result.arena, &p_parser->arena);
+   return result;
+ }
+ 
+ void parse_result_deinit(parse_result* parse_result) {
+-  if (parse_result->root != NULL) {
+-    ast_root_deinit(parse_result->root);
+-    parse_result->alloc->release(parse_result->alloc, parse_result->root);
+-    parse_result->root = NULL;
+-  }
++  // P5: the arena owns the whole tree. one block walk frees it - no
++  // recursive deinit (deep trees exit iteratively), no per-node release,
++  // and a failed parse's orphan nodes die with it instead of leaking.
++  ok_arena_deinit(&parse_result->arena);
++  parse_result->root = NULL;
+ }
+ 
+ void error_at(parser* p_parser, token p_token, const ok_string_view p_message) {
+@@ -266,20 +286,46 @@ void error_at(parser* p_parser, token p_token, const ok_string_view p_message) {
+ }
+ 
+ void error_at_noted(parser* p_parser, token p_token, const ok_string_view p_message, const ok_string_view p_note) {
++  p_parser->had_error = true;
++  // the report cap (P5): a garbage file gets 25 diagnostics and one
++  // closing line, then the parse goes silent and unwinds - error floods
++  // helped nobody. counted are RENDERED reports only (panic-suppressed
++  // repeats were never seen).
++  if (p_parser->bail) {
++    p_parser->panic = true;
++    return;
++  }
+   ok_note note;
+   note.text = p_note;
+   note.has_span = false;
+   note.span.line = 0;
+   note.span.offset = 0;
+   note.span.length = 0;
+-  report_at_noted(&p_parser->panic,
+-                  &p_parser->had_error,
+-                  p_token.type == TOKEN_EOF,
+-                  p_parser->source,
+-                  &p_token,
+-                  REPORT_SEVERITY_ERROR,
+-                  p_message,
+-                  p_note.chars != NULL ? &note : NULL);
++  const report_status reported = report_at_noted(&p_parser->panic,
++                                                  &p_parser->had_error,
++                                                  p_token.type == TOKEN_EOF,
++                                                  p_parser->source,
++                                                  &p_token,
++                                                  REPORT_SEVERITY_ERROR,
++                                                  p_message,
++                                                  p_note.chars != NULL ? &note : NULL);
++  if (reported != REPORT_STATUS_SKIPPED && ++p_parser->report_count >= OK_PARSER_MAX_REPORTED) {
++    // the closing line rides a FRESH panic flag: the error that tripped the
++    // cap just set the real one, and a suppressed "too many errors" line
++    // would make the cap invisible
++    bool closing_panic = false;
++    report_at_noted(&closing_panic,
++                    &p_parser->had_error,
++                    p_token.type == TOKEN_EOF,
++                    p_parser->source,
++                    &p_token,
++                    REPORT_SEVERITY_ERROR,
++                    ok_create_string_view("too many errors - the parse stops reporting here.",
++                                          OK_STRING_VIEW_CALCULATE_LENGTH,
++                                          true),
++                    NULL);
++    p_parser->bail = true;
++  }
+ }
+ 
+ bool advance(parser* p_parser) {
+@@ -306,9 +352,18 @@ bool expect(parser* p_parser, token_type p_type, const ok_string_view p_message)
+   return false;
+ }
+ 
+-void sync_state(parser* p_parser) {
++void sync_state(parser* p_parser, bool p_stop_at_brace) {
++  // statement-boundary recovery (P5): skip to the next statement start.
++  // p_stop_at_brace is the nesting-aware half - inside a block the sync
++  // stops AT the closing brace so the enclosing structure can close
++  // cleanly instead of swallowing its terminator; at module top level a
++  // stray '}' must stay visible (it is the next statement's error to
++  // report, eating it would mis-locate everything after).
+   p_parser->panic = false;
+   while (p_parser->current.type != TOKEN_EOF) {
++    if (p_stop_at_brace && p_parser->current.type == TOKEN_RIGHT_BRACE) {
++      return;
++    }
+     switch (p_parser->previous.type) {
+     case TOKEN_CLASS:
+     case TOKEN_FU:
+@@ -338,7 +393,19 @@ ast_root* parse_root(parser* p_parser) {
+   }
+   ast_specs s = {alloc};
+   ast_root_init(root, trigger, &s);
+-  while (advance(p_parser) && p_parser->previous.type != TOKEN_EOF) {
++  for (;;) {
++    if (p_parser->bail) {
++      break; // the cap tripped: stop consuming, the parse is already failed
++    }
++    if (!advance(p_parser)) {
++      // P5: a lex error mid-stream - the offending byte was reported and
++      // consumed; recover at the next boundary and keep walking
++      sync_state(p_parser, false);
++      continue;
++    }
++    if (p_parser->previous.type == TOKEN_EOF) {
++      break;
++    }
+     ast_statement* statement = NULL;
+     // imports are module-top-level-only (OR-1): parse_root is the one place
+     // they are born. every other route (blocks, class bodies, for-inits)
+@@ -356,8 +423,14 @@ ast_root* parse_root(parser* p_parser) {
+       ast_empty_statement_deinit((ast_empty_statement*)statement);
+       alloc->release(alloc, statement);
+     } else {
++      // P5 recovery: a failed top-level statement no longer ends the walk -
++      // sync to the next statement boundary and keep collecting diagnostics
++      // (and statements). had_error still fails the whole parse.
+       p_parser->had_error = true;
+     }
++    if (p_parser->panic) {
++      sync_state(p_parser, false);
++    }
+   }
+   if (p_parser->previous.type == TOKEN_EOF) {
+     ast_statements_list_append(&root->statements, (ast_statement*)parse_eof_statement(p_parser));
+@@ -365,7 +438,26 @@ ast_root* parse_root(parser* p_parser) {
+   return root;
+ }
+ 
++// P5: the shared depth funnel. every recursive descent into an expression
++// passes here - prefix chains, groupings, call args, subscripts, f-string
++// regions - so one counter bounds them all. over the cap is a located
++// error, never a crash.
+ ast_expression* parse_expression(parser* p_parser, precedence p_precedence) {
++  if (p_parser->depth >= OK_PARSER_MAX_DEPTH) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("expression nests too deeply (the limit is 200).",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    return NULL;
++  }
++  p_parser->depth++;
++  ast_expression* out = parse_expression_inner(p_parser, p_precedence);
++  p_parser->depth--;
++  return out;
++}
++
++static ast_expression* parse_expression_inner(parser* p_parser, precedence p_precedence) {
+   token tok = p_parser->previous;
+   const parse_rule prefix_rule = parse_rules[tok.type];
+   if (prefix_rule.prefix == NULL) {
+@@ -930,9 +1022,12 @@ static ast_expression* parse_interpolation_region(parser* p_parser,
+   parser sub;
+   sub.panic = false;
+   sub.had_error = false;
++  sub.bail = p_parser->bail;      // the cap's state crosses the region border
++  sub.report_count = 0;           // the region reports into its own budget
++  sub.depth = (uint16_t)(p_parser->depth + 1u); // f-string nesting is depth too
+   sub.defer_serial = 0;
+   sub.source = p_parser->source;
+-  sub.alloc = p_parser->alloc;
++  sub.alloc = p_parser->alloc; // the arena view: region nodes ride the same arena
+   sub.current.type = TOKEN_EOF;
+   sub.current.start = p_start;
+   sub.current.length = 0;
+@@ -973,6 +1068,14 @@ static ast_expression* parse_interpolation_region(parser* p_parser,
+   lexer_deinit(&sub.lexer);
+   p_parser->had_error = p_parser->had_error || sub.had_error;
+   p_parser->panic = p_parser->panic || sub.panic;
++  // P5: the region's report budget folds back (the cap guards the whole
++  // parse, regions included) and a tripped cap propagates up
++  if (p_parser->report_count + sub.report_count > p_parser->report_count) {
++    p_parser->report_count = (uint16_t)(p_parser->report_count + sub.report_count);
++  }
++  if (sub.bail) {
++    p_parser->bail = true;
++  }
+   if (inner == NULL) {
+     return NULL;
+   }
+@@ -1618,6 +1721,23 @@ fail:
+ }
+ 
+ ast_statement* parse_statement(parser* p_parser) {
++  // P5: statements recurse through compound bodies - the same shared
++  // depth counter bounds block nesting as bounds expression nesting.
++  if (p_parser->depth >= OK_PARSER_MAX_DEPTH) {
++    error_at(p_parser,
++             p_parser->current,
++             ok_create_string_view("statements nest too deeply (the limit is 200).",
++                                   OK_STRING_VIEW_CALCULATE_LENGTH,
++                                   true));
++    return NULL;
++  }
++  p_parser->depth++;
++  ast_statement* out = parse_statement_inner(p_parser);
++  p_parser->depth--;
++  return out;
++}
++
++static ast_statement* parse_statement_inner(parser* p_parser) {
+   switch (p_parser->previous.type) {
+   case TOKEN_PRINT:
+     return (ast_statement*)parse_print_statement(p_parser);
+@@ -1746,9 +1866,9 @@ ast_statement* try_parse_declaration(parser* p_parser) {
+     break;
+   }
+   }
+-  if (p_parser->panic) {
+-    sync_state(p_parser);
+-  }
++  // P5: the sync moved UP - the statement loops (parse_root, compound
++  // bodies) own the boundary now, nesting-aware, so a bad statement inside
++  // a block recovers instead of unwinding the whole block.
+   return statement;
+ }
+ 
+@@ -1876,6 +1996,12 @@ ast_let_declaration* parse_let_declaration(parser* p_parser,
+         ast_dispatch_deinit((ast_node*)expr);
+         goto free;
+       }
++      // born initialized (the fuzzer's second find): the old code deferred
++      // this init past the semicolon check, so a failed check deinit'd the
++      // let, which dispatched this node while its bytes were still arena
++      // garbage - whatever node_type the garbage decoded as got walked. the
++      // final re-init below keeps the authored-by-the-semicolon semantics.
++      ast_null_expression_init(null, let_tok, &s);
+       ast_expression* ident = (ast_expression*)expr;
+       ast_binding_init(binding, ident, binding_mods, ident->node.token, &s);
+       ast_let_declaration_init(let, binding, (ast_expression*)null, p_declaration_modifiers, let_tok, &s);
+@@ -2493,7 +2619,8 @@ ast_expression_statement* parse_expression_statement(parser* p_parser) {
+     goto fail;
+   }
+   advance(p_parser); // ;
+-  ast_expression_statement* expression_statement = (ast_expression_statement*)malloc(sizeof(ast_expression_statement));
++  ast_expression_statement* expression_statement =
++      (ast_expression_statement*)alloc->allocate(alloc, sizeof(ast_expression_statement));
+   if (expression_statement == NULL) {
+     error_at(p_parser,
+              p_parser->current,
+@@ -2557,12 +2684,24 @@ ast_compound_statement* parse_compound_statement(parser* p_parser) {
+   ast_statements_list list;
+   ast_statements_list_init(&list, alloc);
+   while (p_parser->current.type != TOKEN_RIGHT_BRACE && p_parser->current.type != TOKEN_EOF) {
+-    if (!advance(p_parser)) {
++    // the cap tripped: the block (and the parse) is already failed
++    if (p_parser->bail) {
+       goto fail;
+     }
++    if (!advance(p_parser)) {
++      // P5: a lex error no longer kills the block - the token was reported
++      // and the lexer consumed its byte; sync to the next boundary and keep
++      // going (sync stops AT the closing brace, so the block still closes)
++      sync_state(p_parser, true);
++      continue;
++    }
+     ast_statement* stmt = try_parse_declaration(p_parser);
+     if (stmt == NULL) {
+-      goto fail;
++      // P5 recovery: skip to the next statement boundary, keep the block
++      // alive for the statements after the bad one. the enclosing compile
++      // still fails (had_error), but the diagnostics all land.
++      sync_state(p_parser, true);
++      continue;
+     }
+     if (stmt->node.node_type == AST_EMPTY_STATEMENT) {
+       ast_dispatch_deinit((ast_node*)stmt);
+@@ -2572,6 +2711,9 @@ ast_compound_statement* parse_compound_statement(parser* p_parser) {
+     if (!ast_statements_list_append(&list, stmt)) {
+       goto fail;
+     }
++    if (p_parser->panic) {
++      sync_state(p_parser, true);
++    }
+   }
+   if (p_parser->current.type != TOKEN_RIGHT_BRACE) {
+     error_at(
+@@ -2746,6 +2888,12 @@ static ast_for_in_statement* parse_for_in_rest(parser* p_parser,
+                  "failed to allocate memory for ranged-for binding.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
+     goto fail_body;
+   }
++  ast_specs s = {alloc};
++  // born initialized (the fuzzer's class find): every node is initialized
++  // the moment it is allocated, so the OOM-labeled failure chains below
++  // deinit only nodes whose bytes were ever walked. the deferred-init shape
++  // this replaces could dispatch arena garbage as a node type.
++  ast_identifier_expression_init(ident, p_name_tok, &s);
+   ast_binding* binding = (ast_binding*)alloc->allocate(alloc, sizeof(ast_binding));
+   if (binding == NULL) {
+     error_at(p_parser,
+@@ -2756,6 +2904,7 @@ static ast_for_in_statement* parse_for_in_rest(parser* p_parser,
+     alloc->release(alloc, ident);
+     goto fail_body;
+   }
++  ast_binding_init(binding, (ast_expression*)ident, p_binds, p_name_tok, &s);
+   ast_identifier_expression* value_ident = NULL;
+   ast_binding* value_binding = NULL;
+   if (p_has_value) {
+@@ -2774,6 +2923,8 @@ static ast_for_in_statement* parse_for_in_rest(parser* p_parser,
+       }
+       goto fail_binding;
+     }
++    ast_identifier_expression_init(value_ident, p_value_name_tok, &s);
++    ast_binding_init(value_binding, (ast_expression*)value_ident, p_value_binds, p_value_name_tok, &s);
+   }
+   ast_for_in_statement* fin = (ast_for_in_statement*)alloc->allocate(alloc, sizeof(ast_for_in_statement));
+   if (fin == NULL) {
+@@ -2784,17 +2935,14 @@ static ast_for_in_statement* parse_for_in_rest(parser* p_parser,
+     if (value_ident != NULL) {
+       ast_identifier_expression_deinit(value_ident);
+       alloc->release(alloc, value_ident);
++      value_binding->lvalue = NULL;
++    }
++    if (value_binding != NULL) {
++      ast_binding_deinit(value_binding);
++      alloc->release(alloc, value_binding);
+     }
+-    alloc->release(alloc, value_binding);
+     goto fail_binding;
+   }
+-  ast_specs s = {alloc};
+-  ast_identifier_expression_init(ident, p_name_tok, &s);
+-  ast_binding_init(binding, (ast_expression*)ident, p_binds, p_name_tok, &s);
+-  if (p_has_value) {
+-    ast_identifier_expression_init(value_ident, p_value_name_tok, &s);
+-    ast_binding_init(value_binding, (ast_expression*)value_ident, p_value_binds, p_value_name_tok, &s);
+-  }
+   ast_for_in_statement_init(fin, p_for_tok, &s);
+   fin->binding = binding;
+   fin->value_binding = p_has_value ? value_binding : NULL;
+@@ -2966,6 +3114,12 @@ static ast_let_declaration* build_let_init_from_expression(
+       ast_dispatch_deinit((ast_node*)expr);
+       goto malformed;
+     }
++    // born initialized (the fuzzer's third find - the same deferred-init
++    // disease parse_let_declaration carried): a failed semicolon check
++    // deinits the let, which walks this node; arena garbage must never
++    // decode as a node type. the re-init below keeps the authored-by-';'
++    // semantics.
++    ast_null_expression_init(null, p_let_tok, &s);
+     ast_binding_init(binding, expr, p_binds, p_name_tok, &s);
+     ast_let_declaration_init(let, binding, (ast_expression*)null, DECLARATION_NONE, p_let_tok, &s);
+   } else {
+diff --git a/src/okparser.h b/src/okparser.h
+index a3a0fa1..7ccab86 100644
+--- a/src/okparser.h
++++ b/src/okparser.h
+@@ -2,12 +2,26 @@
+ #define OK_PARSER_H
+ 
+ #include <stdbool.h>
++#include <stdint.h>
+ 
+ #include "ok/ok_source.h"
++#include "okarena.h"
+ #include "okast.h"
+ #include "oklexer.h"
+ #include "oktoken.h"
+ 
++// P5 hardening limits. the depth cap is the stack-overflow vaccine: every
++// recursive descent (expressions, statements, f-string regions) funnels
++// through one shared counter, so a hostile `((((`-chain lands as a located
++// error instead of a segfault - and the compiler's own recursive walk over
++// the finished tree inherits the same bound for free. 200 is the lua-shaped
++// number (LUAI_MAXCCALLS): deep enough that no honest program notices, and
++// cheap enough that the C stack never notices either. the report cap keeps a
++// garbage file from flooding the console - after it trips the parse goes
++// silent and unwinds.
++#define OK_PARSER_MAX_DEPTH 200u
++#define OK_PARSER_MAX_REPORTED 25u
++
+ typedef enum {
+   PREC_NONE = (int)0,
+   PREC_ASSIGNMENT,
+@@ -33,12 +47,17 @@ typedef enum {
+ 
+ typedef struct {
+   ok_source* source;
+-  allocators* alloc;
++  allocators* alloc; // the arena view: every parse-time allocation rides it
++  ok_arena arena;    // P5: owns every AST byte; moves into the result
++  allocators arena_view; // storage for the view (parser-scoped)
+   lexer lexer;
+   token current;
+   token previous;
+   bool panic;
+   bool had_error;
++  bool bail; // P5: the report cap tripped - stop reporting, unwind
++  uint16_t depth;      // P5: the shared recursion depth (expressions + statements)
++  uint16_t report_count; // P5: diagnostics actually rendered
+   uint32_t defer_serial;
+ } parser;
+ 
+@@ -47,7 +66,10 @@ typedef enum { PARSE_OK, PARSE_ERROR } parse_status;
+ typedef struct {
+   parse_status status;
+   ast_root* root;
+-  allocators* alloc;
++  // P5: the parse's whole heap. deinit frees it in one block walk - the
++  // tree needs no recursive teardown, and a failed parse's orphan nodes
++  // die with it. root is kept for the successful reads only.
++  ok_arena arena;
+ } parse_result;
+ 
+ void parse_result_deinit(parse_result* parse_result);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 82e7ff0..4904289 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -2,3 +2,4 @@ add_subdirectory(unit/)
+ add_subdirectory(e2e/)
+ add_subdirectory(capi/)
+ add_subdirectory(integration/)
++add_subdirectory(fuzz/)
+diff --git a/tests/e2e/src/main.cpp b/tests/e2e/src/main.cpp
+index 9100103..9d4842f 100644
+--- a/tests/e2e/src/main.cpp
++++ b/tests/e2e/src/main.cpp
+@@ -60,11 +60,27 @@ run_result run_oklang(const std::string_view path,
+   return {decode_system_status(ret), read_file("out.log"), read_file("err.log")};
+ }
+ 
++// the repl lane (P5): the fixture is the stdin script - piped through a
++// bare `ok` with no path, prompts suppressed on the non-tty road. the
++// `// repl:` directive marks the shape; the expect lines ride the fixture
++// itself (they arrive as comments, which the repl's walker skips).
++run_result run_oklang_repl(const std::string_view path, const std::string_view okpath) {
++  std::stringstream cmd;
++  std::string stdout_file = "out.log";
++  std::string stderr_file = "err.log";
++  cmd << "\"" << okpath << "\" < \"" << path << "\" > " << stdout_file << " 2> " << stderr_file;
++
++  std::string cmd_str = cmd.str();
++  int ret = system(cmd_str.c_str());
++  return {decode_system_status(ret), read_file("out.log"), read_file("err.log")};
++}
++
+ struct test_case {
+   std::string name;
+   std::string expected_result;
+   std::optional<std::string> expected_error;
+   std::optional<int> expected_exit;
++  bool is_repl = false; // the P5 lane: pipe the fixture through a bare `ok`
+   bool has_expectation = false;
+ };
+ 
+@@ -76,12 +92,18 @@ test_case parse_test_file(const std::filesystem::path& p_path) {
+   std::string line;
+   std::regex expect_out_re(R"(//\s*expect:\s*(.*))");
+   std::regex expect_err_re(R"(//\s*expect\s+error(?::\s*(.*))?)");
++  // the repl lane (P5): the fixture feeds a bare `ok` through stdin.
++  std::regex repl_re(R"(//\s*repl:)");
+   // the sys.exit lane (P4): the process's code is the assertion.
+   std::regex expect_exit_re(R"(//\s*expect\s+exit:\s*(-?\d+))");
+ 
+   while (std::getline(fs, line)) {
+     std::smatch match;
+-    if (std::regex_search(line, match, expect_out_re)) {
++    if (std::regex_search(line, match, repl_re)) {
++      // the P5 lane: the fixture pipes through a bare `ok` (stdin, no path)
++      tc.is_repl = true;
++      tc.has_expectation = true;
++    } else if (std::regex_search(line, match, expect_out_re)) {
+       expected << match[1].str() << "\n";
+       tc.has_expectation = true;
+     } else if (std::regex_search(line, match, expect_err_re)) {
+@@ -269,7 +291,7 @@ int main(int argc, char** argv) {
+     const std::string okpath_value = parse_okpath(entry.path());
+     const std::string flags = parse_okflags(entry.path());
+     auto tc = parse_test_file(test_path);
+-    auto rr = run_oklang(test_path, okpath, okpath_value, flags);
++    auto rr = tc.is_repl ? run_oklang_repl(test_path, okpath) : run_oklang(test_path, okpath, okpath_value, flags);
+ 
+     if (!tc.has_expectation) {
+       std::println("{}[NOTOK]{}: '{}'", COLOR_RED, COLOR_RESET, test_path);
+diff --git a/tests/e2e/tests/numbers/unary_plus.ok b/tests/e2e/tests/numbers/unary_plus.ok
+new file mode 100644
+index 0000000..72343e2
+--- /dev/null
++++ b/tests/e2e/tests/numbers/unary_plus.ok
+@@ -0,0 +1,8 @@
++// unary plus is the identity (P5, the fuzzer's fourth find): the parse
++// tables always promised it, the compiler now honors it. no coercion.
++print(+5); // expect: 5
++print(+-3); // expect: -3
++print(+"hi"); // expect: hi
++print(+1.5); // expect: 1.5
++let x = 7;
++print(+x); // expect: 7
+diff --git a/tests/e2e/tests/parser/block_depth_exceeded.ok b/tests/e2e/tests/parser/block_depth_exceeded.ok
+new file mode 100644
+index 0000000..9f32e3c
+--- /dev/null
++++ b/tests/e2e/tests/parser/block_depth_exceeded.ok
+@@ -0,0 +1,603 @@
++// 300 nested blocks: statements have their own funnel into the same cap
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++{
++print(1);
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++}
++// expect error: statements nest too deeply (the limit is 200)
+diff --git a/tests/e2e/tests/parser/depth_exceeded.ok b/tests/e2e/tests/parser/depth_exceeded.ok
+new file mode 100644
+index 0000000..f1d201e
+--- /dev/null
++++ b/tests/e2e/tests/parser/depth_exceeded.ok
+@@ -0,0 +1,3 @@
++// 300 levels: the shared depth guard answers with a located error
++print(((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((1)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))));
++// expect error: expression nests too deeply (the limit is 200)
+diff --git a/tests/e2e/tests/parser/depth_within.ok b/tests/e2e/tests/parser/depth_within.ok
+new file mode 100644
+index 0000000..6b72a00
+--- /dev/null
++++ b/tests/e2e/tests/parser/depth_within.ok
+@@ -0,0 +1,2 @@
++// 150 levels of grouping: inside the 200 cap, an ordinary program
++print(((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((1))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))); // expect: 1
+diff --git a/tests/e2e/tests/parser/error_cap.ok b/tests/e2e/tests/parser/error_cap.ok
+new file mode 100644
+index 0000000..d4abc8d
+--- /dev/null
++++ b/tests/e2e/tests/parser/error_cap.ok
+@@ -0,0 +1,42 @@
++// a garbage file gets 25 diagnostics and the closing line, then silence
++let v0 = ;
++let v1 = ;
++let v2 = ;
++let v3 = ;
++let v4 = ;
++let v5 = ;
++let v6 = ;
++let v7 = ;
++let v8 = ;
++let v9 = ;
++let v10 = ;
++let v11 = ;
++let v12 = ;
++let v13 = ;
++let v14 = ;
++let v15 = ;
++let v16 = ;
++let v17 = ;
++let v18 = ;
++let v19 = ;
++let v20 = ;
++let v21 = ;
++let v22 = ;
++let v23 = ;
++let v24 = ;
++let v25 = ;
++let v26 = ;
++let v27 = ;
++let v28 = ;
++let v29 = ;
++let v30 = ;
++let v31 = ;
++let v32 = ;
++let v33 = ;
++let v34 = ;
++let v35 = ;
++let v36 = ;
++let v37 = ;
++let v38 = ;
++let v39 = ;
++// expect error: too many errors - the parse stops reporting here
+diff --git a/tests/e2e/tests/parser/fstring_nest_exceeded.ok b/tests/e2e/tests/parser/fstring_nest_exceeded.ok
+new file mode 100644
+index 0000000..f061e71
+--- /dev/null
++++ b/tests/e2e/tests/parser/fstring_nest_exceeded.ok
+@@ -0,0 +1,3 @@
++// 250 nested interpolations: the byte scanner caps its own recursion
++print(f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"${f"x"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}"}");
++// expect error: unterminated string
+diff --git a/tests/e2e/tests/parser/lex_error_recovery.ok b/tests/e2e/tests/parser/lex_error_recovery.ok
+new file mode 100644
+index 0000000..cdce051
+--- /dev/null
++++ b/tests/e2e/tests/parser/lex_error_recovery.ok
+@@ -0,0 +1,5 @@
++// the offending byte is consumed and the walk continues to the end
++print("before");
++@
++print("after");
++// expect error: unexpected character
+diff --git a/tests/e2e/tests/parser/recovery_in_block.ok b/tests/e2e/tests/parser/recovery_in_block.ok
+new file mode 100644
+index 0000000..23fe74b
+--- /dev/null
++++ b/tests/e2e/tests/parser/recovery_in_block.ok
+@@ -0,0 +1,9 @@
++// the sync stops AT the closing brace: the block closes cleanly after
++// a failed statement and the walk keeps reporting
++{
++  let = 1;
++  print("still inside");
++  let = 2;
++}
++let = 3;
++// expect error: expected an expression
+diff --git a/tests/e2e/tests/parser/recovery_two_errors.ok b/tests/e2e/tests/parser/recovery_two_errors.ok
+new file mode 100644
+index 0000000..3efb862
+--- /dev/null
++++ b/tests/e2e/tests/parser/recovery_two_errors.ok
+@@ -0,0 +1,6 @@
++// P5 recovery: a failed statement syncs to the next boundary, the walk
++// continues - every bad statement reports, not just the first
++let = 5;
++print("between");
++let = 6;
++// expect error: expected an expression
+diff --git a/tests/e2e/tests/parser/unterminated_recovery.ok b/tests/e2e/tests/parser/unterminated_recovery.ok
+new file mode 100644
+index 0000000..0e37093
+--- /dev/null
++++ b/tests/e2e/tests/parser/unterminated_recovery.ok
+@@ -0,0 +1,4 @@
++print("before");
++let s = "never closed;
++print("after");
++// expect error: unterminated string
+diff --git a/tests/e2e/tests/repl/autoprint_shapes.ok b/tests/e2e/tests/repl/autoprint_shapes.ok
+new file mode 100644
+index 0000000..2f0382e
+--- /dev/null
++++ b/tests/e2e/tests/repl/autoprint_shapes.ok
+@@ -0,0 +1,19 @@
++// auto-print rides the language's own print: numbers, strings raw,
++// booleans, null, the composite <shape n> pins. no host-side formatting.
++// repl:
++1.5
++-0.25
++"s"
++true
++false
++null
++[1, 2]
++{"k": 1}
++// expect: 1.5
++// expect: -0.25
++// expect: s
++// expect: true
++// expect: false
++// expect: null
++// expect: <array 2>
++// expect: <map 1>
+diff --git a/tests/e2e/tests/repl/basic.ok b/tests/e2e/tests/repl/basic.ok
+new file mode 100644
+index 0000000..65c96fd
+--- /dev/null
++++ b/tests/e2e/tests/repl/basic.ok
+@@ -0,0 +1,14 @@
++// the repl's plain lanes: statements run, output compares, the session
++// breathes past errors. this file IS the stdin script - the repl lane
++// pipes it through a bare `ok`.
++// repl:
++print("hello");
++1 + 2
++"hi" + "!"
++[1, 2, 3].len()
++print("done");
++// expect: hello
++// expect: 3
++// expect: hi!
++// expect: 3
++// expect: done
+diff --git a/tests/e2e/tests/repl/empty_entries.ok b/tests/e2e/tests/repl/empty_entries.ok
+new file mode 100644
+index 0000000..cb68dcd
+--- /dev/null
++++ b/tests/e2e/tests/repl/empty_entries.ok
+@@ -0,0 +1,7 @@
++// an empty entry and a comment-only entry never run:
++// repl:
++
++// just a comment
++
++print("end");
++// expect: end
+diff --git a/tests/e2e/tests/repl/errors_breathe.ok b/tests/e2e/tests/repl/errors_breathe.ok
+new file mode 100644
+index 0000000..7459754
+--- /dev/null
++++ b/tests/e2e/tests/repl/errors_breathe.ok
+@@ -0,0 +1,9 @@
++// a broken entry reports and the session keeps breathing; the exit is
++// still clean at EOF (the repl is a host, not a crash).
++// repl:
++let = oops;
++print("still alive");
++1 + undefined_name
++print("and again");
++// expect: still alive
++// expect: and again
+diff --git a/tests/e2e/tests/repl/exit.ok b/tests/e2e/tests/repl/exit.ok
+new file mode 100644
+index 0000000..c889f8c
+--- /dev/null
++++ b/tests/e2e/tests/repl/exit.ok
+@@ -0,0 +1,9 @@
++// std.sys's exit ends the session with its code - the process's code.
++// imports are per-entry (bindings are TU constants, spent with their
++// entry): the import and the exit share one entry.
++// repl:
++print("before");
++import "std/sys" as sys; sys.exit(3);
++print("never");
++// expect: before
++// expect exit: 3
+diff --git a/tests/e2e/tests/repl/multiline.ok b/tests/e2e/tests/repl/multiline.ok
+new file mode 100644
+index 0000000..f901f34
+--- /dev/null
++++ b/tests/e2e/tests/repl/multiline.ok
+@@ -0,0 +1,16 @@
++// continuation: open brackets, m-strings, and interpolation regions keep
++// the buffer open until they close; each block below is ONE entry.
++// repl:
++glob class Shape {
++  pub fu corners() { return 4; }
++}
++Shape().corners()
++glob let banner = m"line one
++line two
++";
++print(banner.bytes());
++print(f"${1 +
++2}");
++// expect: 4
++// expect: 18
++// expect: 3
+diff --git a/tests/e2e/tests/repl/persistence.ok b/tests/e2e/tests/repl/persistence.ok
+new file mode 100644
+index 0000000..04892ea
+--- /dev/null
++++ b/tests/e2e/tests/repl/persistence.ok
+@@ -0,0 +1,15 @@
++// persistence is the language's own lane: `glob` survives the entry, plain
++// `let` is local to its entry (a per-buffer local of that run's main).
++// an assignment is an expression: bare (no ';') it auto-prints its value.
++// repl:
++glob let x = 10;
++x * 2
++glob let mut count = 0;
++count = count + x
++count
++let local_only = 99;
++print("runs fine");
++// expect: 20
++// expect: 10
++// expect: 10
++// expect: runs fine
+diff --git a/tests/e2e/tests/repl/suppression.ok b/tests/e2e/tests/repl/suppression.ok
+new file mode 100644
+index 0000000..f946043
+--- /dev/null
++++ b/tests/e2e/tests/repl/suppression.ok
+@@ -0,0 +1,7 @@
++// the ';' suppresses the auto-print: a lone expression statement runs for
++// its side effects and prints nothing.
++// repl:
++40 + 2;
++"s" + "ilence";
++print("after");
++// expect: after
+diff --git a/tests/fuzz/CMakeLists.txt b/tests/fuzz/CMakeLists.txt
+new file mode 100644
+index 0000000..8e63499
+--- /dev/null
++++ b/tests/fuzz/CMakeLists.txt
+@@ -0,0 +1,30 @@
++# the zero-dep fuzzer (P5): corpus-driven, deterministic, engineless. links
++# the lib objects directly - the same internal lane the unit tests use - so
++# it can drive parser + compiler without ever handing the vm a byte.
++add_executable(okfuzz
++  src/fuzz.c
++)
++
++target_link_libraries(okfuzz
++  PRIVATE
++  ok
++  ok_sanitizers
++)
++
++# internal headers (parser/compiler/diag), same grant the unit tests run on
++target_include_directories(okfuzz
++  PRIVATE
++  ${PROJECT_SOURCE_DIR}/src
++)
++
++# the committed corpus, found bare (no flags) in every CI-style run
++target_compile_definitions(okfuzz PRIVATE OK_FUZZ_CORPUS_PREFIX="${CMAKE_SOURCE_DIR}/tests/fuzz")
++
++# the P1 gate flags (no -Wpedantic: dirent is the harness lane, POSIX like the CLI)
++if (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID MATCHES "Clang")
++  target_compile_options(okfuzz PRIVATE -Wall -Wextra -Werror -Wno-missing-braces)
++endif()
++
++# the standing gate run: the default seed, deterministic, reproducible.
++# findings change the corpus, never the seed.
++add_test(NAME ok.fuzz COMMAND okfuzz 20000)
+diff --git a/tests/fuzz/corpus/class_shapes.ok b/tests/fuzz/corpus/class_shapes.ok
+new file mode 100644
+index 0000000..d8f4ab8
+--- /dev/null
++++ b/tests/fuzz/corpus/class_shapes.ok
+@@ -0,0 +1,9 @@
++pub class Point {
++  pub let x = 0;
++  pub let y = 0;
++  fu init(a, b) { self.x = a; self.y = b; }
++  fu show() { print(self.x); }
++}
++class Sub extends Point { fu show() { super.show(); } }
++let p = new Point(1, 2);
++p.show();
+diff --git a/tests/fuzz/corpus/comments_only.ok b/tests/fuzz/corpus/comments_only.ok
+new file mode 100644
+index 0000000..d630a50
+--- /dev/null
++++ b/tests/fuzz/corpus/comments_only.ok
+@@ -0,0 +1,2 @@
++// line one
++// line two
+diff --git a/tests/fuzz/corpus/coroutines.ok b/tests/fuzz/corpus/coroutines.ok
+new file mode 100644
+index 0000000..be487cd
+--- /dev/null
++++ b/tests/fuzz/corpus/coroutines.ok
+@@ -0,0 +1,3 @@
++fu gen() { defer print("done"); return 1; }
++let c = coro(gen);
++print(c());
+diff --git a/tests/fuzz/corpus/deep_blocks.ok b/tests/fuzz/corpus/deep_blocks.ok
+new file mode 100644
+index 0000000..612ca0d
+--- /dev/null
++++ b/tests/fuzz/corpus/deep_blocks.ok
+@@ -0,0 +1 @@
++{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{print(1);}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+diff --git a/tests/fuzz/corpus/deep_parens.ok b/tests/fuzz/corpus/deep_parens.ok
+new file mode 100644
+index 0000000..aacbb27
+--- /dev/null
++++ b/tests/fuzz/corpus/deep_parens.ok
+@@ -0,0 +1 @@
++print(((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((1)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))));
+diff --git a/tests/fuzz/corpus/empty.ok b/tests/fuzz/corpus/empty.ok
+new file mode 100644
+index 0000000..a402941
+--- /dev/null
++++ b/tests/fuzz/corpus/empty.ok
+@@ -0,0 +1,4 @@
++// only a comment
++
++   
++	
+diff --git a/tests/fuzz/corpus/escapes.ok b/tests/fuzz/corpus/escapes.ok
+new file mode 100644
+index 0000000..80f7308
+--- /dev/null
++++ b/tests/fuzz/corpus/escapes.ok
+@@ -0,0 +1,3 @@
++print("\a\b\e\f\v\0\x41\x1B\u{1F600}\u{7F}\n\r\t\\\"\'");
++print(m"""a\u{41}b""");
++print(f"${\"s\"}");
+diff --git a/tests/fuzz/corpus/for_shapes.ok b/tests/fuzz/corpus/for_shapes.ok
+new file mode 100644
+index 0000000..896be19
+--- /dev/null
++++ b/tests/fuzz/corpus/for_shapes.ok
+@@ -0,0 +1,4 @@
++for let i = 0; i < 3; i = i + 1 { print(i); }
++for x in [1, 2] { print(x); }
++let m = {"a": 1};
++for k, v in m { print(k); }
+diff --git a/tests/fuzz/corpus/fstring_chain.ok b/tests/fuzz/corpus/fstring_chain.ok
+new file mode 100644
+index 0000000..627b437
+--- /dev/null
++++ b/tests/fuzz/corpus/fstring_chain.ok
+@@ -0,0 +1 @@
++print(f"${f"${f"${f"${f"${f"${f"${f"${x}"}"}"}"}"}"}"}");
+diff --git a/tests/fuzz/corpus/invalid_utf8.bin b/tests/fuzz/corpus/invalid_utf8.bin
+new file mode 100644
+index 0000000..1180765
+--- /dev/null
++++ b/tests/fuzz/corpus/invalid_utf8.bin
+@@ -0,0 +1,2 @@
++print("café ��");
++let x = "�";
+diff --git a/tests/fuzz/corpus/modules.ok b/tests/fuzz/corpus/modules.ok
+new file mode 100644
+index 0000000..6968d59
+--- /dev/null
++++ b/tests/fuzz/corpus/modules.ok
+@@ -0,0 +1,5 @@
++import std.math;
++import std.io;
++print(std.math.pi);
++import { sin } from "std.math";
++print(sin(0));
+diff --git a/tests/fuzz/corpus/numbers.ok b/tests/fuzz/corpus/numbers.ok
+new file mode 100644
+index 0000000..99350a7
+--- /dev/null
++++ b/tests/fuzz/corpus/numbers.ok
+@@ -0,0 +1,4 @@
++print(0x1F + 0b101 + 0o17);
++print(1.5e10 / 1e-3);
++print(1..2);
++print(0.1 + 0.2);
+diff --git a/tests/fuzz/corpus/operators.ok b/tests/fuzz/corpus/operators.ok
+new file mode 100644
+index 0000000..a118e78
+--- /dev/null
++++ b/tests/fuzz/corpus/operators.ok
+@@ -0,0 +1,6 @@
++let a = 1 + 2 * 3 - 4 / 2 % 5;
++let b = a << 2 >> 1 | 3 & 7 ^ 1;
++let c = a == b != 1 === 2 !== 3 < 4 <= 5 > 6 >= 7;
++let d = !c && true || false;
++let e = a ?? b;
++print(-a);
+diff --git a/tests/fuzz/corpus/strings_multiline.ok b/tests/fuzz/corpus/strings_multiline.ok
+new file mode 100644
+index 0000000..357dabb
+--- /dev/null
++++ b/tests/fuzz/corpus/strings_multiline.ok
+@@ -0,0 +1,5 @@
++let s = m"""
++line one ${1 + 1}
++line "quoted" three
++""";
++print(s.bytes());
+diff --git a/tests/fuzz/corpus/unterminated.ok b/tests/fuzz/corpus/unterminated.ok
+new file mode 100644
+index 0000000..4aaaf8a
+--- /dev/null
++++ b/tests/fuzz/corpus/unterminated.ok
+@@ -0,0 +1,3 @@
++print("before);
++let s = "never closed;
++{
+diff --git a/tests/fuzz/corpus/utf8.ok b/tests/fuzz/corpus/utf8.ok
+new file mode 100644
+index 0000000..b25f605
+--- /dev/null
++++ b/tests/fuzz/corpus/utf8.ok
+@@ -0,0 +1,3 @@
++let café = "naïve — über";
++print(café.len());
++print("🚀 unicode 🎉");
+diff --git a/tests/fuzz/crosscheck-manifest.txt b/tests/fuzz/crosscheck-manifest.txt
+new file mode 100644
+index 0000000..4750c02
+--- /dev/null
++++ b/tests/fuzz/crosscheck-manifest.txt
+@@ -0,0 +1,698 @@
++# the tree-sitter cross-check manifest (P5): the native parser's verdict
++# for every .ok/.bin under the two committed roots. regenerated by
++# tests/fuzz/crosscheck.sh; the grammar sweep (tree-sitter-oklang) diffs
++# against this - drift in either direction is a bug.
++# root: tests/e2e/tests
++accept  arrays/aliasing.ok
++accept  arrays/compound_assign.ok
++accept  arrays/empty.ok
++accept  arrays/equality_identity.ok
++accept  arrays/errors/compound_immutable.ok
++accept  arrays/errors/fractional_index.ok
++reject  arrays/errors/iterate_number.ok  (parse)
++accept  arrays/errors/len_not_array.ok
++accept  arrays/errors/negative_index.ok
++accept  arrays/errors/null_index.ok
++accept  arrays/errors/oob_get.ok
++accept  arrays/errors/oob_store.ok
++accept  arrays/errors/pop_not_array.ok
++accept  arrays/errors/remove_bad_range.ok
++accept  arrays/errors/remove_oob.ok
++accept  arrays/errors/string_index.ok
++accept  arrays/errors/subscript_number.ok
++accept  arrays/for_in.ok
++accept  arrays/for_in_break_continue.ok
++accept  arrays/for_in_empty.ok
++accept  arrays/for_in_mut.ok
++accept  arrays/for_in_nested.ok
++accept  arrays/get_set_roundtrip.ok
++accept  arrays/literal.ok
++accept  arrays/literal_order.ok
++accept  arrays/mixed.ok
++accept  arrays/nested.ok
++accept  arrays/push_pop.ok
++accept  arrays/regressions/assign_call_rhs_window.ok
++accept  arrays/regressions/captured_array.ok
++accept  arrays/regressions/compound_single_eval.ok
++accept  arrays/regressions/container_elision_gates.ok
++accept  arrays/regressions/eval_order.ok
++accept  arrays/regressions/for_in_shadow.ok
++accept  arrays/regressions/grow_300.ok
++accept  arrays/regressions/literal_300.ok
++accept  arrays/regressions/literal_in_call.ok
++accept  arrays/regressions/make_counter.ok
++accept  arrays/regressions/new_300.ok
++accept  arrays/remove.ok
++accept  classes/as_error.ok
++accept  classes/as_not_type_error.ok
++accept  classes/bare_builtin_shadow.ok
++accept  classes/bare_method_call.ok
++accept  classes/bare_static_method.ok
++accept  classes/basic.ok
++accept  classes/bound_method.ok
++accept  classes/builtin_classes.ok
++accept  classes/class_in_method.ok
++accept  classes/classes_as_values.ok
++accept  classes/classof_isinstance.ok
++accept  classes/conversion_bad_return_error.ok
++accept  classes/conversion_private_error.ok
++accept  classes/conversions.ok
++accept  classes/field_callable.ok
++accept  classes/field_redeclare_error.ok
++accept  classes/fields.ok
++accept  classes/fused_operator_conditions.ok
++accept  classes/glob_class.ok
++accept  classes/identity.ok
++accept  classes/immutable_error.ok
++accept  classes/inheritance.ok
++accept  classes/init_super_error.ok
++accept  classes/instance_as_num_error.ok
++accept  classes/interned_names.ok
++accept  classes/is_error.ok
++accept  classes/is_operator.ok
++accept  classes/local_class.ok
++accept  classes/local_class_parent_error.ok
++accept  classes/local_class_redefine_closures.ok
++accept  classes/local_class_redefine_in_method.ok
++accept  classes/local_class_redefine_inherit.ok
++accept  classes/local_class_twice.ok
++accept  classes/method_assign_error.ok
++accept  classes/native_method_arity_error.ok
++accept  classes/native_method_error.ok
++accept  classes/native_methods.ok
++accept  classes/operator_arity_error.ok
++accept  classes/operator_call.ok
++reject  classes/operator_field_name_error.ok  (parse)
++accept  classes/operator_nospace.ok
++accept  classes/operator_private_error.ok
++accept  classes/operator_redeclare_error.ok
++accept  classes/operator_type_error.ok
++accept  classes/operators_arith.ok
++accept  classes/operators_call_instance.ok
++accept  classes/operators_compare.ok
++accept  classes/operators_inherit.ok
++accept  classes/operators_subscript.ok
++accept  classes/operators_subscript_error.ok
++accept  classes/operators_unary.ok
++accept  classes/poly_mic.ok
++accept  classes/privacy_fields.ok
++accept  classes/privacy_methods.ok
++accept  classes/pub_field_immutable_error.ok
++accept  classes/pub_fields.ok
++accept  classes/pub_static_immutable_error.ok
++accept  classes/pub_statics.ok
++accept  classes/pub_survives_error.ok
++accept  classes/signature_error.ok
++accept  classes/static_method_assign_error.ok
++accept  classes/static_redeclare_error.ok
++accept  classes/statics.ok
++accept  classes/statics_errors.ok
++accept  classes/super_outside_error.ok
++accept  classes/super_strict_errors.ok
++accept  classes/this_lambda.ok
++accept  closures/capture.ok
++accept  closures/counter.ok
++accept  closures/independent_capture.ok
++accept  closures/local_slot_reuse.ok
++accept  closures/mutable.ok
++accept  closures/nested_capture.ok
++accept  closures/return_closure.ok
++accept  closures/two_closures.ok
++accept  control/branching.ok
++accept  control/expression_in_if.ok
++accept  control/if_else.ok
++accept  control/if_else_if.ok
++accept  control/if_false.ok
++accept  control/if_true.ok
++accept  control/nested_if.ok
++accept  control/truthiness.ok
++accept  coros/basic.ok
++accept  coros/classes_interplay.ok
++accept  coros/coro_in_coro.ok
++accept  coros/defers.ok
++accept  coros/defers_continuation.ok
++accept  coros/error_crossing.ok
++accept  coros/errors/body_arity_error.ok
++accept  coros/errors/body_not_fu_error.ok
++accept  coros/errors/resume_arity_error.ok
++accept  coros/errors/resume_running_error.ok
++accept  coros/errors/yield_in_constructor_error.ok
++accept  coros/errors/yield_in_defer_error.ok
++accept  coros/errors/yield_in_operator_error.ok
++accept  coros/errors/yield_outside_error.ok
++accept  coros/gc_parked.ok
++accept  coros/nested_calls.ok
++accept  coros/status_running.ok
++accept  coros/upvalues.ok
++accept  defaults/all_defaulted.ok
++accept  defaults/basic.ok
++accept  defaults/default_expression.ok
++accept  defaults/default_global_ref.ok
++accept  defaults/default_with_nested_call.ok
++accept  defaults/dynamic_callee.ok
++accept  defaults/earlier_param.ok
++reject  defaults/errors/non_trailing.ok  (parse)
++accept  defaults/errors/too_few.ok
++accept  defaults/errors/too_many.ok
++accept  defaults/fresh_mutable_default.ok
++accept  defaults/lambda_default.ok
++accept  defaults/side_effect_once.ok
++accept  defaults/single.ok
++reject  errors/catch_mut_binder.ok  (parse)
++accept  errors/defer_basic.ok
++accept  errors/defer_break_continue.ok
++accept  errors/defer_closures_and_calls.ok
++accept  errors/defer_continuation.ok
++accept  errors/defer_continuation_uncaught.ok
++accept  errors/defer_error_replaces.ok
++accept  errors/defer_gc_churn.ok
++accept  errors/defer_in_loop.ok
++reject  errors/defer_not_a_call_error.ok  (parse)
++accept  errors/defer_return.ok
++accept  errors/defer_snapshot.ok
++accept  errors/defer_spread_rejected.ok
++accept  errors/defer_uncaught_sweep.ok
++accept  errors/defer_unwind_before_catch.ok
++accept  errors/deferr_only_on_error.ok
++accept  errors/diag_bare_note.ok
++reject  errors/diag_eof_span.ok  (parse)
++accept  errors/diag_note_located.ok
++accept  errors/diag_redef_note.ok
++accept  errors/diag_runtime_location.ok
++accept  errors/diag_snippet_caret.ok
++accept  errors/diag_snippet_line.ok
++accept  errors/diag_trace_frame.ok
++accept  errors/diag_trace_location.ok
++accept  errors/diag_true_column.ok
++reject  errors/diag_unterminated.ok  (parse)
++accept  errors/immutable_binop_assign.ok
++accept  errors/immutable_mutation.ok
++accept  errors/invalid_call.ok
++accept  errors/invalid_operands.ok
++accept  errors/rethrow_outside_catch.ok
++accept  errors/throw_uncaught_value.ok
++accept  errors/too_few_arguments.ok
++reject  errors/too_many_arguments.ok  (parse)
++accept  errors/try_catch_across_call.ok
++accept  errors/try_catch_any_value.ok
++accept  errors/try_catch_bare.ok
++accept  errors/try_catch_binder_immutable.ok
++accept  errors/try_catch_in_loop.ok
++accept  errors/try_catch_nested.ok
++accept  errors/try_catch_rethrow.ok
++accept  errors/try_catch_runtime_error.ok
++reject  errors/try_requires_catch.ok  (parse)
++accept  errors/undefined_variable.ok
++accept  functions/arguments.ok
++accept  functions/basic.ok
++accept  functions/glob.ok
++accept  functions/lambda/arguments.ok
++accept  functions/lambda/as_value.ok
++accept  functions/lambda/basic.ok
++accept  functions/lambda/imcall.ok
++accept  functions/lambda/mutable_args.ok
++accept  functions/many_args.ok
++accept  functions/multiple_return.ok
++accept  functions/mutable_args.ok
++accept  functions/nested_call.ok
++accept  functions/recursion.ok
++accept  functions/repeated_call.ok
++accept  functions/return.ok
++accept  generated/1/constant_long.ok
++accept  generated/2/global_long.ok
++accept  generated/3/jump_long.ok
++accept  generated/4/local_long.ok
++accept  generated/5/upvalue_long.ok
++accept  integration/closure_if.ok
++accept  integration/closure_loop.ok
++accept  integration/closure_with_loop_and_mutation.ok
++accept  integration/fuck_around.ok
++accept  integration/function_calls_function.ok
++accept  integration/globals_and_closures.ok
++accept  integration/loop_and_function.ok
++accept  integration/loop_with_if_chain.ok
++accept  integration/many_locals.ok
++accept  integration/many_nests.ok
++accept  integration/many_upvalues.ok
++accept  integration/nested_closures.ok
++accept  integration/nested_control_flow.ok
++accept  integration/nested_loops.ok
++accept  integration/recursion_with_locals.ok
++accept  loops/for/basic.ok
++accept  loops/for/break.ok
++accept  loops/for/continue.ok
++accept  loops/for/mutable.ok
++accept  loops/for/nested.ok
++accept  loops/for/nested_break.ok
++accept  loops/for/nested_continue.ok
++accept  loops/for/one_iter.ok
++accept  loops/for/zero_iter.ok
++accept  loops/fused_conditions.ok
++accept  loops/numeric/basic.ok
++accept  loops/numeric/bounds_evaluated_once.ok
++accept  loops/numeric/break_continue.ok
++accept  loops/numeric/capture.ok
++accept  loops/numeric/direction_mismatch_is_empty.ok
++reject  loops/numeric/errors/immutable_counter.ok  (parse)
++reject  loops/numeric/errors/mut_counter_non_number.ok  (parse)
++reject  loops/numeric/errors/non_number_limit.ok  (parse)
++reject  loops/numeric/errors/non_number_start.ok  (parse)
++reject  loops/numeric/errors/non_number_step.ok  (parse)
++reject  loops/numeric/errors/step_zero.ok  (parse)
++accept  loops/numeric/fractional_step.ok
++accept  loops/numeric/frozen_limit.ok
++accept  loops/numeric/limit_sees_counter.ok
++accept  loops/numeric/mut_reseat.ok
++accept  loops/numeric/negative_step.ok
++accept  loops/numeric/nested_shadowing.ok
++accept  loops/numeric/nested_with_for_in.ok
++accept  loops/numeric/one_iter.ok
++accept  loops/numeric/step_expr.ok
++accept  loops/numeric/two_pow_53_boundary.ok
++accept  loops/numeric/zero_iter.ok
++accept  loops/while/basic.ok
++accept  loops/while/break.ok
++accept  loops/while/continue.ok
++accept  loops/while/mutable.ok
++accept  loops/while/nested.ok
++accept  loops/while/nested_break.ok
++accept  loops/while/one_iter.ok
++accept  loops/while/zero_iter.ok
++accept  maps/aliasing.ok
++accept  maps/as_str.ok
++accept  maps/compound_assign.ok
++reject  maps/empty_literal.ok  (parse)
++accept  maps/equality_identity.ok
++accept  maps/errors/array_key.ok
++accept  maps/errors/as_map_not_map.ok
++accept  maps/errors/as_num_map.ok
++accept  maps/errors/compound_on_missing.ok
++accept  maps/errors/function_key.ok
++accept  maps/errors/get_bad_arity.ok
++accept  maps/errors/get_not_map.ok
++accept  maps/errors/insert_during_iteration.ok
++accept  maps/errors/iterate_number.ok
++accept  maps/errors/map_key.ok
++accept  maps/errors/missing_key.ok
++accept  maps/errors/null_key_literal.ok
++accept  maps/errors/null_key_read.ok
++accept  maps/errors/null_key_write.ok
++accept  maps/errors/remove_bad_arity.ok
++accept  maps/errors/remove_during_iteration.ok
++accept  maps/errors/subscript_map_number_index.ok
++accept  maps/errors/two_binding_array.ok
++accept  maps/get_lax.ok
++accept  maps/get_set_roundtrip.ok
++accept  maps/iteration/basic.ok
++accept  maps/iteration/break_continue.ok
++accept  maps/iteration/capture.ok
++accept  maps/iteration/empty.ok
++accept  maps/iteration/mixed_array_map.ok
++accept  maps/iteration/mut_bindings.ok
++accept  maps/iteration/nested.ok
++accept  maps/iteration/numeric_unchanged.ok
++accept  maps/literal.ok
++accept  maps/literal_computed_keys.ok
++accept  maps/literal_duplicates.ok
++accept  maps/literal_in_call.ok
++accept  maps/literal_nested.ok
++accept  maps/literal_trailing_comma.ok
++accept  maps/mutation_during_iteration_overwrite.ok
++accept  maps/null_values.ok
++accept  maps/print_tag.ok
++accept  maps/regressions/array_as_str_separator.ok
++accept  maps/regressions/gc_churn.ok
++accept  maps/regressions/int_and_double_key.ok
++accept  maps/regressions/minus_zero_key.ok
++accept  maps/remove.ok
++accept  maps/shadowing.ok
++reject  modules/abs_path.ok  (parse)
++accept  modules/as/lib.ok
++accept  modules/as/main.ok
++reject  modules/backslash.ok  (parse)
++accept  modules/basic/lib.ok
++accept  modules/basic/main.ok
++accept  modules/captured/lib.ok
++accept  modules/captured/main.ok
++accept  modules/chain/leaf.ok
++accept  modules/chain/main.ok
++accept  modules/chain/mid.ok
++accept  modules/classes/lib.ok
++accept  modules/classes/main.ok
++accept  modules/collide/lib.ok
++accept  modules/collide/main.ok
++accept  modules/cross_trace/lib.ok
++accept  modules/cross_trace/main.ok
++accept  modules/cycle/a.ok
++accept  modules/cycle/b.ok
++accept  modules/cycle/main.ok
++accept  modules/deep/d01.ok
++accept  modules/deep/d02.ok
++accept  modules/deep/d03.ok
++accept  modules/deep/d04.ok
++accept  modules/deep/d05.ok
++accept  modules/deep/d06.ok
++accept  modules/deep/d07.ok
++accept  modules/deep/d08.ok
++accept  modules/deep/d09.ok
++accept  modules/deep/d10.ok
++accept  modules/deep/d11.ok
++accept  modules/deep/d12.ok
++accept  modules/deep/d13.ok
++accept  modules/deep/d14.ok
++accept  modules/deep/d15.ok
++accept  modules/deep/d16.ok
++accept  modules/deep/d17.ok
++accept  modules/deep/d18.ok
++accept  modules/deep/d19.ok
++accept  modules/deep/d20.ok
++accept  modules/deep/main.ok
++accept  modules/diamond/left.ok
++accept  modules/diamond/main.ok
++accept  modules/diamond/right.ok
++accept  modules/diamond/shared.ok
++accept  modules/earlyret/lib.ok
++accept  modules/earlyret/main.ok
++reject  modules/empty_segment.ok  (parse)
++accept  modules/from/lib.ok
++accept  modules/from/main.ok
++accept  modules/from_dup/lib.ok
++accept  modules/from_dup/main.ok
++reject  modules/from_unquoted.ok  (parse)
++accept  modules/glob/glib.ok
++accept  modules/glob/main.ok
++accept  modules/immutable/lib.ok
++accept  modules/immutable/main.ok
++reject  modules/import_in_block.ok  (parse)
++reject  modules/import_in_fu.ok  (parse)
++accept  modules/merge/a/one.ok
++accept  modules/merge/a/two.ok
++accept  modules/merge/main.ok
++accept  modules/merge_conflict/main.ok
++accept  modules/merge_conflict/x.ok
++accept  modules/merge_conflict/x/y.ok
++accept  modules/missing_export/lib.ok
++accept  modules/missing_export/main.ok
++accept  modules/missing_from/lib.ok
++accept  modules/missing_from/main.ok
++accept  modules/native_abimajor/main.ok
++accept  modules/native_abiminor_old/main.ok
++accept  modules/native_badabi/main.ok
++accept  modules/native_badname/main.ok
++accept  modules/native_force/main.ok
++accept  modules/native_hello/main.ok
++accept  modules/native_hint/main.ok
++accept  modules/native_pubfield/main.ok
++accept  modules/native_restrict/main.ok
++accept  modules/native_state/main.ok
++accept  modules/notfound_bare.ok
++accept  modules/notfound_relative.ok
++accept  modules/okpath/main.ok
++accept  modules/okpath/roots/plug/ok.ok
++reject  modules/parsefail/lib.ok  (parse)
++accept  modules/parsefail/main.ok
++accept  modules/privacy/lib.ok
++accept  modules/privacy/main.ok
++accept  modules/project_ambiguous/main.ok
++accept  modules/project_ambiguous/project.ok
++accept  modules/project_app/main.ok
++accept  modules/project_app/project.ok
++accept  modules/project_app/src/app.ok
++accept  modules/project_app/src/util.ok
++accept  modules/project_autobuild/main.ok
++accept  modules/project_autobuild/project.ok
++accept  modules/project_cycle/main.ok
++accept  modules/project_cycle/project.ok
++accept  modules/project_cycle/vendor/b/project.ok
++accept  modules/project_dep/main.ok
++accept  modules/project_dep/project.ok
++accept  modules/project_dep/vendor/helpers/x.ok
++accept  modules/project_dep/vendor/mathx/project.ok
++accept  modules/project_dep/vendor/mathx/src/vec.ok
++accept  modules/project_dep/vendor/tiny/t.ok
++accept  modules/project_manifest_imports/main.ok
++accept  modules/project_manifest_imports/project.ok
++accept  modules/project_manifest_missing/main.ok
++accept  modules/project_manifest_missing/project.ok
++accept  modules/project_missing_dep/main.ok
++accept  modules/project_missing_dep/project.ok
++accept  modules/project_native/main.ok
++accept  modules/project_native/project.ok
++accept  modules/project_nobuild/main.ok
++accept  modules/project_nobuild/project.ok
++accept  modules/project_restrict/main.ok
++accept  modules/project_restrict/project.ok
++accept  modules/project_where404/main.ok
++accept  modules/project_where404/project.ok
++accept  modules/project_where404/src/real.ok
++reject  modules/pub_glob.ok  (parse)
++accept  modules/pub_in_block.ok
++accept  modules/pubmembers/lib.ok
++accept  modules/pubmembers/main.ok
++accept  modules/pubmembers_private/lib.ok
++accept  modules/pubmembers_private/main.ok
++accept  modules/selfcycle/main.ok
++accept  modules/selfcycle/s.ok
++accept  modules/spanpub/lib.ok
++accept  modules/spanpub/main.ok
++reject  modules/star_from.ok  (parse)
++reject  modules/star_import.ok  (parse)
++accept  modules/std/bare.ok
++accept  modules/std/basic.ok
++accept  modules/std/empty_modules.ok
++accept  modules/std/errors/fs_list_not_dir.ok
++accept  modules/std/errors/fs_mkdir_exists.ok
++accept  modules/std/errors/fs_path_nul.ok
++accept  modules/std/errors/fs_read_directory.ok
++accept  modules/std/errors/fs_read_missing.ok
++accept  modules/std/errors/fs_read_not_string.ok
++accept  modules/std/errors/fs_remove_missing.ok
++accept  modules/std/errors/fs_remove_nonempty.ok
++accept  modules/std/errors/fs_write_missing_parent.ok
++accept  modules/std/errors/math_domain_asin.ok
++accept  modules/std/errors/math_domain_log.ok
++accept  modules/std/errors/math_domain_sqrt.ok
++accept  modules/std/errors/math_idiv_zero.ok
++accept  modules/std/errors/math_pow_nan_lane.ok
++accept  modules/std/errors/math_result_range.ok
++accept  modules/std/errors/math_type.ok
++accept  modules/std/errors/sys_env_get_not_string.ok
++accept  modules/std/errors/sys_env_set_bad_name.ok
++accept  modules/std/errors/sys_exit_not_number.ok
++accept  modules/std/errors/sys_exit_not_whole.ok
++accept  modules/std/exit/basic.ok
++accept  modules/std/exit/catch.ok
++accept  modules/std/exit/code.ok
++accept  modules/std/exit/defer.ok
++accept  modules/std/flat_alias.ok
++accept  modules/std/from_array.ok
++accept  modules/std/from_missing.ok
++accept  modules/std/fs.ok
++accept  modules/std/immutable.ok
++accept  modules/std/in_module/lib.ok
++accept  modules/std/in_module/main.ok
++accept  modules/std/io.ok
++accept  modules/std/math.ok
++accept  modules/std/restrict/host_gated_fs.ok
++accept  modules/std/restrict/host_gated_sys.ok
++accept  modules/std/shadow/main.ok
++accept  modules/std/shadow/std/array.ok
++accept  modules/std/sys.ok
++accept  modules/std/unknown.ok
++accept  modules/std_standalone.ok
++accept  modules/stdalias/lib.ok
++accept  modules/stdalias/main.ok
++accept  modules/stdres/lib.ok
++accept  modules/stdres/main.ok
++accept  modules/surfaceglob/glib.ok
++accept  modules/surfaceglob/main.ok
++accept  modules/surfaceglob/pkg/inner.ok
++accept  modules/surfacepub/main.ok
++accept  modules/surfacepub/rexport.ok
++accept  modules/surfacepub/rexport_inner.ok
++accept  modules/topfail/lib.ok
++accept  modules/topfail/main.ok
++reject  modules/trailing_slash.ok  (parse)
++reject  modules/unquoted.ok  (parse)
++accept  numbers/unary_plus.ok
++accept  operators/arithmetic.ok
++accept  operators/as/basic.ok
++accept  operators/as/errors.ok
++accept  operators/as/precedence_shadow.ok
++accept  operators/as/shadow_call_error.ok
++accept  operators/as/shadowed_tag_error.ok
++accept  operators/assignment.ok
++accept  operators/chain.ok
++accept  operators/comparison.ok
++accept  operators/equality.ok
++accept  operators/errors/modulo_invalid.ok
++accept  operators/errors/modulo_zero.ok
++accept  operators/grouping.ok
++accept  operators/logical.ok
++accept  operators/mixed.ok
++accept  operators/modulo.ok
++accept  operators/precedence.ok
++accept  operators/ternary/arms.ok
++accept  operators/ternary/basic.ok
++reject  operators/ternary/errors/missing_otherwise.ok  (parse)
++accept  operators/ternary/nesting.ok
++accept  operators/ternary/side_effects.ok
++accept  operators/ternary/terminator.ok
++accept  operators/unary.ok
++reject  parser/block_depth_exceeded.ok  (parse)
++reject  parser/depth_exceeded.ok  (parse)
++accept  parser/depth_within.ok
++reject  parser/error_cap.ok  (parse)
++reject  parser/fstring_nest_exceeded.ok  (parse)
++reject  parser/lex_error_recovery.ok  (parse)
++reject  parser/recovery_in_block.ok  (parse)
++reject  parser/recovery_two_errors.ok  (parse)
++reject  parser/unterminated_recovery.ok  (parse)
++accept  regressions/assign_direct_binop_shapes.ok
++accept  regressions/assign_operand_read_timing.ok
++accept  regressions/closure_in_for.ok
++reject  regressions/closure_loop.ok  (parse)
++accept  regressions/global_assignment_is_an_expression.ok
++accept  regressions/global_decl_leak.ok
++accept  regressions/load_null_count_operand.ok
++accept  regressions/local_slots_compiler_reuse.ok
++accept  regressions/shadow_len_does_not_invalidate_for_in.ok
++accept  regressions/ternary_then_in_then_arm.ok
++accept  scope/after_block.ok
++accept  scope/deep.ok
++accept  scope/locals_in_expr.ok
++accept  scope/multiple_locals.ok
++accept  scope/nested.ok
++accept  scope/shadowing.ok
++accept  smoke/hello.ok
++accept  smoke/literal.ok
++accept  smoke/nested_blocks.ok
++accept  spans/chained.ok
++accept  spans/closures.ok
++accept  spans/errors/arithmetic_position_error.ok
++accept  spans/errors/arity_too_few.ok
++accept  spans/errors/arity_too_many.ok
++accept  spans/errors/bare_return_mismatch.ok
++reject  spans/errors/default_rejected.ok  (parse)
++reject  spans/errors/empty_bindings.ok  (parse)
++accept  spans/errors/expr_position_error.ok
++reject  spans/errors/glob_rejected.ok  (parse)
++accept  spans/errors/noncall_error.ok
++accept  spans/errors/span_forward_error.ok
++accept  spans/errors/span_mismatch.ok
++accept  spans/falloff_padding.ok
++accept  spans/many_results.ok
++accept  spans/mut_and_mixed.ok
++accept  spans/nested_functions.ok
++accept  spans/null_results.ok
++accept  spans/results_in_loops.ok
++accept  spans/sequential.ok
++accept  spans/shadowing.ok
++accept  spans/single_binding_span.ok
++accept  spans/statement_discard.ok
++accept  spans/three_results.ok
++accept  spans/two_results.ok
++accept  spans/varargs/arity_errors.ok
++accept  spans/varargs/empty_varargs.ok
++accept  spans/varargs/errors/fixed_arity_spread_count.ok
++reject  spans/varargs/errors/not_last.ok  (parse)
++accept  spans/varargs/errors/spread_in_array_literal.ok
++accept  spans/varargs/errors/spread_in_map_literal.ok
++reject  spans/varargs/errors/spread_let_rejected.ok  (parse)
++accept  spans/varargs/errors/spread_not_last.ok
++reject  spans/varargs/errors/two_varargs.ok  (parse)
++reject  spans/varargs/errors/varargs_default.ok  (parse)
++accept  spans/varargs/fixed_plus_varargs.ok
++accept  spans/varargs/gc_churn.ok
++accept  spans/varargs/pack_is_a_local.ok
++accept  spans/varargs/spread.ok
++accept  spans/varargs/spread_empty_fixed.ok
++accept  spans/varargs/spread_not_array.ok
++accept  spans/varargs/sum_all.ok
++accept  spans/varargs/varargs_with_spans.ok
++accept  spans/varargs/with_defaults.ok
++accept  spans/window_pressure.ok
++accept  strings/concat.ok
++accept  strings/equality.ok
++accept  strings/errors/concat_number.ok
++reject  strings/errors/dollar_escape_refused.ok  (parse)
++reject  strings/errors/empty_interpolation.ok  (parse)
++reject  strings/errors/format_spec_reserved.ok  (parse)
++reject  strings/errors/gate_bidi.ok  (parse)
++reject  strings/errors/gate_control.ok  (parse)
++reject  strings/errors/gate_malformed.ok  (parse)
++reject  strings/errors/gate_overlong.ok  (parse)
++accept  strings/errors/immutable_set.ok
++accept  strings/errors/index_fraction.ok
++accept  strings/errors/index_negative.ok
++accept  strings/errors/index_not_num.ok
++accept  strings/errors/index_oob.ok
++accept  strings/errors/iter_two_bindings.ok
++accept  strings/errors/join_non_string.ok
++accept  strings/errors/join_not_array.ok
++reject  strings/errors/junk_after_expression.ok  (parse)
++reject  strings/errors/mf_is_an_identifier.ok  (parse)
++reject  strings/errors/newline_in_single_line.ok  (parse)
++accept  strings/errors/number_concat.ok
++reject  strings/errors/octal_refused.ok  (parse)
++accept  strings/errors/repeat_fraction.ok
++accept  strings/errors/repeat_negative.ok
++accept  strings/errors/repeat_not_number.ok
++accept  strings/errors/split_empty_separator.ok
++accept  strings/errors/split_not_string.ok
++reject  strings/errors/u_bad_hex.ok  (parse)
++reject  strings/errors/u_missing_brace.ok  (parse)
++reject  strings/errors/u_no_braces.ok  (parse)
++reject  strings/errors/u_range.ok  (parse)
++reject  strings/errors/u_surrogate.ok  (parse)
++reject  strings/errors/unknown_chunk_escape.ok  (parse)
++reject  strings/errors/unknown_escape.ok  (parse)
++reject  strings/errors/unterminated_interpolation.ok  (parse)
++reject  strings/errors/unterminated_mstring.ok  (parse)
++reject  strings/errors/x_above_ascii.ok  (parse)
++reject  strings/errors/x_no_hex.ok  (parse)
++reject  strings/errors/x_three_digits.ok  (parse)
++accept  strings/escapes.ok
++accept  strings/fmstring.ok
++accept  strings/fstring.ok
++accept  strings/fstring_escapes.ok
++accept  strings/fstring_nesting.ok
++accept  strings/index.ok
++accept  strings/interning.ok
++accept  strings/interning_churn.ok
++accept  strings/iterate.ok
++accept  strings/len.ok
++accept  strings/mstring.ok
++accept  strings/toolkit.ok
++accept  strings/unicode_id.ok
++accept  variables/glob/basic.ok
++accept  variables/glob/from_function.ok
++accept  variables/glob/global_and_local.ok
++accept  variables/glob/global_reassign.ok
++accept  variables/glob/immutable_error.ok
++accept  variables/glob/late_bound_current_behavior.ok
++accept  variables/glob/local_and_global.ok
++accept  variables/glob/mutable.ok
++accept  variables/immutable_error.ok
++accept  variables/local.ok
++accept  variables/multiple.ok
++accept  variables/mutable_multiple.ok
++accept  variables/use_before_decl_error.ok
++# root: tests/fuzz/corpus
++reject  class_shapes.ok  (parse)
++accept  comments_only.ok
++reject  coroutines.ok  (parse)
++reject  deep_blocks.ok  (parse)
++reject  deep_parens.ok  (parse)
++accept  empty.ok
++reject  escapes.ok  (parse)
++reject  for_shapes.ok  (parse)
++accept  fstring_chain.ok
++reject  invalid_utf8.bin  (parse)
++reject  modules.ok  (parse)
++reject  numbers.ok  (parse)
++reject  operators.ok  (parse)
++reject  strings_multiline.ok  (parse)
++reject  unterminated.ok  (parse)
++accept  utf8.ok
++# end of manifest
+diff --git a/tests/fuzz/crosscheck.sh b/tests/fuzz/crosscheck.sh
+new file mode 100644
+index 0000000..b6e0240
+--- /dev/null
++++ b/tests/fuzz/crosscheck.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++# regenerates tests/fuzz/crosscheck-manifest.txt - the native parser's
++# verdict for every .ok/.bin under the e2e corpus and the fuzz corpus.
++# the tree-sitter sweep (Q's repo) diffs the grammar against the committed
++# manifest; drift in either direction is a bug (the patch-16 discipline).
++# usage: crosscheck.sh [path-to-okfuzz]   (any cwd)
++set -u
++OKFUZZ="${1:-./build-gcc/okfuzz}"
++HERE="$(cd "$(dirname "$0")" && pwd)"
++ROOT="$(cd "$HERE/../.." && pwd)"
++{
++  echo "# the tree-sitter cross-check manifest (P5): the native parser's verdict"
++  echo "# for every .ok/.bin under the two committed roots. regenerated by"
++  echo "# tests/fuzz/crosscheck.sh; the grammar sweep (tree-sitter-oklang) diffs"
++  echo "# against this - drift in either direction is a bug."
++  echo "# root: tests/e2e/tests"
++  "$OKFUZZ" --crosscheck "$ROOT/tests/e2e/tests" | grep -v '^crosscheck:'
++  echo "# root: tests/fuzz/corpus"
++  "$OKFUZZ" --crosscheck "$ROOT/tests/fuzz/corpus" | grep -v '^crosscheck:'
++  echo "# end of manifest"
++} > "$ROOT/tests/fuzz/crosscheck-manifest.txt"
++echo "manifest written: $ROOT/tests/fuzz/crosscheck-manifest.txt"
+diff --git a/tests/fuzz/src/fuzz.c b/tests/fuzz/src/fuzz.c
+new file mode 100644
+index 0000000..b76c01d
+--- /dev/null
++++ b/tests/fuzz/src/fuzz.c
+@@ -0,0 +1,536 @@
++// the zero-dep fuzzer (P5, the front-door patch). the stance, per the
++// roadmap: corpus-driven, deterministic seed loop, byte mutations over the
++// fixture corpus + synthesized inputs, feeding the lexer/parser/compiler.
++// the vm is deliberately NOT fed - hostile bytes must never become a running
++// program - so the bar is: no crash, no sanitizer trip, and every diagnostic
++// carries a location (validated through the okdiag sink, not by scanning
++// stderr). the corpus is committed; the seed loop is deterministic; every
++// CI-style run is reproducible to the byte.
++//
++// usage:
++//   okfuzz [iterations] [seed]      the fuzz loop (defaults 20000, 0xC0FFEE)
++//   okfuzz --crosscheck <root>      manifest of parse+compile outcomes for
++//                                   every .ok/.bin file under root (recursive,
++//                                   sorted) - the native side of the
++//                                   tree-sitter cross-check; the grammar sweep
++//                                   diffs against this.
++//   okfuzz --corpus <dir> ...       where the seeds live (default: the
++//                                   compiled-in corpus prefix + /corpus)
++//
++// exit 0 = the bar held. anything else is a finding, and the input that
++// tripped it is printed with its seed.
++
++#define _POSIX_C_SOURCE 200809L // dirent, harness-only (never library code)
++
++#include <dirent.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#include "ok/ok.h"
++#include "ok/ok_string.h"
++#include "okcompiler.h"
++#include "okdiag.h"
++#include "okparser.h"
++#include "okstate.h"
++
++#ifndef OK_FUZZ_CORPUS_PREFIX
++#define OK_FUZZ_CORPUS_PREFIX ""
++#endif
++
++#define FUZZ_MAX_INPUT 4096u
++#define FUZZ_INSTANCE_LIFETIME 256u // inputs per ok instance (bounded state bleed)
++
++// ---------------------------------------------------------------- the rng
++
++// splitmix64: deterministic, one word of state, good enough mixing for byte
++// mutations. the whole point is reproducibility: seed + iterations == the
++// same run, forever.
++typedef struct {
++  uint64_t state;
++} rng;
++
++static uint64_t rng_next(rng* p_rng) {
++  uint64_t z = (p_rng->state += 0x9E3779B97F4A7C15ULL);
++  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
++  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
++  return z ^ (z >> 31);
++}
++
++static uint32_t rng_below(rng* p_rng, uint32_t p_bound) {
++  return p_bound == 0 ? 0 : (uint32_t)(rng_next(p_rng) % p_bound);
++}
++
++// ---------------------------------------------------------------- the corpus
++
++typedef struct {
++  char** files;
++  uint32_t count;
++  uint32_t capacity;
++} file_list;
++
++static void file_list_push(file_list* p_list, char* p_path) {
++  if (p_list->count == p_list->capacity) {
++    p_list->capacity = p_list->capacity == 0 ? 16 : p_list->capacity * 2;
++    p_list->files = (char**)realloc(p_list->files, p_list->capacity * sizeof(char*));
++    if (p_list->files == NULL) {
++      fprintf(stderr, "fuzz: out of memory growing the file list.\n");
++      exit(70);
++    }
++  }
++  p_list->files[p_list->count++] = p_path;
++}
++
++static int path_cmp(const void* p_a, const void* p_b) {
++  return strcmp(*(const char**)p_a, *(const char**)p_b);
++}
++
++// recursive, sorted walk: every .ok (and .bin - the invalid-utf-8 seeds)
++// under p_root lands in p_out, path-joined into a malloc'd string.
++static void walk(file_list* p_out, const char* p_root) {
++  DIR* dir = opendir(p_root);
++  if (dir == NULL) {
++    return;
++  }
++  struct dirent* entry;
++  while ((entry = readdir(dir)) != NULL) {
++    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
++      continue;
++    }
++    const size_t root_len = strlen(p_root);
++    const size_t name_len = strlen(entry->d_name);
++    char* path = (char*)malloc(root_len + 1 + name_len + 1);
++    if (path == NULL) {
++      closedir(dir);
++      fprintf(stderr, "fuzz: out of memory walking the corpus.\n");
++      exit(70);
++    }
++    memcpy(path, p_root, root_len);
++    path[root_len] = '/';
++    memcpy(path + root_len + 1, entry->d_name, name_len + 1);
++    struct stat st;
++    if (stat(path, &st) != 0) {
++      free(path);
++      continue;
++    }
++    if (S_ISDIR(st.st_mode)) {
++      walk(p_out, path);
++      free(path);
++    } else if (S_ISREG(st.st_mode)) {
++      const size_t path_len = root_len + 1 + name_len;
++      if (path_len >= 4 &&
++          (memcmp(path + path_len - 3, ".ok", 3) == 0 || memcmp(path + path_len - 4, ".bin", 4) == 0)) {
++        file_list_push(p_out, path);
++      } else {
++        free(path);
++      }
++    } else {
++      free(path);
++    }
++  }
++  closedir(dir);
++  qsort(p_out->files, p_out->count, sizeof(char*), path_cmp);
++}
++
++static char* read_whole_file(const char* p_path, size_t* p_length) {
++  FILE* file = fopen(p_path, "rb");
++  if (file == NULL) {
++    return NULL;
++  }
++  fseek(file, 0, SEEK_END);
++  const long size = ftell(file);
++  rewind(file);
++  if (size < 0) {
++    fclose(file);
++    return NULL;
++  }
++  char* buffer = (char*)malloc((size_t)size + 1);
++  if (buffer == NULL) {
++    fclose(file);
++    return NULL;
++  }
++  if (fread(buffer, 1, (size_t)size, file) != (size_t)size) {
++    free(buffer);
++    fclose(file);
++    return NULL;
++  }
++  buffer[size] = '\0';
++  fclose(file);
++  *p_length = (size_t)size;
++  return buffer;
++}
++
++// ---------------------------------------------------------------- the pipeline
++
++// the counters the summary line is made of.
++static uint64_t stat_inputs;
++static uint64_t stat_parsed;
++static uint64_t stat_compiled;
++static uint64_t stat_parse_errors;
++static uint64_t stat_compile_errors;
++static uint64_t stat_diagnostics;
++static uint64_t stat_bare; // the bar: this stays zero or the run fails
++
++// the sink (P5): every rendered diagnostic passes here. the location
++// contract: a real span with line >= 1, column >= 1, and an offset that
++// actually sits inside the source it names.
++static report_status fuzz_sink(bool* p_panic,
++                               bool* p_had_error,
++                               const char* p_path,
++                               const char* p_source,
++                               const ok_span* p_span,
++                               bool p_is_eof,
++                               report_severity p_severity,
++                               const ok_string_view p_message,
++                               const ok_note* p_note) {
++  (void)p_path;
++  (void)p_is_eof;
++  (void)p_severity;
++  (void)p_note;
++  *p_panic = true;
++  *p_had_error = true;
++  stat_diagnostics++;
++  const bool located = p_span != NULL && p_span->line >= 1 && p_span->column >= 1;
++  bool in_bounds = true;
++  if (located && p_source != NULL) {
++    const size_t length = strlen(p_source);
++    if ((size_t)p_span->offset > length) {
++      in_bounds = false;
++    }
++  }
++  if (!located || !in_bounds) {
++    stat_bare++;
++    fprintf(stdout,
++            "FUZZ FINDING (unlocated diagnostic): span=%s line=%u column=%u offset=%u message=%.*s\n",
++            p_span == NULL ? "none" : "present",
++            p_span == NULL ? 0u : p_span->line,
++            p_span == NULL ? 0u : p_span->column,
++            p_span == NULL ? 0u : p_span->offset,
++            (int)ok_string_view_get_length(&p_message),
++            p_message.chars);
++  }
++  return REPORT_STATUS_OK;
++}
++
++// one input through lexer + parser + compiler. never the vm.
++static void feed(ok* p_ok, const char* p_code) {
++  ok_source source;
++  source.code = (char*)p_code;
++  source.path = "fuzz";
++  parser parser;
++  parser_specs specs;
++  specs.alloc = &p_ok->alloc;
++  specs.source = &source;
++  parser_init(&parser, specs);
++  parse_result parsed = parser_parse(&parser);
++  if (parsed.status != PARSE_OK) {
++    stat_parse_errors++;
++  } else {
++    stat_parsed++;
++    compile_specs compile;
++    memset(&compile, 0, sizeof(compile));
++    compile.root = parsed.root;
++    compile.source = &source;
++    bool seed_error = false;
++    compile.top_level_declarations = ok_get_top_level_declarations(p_ok, &seed_error);
++    compile.imports = (ok_import_bindings){NULL, 0};
++    compile.is_module = false;
++    compile.module_path = ok_create_string_view(NULL, 0, false);
++    compile_result compiled = compiler_compile(&p_ok->compiler, compile);
++    if (compiled.status == COMPILE_OK) {
++      stat_compiled++;
++    } else {
++      stat_compile_errors++;
++    }
++    module_exports_deinit(&compiled.exports, &p_ok->alloc);
++    top_level_declarations_deinit(&compile.top_level_declarations, &p_ok->alloc);
++  }
++  parse_result_deinit(&parsed);
++}
++
++static ok* make_instance(void) {
++  ok_specs specs;
++  memset(&specs, 0, sizeof(specs));
++  specs.caps_dropped = OK_CAP_ALL; // the hardest door: pure compute, ever
++  ok* fresh = ok_create(specs);
++  if (fresh == NULL) {
++    fprintf(stderr, "fuzz: ok_create refused.\n");
++    exit(70);
++  }
++  return fresh;
++}
++
++// ---------------------------------------------------------------- mutation
++
++// bytes with business being interesting: quotes and prefixes, escapes,
++// braces and regions, terminators, digits, and the utf-8 edges (a stray
++// continuation byte, a lead byte, an always-invalid byte).
++static const char k_interesting[] = {'"',   '\'', 'f',  'm',  '{',  '}',  '(',  ')',  '[',  ']',
++                                     ';',   ':',  ',',  '.',  '$',  '\\', '\0', ' ',  '\t', '\n',
++                                     'u',   'x',  '0',  '7',  'a',  'b',  'e',  '=',  '<',  '>',
++                                     '!',   '?',  '&',  '|',  '+',  '-',  '*',  '/',  '%',  '#',
++                                     '~',   '^',  (char)0x80, (char)0xC3, (char)0xA9, (char)0xFF};
++
++// token-ish fragments for the synthesis lane: real shapes, hostile orders.
++static const char* const k_fragments[] = {
++    "let ", "mut ", "pub ", "class ", "fu ", "import ", "defer ", "for ", "while ", "if ",
++    "else ", "return ", "break", "continue", "print", "this", "super", "true", "false",
++    "null", "new ", "(", ")", "{", "}", "[", "]", ";", ",", ":", ".", "..", "...", "=",
++    "==", "===", "!=", "<", ">", "<=", ">=", "&&", "||", "!", "+", "-", "*", "/", "%",
++    "123", "1.5", "0x1F", "1e10", "\"s\"", "m\"\"\"", "f\"${", "f\"${x}\"", "\\u{", "\\u{1F600}",
++    "\\x", "\\x41", "\\0", "\\e", "//c\n", "${", "}", "\"", "'", "f\"", "m\"", "str", "num",
++    "array", "map", "fu(){}", "=> ", "?.", "std", "io", "math", "@", "`", "\xC3\xA9", "\xF0\x9F\x98"};
++
++static char pick_interesting(rng* p_rng) {
++  return k_interesting[rng_below(p_rng, sizeof(k_interesting))];
++}
++
++static void mutate(rng* p_rng, char* p_buffer, size_t* p_length, const file_list* p_corpus) {
++  size_t length = *p_length;
++  for (uint32_t round = 1 + rng_below(p_rng, 8); round > 0; --round) {
++    const uint32_t op = rng_below(p_rng, 7);
++    if (op == 0 && length > 0) { // flip one bit in one byte
++      const size_t at = rng_below(p_rng, (uint32_t)length);
++      p_buffer[at] ^= (char)(1 << rng_below(p_rng, 8));
++    } else if (op == 1 && length + 1 < FUZZ_MAX_INPUT) { // insert an interesting byte
++      const size_t at = rng_below(p_rng, (uint32_t)length + 1);
++      memmove(p_buffer + at + 1, p_buffer + at, length - at);
++      p_buffer[at] = pick_interesting(p_rng);
++      length++;
++    } else if (op == 2 && length > 1) { // delete one byte
++      const size_t at = rng_below(p_rng, (uint32_t)length);
++      memmove(p_buffer + at, p_buffer + at + 1, length - at - 1);
++      length--;
++    } else if (op == 3 && length > 2) { // duplicate a span onto itself
++      const size_t at = rng_below(p_rng, (uint32_t)length - 1);
++      const size_t span = 1 + rng_below(p_rng, 16);
++      if (length - at < span || length + span >= FUZZ_MAX_INPUT) {
++        continue;
++      }
++      memmove(p_buffer + at + span, p_buffer + at, length - at);
++      memcpy(p_buffer + at, p_buffer + at + span, span); // the copy now sits before itself
++      length += span;
++    } else if (op == 4 && p_corpus->count > 0 && length > 0) { // splice from another seed
++      const uint32_t other = rng_below(p_rng, p_corpus->count);
++      size_t other_length = 0;
++      char* donor = read_whole_file(p_corpus->files[other], &other_length);
++      if (donor == NULL) {
++        continue;
++      }
++      const size_t take =
++          other_length == 0 ? 0 : 1 + rng_below(p_rng, (uint32_t)(other_length > 64 ? 64 : other_length));
++      const size_t from = other_length == 0 ? 0 : rng_below(p_rng, (uint32_t)(other_length - take + 1));
++      const size_t at = rng_below(p_rng, (uint32_t)length + 1);
++      if (length + take < FUZZ_MAX_INPUT) {
++        memmove(p_buffer + at + take, p_buffer + at, length - at);
++        memcpy(p_buffer + at, donor + from, take);
++        length += take;
++      }
++      free(donor);
++    } else if (op == 5 && length > 0) { // replace one byte with an interesting one
++      const size_t at = rng_below(p_rng, (uint32_t)length);
++      p_buffer[at] = pick_interesting(p_rng);
++    } else if (length + 16 < FUZZ_MAX_INPUT) { // splice a fragment in
++      const char* fragment = k_fragments[rng_below(p_rng, sizeof(k_fragments) / sizeof(k_fragments[0]))];
++      const size_t fragment_length = strlen(fragment);
++      const size_t at = rng_below(p_rng, (uint32_t)length + 1);
++      memmove(p_buffer + at + fragment_length, p_buffer + at, length - at);
++      memcpy(p_buffer + at, fragment, fragment_length);
++      length += fragment_length;
++    }
++  }
++  p_buffer[length] = '\0';
++  *p_length = length;
++}
++
++// ---------------------------------------------------------------- the modes
++
++static int run_fuzz(const char* p_corpus_dir, uint64_t p_iterations, uint64_t p_seed) {
++  file_list corpus;
++  corpus.files = NULL;
++  corpus.count = 0;
++  corpus.capacity = 0;
++  walk(&corpus, p_corpus_dir);
++  if (corpus.count == 0) {
++    fprintf(stderr, "fuzz: no corpus under \"%s\" - the seeds are committed, they must be there.\n", p_corpus_dir);
++    return 70;
++  }
++
++  rng prng;
++  prng.state = p_seed;
++  ok* instance = make_instance();
++  uint32_t instance_age = 0;
++
++  char* buffer = (char*)malloc(FUZZ_MAX_INPUT + 1);
++  if (buffer == NULL) {
++    fprintf(stderr, "fuzz: out of memory.\n");
++    return 70;
++  }
++
++  for (uint64_t i = 0; i < p_iterations; ++i) {
++    // the base: mostly a corpus seed, sometimes pure synthesis (an empty
++    // base grown from fragments alone)
++    size_t length = 0;
++    if (rng_below(&prng, 4) != 0) {
++      const uint32_t which = rng_below(&prng, corpus.count);
++      char* seed = read_whole_file(corpus.files[which], &length);
++      if (seed == NULL) {
++        continue;
++      }
++      if (length > FUZZ_MAX_INPUT) {
++        length = FUZZ_MAX_INPUT;
++      }
++      memcpy(buffer, seed, length);
++      free(seed);
++    }
++    buffer[length] = '\0';
++    mutate(&prng, buffer, &length, &corpus);
++
++    // the triage lane: OK_FUZZ_TRACE=1 prints every input before it feeds,
++    // so a crash's last line IS the reproducer.
++    if (getenv("OK_FUZZ_TRACE") != NULL) {
++      fprintf(stderr, "=== input %llu (len %llu) ===\n%s\n", (unsigned long long)i, (unsigned long long)length, buffer);
++      fflush(stderr);
++    }
++
++    stat_inputs++;
++    feed(instance, buffer);
++    if (++instance_age == FUZZ_INSTANCE_LIFETIME) {
++      ok_free(instance);
++      instance = make_instance();
++      instance_age = 0;
++    }
++  }
++
++  ok_free(instance);
++  free(buffer);
++  for (uint32_t i = 0; i < corpus.count; ++i) {
++    free(corpus.files[i]);
++  }
++  free(corpus.files);
++
++  printf("fuzz: %llu inputs (%llu parsed, %llu compiled, %llu parse errors, %llu compile errors), "
++         "%llu diagnostics, %llu unlocated\n",
++         (unsigned long long)stat_inputs,
++         (unsigned long long)stat_parsed,
++         (unsigned long long)stat_compiled,
++         (unsigned long long)stat_parse_errors,
++         (unsigned long long)stat_compile_errors,
++         (unsigned long long)stat_diagnostics,
++         (unsigned long long)stat_bare);
++  if (stat_bare != 0) {
++    fprintf(stderr, "fuzz: THE BAR TRIPPED - %llu unlocated diagnostics.\n", (unsigned long long)stat_bare);
++    return 1;
++  }
++  return 0;
++}
++
++// the crosscheck manifest: for every corpus file, the native PARSER's
++// verdict (parse-only - the apples-to-apples with a grammar; compile-time
++// resolution is not the grammar's question). the tree-sitter sweep (Q's
++// side) diffs against this; drift in either direction is a bug. one fresh
++// instance per file - the manifest must not depend on evaluation order.
++static int run_crosscheck(const char* p_root) {
++  file_list files;
++  files.files = NULL;
++  files.count = 0;
++  files.capacity = 0;
++  walk(&files, p_root);
++  if (files.count == 0) {
++    fprintf(stderr, "crosscheck: nothing to walk under \"%s\".\n", p_root);
++    return 70;
++  }
++
++  uint64_t accepted = 0;
++  uint64_t rejected = 0;
++  const size_t root_len = strlen(p_root);
++  for (uint32_t i = 0; i < files.count; ++i) {
++    ok* instance = make_instance();
++    size_t length = 0;
++    char* code = read_whole_file(files.files[i], &length);
++    if (code == NULL) {
++      ok_free(instance);
++      continue;
++    }
++    ok_source source;
++    source.code = code;
++    source.path = files.files[i];
++    parser parser;
++    parser_specs specs;
++    specs.alloc = &instance->alloc;
++    specs.source = &source;
++    parser_init(&parser, specs);
++    parse_result parsed = parser_parse(&parser);
++    // paths print relative to the root: the manifest commits into the repo,
++    // and absolute paths would drift with every checkout
++    const char* relative = files.files[i];
++    if (strncmp(relative, p_root, root_len) == 0 && relative[root_len] == '/') {
++      relative += root_len + 1;
++    }
++    if (parsed.status == PARSE_OK) {
++      accepted++;
++      printf("accept  %s\n", relative);
++    } else {
++      rejected++;
++      printf("reject  %s  (parse)\n", relative);
++    }
++    parse_result_deinit(&parsed);
++    ok_free(instance);
++    free(code);
++  }
++
++  for (uint32_t i = 0; i < files.count; ++i) {
++    free(files.files[i]);
++  }
++  free(files.files);
++  printf("crosscheck: %llu files, %llu accept, %llu reject, %llu diagnostics, %llu unlocated\n",
++         (unsigned long long)(accepted + rejected),
++         (unsigned long long)accepted,
++         (unsigned long long)rejected,
++         (unsigned long long)stat_diagnostics,
++         (unsigned long long)stat_bare);
++  if (stat_bare != 0) {
++    fprintf(stderr, "crosscheck: THE BAR TRIPPED - %llu unlocated diagnostics.\n", (unsigned long long)stat_bare);
++    return 1;
++  }
++  return 0;
++}
++
++int main(int argc, char** argv) {
++  okdiag_install_sink(fuzz_sink);
++
++  const char* corpus_dir = OK_FUZZ_CORPUS_PREFIX "/corpus";
++  const char* crosscheck_root = NULL;
++  uint64_t iterations = 20000;
++  uint64_t seed = 0xC0FFEEULL;
++  uint32_t positional = 0;
++
++  for (int i = 1; i < argc; ++i) {
++    if (strcmp(argv[i], "--corpus") == 0 && i + 1 < argc) {
++      corpus_dir = argv[++i];
++    } else if (strcmp(argv[i], "--crosscheck") == 0 && i + 1 < argc) {
++      crosscheck_root = argv[++i];
++    } else {
++      char* end = NULL;
++      const unsigned long long value = strtoull(argv[i], &end, 0);
++      if (end == argv[i] || *end != '\0' || positional > 1) {
++        fprintf(stderr, "usage: okfuzz [--corpus <dir>] [--crosscheck <root>] [iterations] [seed]\n");
++        return 64;
++      }
++      if (positional == 0) {
++        iterations = value;
++      } else {
++        seed = value;
++      }
++      positional++;
++    }
++  }
++
++  if (crosscheck_root != NULL) {
++    return run_crosscheck(crosscheck_root);
++  }
++  return run_fuzz(corpus_dir, iterations, seed);
++}
+-- 
+2.47.3
+

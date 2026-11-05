@@ -52,22 +52,27 @@ source of truth: `https://codeberg.org/qais/oklang`, master at `9ad153c`,
 **tagged v0.1.0**. the `register` branch is history — deletion pending Q's
 confidence, don't touch it.
 
-current phase [perishable — refresh at round end] (nov 5, session 45):
-the 0.9.0 wave (Reconciliation) is 4/7 landed and the series is now
-CONDENSED per Q's ruling ("condense the remaining patches as
-appropriate" — one patch per workstream, whole workstreams per
-session when the session holds). P1-P3 landed through d48edf4
-(patches 53-58; that landing verified zero drift + full matrix:
-564x7, capi 325x5, delta flat). patch 59 (P4, the host doors:
-std.fs + std.sys behind OK_CAP_HOST, the ok_fs/ok_time/ok_env
-one-door layers + the audit reroutes, sys.exit as the uncatchable
-OK_EK_EXIT lane with OK_EXITED + ok_exit_code public) is DELIVERED
-as 65d8885 on the sandbox clone's reconciliation, one over d48edf4,
-awaiting Q's hand — gates on its head: e2e 585x7 (564 → 585), capi
-334x5, delta flat. what remains: P5 the front-door patch (parser
-hardening: the four classes + the zero-dep fuzzer + corpus + the
-REPL round — termios, history, auto-print, multi-line) and P6 the
-measurement patch (delta blue's pub-fields rewrite + re-baseline,
+current phase [perishable — refresh at round end] (nov 5, session 46):
+the 0.9.0 wave (Reconciliation) is 5/7 landed, the series CONDENSED
+per Q's ruling. P1-P4 landed through bb740c0 (Q's "fs/sys/en";
+zero-drift verified, the fourth byte-identical landing in a row).
+patch 60 (P5, the front-door patch, delivered WHOLE) is DELIVERED
+as 36c0b75 on the sandbox clone's reconciliation, one over bb740c0,
+awaiting Q's hand — gates on its head: e2e 603x7 (585 → 603), capi
+334x5, the NEW fuzz lane x2 (20k inputs, 0 unlocated, gcc == asan),
+delta flat at 1.92x/1.87x. P5 carried: the four hardening classes
+(parse arena, 200 depth funnel, 25-report cap, statement-boundary
+recovery), the zero-dep fuzzer + committed corpus + the okdiag-sink
+location bar (which found FOUR pre-existing bugs day one, all fixed:
+the f-string NULL deinit, two deferred-init walks, the unary-plus
+abort — `print(+5);` used to crash), the cross-check manifest (the
+tree-sitter sweep's diff target), and the REPL round (term.c the
+posix isolation zone, auto-print with ';' suppression, nesting-aware
+continuation, glob persistence). THE PORTABILITY LANE is recorded
+and deliberately untouched: pure c99 at compile time, lua-shaped
+(one config header, posix behind feature macros), to be done in
+isolation later — see the session-46 worklog entry. what remains:
+P6 the measurement patch (delta blue's pub-fields rewrite + re-baseline,
 compare+jump fusion, allocation shaving, OP_TAILCALL, the bench
 bridge + baseline column, the incremental GC attempt behind its
 bar) — P7 dissolved into both. sys.args/name/err are ruled in but

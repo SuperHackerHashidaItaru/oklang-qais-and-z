@@ -1,6 +1,10 @@
 # ROADMAP 0.9.0 — the last pre-v1 wave (draft, round one folded)
 
 status: DRAFT, round one complete (2026-11-04), round two folded. 2026-11-05
+(session 46): P1-P5 LANDED (patches 53-60; P5 delivered whole — hardening +
+fuzzer + cross-check + REPL, with the fuzzer's four pre-existing bug finds
+fixed), the PORTABILITY LANE recorded (pure c99 at compile time, lua-shaped,
+deliberately deferred per Q's ruling). 2026-11-05
 (session 45): P1-P4 LANDED (patches 53-59), the series CONDENSED per
 Q's ruling — "now also that the session don't cut off as aggressively
 you can condense the remaining patches as appropriate": one patch per
@@ -434,12 +438,19 @@ one session each, gated by the full matrix every time:
   uncatchable OK_EK_EXIT lane (OK_EXITED + ok_exit_code public) + 21
   fixtures + the runners' `// expect exit:` lane + capi +9 (the
   sandbox lane got its first real HOST consumers).
-- **P5** (condensed with P7's REPL round — the front-door patch):
-  parser hardening (the four classes: depth guard, arena ownership,
-  bounded peek/eat, statement-boundary sync) + the zero-dep fuzz
-  harness + corpus + the cross-check growth + the REPL round (raw-mode
-  editing, ctrl-left/right word jumps, history with a size cap,
-  auto-print of lone expressions with `;` suppression, multi-line
+- **P5**: LANDED (patch 60, awaiting Q's hand) — the front-door patch,
+  condensed with P7's REPL round. the four hardening classes (the parse
+  arena, the shared 200 depth funnel, the 25-report cap, nesting-aware
+  statement-boundary recovery; bounded peek/eat closed by audit) + the
+  zero-dep fuzzer with its committed corpus and the okdiag-sink location
+  bar (FOUR pre-existing bugs found and fixed day one: the f-string NULL
+  deinit, two deferred-init walks, the unary-plus abort) + the cross-check
+  manifest lane (the tree-sitter sweep's diff target, grown with the fuzz
+  findings) + the REPL round (termios raw-mode editing in the posix
+  isolation zone, ctrl-left/right word jumps, history capped at 100,
+  auto-print of lone expressions with `;` suppression, nesting-aware
+  multi-line continuation, glob persistence - the repl invents nothing,
+  `glob` survives the entry, plain `let` and imports are per-entry).
   continuation — POSIX termios, CLI layer only).
 - **P6** (condensed with P7's GC question — the measurement patch):
   optimization round 1 — delta blue's pub-fields rewrite + re-baseline,
