@@ -1522,3 +1522,40 @@ line (47702 diagnostics, 0 unlocated, gcc == asan), delta blue
 correct 1.40654e7 at 1.93x/1.87x, flat. the patch is pure ascii
 end to end (iconv-verified) — no landing medium, however lossy,
 can change what it says.
+
+## 62-p6-round-one-tailcalls-member-store-fix.patch
+
+P6 round one. three things, one patch:
+
+- **the member-store receiver fix** (pre-existing, found by delta blue's
+  pub-fields rewrite on its first run): `obj.field = <call-shaped rhs>`
+  miscompiled. the assignment staged the receiver into a temp, then
+  compiled the rhs into a register below it; a call rhs opens the
+  callee's register window there and null-fills upward, erasing the
+  staged receiver before the store read it. the subscript lane had the
+  documented discipline (fresh rhs temp above the staging); the member
+  lane now shares it. regression fixture + fuzz seed included.
+- **OP_TAILCALL / OP_TAILCALL_LONG**: `return name(args);` with a
+  plain-identifier callee (register/upvalue/global, no spread) hands
+  the frame to the callee in place - upvalues close, the frame's try
+  records drop, the staged window moves down to the frame base, and the
+  callee replaces the frame carrying the ORIGINAL return contract. a
+  million mutual tailcalls ride one frame slot. the defer epilogue runs
+  in bytecode before the handover. non-closure callees degrade through
+  the vm_call lane (call_value + nested run_until under a yield
+  barrier). v1 scope: method/super invokes, spreads, field/static and
+  lambda-expression callees keep the classic call-then-return shape.
+- **the regen door's ordering**: crosscheck.sh wrote the manifest before
+  the pins, so a freshly added seed tripped the manifest walk's own
+  load-time verification. order is now healer, pins, manifest.
+
+rides with the collab-side benchmark rewrite (delta_blue.ok's
+pub-fields port, the 1.93x -> 1.35x re-baseline in
+bench/results/delta_blue.md) - the rewrite found the member-store bug;
+the fix unblocked it.
+
+gates: builds 9/9, e2e 605x7 (603 -> 605: +1 member-store fixture, +1
+tailcalls fixture), unit+embed 5x3, capi 334x5, cli 10/10, fuzz x2
+gcc == asan (50047 diagnostics, 0 unlocated; the corpus grew to 17
+seeds), delta blue correct 1.40654e7, flat at the new baseline.
+applies clean on b42d605; pure ascii end to end.

@@ -1,0 +1,706 @@
+From 934e4bc2948ebf58b06eec4add078fd5c3e8bb57 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Thu, 5 Nov 2026 05:50:33 +0000
+Subject: [PATCH] P6 round one: OP_TAILCALL, the member-store receiver fix, the
+ regen door's ordering
+
+the member-store fix (found by delta blue's pub-fields rewrite):
+obj.field = <call-shaped rhs> died with 'only instances and classes
+have assignable members' - the assignment's staged receiver temp sat
+inside the call rhs's callee register window and was null-filled
+before the store read it. the subscript lane had the discipline
+(fresh rhs temp above the staging); the member lane now shares it.
+
+OP_TAILCALL / OP_TAILCALL_LONG: 'return name(args);' where the callee
+is a plain identifier (register/upvalue/global, no spread) hands the
+frame to the callee in place - close upvalues, drop this frame's
+handler records, move the staged window down, replace the frame with
+the ORIGINAL return contract inherited. one million mutual tailcalls
+ride one frame slot. the defer epilogue runs in bytecode before the
+handover (the compiler emits it exactly like the classic return).
+non-closure callees degrade through the vm_call lane: call_value,
+nested run_until under a yield barrier when a frame was pushed, then
+the result answers the contract. v1 scope: method/super invokes,
+spreads, field/static and lambda callees keep the classic shape.
+
+the regen door's ordering: crosscheck.sh wrote the manifest before
+the pins, so a seed that just joined the corpus tripped the manifest
+walk's own load-time verification - the door tripped on its fresh
+seed. order is now healer, pins, manifest.
+
+new: tests/e2e classes/member_store_call_rhs.ok,
+functions/tailcalls.ok, fuzz corpus tailcalls.ok (17 seeds pinned).
+
+gates: builds 9/9, e2e 605x7 (603 -> 605), unit+embed 5x3, capi
+334x5, cli 10/10, fuzz x2 gcc==asan (50047 diagnostics, 0 unlocated
+- the new seed's mutations), delta blue flat at the pub-fields
+baseline (1.40654e7, ~1.35x/1.32x wren)
+---
+ src/okchunk.h                                 |   8 +
+ src/okcompiler.c                              |  77 ++++++-
+ src/okdebug.c                                 |   9 +
+ src/okvm.c                                    | 196 ++++++++++++++++++
+ .../tests/classes/member_store_call_rhs.ok    |  58 ++++++
+ tests/e2e/tests/functions/tailcalls.ok        | 101 +++++++++
+ tests/fuzz/corpus/checksums                   |   1 +
+ tests/fuzz/corpus/tailcalls.ok                |  16 ++
+ tests/fuzz/crosscheck-manifest.txt            |   3 +
+ tests/fuzz/crosscheck.sh                      |  24 ++-
+ 10 files changed, 478 insertions(+), 15 deletions(-)
+ create mode 100644 tests/e2e/tests/classes/member_store_call_rhs.ok
+ create mode 100644 tests/e2e/tests/functions/tailcalls.ok
+ create mode 100644 tests/fuzz/corpus/tailcalls.ok
+
+diff --git a/src/okchunk.h b/src/okchunk.h
+index 8fa317f..193832e 100644
+--- a/src/okchunk.h
++++ b/src/okchunk.h
+@@ -201,6 +201,13 @@ typedef enum {
+   OP_CLOSE_UPVALUES,     // w:    (A)             -> close upvalues where index >= A
+   OP_CALL,               // w:    (p, a, b, c)    -> r[a] ... r[a + c - 2] = r[a](r[a + 1] ... r[a + b]); { p == 1 => argc = r[a + 1] ... r[top - 1] } { c == 0 => take all returned, else take c - 1 }
+   OP_CALL_LONG,          // 2w:   (p, A, B, C)    -> r[A] ... r[A + C - 2] = r[A](r[A + 1] ... r[A + B - 1]); { same as narrow variant }
++  OP_TAILCALL,           // w:    (a, b)          -> the frame in place runs r[a](r[a + 1] ... r[a + b]) and its results
++                         //                          answer THIS frame's return contract (c room reserved, unused:
++                         //                          the inherited return_count is the runtime truth). the compiler's only
++                         //                          writer: `return name(args);` after its defer epilogue. closures
++                         //                          replace the frame (constant stack, the deep-recursion lane);
++                         //                          a non-closure callee degrades to call-then-return.
++  OP_TAILCALL_LONG,      // 2w:   (A, B)          -> same, wide
+   OP_RETURN,             // w:    (a', b')        -> return r[a'] ... r[a' + b' - 1] { b' == 0 => return r[a'] ... r[top - 1] (passthrough) }
+   OP_RETURN_LONG,        // 2w:   (A, B)          -> return r[A] ... r[A + B - 1]; { same as narrow variant }
+   OP_RETURN_1,           // w:    (A, e)          -> return switch RETURNED(e)
+@@ -668,6 +675,7 @@ static inline uint32_t opcode_word_count(opcode p_op) {
+   case OP_LOAD_UPVALUE_LONG:
+   case OP_STORE_UPVALUE_LONG:
+   case OP_CALL_LONG:
++  case OP_TAILCALL_LONG:
+   case OP_RETURN_LONG:
+   case OP_CLOSURE_LONG:
+   case OP_NOT_LONG:
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index 6e8dc57..a7f33da 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -549,6 +549,8 @@ static bool compile_for_in_statement(compiler* p_compiler, ast_for_in_statement*
+ static bool compile_for_numeric_statement(compiler* p_compiler, ast_for_numeric_statement* p_for_numeric);
+ static bool compile_control_flow_statement(compiler* p_compiler, ast_control_flow_statement* p_control);
+ static bool compile_return_statement(compiler* p_compiler, ast_return_statement* p_return);
++static bool compile_expressions_list(
++    compiler* p_compiler, ast_expressions_list* p_list, uint32_t p_limit, _register* p_args_start, ast_node* p_author);
+ static bool compile_throw_statement(compiler* p_compiler, ast_throw_statement* p_throw);
+ static bool compile_try_statement(compiler* p_compiler, ast_try_statement* p_try);
+ static bool compile_defer_statement(compiler* p_compiler, ast_defer_statement* p_defer);
+@@ -3641,6 +3643,67 @@ static bool compile_return_statement(compiler* p_compiler, ast_return_statement*
+     return emit_default_return(p_compiler, (ast_node*)p_return);
+   }
+   if (count == 1) {
++    // the tailcall lane (P6): `return name(args);` where the callee is a
++    // plain identifier in a register/upvalue/global. the call's results
++    // answer this frame's return contract directly - OP_TAILCALL hands the
++    // window to the callee in place (constant stack for the deep-recursion
++    // lane). v1 scope: method/super invokes, spreads, field/static callees,
++    // and lambda-expression callees keep the classic call-then-return shape.
++    {
++      ast_expression* returned_expr = p_return->returned.data[0];
++      if (returned_expr->node.node_type == AST_CALL_EXPRESSION) {
++        ast_call_expression* call = (ast_call_expression*)returned_expr;
++        const bool has_spread = call->arguments.count > 0 &&
++                                call->arguments.data[call->arguments.count - 1]->node.node_type ==
++                                    AST_SPREAD_EXPRESSION;
++        if (call->callable->node.node_type == AST_IDENTIFIER_EXPRESSION && !has_spread) {
++          ok_string_view callee_name =
++              ast_identifier_expression_get_value((ast_identifier_expression*)call->callable);
++          location loc = resolve_variable(p_compiler, callee_name, (ast_node*)p_return);
++          if (loc.error == LOCATION_OK && (loc.kind == LOCATION_KIND_REGISTER || loc.kind == LOCATION_KIND_UPVALUE ||
++                                           loc.kind == LOCATION_KIND_GLOBAL)) {
++            register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
++            _register dest;
++            if (!register_allocator_allocate_temp(regalloc, &dest)) {
++              report_oom(p_compiler, (ast_node*)p_return);
++              return false;
++            }
++            if (!materialize_value(p_compiler, dest, loc, (ast_node*)p_return)) {
++              return false;
++            }
++            _register args;
++            args.index = 0;
++            args.flags = REGISTER_FLAG_NONE;
++            args.errors = REGISTER_OK;
++            if (!compile_expressions_list(p_compiler, &call->arguments, A_MAX, &args, (ast_node*)p_return)) {
++              return false;
++            }
++            // the crossed scopes' defers run before the handover, exactly
++            // like the classic return: the thunks stage at the runtime top,
++            // above the callable and args staged here.
++            if (!emit_defer_exits_from_innermost(p_compiler, 0, (ast_node*)p_return)) {
++              return false;
++            }
++            const uint32_t argc = call->arguments.count;
++            const bool is_long = dest.index > a_MAX || (argc > 0 && args.index > a_MAX) || argc > b_MAX;
++            bool emitted = false;
++            if (is_long) {
++              emitted = emit_word2(p_compiler,
++                                   encode_OPPABCQ(OP_TAILCALL_LONG, false, dest.index, argc, 0, false),
++                                   (ast_node*)p_return);
++            } else {
++              emitted = emit_word(
++                  p_compiler, encode_oppabc(OP_TAILCALL, false, (uint8_t)dest.index, (uint8_t)argc, 0), (ast_node*)p_return);
++            }
++            if (!emitted) {
++              report_oom(p_compiler, (ast_node*)p_return);
++              return false;
++            }
++            return true; // the tailcall IS the return - nothing follows it
++          }
++        }
++      }
++    }
+     // the classic single-result fast path: RETURN_1 with its
+     // constant/global/upvalue/register operand encodings.
+     expression_result returned;
+@@ -4296,14 +4359,18 @@ static bool compile_assign_expression(compiler* p_compiler,
+   // keep the scratch-then-store path. store_lvalue still runs afterwards:
+   // the mutability gate and the (now no-op) self move check both still apply.
+   _register rhs_dest = p_dest;
+-  if (lv.kind == LVALUE_SUBSCRIPT) {
+-    // the rhs compiles into its own temp above the lvalue's staged base/index.
++  if (lv.kind == LVALUE_SUBSCRIPT || lv.kind == LVALUE_MEMBER) {
++    // the rhs compiles into its own temp above the lvalue's staged registers.
+     // a call rhs opens the callee's register window at its destination, and the
+     // callee's frame ([dest, dest + fu->registers)) null-fills every slot above it.
+-    // the staged base/index temps sit above p_dest, so compiling the rhs
++    // the staged temps sit above p_dest, so compiling the rhs
+     // there let the callee erase them (arr[0] = reseat(), where reseat captures
+-    // and reseats arr, died with "expected an array"). found by the elision-gate
+-    // regression hunt. compound assigns were always safe because their cur/rhs temps are allocated after the staging.
++    // and reseats arr, died with "expected an array"; obj.f = not this.g(),
++    // the P6 pub-fields finding, died with "only instances and classes have
++    // assignable members" - the member store's staged receiver sat inside the
++    // callee's window and was null-filled before the store read it). found by
++    // the elision-gate regression hunt, then again by delta blue's rewrite.
++    // compound assigns were always safe because their cur/rhs temps are allocated after the staging.
+     if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &rhs_dest)) {
+       report_oom(p_compiler, (ast_node*)p_assign);
+       return false;
+diff --git a/src/okdebug.c b/src/okdebug.c
+index 8273a0f..e9d035d 100644
+--- a/src/okdebug.c
++++ b/src/okdebug.c
+@@ -33,6 +33,8 @@ static const char* const OPCODE_NAMES[] = {
+     "CLOSE_UPVALUES",
+     "CALL",
+     "CALL_LONG",
++    "TAILCALL",
++    "TAILCALL_LONG",
+     "RETURN",
+     "RETURN_LONG",
+     "RETURN_1",
+@@ -222,6 +224,7 @@ static bool op_is_two_words(opcode p_op) {
+   case OP_LOAD_UPVALUE_LONG:
+   case OP_STORE_UPVALUE_LONG:
+   case OP_CALL_LONG:
++  case OP_TAILCALL_LONG:
+   case OP_RETURN_LONG:
+   case OP_CLOSURE_LONG:
+   case OP_NOT_LONG:
+@@ -437,6 +440,12 @@ uint32_t debug_disassemble_instruction(disassembler* p_disassembler, uint32_t p_
+       printf("%u", C - 1);
+     }
+     break;
++  case OP_TAILCALL:
++    printf("tailcall r%u, argc %u (frame's contract)", a, b);
++    break;
++  case OP_TAILCALL_LONG:
++    printf("tailcall r%u, argc %u (frame's contract)", A, B);
++    break;
+   case OP_VA_PACK:
+     printf("r%u = pack r%u ... r[argc]", ap, bp);
+     break;
+diff --git a/src/okvm.c b/src/okvm.c
+index 73a443a..51be61c 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -3487,6 +3487,8 @@ static void* ok_dispatch_table[OP__COUNT] = {
+   [OP_CLOSE_UPVALUES] = &&L_OP_CLOSE_UPVALUES,
+   [OP_CALL] = &&L_OP_CALL,
+   [OP_CALL_LONG] = &&L_OP_CALL_LONG,
++  [OP_TAILCALL] = &&L_OP_TAILCALL,
++  [OP_TAILCALL_LONG] = &&L_OP_TAILCALL_LONG,
+   [OP_RETURN] = &&L_OP_RETURN,
+   [OP_RETURN_LONG] = &&L_OP_RETURN_LONG,
+   [OP_RETURN_1] = &&L_OP_RETURN_1,
+@@ -3894,6 +3896,200 @@ static void* ok_dispatch_table[OP__COUNT] = {
+       }
+       DISPATCH();
+     }
++    CASE(OP_TAILCALL):
++    CASE(OP_TAILCALL_LONG): {
++      // the frame in place runs the callee and its results answer THIS
++      // frame's return contract. the compiler's only writer is
++      // `return name(args);` - the defer epilogue already ran in bytecode,
++      // so what remains is the frame's own teardown: close the upvalues,
++      // drop this frame's handler records, then hand the window over.
++      const bool is_long = op_of(instruction) == OP_TAILCALL_LONG;
++      word2 joined = 0;
++      if (is_long) {
++        joined = JOIN_WORD(instruction); // consumes the second word, long ops only
++      }
++      const uint16_t a = is_long ? A_of(joined) : (uint16_t)a_of(instruction);
++      const uint16_t b = is_long ? B_of(joined) : (uint16_t)b_of(instruction);
++      value callee_v = REG_AT(a);
++      if (IS_VALUE_CLOSURE(callee_v)) {
++        object_closure* callee = VALUE_AS_CLOSURE(callee_v);
++        const object_function* fu = callee->function;
++        const uint32_t base = frame->registers_base;
++        // the same two-sided arity walk as call(), against the INHERITED
++        // contract: the original caller's request is this frame's
++        // return_count, and the tail callee must satisfy it exactly.
++        const uint32_t retc = frame->return_count;
++        if (fu->has_varargs) {
++          const uint32_t floor = (uint32_t)(fu->arity - fu->ndefaults) - 1u;
++          if (b < floor) {
++            runtime_error(p_vm,
++                          OK_EK_ARITY,
++                          "invalid call to '%s': expected at least %u argument%s, got %u.",
++                          fu->name->string.chars,
++                          floor,
++                          s_if_plural(floor),
++                          b);
++            FAIL_PATH();
++            DISPATCH();
++          }
++        } else if (b < (uint32_t)(fu->arity - fu->ndefaults) || b > fu->arity) {
++          if (fu->ndefaults == 0) {
++            runtime_error(p_vm,
++                          OK_EK_ARITY,
++                          "invalid call to '%s': expected %u argument%s, got %u.",
++                          fu->name->string.chars,
++                          fu->arity,
++                          s_if_plural(fu->arity),
++                          b);
++          } else if (b < fu->arity - fu->ndefaults) {
++            runtime_error(p_vm,
++                          OK_EK_ARITY,
++                          "invalid call to '%s': expected at least %u argument%s, got %u.",
++                          fu->name->string.chars,
++                          fu->arity - fu->ndefaults,
++                          s_if_plural(fu->arity - fu->ndefaults),
++                          b);
++          } else {
++            runtime_error(p_vm,
++                          OK_EK_ARITY,
++                          "invalid call to '%s': expected at most %u argument%s, got %u.",
++                          fu->name->string.chars,
++                          fu->arity,
++                          s_if_plural(fu->arity),
++                          b);
++          }
++          FAIL_PATH();
++          DISPATCH();
++        }
++        if (retc != RETURN_COUNT_DYNAMIC && retc >= 1 && retc != (uint32_t)fu->results) {
++          runtime_error(p_vm,
++                        OK_EK_ARITY,
++                        "invalid call to '%s': it returns %u value%s, %u were requested here.",
++                        fu->name->string.chars,
++                        fu->results,
++                        s_if_plural(fu->results),
++                        retc);
++          FAIL_PATH();
++          DISPATCH();
++        }
++        uint32_t frame_top = base + fu->registers;
++        if (fu->has_varargs && (uint32_t)b + 1u > frame_top) {
++          frame_top = base + b + 1u;
++        }
++        if (frame_top > UINT16_MAX + 1u) {
++          runtime_error(p_vm, OK_EK_ARITY, "invalid call to '%s': too many arguments.", fu->name->string.chars);
++          FAIL_PATH();
++          DISPATCH();
++        }
++        if (frame_top > reg->array.capacity) {
++          const uint32_t target = frame_top + (frame_top >> 1u);
++          const uint32_t new_capacity = target > UINT16_MAX + 1u ? UINT16_MAX + 1u : target;
++          const uint32_t initialized_uptill = reg->array.capacity;
++          if (!register_array_grow(&reg->array, new_capacity)) {
++            runtime_oom(p_vm, "out of memory: failed to grow register file.");
++            FAIL_PATH();
++            DISPATCH();
++          }
++          for (uint32_t i = initialized_uptill; i < new_capacity; ++i) {
++            reg->array.data[i] = NULL_AS_VALUE();
++          }
++        }
++        // the frame's own teardown, then the handover. order matters: the
++        // upvalue cells snapshot the CURRENT window, the dying frame's try
++        // records must not outlive it (a stale record would hijack a later
++        // error into a dead window).
++        close_upvalues(exe, base);
++        while (exe->handlers.count > 0 &&
++               exe->handlers.data[exe->handlers.count - 1].frame >= exe->call_stack.count - 1) {
++          exe->handlers.count--;
++        }
++        // the callable rode r[a]; the callee's window wants it at r0 with the
++        // args at r1..rargc (the calling convention's window shape). move
++        // the whole staged span down to the frame base - a downward memmove,
++        // overlap-safe by definition.
++        memmove(&reg->array.data[base],
++                &reg->array.data[base + a],
++                (size_t)(b + 1u) * sizeof(value));
++        // everything the callee has not received reads as null (call()'s
++        // stale-bits discipline: mark_vm roots [0, top) unconditionally).
++        {
++          uint32_t first_unwritten = base + b + 1u;
++          if (first_unwritten > frame_top) {
++            first_unwritten = frame_top;
++          }
++          for (uint32_t i = first_unwritten; i < frame_top; ++i) {
++            reg->array.data[i] = NULL_AS_VALUE();
++          }
++        }
++        reg->top = frame_top;
++        // the in-place replacement: same window base, same return contract,
++        // the callee's code. the call stack never grew - that is the whole
++        // point (deep recursion rides one frame slot).
++        frame->closure = callee;
++        frame->ip = fu->chunk.code.data;
++        frame->argc = b;
++        frame->defer_thunk = false;
++        ip = frame->ip;
++        DISPATCH();
++      }
++      // the degrade: a non-closure callee (native, class construction, bound
++      // method, instance operator) cannot take the frame in place. run it
++      // exactly like vm_call would - push through call_value, nested-run if a
++      // frame was pushed - then answer the return contract with its result.
++      // one C-frame deeper than the closure lane for the pushed shapes; the
++      // deep-recursion use case (plain closures) never lands here.
++      frame->ip = ip;
++      {
++        const uint32_t my_depth = exe->call_stack.count;
++        if (!call_value(p_vm, exe, reg, frame->registers_base, a, b, frame->return_count)) {
++          FAIL_PATH();
++          DISPATCH();
++        }
++        exe = p_vm->current_execution_state;
++        reg = &exe->registers;
++        if (exe->call_stack.count > my_depth) {
++          // a frame was pushed: run it to completion under a yield barrier
++          // (this C frame holds the return bookkeeping - a yield from under
++          // it could never resume honestly, the defer lane's discipline).
++          const uint8_t saved_barrier = exe->yield_barrier;
++          if (exe->yield_barrier == 0) {
++            exe->yield_barrier_kind = YIELD_BARRIER_DEFER;
++          }
++          exe->yield_barrier++;
++          const interpret_result nested = run_until(p_vm, my_depth);
++          exe->yield_barrier = saved_barrier;
++          if (nested.status != RUNTIME_OK) {
++            FAIL_PATH();
++            DISPATCH();
++          }
++          exe = p_vm->current_execution_state;
++          reg = &exe->registers;
++        }
++      }
++      frame = &exe->call_stack.data[exe->call_stack.count - 1];
++      ip = frame->ip;
++      if (exe->native_suspend_pending) {
++        // a suspend-requesting native in direct tail position: the parked
++        // frame would be this spent frame, and its resume would continue
++        // past the tailcall into a body that already returned. refuse it
++        // loudly - the same discipline as the yield barrier's edges.
++        runtime_error(p_vm, OK_EK_VALUE, "cannot suspend from a tail call: the frame is spent.");
++        FAIL_PATH();
++        DISPATCH();
++      }
++      // the callee's results answered the contract at the call window
++      // (return_base = this frame's base + a): hand them back as this
++      // frame's return, exactly like RETURN would.
++      {
++        const uint16_t returned = return_from_frame(exe, reg, frame, a, 1);
++        if (exe->call_stack.count == p_call_depth) {
++          return top_level_return(reg, frame, returned);
++        }
++        frame = &exe->call_stack.data[exe->call_stack.count - 1];
++        ip = frame->ip;
++      }
++      DISPATCH();
++    }
+     CASE(OP_RETURN): {
+       const uint16_t ap = aprime_of(instruction);
+       const uint16_t bp = bprime_of(instruction);
+diff --git a/tests/e2e/tests/classes/member_store_call_rhs.ok b/tests/e2e/tests/classes/member_store_call_rhs.ok
+new file mode 100644
+index 0000000..1227021
+--- /dev/null
++++ b/tests/e2e/tests/classes/member_store_call_rhs.ok
+@@ -0,0 +1,58 @@
++// the member-store receiver must survive a call-shaped rhs: a call opens
++// the callee's register window at its destination and the callee's frame
++// null-fills every slot above it, so the assignment's staged receiver has
++// to sit below that window. found by delta blue's pub-fields rewrite
++// (obj.stay_ = not this.is_input() died with "only instances and classes
++// have assignable members" - the receiver register was erased mid-statement).
++class Box {
++  pub let mut flag_ = false;
++  pub let mut n_ = 0;
++  fu init() {}
++}
++
++class Widget {
++  let box_;
++  fu init(box) { this.box_ = box; }
++  pub fu is_ready() { return true; }
++  pub fu value_for(x) { return x * 2; }
++
++  pub fu round1() {
++    // the direct shape: call in the rhs of a member store
++    box_.flag_ = this.is_ready();
++    // the not-wrapped call (delta blue's exact shape) - overwrites to false
++    box_.flag_ = not this.is_ready();
++    // a call with arguments, receiver staged before the window opens
++    box_.n_ = this.value_for(21);
++  }
++
++  pub fu round2() {
++    // nested member stores in sequence, one temp reusing the other's slot
++    box_.n_ = this.value_for(box_.n_);
++    box_.flag_ = box_.n_ == 42;
++  }
++}
++
++let box = Box();
++let w = Widget(box);
++w.round1();
++print(box.flag_); // expect: false
++print(box.n_); // expect: 42
++w.round2();
++print(box.flag_); // expect: false
++print(box.n_); // expect: 84
++
++// subscript + member on the same line: both lvalue kinds stage registers
++let boxes = [Box(), Box()];
++boxes[0].flag_ = w.is_ready();
++print(boxes[0].flag_); // expect: true
++
++// chained through a method call result: this.input().value_ = ... (the
++// equality constraint's execute shape)
++class Pair {
++  pub let mut v_ = 0;
++  fu init() {}
++  pub fu other() { return this; }
++}
++let p = Pair();
++p.other().v_ = 7;
++print(p.v_); // expect: 7
+diff --git a/tests/e2e/tests/functions/tailcalls.ok b/tests/e2e/tests/functions/tailcalls.ok
+new file mode 100644
+index 0000000..d432059
+--- /dev/null
++++ b/tests/e2e/tests/functions/tailcalls.ok
+@@ -0,0 +1,101 @@
++// OP_TAILCALL (P6): `return name(args);` hands the frame to the callee in
++// place - the call stack stays flat, so deep recursion rides one frame slot.
++// found its first real shapes the moment delta blue's rewrite landed; the
++// lane is deliberately narrow (plain identifier callees, no spread - the
++// method/super invokes keep the classic shape) and the contract it answers
++// is the original caller's.
++
++// self-recursion through the global lane: half a million deep, flat
++fu count(n) {
++    if n == 0 {
++        return 0;
++    }
++    return count(n - 1);
++}
++print(count(500000)); // expect: 0
++
++// mutual recursion through a glob (sequential visibility: one name must be
++// declared before the other's body, the glob breaks the cycle)
++glob let mut is_odd = null;
++fu deep_even(n) {
++    if n == 0 {
++        return true;
++    }
++    return is_odd(n - 1);
++}
++fu deep_odd_impl(n) {
++    if n == 0 {
++        return false;
++    }
++    return deep_even(n - 1);
++}
++is_odd = deep_odd_impl;
++print(deep_even(1000000)); // expect: true
++print(is_odd(999999)); // expect: true
++
++// the defer epilogue runs before the handover (lifo, per scope)
++fu say(what) {
++    print(what);
++    return true;
++}
++fu deferred(n) {
++    if n == 0 {
++        return 100;
++    }
++    defer say(n);
++    return deferred(n - 1);
++}
++print(deferred(3)); // expect: 3
++// expect: 2
++// expect: 1
++// expect: 100
++
++// a try region crossed by the tailcall pops its record
++fu tried(n) {
++    try {
++        if n == 0 {
++            return "done";
++        }
++        return tried(n - 1);
++    } catch {
++        return "caught";
++    }
++}
++print(tried(1000)); // expect: done
++
++// an error thrown past a tailcalled frame unwinds to the right catch
++fu boom() {
++    throw "boom";
++}
++fu tail_to_boom() {
++    return boom();
++}
++try {
++    tail_to_boom();
++} catch {
++    say("outer caught"); // expect: outer caught
++}
++
++// upvalues close at the handover; the callee reads its own, unbothered
++fu make_inner() {
++    let captured = 7;
++    return fu() {
++        return captured;
++    };
++}
++fu tail_to(f) {
++    return f();
++}
++print(tail_to(make_inner())); // expect: 7
++
++// a native callee in tail position (the degrade lane: call, then return)
++fu tail_to_len(x) {
++    return len(x);
++}
++print(tail_to_len("abc")); // expect: 3
++
++// the plain non-tail return keeps its shape (a value, not a call)
++fu plain(n) {
++    return n + 1;
++}
++print(plain(41)); // expect: 42
+diff --git a/tests/fuzz/corpus/checksums b/tests/fuzz/corpus/checksums
+index 352a0b6..6c70506 100644
+--- a/tests/fuzz/corpus/checksums
++++ b/tests/fuzz/corpus/checksums
+@@ -17,5 +17,6 @@ fnv1a64 ee55bdfdff37bedb modules.ok
+ fnv1a64 93cd53309a16da5b numbers.ok
+ fnv1a64 c770bbd0b78ad6a9 operators.ok
+ fnv1a64 223311471f71c209 strings_multiline.ok
++fnv1a64 1cc87409902bd746 tailcalls.ok
+ fnv1a64 933397058c73a3b0 unterminated.ok
+ fnv1a64 db2f5bb2fee01fac utf8.ok
+diff --git a/tests/fuzz/corpus/tailcalls.ok b/tests/fuzz/corpus/tailcalls.ok
+new file mode 100644
+index 0000000..0d79654
+--- /dev/null
++++ b/tests/fuzz/corpus/tailcalls.ok
+@@ -0,0 +1,16 @@
++// the tailcall lane's shapes: self and mutual recursion, defer epilogues,
++// try crossings, native degrade - one seed the mutations can remix.
++fu count(n) {
++  if n == 0 { return 0; }
++  defer say(n);
++  return count(n - 1);
++}
++fu say(what) { return what; }
++glob let mut is_odd = null;
++fu even(n) { if n == 0 { return true; } return is_odd(n - 1); }
++fu odd_impl(n) { if n == 0 { return false; } return even(n - 1); }
++is_odd = odd_impl;
++try { print(count(3)); } catch { print("caught"); }
++print(even(10));
++fu tail_len(x) { return len(x); }
++print(tail_len("abc"));
+diff --git a/tests/fuzz/crosscheck-manifest.txt b/tests/fuzz/crosscheck-manifest.txt
+index 8a0c064..b5185ec 100644
+--- a/tests/fuzz/crosscheck-manifest.txt
++++ b/tests/fuzz/crosscheck-manifest.txt
+@@ -76,6 +76,7 @@ accept  classes/local_class_redefine_closures.ok
+ accept  classes/local_class_redefine_in_method.ok
+ accept  classes/local_class_redefine_inherit.ok
+ accept  classes/local_class_twice.ok
++accept  classes/member_store_call_rhs.ok
+ accept  classes/method_assign_error.ok
+ accept  classes/native_method_arity_error.ok
+ accept  classes/native_method_error.ok
+@@ -218,6 +219,7 @@ accept  functions/nested_call.ok
+ accept  functions/recursion.ok
+ accept  functions/repeated_call.ok
+ accept  functions/return.ok
++accept  functions/tailcalls.ok
+ accept  generated/1/constant_long.ok
+ accept  generated/2/global_long.ok
+ accept  generated/3/jump_long.ok
+@@ -701,6 +703,7 @@ reject  modules.ok  (parse)
+ reject  numbers.ok  (parse)
+ reject  operators.ok  (parse)
+ reject  strings_multiline.ok  (parse)
++accept  tailcalls.ok
+ reject  unterminated.ok  (parse)
+ accept  utf8.ok
+ # end of manifest
+diff --git a/tests/fuzz/crosscheck.sh b/tests/fuzz/crosscheck.sh
+index bb2d99d..869ee0d 100644
+--- a/tests/fuzz/crosscheck.sh
++++ b/tests/fuzz/crosscheck.sh
+@@ -18,6 +18,20 @@ ROOT="$(cd "$HERE/../.." && pwd)"
+ # manifest or the pins being regenerated.
+ bash "$HERE/corpus/gen.sh"
+ 
++# the pins BEFORE the manifest: the manifest's --crosscheck walk verifies
++# pins at load (the consuming-lane discipline), and a seed that just joined
++# the corpus must already carry its pin when that walk runs - regen order
++# is healer, pins, manifest, or the door trips on its own fresh seed.
++{
++  echo "# the corpus integrity pins: fnv1a64 of every seed's bytes, names"
++  echo "# relative to tests/fuzz/corpus, walk order. verified by okfuzz at"
++  echo "# corpus load (both consuming lanes); binary seeds regenerate from"
++  echo "# gen.sh, so a seed failing its pin is either an unregen'd change"
++  echo "# or a mangled landing - run crosscheck.sh to settle both."
++  "$OKFUZZ" --checksums "$ROOT/tests/fuzz/corpus"
++} > "$ROOT/tests/fuzz/corpus/checksums"
++echo "pins written: $ROOT/tests/fuzz/corpus/checksums"
++
+ {
+   echo "# the tree-sitter cross-check manifest (P5): the native parser's verdict"
+   echo "# for every .ok/.bin under the two committed roots. regenerated by"
+@@ -30,13 +44,3 @@ bash "$HERE/corpus/gen.sh"
+   echo "# end of manifest"
+ } > "$ROOT/tests/fuzz/crosscheck-manifest.txt"
+ echo "manifest written: $ROOT/tests/fuzz/crosscheck-manifest.txt"
+-
+-{
+-  echo "# the corpus integrity pins: fnv1a64 of every seed's bytes, names"
+-  echo "# relative to tests/fuzz/corpus, walk order. verified by okfuzz at"
+-  echo "# corpus load (both consuming lanes); binary seeds regenerate from"
+-  echo "# gen.sh, so a seed failing its pin is either an unregen'd change"
+-  echo "# or a mangled landing - run crosscheck.sh to settle both."
+-  "$OKFUZZ" --checksums "$ROOT/tests/fuzz/corpus"
+-} > "$ROOT/tests/fuzz/corpus/checksums"
+-echo "pins written: $ROOT/tests/fuzz/corpus/checksums"
+-- 
+2.47.3
+

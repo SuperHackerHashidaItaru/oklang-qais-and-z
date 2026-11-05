@@ -52,51 +52,39 @@ source of truth: `https://codeberg.org/qais/oklang`, master at `9ad153c`,
 **tagged v0.1.0**. the `register` branch is history — deletion pending Q's
 confidence, don't touch it.
 
-current phase [perishable — refresh at round end] (nov 5, session 47):
-the 0.9.0 wave (Reconciliation) is 5/7 landed, the series CONDENSED
-per Q's ruling. P1-P5 landed: P5 is Q's 4ad2cbd ("parsser hardne +
-fuzz + better cli (repl)") — the FIRST landing with drift: the
-medium replaced the invalid-utf-8 corpus seed's bytes with U+FFFD,
-silently flipping its crosscheck verdict (accept vs the committed
-reject). patch 61 (the corpus integrity lane) is DELIVERED as 8a5a015
-on the sandbox clone's reconciliation, one over 36c0b75: gen.sh (the
-binary seeds regenerate from pure-ascii octal escapes — the healer),
-tests/fuzz/corpus/checksums (fnv1a64 pins), okfuzz --checksums +
-load-time verification in both consuming lanes (mismatch/unpinned/
-pin-without-seed all fail loudly naming the file), crosscheck.sh as
-the one regen door (heals first), and the manifest catching up the
-8 repl fixtures patch 60 shipped unregistered. after Q applies 61 and
-runs `bash tests/fuzz/corpus/gen.sh`, the trees are byte-identical
-again — the simulation on 4ad2cbd proved the empty diff. gates on
-8a5a015's head: e2e 603x7, capi 334x5, fuzz x2 byte-identical to
-session 46 (47702 diagnostics, 0 unlocated), delta flat 1.93x/1.87x.
-P5 carried: the four hardening classes
-(parse arena, 200 depth funnel, 25-report cap, statement-boundary
-recovery), the zero-dep fuzzer + committed corpus + the okdiag-sink
-location bar (which found FOUR pre-existing bugs day one, all fixed:
-the f-string NULL deinit, two deferred-init walks, the unary-plus
-abort — `print(+5);` used to crash), the cross-check manifest (the
-tree-sitter sweep's diff target), and the REPL round (term.c the
-posix isolation zone, auto-print with ';' suppression, nesting-aware
-continuation, glob persistence). THE PORTABILITY LANE is recorded
-and deliberately untouched: pure c99 at compile time, lua-shaped
-(one config header, posix behind feature macros), to be done in
-isolation later — see the session-46 worklog entry. what remains:
-P6 the measurement patch (delta blue's pub-fields rewrite + re-baseline,
-compare+jump fusion, allocation shaving, OP_TAILCALL, the bench
-bridge + baseline column, the incremental GC attempt behind its
-bar) — P7 dissolved into both. sys.args/name/err are ruled in but
-not yet scheduled (the next round's call). master still sits at
-v0.4.0 ON PURPOSE: the ruled release plan (ROADMAP-0.9.0-draft) runs
-the wave to rc, then the review + amend pass, then releases
-v0.5.0 → v1.0.0 as their own cuts — the git mechanics are
-`docs/drafts/RELEASE-RUNBOOK.md` (round two folded the tidy
-correction: rel/ branches pin coros-family shas, tidy is in no
-command). all six survivors RULED (round two): len = codepoints
-(landed in P2), Reconciliation, property tests post-v1, no perf
-target ("the best version of itself"), GC incremental in v1 /
-generational post-v1, the std door + sys.args/name/err + math.idiv.
-${} is the interpolation delimiter — landed. tree-sitter still owes
+current phase [perishable — refresh at round end] (nov 5, session 48):
+the 0.9.0 wave (Reconciliation) is 6/7 landed. P5 is Q's 4ad2cbd
+(landed with the FIRST DRIFT - the invalid-utf-8 seed mangled to
+U+FFFD by the medium; patch 61's integrity lane answered the class,
+and Q applied it as b42d605 - BUT gen.sh has NOT run yet: the seed
+still carries the mangled bytes and Q's fuzz/crosscheck lanes run red
+until `bash tests/fuzz/corpus/gen.sh` + commit). patch 62 (P6 round
+one) is DELIVERED as 934e4bc on the sandbox clone's reconciliation:
+the member-store receiver fix (a pre-existing miscompile the bench
+rewrite found: obj.field = <call rhs> erased its staged receiver),
+OP_TAILCALL (return name(args) hands the frame over in place - a
+million mutual tailcalls, one frame slot; defers run first, non-
+closure callees degrade through the vm_call lane), and the regen
+door's healer-pins-manifest ordering. WITH IT, on the collab side:
+delta_blue.ok's pub-fields rewrite (every accessor call became the
+direct field access wren uses - 1.93x/1.88x of wren -> 1.35x/1.33x,
+the accessor tax was ~30% of the benchmark; results/delta_blue.md
+re-baselined). gates on 934e4bc: e2e 605x7, capi 334x5, fuzz x2
+(50047 diagnostics, 0 unlocated, 17 seeds), delta flat at the new
+baseline. what remains (P6 round two): fusion pass 2 (and/or
+comparison operands), the allocation shaving pass against the NEW
+baseline, the bench bridge trigger + baseline column, the incremental
+GC attempt or its measured deferral. sys.args/name/err remain
+ruled-in-unscheduled. THE PORTABILITY LANE stays recorded, untouched.
+master still sits at v0.4.0 ON PURPOSE: the ruled release plan
+(ROADMAP-0.9.0-draft) runs the wave to rc, then the review + amend
+pass, then releases v0.5.0 -> v1.0.0 as their own cuts - the git
+mechanics are docs/drafts/RELEASE-RUNBOOK.md. all six survivors RULED
+(round two): len = codepoints (landed in P2), Reconciliation,
+property tests post-v1, no perf target ("the best version of
+itself"), GC incremental in v1 / generational post-v1, the std door +
+sys.args/name/err + math.idiv. ${} is the interpolation delimiter -
+landed.${} is the interpolation delimiter — landed. tree-sitter still owes
 the grammar catch-up (Q's flank — interpolation + multiline grammar
 now too). the bench workflow is live (automated runs pin oklang
 0666651, a lane ref). workspace: the sandbox `oklang/` clone is the

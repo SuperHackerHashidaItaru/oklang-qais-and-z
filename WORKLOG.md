@@ -2745,3 +2745,89 @@ session holds. the roadmap's series section is re-densed accordingly
   runs on a clean baseline. sys.args/name/err remain
   ruled-in-unscheduled. the portability lane stays recorded, stays
   untouched.
+
+## session 48 (2026-11-05): P6 round one - the pub-fields rewrite, and the tailcall lane (62)
+
+- context: Q confirmed the hotfix ("oki good catch, pushed hot fix to
+  reconciliation"). the receipt: b42d605 "fix corpus integrity" is 8a5a015's
+  content byte-identical (diff excluding the seed: EMPTY) - but gen.sh was
+  NOT run: the seed still carries the mangled ef bf bd bytes, so Q's tree
+  runs the fuzz and crosscheck lanes RED right now (exit 70, the tripwire
+  naming the file, the heal command printed - the lane doing exactly its
+  job on the first real-world case). one command remains on Q's side:
+  `bash tests/fuzz/corpus/gen.sh` + commit the healed seed.
+- P6 opened per the plan. the round, in order:
+  - THE MEMBER-STORE BUG (pre-existing, found by the rewrite's first run):
+    `obj.field = <call-shaped rhs>` miscompiled - compile_assign_expression
+    staged the member receiver into a temp, then compiled the rhs into a
+    register BELOW it; a call rhs opens the callee's window at that
+    register and null-fills upward, erasing the staged receiver before
+    the store read it ("only instances and classes have assignable
+    members", the delta blue shape `out.stay_ = not this.is_input();`).
+    the subscript lane had the discipline documented ("the 3 temp
+    discipline... they must survive compilation of the rhs") and a fresh
+    rhs_dest above the staging; the member lane now shares it - one
+    condition extended, the comment tells both hunts' stories.
+  - THE PUB-FIELDS REWRITE (collab side, the headline): delta_blue.ok's
+    every cross-class accessor call became the direct field access wren's
+    original uses. done as a MECHANICAL python transformation of the
+    committed file after the first from-memory reconstruction proved
+    unfaithful (it reordered ScaleConstraint's init - whose
+    fields-before-super order is load-bearing, the construction chain
+    dispatches into mark_inputs while init is still inside super - and
+    dropped add_to_graph/remove_from_graph overrides; the honest lesson
+    recorded: benchmark rewrites are diffs, not reconstructions). 237
+    diff lines, all accessor-to-field shapes; output byte-identical
+    (1.40654e+07). RESULT: 249.7 -> 176.1 ms release, 243.3 -> 173.4
+    threaded; 1.93x/1.88x of wren -> 1.35x/1.33x. THE ACCESSOR TAX WAS
+    ~30% OF THE WHOLE BENCHMARK. results/delta_blue.md carries the
+    re-baseline table + the honest notes (the remaining 1.35x is the
+    allocation-shaped profile PERF-PASS-1 already named).
+  - OP_TAILCALL / OP_TAILCALL_LONG: `return name(args);` (plain-identifier
+    callee, register/upvalue/global, no spread) hands the frame to the
+    callee IN PLACE - close upvalues, drop this frame's handler records,
+    memmove the staged window down (the callable's slot becomes the
+    callee's r0, args at r1..rargc - the calling convention's own shape),
+    replace the frame with the ORIGINAL return contract inherited (the
+    c operand stays unused: frame->return_count is the runtime truth).
+    one million mutual tailcalls through a glob ride one frame slot. the
+    defer epilogue runs in bytecode BEFORE the handover (the compiler
+    emits it exactly like the classic return). the degrade for
+    non-closure callees: the vm_call lane - call_value, nested run_until
+    under a yield barrier when a frame was pushed (the defer lane's
+    discipline), then the result answers the contract. the first
+    implementation assumed call_value synchronous always - a real bug
+    that regressed operators_call_instance + coros/classes_interplay
+    (instance-operator tailcalls returned null: the arm "returned" from
+    the not-yet-run pushed frame) - the gates caught it, the vm_call
+    mirror fixed it, both fixtures green again. v1 scope honest:
+    method/super invokes, spreads, field/static and lambda-expression
+    callees keep the classic shape.
+  - THE REGEN DOOR'S ORDERING: crosscheck.sh wrote the manifest before
+    the pins, so adding the tailcalls seed tripped the manifest walk's
+    own load-time verification (the door tripped on its own fresh seed).
+    order is now healer, pins, manifest - found by the gates, fixed
+    before delivery.
+- new surfaces: e2e classes/member_store_call_rhs.ok (the receiver-
+  survival shapes incl. the delta blue form), functions/tailcalls.ok
+  (self + mutual deep recursion, defer epilogue, try crossings, error
+  unwinding past a tailcalled frame, upvalue closes, the native
+  degrade), fuzz corpus tailcalls.ok (17 seeds pinned, manifest
+  caught up).
+- receipts: builds 9/9, e2e 605/605 x7 (603 -> 605), unit + embed 5x3,
+  capi 334x5, cli 10/10, fuzz x2 gcc == asan byte-identical (50047
+  diagnostics, 0 unlocated - the new seed's mutations), delta blue
+  correct 1.40654e7, flat at the pub-fields baseline (~1.35x/1.32x,
+  run noise; no tail-shaped returns in the benchmark). patch 62 is
+  pure ascii, applies clean on b42d605 (the worktree check).
+- delivered: patches/62-p6-round-one-tailcalls-member-store-fix.patch
+  (mirrored in download/), its README entry, the collab bench rewrite +
+  results re-baseline, the roadmap's P6 partial marker, Z-GUIDE's
+  perishables refreshed, this entry.
+- next (P6 round two): compare+jump fusion pass 2 (the and/or comparison
+  operands + negated conditions - the S-flag extension sketched), the
+  allocation shaving pass against the NEW baseline (bound-method
+  materialization on GET_MEMBER method hits is the first suspect), the
+  bench bridge trigger + baseline column (collab CI side), and the
+  incremental GC attempt behind its bar - or its measured deferral,
+  with data. the portability lane stays recorded, stays untouched.

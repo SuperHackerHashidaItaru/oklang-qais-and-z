@@ -1,6 +1,9 @@
 # ROADMAP 0.9.0 — the last pre-v1 wave (draft, round one folded)
 
 status: DRAFT, round one complete (2026-11-04), round two folded. 2026-11-05
+(session 48): P6 ROUND ONE delivered (patch 62: OP_TAILCALL + the
+member-store fix; the pub-fields bench rewrite re-baselined delta blue
+from 1.93x to 1.35x of wren). 2026-11-05
 (session 47): P5 landed on reconciliation (Q's 4ad2cbd) carrying the FIRST
 DRIFT in five landings — the invalid-utf-8 corpus seed mangled to U+FFFD
 by the landing medium, verdict silently flipped; patch 61 (the corpus
@@ -464,11 +467,17 @@ one session each, gated by the full matrix every time:
   `bash tests/fuzz/corpus/gen.sh`, commit the healed seed, and the
   trees are byte-identical again (simulated on 4ad2cbd: empty diff).
 - **P6** (condensed with P7's GC question — the measurement patch):
-  optimization round 1 — delta blue's pub-fields rewrite + re-baseline,
-  compare+jump fusion, allocation shaving, OP_TAILCALL, the bench
-  bridge trigger + the baseline column — and the incremental GC
-  attempt (or its measured deferral, with data) rides the same patch's
-  measurement bar.
+  ROUND ONE LANDED (patch 62 + the collab-side rewrite): delta blue's
+  pub-fields rewrite + re-baseline (1.93x/1.88x of wren -> 1.35x/1.33x
+  — the accessor tax was ~30% of the benchmark; the rewrite also
+  flushed out and fixed a pre-existing member-store miscompile),
+  OP_TAILCALL (the frame hands over in place; a million mutual
+  tailcalls ride one frame slot), the regen door's ordering fix.
+  ROUND TWO REMAINS: compare+jump fusion pass 2 (the and/or comparison
+  operands + negated conditions), allocation shaving against the NEW
+  baseline, the bench bridge trigger + the baseline column — and the
+  incremental GC attempt (or its measured deferral, with data) rides
+  the same patch's measurement bar.
 - P7 as a slot DISSOLVES into P5 + P6 above; the leftovers the next
   round decides stay collected in the worklog.
 
