@@ -1,6 +1,11 @@
 # ROADMAP 0.9.0 — the last pre-v1 wave (draft, round one folded)
 
-status: DRAFT, round one complete (2026-11-04). the modules wave is
+status: DRAFT, round one complete (2026-11-04), round two folded. 2026-11-05
+(session 45): P1-P4 LANDED (patches 53-59), the series CONDENSED per
+Q's ruling — "now also that the session don't cut off as aggressively
+you can condense the remaining patches as appropriate": one patch per
+workstream, whole workstreams per session when the session holds. the
+modules wave is
 complete (patches 43-52, e2e 510x7); this draft shapes the last pre-v1
 version. Q's original framing: "we literally have nothing left, only
 minor stuff (utf8, std expansion pack, and tooling (cli already
@@ -395,49 +400,60 @@ lua-style amalgamation option), the deprecation windows closed (print
 statement, %g, flat aliases), impl-defined behavior documented.
 horizon: checklist is the clock, calendar is vibes.
 
-## the patch series (re-densed after round one)
+## the patch series (re-densed after round one, condensed after P4)
 
 one session each, gated by the full matrix every time:
 
-- **P1**: the honesty warmup — the version stamp + `ok --version` /
-  `ok -v` + `ok create` + OK_ROOT in the harnesses + the c99/-Werror
-  gate + the warning sweep.
-- **P2**: utf8 core — the ok_utf8 port + the front-door validation gate
-  (NUL / bidi / C0), codepoint-first iteration + index, the str hidden
-  shape, the len ruling applied, `\u{}` escapes + tests.
-- **P3**: the strings round — **f"" interpolation** (RULED round two:
-  the delimiter is `${` followed by `}` — Q's proposal, Z's
-  endorsement; `$` is unclaimed by the language, braces go back to
-  being literal so JSON and friends need no escaping inside f-strings,
-  `\${` is the literal dollar-brace, a `$` not followed by `{` is just
-  a dollar, and plain "" never interpolates; full escaping at
-  string level only — never any lower layer's escaping; expressions
-  nest with brace tracking so quoted
-  strings inside interpolations work; NO format-spec mini-language —
-  `:` after the expression is reserved and errors for now, so a later
-  spec addition breaks nobody) + **m"" multiline** (RULED in, Q —
-  "since we have f strings now, why dont we make new type of strings";
-  same escape set as normal strings for predictability, literal
-  newlines, no dedent magic, `fm""` stacks; the unterminated error
-  names the opening line) + the str method toolkit + std.math + the
-  deprecation windows open.
-- **P4**: fs/env/clock behind OK_CAP_HOST — std.fs + std.sys + the
-  ok_fs/ok_time abstraction layers they ride + the host-abstraction
-  audit sweep + tests (the sandbox lane gets its first real HOST
-  consumers).
-- **P5**: parser hardening (the four classes) + the fuzz harness +
-  corpus + the cross-check growth.
-- **P6**: optimization round 1 — delta blue's pub-fields rewrite +
-  re-baseline, compare+jump fusion, allocation shaving, OP_TAILCALL,
-  the bench bridge trigger — measured against the whole suite.
-- **P7** (the maybes, per the rulings): the REPL round, the incremental
-  GC attempt (or its measured deferral), the leftovers the next round
-  decides.
+- **P1**: LANDED (patch 53, Q's 057309c) — the version stamp + `ok
+  --version` / `ok -v` + `ok create` + OK_ROOT in the harnesses + the
+  c99/-Werror gate + the 530-warning sweep.
+- **P2**: LANDED (patch 54, same landing) — the ok_utf8 port + the
+  front-door validation gate (NUL / bidi / C0), codepoint-first
+  iteration + index, the str hidden shape, len = codepoints (the open
+  ruling resolved: Z's rec, Q's word, both counts cached), `\u{}`
+  escapes + tests. one bug fixed in-patch: the for-slot call-window.
+- **P3**: LANDED (patches 55-58, Q's f05445a + 54fd30f + d48edf4) —
+  **f"" interpolation** (RULED round two: the delimiter is `${`
+  followed by `}` — Q's proposal, Z's endorsement; `$` is unclaimed by
+  the language, braces go back to being literal so JSON and friends
+  need no escaping inside f-strings, `\${` is the literal
+  dollar-brace, a `$` not followed by `{` is just a dollar, and plain
+  "" never interpolates; full escaping at string level only; expressions
+  nest with brace tracking so quoted strings inside interpolations
+  work; NO format-spec mini-language — `:` after the expression is
+  reserved and errors for now) + **m"" multiline** (literal newlines,
+  same escape set, no dedent magic, `fm""` stacks; the unterminated
+  error names the opening line) + the str method toolkit + std.math +
+  the deprecation windows open; then the constants lane (pi, e) and
+  the complete escape set (`\a \b \e \f \v \0`, `\xNN` to ASCII,
+  octal refused; the `\u{}` braces KEPT — reason, not preference:
+  variable width vs the BMP cap and surrogate pairs).
+- **P4**: LANDED (patch 59, awaiting Q's hand) — fs/env/clock behind
+  OK_CAP_HOST: std.fs + std.sys + the ok_fs/ok_time/ok_env one-door
+  layers + the host-abstraction audit reroutes + sys.exit as the
+  uncatchable OK_EK_EXIT lane (OK_EXITED + ok_exit_code public) + 21
+  fixtures + the runners' `// expect exit:` lane + capi +9 (the
+  sandbox lane got its first real HOST consumers).
+- **P5** (condensed with P7's REPL round — the front-door patch):
+  parser hardening (the four classes: depth guard, arena ownership,
+  bounded peek/eat, statement-boundary sync) + the zero-dep fuzz
+  harness + corpus + the cross-check growth + the REPL round (raw-mode
+  editing, ctrl-left/right word jumps, history with a size cap,
+  auto-print of lone expressions with `;` suppression, multi-line
+  continuation — POSIX termios, CLI layer only).
+- **P6** (condensed with P7's GC question — the measurement patch):
+  optimization round 1 — delta blue's pub-fields rewrite + re-baseline,
+  compare+jump fusion, allocation shaving, OP_TAILCALL, the bench
+  bridge trigger + the baseline column — and the incremental GC
+  attempt (or its measured deferral, with data) rides the same patch's
+  measurement bar.
+- P7 as a slot DISSOLVES into P5 + P6 above; the leftovers the next
+  round decides stay collected in the worklog.
 
-"maybe a session or 2" stays honest for P1-P5; the optimization passes
-run as long as the profile says. everything lands on modules-staging
-(or a fresh lane — now moot, the release plan above governs), same
-protocol.
+"maybe a session or 2" stays honest for what remains; the optimization
+passes run as long as the profile says. everything lands on the
+reconciliation lane (the working branch answers the codename question
+in practice; the formal call stays Q's), same protocol.
 
 ## the survivors, closed (round two — nothing left OPEN)
 

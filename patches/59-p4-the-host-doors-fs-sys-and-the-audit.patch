@@ -1,0 +1,1840 @@
+From 65d8885b82ac0b7f20129b5d59bac54134c945f1 Mon Sep 17 00:00:00 2001
+From: Z <z@local>
+Date: Thu, 5 Nov 2026 02:22:46 +0000
+Subject: [PATCH] P4 the host doors: std.fs + std.sys behind OK_CAP_HOST
+ (ok_fs/ok_time/ok_env layers, the audit reroutes, sys.exit as the uncatchable
+ OK_EK_EXIT lane, ok_exit_code + OK_EXITED, the e2e exit/restrict lanes)
+
+---
+ CMakeLists.txt                                |   3 +
+ README.md                                     |   2 +
+ cli/src/main.c                                |   8 +
+ include/ok/ok.h                               |  10 +
+ src/ok.c                                      | 468 +++++++++++++++++-
+ src/ok_env.c                                  |  77 +++
+ src/ok_env.h                                  |  29 ++
+ src/ok_fs.c                                   | 152 ++++++
+ src/ok_fs.h                                   |  60 +++
+ src/ok_posix.h                                |  16 +
+ src/ok_time.c                                 |  23 +
+ src/ok_time.h                                 |  19 +
+ src/okdylib.c                                 |   5 +-
+ src/okmodules.c                               | 105 ++--
+ src/okstate.h                                 |   6 +
+ src/okvm.c                                    |  25 +
+ src/okvm.h                                    |   8 +
+ tests/capi/src/main.c                         |  31 ++
+ tests/e2e/src/main.cpp                        |  26 +-
+ .../modules/std/errors/fs_list_not_dir.ok     |   5 +
+ .../modules/std/errors/fs_mkdir_exists.ok     |   8 +
+ .../tests/modules/std/errors/fs_path_nul.ok   |   5 +
+ .../modules/std/errors/fs_read_directory.ok   |   9 +
+ .../modules/std/errors/fs_read_missing.ok     |   4 +
+ .../modules/std/errors/fs_read_not_string.ok  |   3 +
+ .../modules/std/errors/fs_remove_missing.ok   |   3 +
+ .../modules/std/errors/fs_remove_nonempty.ok  |  10 +
+ .../std/errors/fs_write_missing_parent.ok     |   4 +
+ .../std/errors/sys_env_get_not_string.ok      |   3 +
+ .../std/errors/sys_env_set_bad_name.ok        |   4 +
+ .../modules/std/errors/sys_exit_not_number.ok |   3 +
+ .../modules/std/errors/sys_exit_not_whole.ok  |   4 +
+ tests/e2e/tests/modules/std/exit/basic.ok     |   6 +
+ tests/e2e/tests/modules/std/exit/catch.ok     |  11 +
+ tests/e2e/tests/modules/std/exit/code.ok      |   6 +
+ tests/e2e/tests/modules/std/exit/defer.ok     |  21 +
+ tests/e2e/tests/modules/std/fs.ok             |  60 +++
+ .../modules/std/restrict/host_gated_fs.ok     |   4 +
+ .../modules/std/restrict/host_gated_sys.ok    |   4 +
+ tests/e2e/tests/modules/std/sys.ok            |  40 ++
+ 40 files changed, 1242 insertions(+), 48 deletions(-)
+ create mode 100644 src/ok_env.c
+ create mode 100644 src/ok_env.h
+ create mode 100644 src/ok_fs.c
+ create mode 100644 src/ok_fs.h
+ create mode 100644 src/ok_posix.h
+ create mode 100644 src/ok_time.c
+ create mode 100644 src/ok_time.h
+ create mode 100644 tests/e2e/tests/modules/std/errors/fs_list_not_dir.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/fs_mkdir_exists.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/fs_path_nul.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/fs_read_directory.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/fs_read_missing.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/fs_read_not_string.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/fs_remove_missing.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/fs_remove_nonempty.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/fs_write_missing_parent.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/sys_env_get_not_string.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/sys_env_set_bad_name.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/sys_exit_not_number.ok
+ create mode 100644 tests/e2e/tests/modules/std/errors/sys_exit_not_whole.ok
+ create mode 100644 tests/e2e/tests/modules/std/exit/basic.ok
+ create mode 100644 tests/e2e/tests/modules/std/exit/catch.ok
+ create mode 100644 tests/e2e/tests/modules/std/exit/code.ok
+ create mode 100644 tests/e2e/tests/modules/std/exit/defer.ok
+ create mode 100644 tests/e2e/tests/modules/std/fs.ok
+ create mode 100644 tests/e2e/tests/modules/std/restrict/host_gated_fs.ok
+ create mode 100644 tests/e2e/tests/modules/std/restrict/host_gated_sys.ok
+ create mode 100644 tests/e2e/tests/modules/std/sys.ok
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 19b8c5c..f8b6a18 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -56,6 +56,8 @@ target_sources(ok PRIVATE
+   src/okcompiler.c
+   src/okdebug.c
+   src/okdiag.c
++  src/ok_env.c
++  src/ok_fs.c
+   src/okglobals_store.c
+   src/oklexer.c
+   src/okmm.c
+@@ -67,6 +69,7 @@ target_sources(ok PRIVATE
+   src/okoperator.c
+   src/okparser.c
+   src/oktoken.c
++  src/ok_time.c
+   src/okutils.c
+   src/okvalue.c
+   src/okvm.c
+diff --git a/README.md b/README.md
+index f834326..54eb781 100644
+--- a/README.md
++++ b/README.md
+@@ -73,6 +73,8 @@ Features:
+ * Ternary expression that reads naturally `condition then consequence otherwise alternative`
+ * Mark-and-sweep garbage collection with a stress mode that caught a lot of bugs
+ * Native functions and opaque native values (handles)
++* Modules (script and native, one registry, one import ladder) with a built-in `std/` tree: `std.math`, and the HOST-gated host doors `std.fs` (files, directories, paths) and `std.sys` (environment, clocks, `exit`) - the latter refuse to import unless the instance holds `OK_CAP_HOST`
++* `sys.exit(code)`: ends the run cleanly (uncatchable, defers run, the code surfaces through the embedder's `ok_exit_code`)
+ * Minimal C embedding API
+ * Disassembler `ok --dump`
+ 
+diff --git a/cli/src/main.c b/cli/src/main.c
+index 747681a..b5b1358 100644
+--- a/cli/src/main.c
++++ b/cli/src/main.c
+@@ -468,6 +468,10 @@ void repl(ok* p_ok) {
+       fprintf(stderr, "runtime error occurred.\n");
+     } else if (result == OK_INIT_ERROR) {
+       fprintf(stderr, "init error occurred.\n");
++    } else if (result == OK_EXITED) {
++      // the script asked to stop (std.sys's exit): the process answers with
++      // the requested code. a REPL host would instead break its loop here.
++      exit(ok_exit_code(p_ok));
+     }
+   }
+ }
+@@ -486,6 +490,10 @@ void run_file(ok* p_ok, const char* p_path) {
+     exit(65);
+   } else if (result == OK_RUNTIME_ERROR || result == OK_INIT_ERROR) {
+     exit(70);
++  } else if (result == OK_EXITED) {
++    // P4: the script's own request (std.sys's exit) - its code is the
++    // process's code. the sysexits lanes above stay for real failures.
++    exit(ok_exit_code(p_ok));
+   }
+ }
+ 
+diff --git a/include/ok/ok.h b/include/ok/ok.h
+index 9eec01a..a60b13a 100644
+--- a/include/ok/ok.h
++++ b/include/ok/ok.h
+@@ -18,6 +18,10 @@ typedef enum {
+   OK_PARSE_ERROR,
+   OK_COMPILE_ERROR,
+   OK_RUNTIME_ERROR,
++  // P4: the script asked the host to stop (std.sys's exit). not an error:
++  // the run ENDED, nothing failed, no diagnostic printed. the requested
++  // code reads back with ok_exit_code.
++  OK_EXITED,
+ } ok_result;
+ 
+ /* runtime */
+@@ -30,6 +34,12 @@ void ok_free(ok* p_ok);
+ // after the run. the code is copied only when source retention is on.
+ ok_result ok_run(ok* p_ok, ok_source p_source);
+ 
++// the exit code std.sys's exit() requested. meaningful after ok_run
++// answered OK_EXITED; 0 otherwise (including after every other result -
++// a stale code from an earlier run can never leak through, the lane
++// resets at every ok_run).
++int32_t ok_exit_code(ok* p_ok);
++
+ // opt-in source retention (default off).
+ // when on: every ok_run's source is copied into the ok state and kept alive until ok_free.
+ // runtime reports can reference source text for functions compiled by earlier runs
+diff --git a/src/ok.c b/src/ok.c
+index b1acd99..56bea07 100644
+--- a/src/ok.c
++++ b/src/ok.c
+@@ -8,6 +8,8 @@
+ #include "ok/ok_module.h"
+ #include "okcompiler.h"
+ #include "okdebug.h"
++#include "ok_env.h" // P4: std.sys's environment door
++#include "ok_fs.h"  // P4: std.fs's file door
+ #include "okgc.h"
+ #include "okmodules.h"
+ #include "okobject.h"
+@@ -15,6 +17,7 @@
+ #include "okparser.h"
+ #include "okspecs.h"
+ #include "okstate.h"
++#include "ok_time.h" // P4: std.sys's clock door
+ #include "okutf8.h"
+ #include "okutils.h"
+ #include "okvalue.h"
+@@ -903,6 +906,449 @@ static bool ok_define_math_members(ok* p_ok) {
+   return status;
+ }
+ 
++// ============================ std.fs + std.sys (P4) ============================
++//
++// the host door natives. every host call routes through the ok_fs /
++// ok_time / ok_env layers (the audit's one-door rule) - nothing here
++// touches a syscall directly, so an embedder reading those three files
++// knows every byte ok can move across the host boundary. the modules
++// themselves are HOST-gated at the import site (okmodules.c's std lane);
++// these natives can therefore assume the cap held when the module loaded.
++
++// the splice: one static message per site, the '*' is the member name.
++static void host_error(ok* p_ok, const char* p_pattern, const char* p_name) {
++  char message[192];
++  const int written = snprintf(message, sizeof(message), p_pattern, p_name);
++  if (written > 0 && (size_t)written < sizeof(message)) {
++    ok_native_error(p_ok, ok_create_string_view(message, (uint64_t)written, true));
++  } else {
++    ok_native_error(p_ok, ok_create_string_view("invalid argument.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  }
++}
++
++// a message carrying one path: 512 (the defer lane's buffer precedent -
++// a path longer than this truncates the MESSAGE, never the operation).
++static void host_path_error(ok* p_ok, const char* p_pattern, const char* p_path) {
++  char message[512];
++  const int written = snprintf(message, sizeof(message), p_pattern, p_path);
++  if (written > 0 && (size_t)written < sizeof(message)) {
++    ok_native_error(p_ok, ok_create_string_view(message, (uint64_t)written, true));
++  } else {
++    ok_native_error(p_ok, ok_create_string_view("the host operation failed.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  }
++}
++
++// one NUL-terminated copy of a path/name argument. the C host APIs want
++// C strings; ok strings are length-carried and may contain anything, and
++// an embedded NUL would silently truncate - which for a path is a WRONG
++// path, so it refuses instead. the caller releases the copy.
++static bool host_zstring(ok* p_ok, ok_value p_arg, char** p_out, const char* p_who) {
++  str_bytes s;
++  if (!str_unpack(p_arg, &s)) {
++    host_error(p_ok, "invalid argument: '%s' expects a string.", p_who);
++    return false;
++  }
++  if (memchr(s.chars, '\0', s.length) != NULL) {
++    host_error(p_ok, "invalid argument: the string passed to '%s' contains a NUL.", p_who);
++    return false;
++  }
++  char* z = (char*)p_ok->alloc.allocate(&p_ok->alloc, s.length + 1);
++  if (z == NULL) {
++    ok_native_error(p_ok,
++                    ok_create_string_view(
++                        "out of memory: failed to allocate a path buffer.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return false;
++  }
++  memcpy(z, s.chars, (size_t)s.length);
++  z[s.length] = '\0';
++  *p_out = z;
++  return true;
++}
++
++// one ok array of strings from a C name list (ok_fs_list / ok_env_list's
++// shape). the C list is released here - the ok array is the caller's
++// (call_native guards it the moment the native returns).
++static ok_value host_names_array(ok* p_ok, char** p_names, uint32_t p_count) {
++  object_specs specs = {&p_ok->alloc, &p_ok->objects_store};
++  object_array* arr = create_object_array(&specs);
++  if (arr == NULL || !gc_guard_up(&p_ok->gc, OBJECT_AS_VALUE(arr))) {
++    goto fail;
++  }
++  for (uint32_t i = 0; i < p_count; ++i) {
++    object_string* piece =
++        create_object_string(ok_create_string_view(p_names[i], (uint32_t)strlen(p_names[i]), false), &specs);
++    if (piece == NULL || !gc_guard_up(&p_ok->gc, OBJECT_AS_VALUE(piece))) {
++      gc_guard_down(&p_ok->gc); // the array
++      goto fail;
++    }
++    const bool appended = value_array_append(&arr->values, OBJECT_AS_VALUE(piece));
++    gc_guard_down(&p_ok->gc); // the piece: the array owns it now
++    if (!appended) {
++      goto fail_with_array;
++    }
++  }
++  gc_guard_down(&p_ok->gc); // the array: the caller owns it now
++  for (uint32_t i = 0; i < p_count; ++i) {
++    p_ok->raw_alloc.release(p_names[i]);
++  }
++  p_ok->raw_alloc.release(p_names);
++  return OBJECT_AS_VALUE(arr);
++
++fail_with_array:
++  gc_guard_down(&p_ok->gc); // the array (half-built, unreferenced)
++fail:
++  for (uint32_t i = 0; i < p_count; ++i) {
++    p_ok->raw_alloc.release(p_names[i]);
++  }
++  p_ok->raw_alloc.release(p_names);
++  ok_native_error(p_ok,
++                  ok_create_string_view(
++                      "out of memory: failed to build the names array.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++  return NULL_AS_VALUE();
++}
++
++// fs.read(path): the whole file, one string. the 1 GiB cap and the
++// regular-files-only rule are ok_fs's own (the loader's contract, shared).
++static ok_value native_fs_read(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  char* path = NULL;
++  if (!host_zstring(p_ok, p_argv[0], &path, "fs.read")) {
++    return NULL_AS_VALUE();
++  }
++  ok_fs_buffer buffer;
++  const bool read = ok_fs_read_file(path, &p_ok->raw_alloc, &buffer);
++  if (!read) {
++    host_path_error(p_ok, "fs.read failed: '%s' is not a readable regular file.", path);
++    p_ok->alloc.release(&p_ok->alloc, path);
++    return NULL_AS_VALUE();
++  }
++  p_ok->alloc.release(&p_ok->alloc, path);
++  const ok_value contents = str_from_range(p_ok, buffer.chars, buffer.length);
++  p_ok->raw_alloc.release(buffer.chars);
++  return contents;
++}
++
++// fs.write / fs.append: whole-buffer, one fwrite, checked. the DATA may
++// carry NULs - only paths refuse them.
++static ok_value native_fs_write_impl(ok* p_ok, ok_value p_path_arg, ok_value p_data_arg, bool p_append,
++                                     const char* p_who) {
++  char* path = NULL;
++  if (!host_zstring(p_ok, p_path_arg, &path, p_who)) {
++    return NULL_AS_VALUE();
++  }
++  str_bytes data;
++  if (!str_unpack(p_data_arg, &data)) {
++    host_error(p_ok, "invalid argument: '%s' expects a string of data.", p_who);
++    p_ok->alloc.release(&p_ok->alloc, path);
++    return NULL_AS_VALUE();
++  }
++  const bool written = ok_fs_write_file(path, data.chars, data.length, p_append);
++  if (!written) {
++    // two-step splice: the member name rides the pattern, host_path_error
++    // carries the path (one format arg each, never a dangling conversion)
++    char pattern[64];
++    snprintf(pattern, sizeof(pattern), "%s failed: cannot write '%%s'.", p_who);
++    host_path_error(p_ok, pattern, path);
++    p_ok->alloc.release(&p_ok->alloc, path);
++    return NULL_AS_VALUE();
++  }
++  p_ok->alloc.release(&p_ok->alloc, path);
++  return NULL_AS_VALUE();
++}
++
++static ok_value native_fs_write(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  return native_fs_write_impl(p_ok, p_argv[0], p_argv[1], false, "fs.write");
++}
++
++static ok_value native_fs_append(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  return native_fs_write_impl(p_ok, p_argv[0], p_argv[1], true, "fs.append");
++}
++
++// the probes: three shapes of "what is at this path".
++static ok_value native_fs_exists(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  char* path = NULL;
++  if (!host_zstring(p_ok, p_argv[0], &path, "fs.exists")) {
++    return NULL_AS_VALUE();
++  }
++  const bool exists = ok_fs_exists(path);
++  p_ok->alloc.release(&p_ok->alloc, path);
++  return BOOL_AS_VALUE(exists);
++}
++
++static ok_value native_fs_is_file(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  char* path = NULL;
++  if (!host_zstring(p_ok, p_argv[0], &path, "fs.is_file")) {
++    return NULL_AS_VALUE();
++  }
++  const bool is_file = ok_fs_is_file(path);
++  p_ok->alloc.release(&p_ok->alloc, path);
++  return BOOL_AS_VALUE(is_file);
++}
++
++static ok_value native_fs_is_dir(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  char* path = NULL;
++  if (!host_zstring(p_ok, p_argv[0], &path, "fs.is_dir")) {
++    return NULL_AS_VALUE();
++  }
++  const bool is_dir = ok_fs_is_dir(path);
++  p_ok->alloc.release(&p_ok->alloc, path);
++  return BOOL_AS_VALUE(is_dir);
++}
++
++// fs.remove: a file or an EMPTY directory (the layer has no recursion,
++// ever). fs.mkdir: one level, no parents.
++static ok_value native_fs_remove(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  char* path = NULL;
++  if (!host_zstring(p_ok, p_argv[0], &path, "fs.remove")) {
++    return NULL_AS_VALUE();
++  }
++  const bool removed = ok_fs_remove(path);
++  if (!removed) {
++    host_path_error(p_ok, "fs.remove failed: '%s' is not an existing file or empty directory.", path);
++  }
++  p_ok->alloc.release(&p_ok->alloc, path);
++  return NULL_AS_VALUE();
++}
++
++static ok_value native_fs_mkdir(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  char* path = NULL;
++  if (!host_zstring(p_ok, p_argv[0], &path, "fs.mkdir")) {
++    return NULL_AS_VALUE();
++  }
++  const bool made = ok_fs_mkdir(path);
++  if (!made) {
++    host_path_error(p_ok, "fs.mkdir failed: cannot create '%s' (it may exist, or a parent is missing).", path);
++  }
++  p_ok->alloc.release(&p_ok->alloc, path);
++  return NULL_AS_VALUE();
++}
++
++// fs.list: the entry names, sorted - the determinism rule. "." and ".."
++// are structure, not entries.
++static ok_value native_fs_list(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  char* path = NULL;
++  if (!host_zstring(p_ok, p_argv[0], &path, "fs.list")) {
++    return NULL_AS_VALUE();
++  }
++  char** names = NULL;
++  uint32_t count = 0;
++  const bool listed = ok_fs_list(path, &p_ok->raw_alloc, &names, &count);
++  if (!listed) {
++    host_path_error(p_ok, "fs.list failed: '%s' is not a readable directory.", path);
++    p_ok->alloc.release(&p_ok->alloc, path);
++    return NULL_AS_VALUE();
++  }
++  p_ok->alloc.release(&p_ok->alloc, path);
++  return host_names_array(p_ok, names, count);
++}
++
++// fs.cwd: the process working directory (its CONTENT is host state -
++// never a fixture's output).
++static ok_value native_fs_cwd(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  (void)p_argv;
++  char buffer[4096];
++  if (!ok_fs_cwd(buffer, sizeof(buffer))) {
++    ok_native_error(p_ok,
++                    ok_create_string_view("fs.cwd failed: the working directory is unreadable or too long.",
++                                          OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  return str_from_range(p_ok, buffer, (uint64_t)strlen(buffer));
++}
++
++// fs.join(a, b): pure path joining, no host contact at all - it rides
++// the module because that is where path shape lives. empty sides pass
++// through; a trailing separator does not double.
++static ok_value native_fs_join(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  str_bytes a;
++  str_bytes b;
++  if (!str_unpack(p_argv[0], &a) || !str_unpack(p_argv[1], &b)) {
++    host_error(p_ok, "invalid argument: '%s' expects strings.", "fs.join");
++    return NULL_AS_VALUE();
++  }
++  if (a.length == 0) {
++    return p_argv[1];
++  }
++  if (b.length == 0) {
++    return p_argv[0];
++  }
++  const bool sep = a.chars[a.length - 1] == '/';
++  const uint64_t total = a.length + (sep ? 0 : 1) + b.length;
++  char* scratch = (char*)p_ok->alloc.allocate(&p_ok->alloc, total);
++  if (scratch == NULL) {
++    ok_native_error(p_ok,
++                    ok_create_string_view(
++                        "out of memory: failed to allocate the joined path.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  memcpy(scratch, a.chars, (size_t)a.length);
++  if (!sep) {
++    scratch[a.length] = '/';
++  }
++  memcpy(scratch + a.length + (sep ? 0 : 1), b.chars, (size_t)b.length);
++  const ok_value joined = str_from_range(p_ok, scratch, total);
++  p_ok->alloc.release(&p_ok->alloc, scratch);
++  return joined;
++}
++
++// sys.env_get: the entry's value, or null when unset (null is a legal
++// value in ok - the sentinel question never arises).
++static ok_value native_sys_env_get(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  char* name = NULL;
++  if (!host_zstring(p_ok, p_argv[0], &name, "sys.env_get")) {
++    return NULL_AS_VALUE();
++  }
++  const char* value = ok_env_get(name);
++  p_ok->alloc.release(&p_ok->alloc, name);
++  if (value == NULL) {
++    return NULL_AS_VALUE();
++  }
++  return str_from_range(p_ok, value, (uint64_t)strlen(value));
++}
++
++// sys.env_set / sys.env_unset: setenv's EINVAL lanes (an '=' or NUL in
++// the name) arrive as the invalid-name error; unset is idempotent.
++static ok_value native_sys_env_set(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  char* name = NULL;
++  if (!host_zstring(p_ok, p_argv[0], &name, "sys.env_set")) {
++    return NULL_AS_VALUE();
++  }
++  char* value = NULL;
++  if (!host_zstring(p_ok, p_argv[1], &value, "sys.env_set")) {
++    p_ok->alloc.release(&p_ok->alloc, name);
++    return NULL_AS_VALUE();
++  }
++  const bool set = ok_env_set(name, value);
++  if (!set) {
++    host_path_error(p_ok, "sys.env_set failed: '%s' is not a valid environment name.", name);
++  }
++  p_ok->alloc.release(&p_ok->alloc, name);
++  p_ok->alloc.release(&p_ok->alloc, value);
++  return NULL_AS_VALUE();
++}
++
++static ok_value native_sys_env_unset(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  char* name = NULL;
++  if (!host_zstring(p_ok, p_argv[0], &name, "sys.env_unset")) {
++    return NULL_AS_VALUE();
++  }
++  const bool unset = ok_env_unset(name);
++  if (!unset) {
++    host_path_error(p_ok, "sys.env_unset failed: '%s' is not a valid environment name.", name);
++  }
++  p_ok->alloc.release(&p_ok->alloc, name);
++  return NULL_AS_VALUE();
++}
++
++// sys.env_keys: the names, sorted and deduped - the determinism rule.
++static ok_value native_sys_env_keys(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  (void)p_argv;
++  char** names = NULL;
++  uint32_t count = 0;
++  if (!ok_env_list(&p_ok->raw_alloc, &names, &count)) {
++    ok_native_error(p_ok,
++                    ok_create_string_view(
++                        "out of memory: failed to list the environment.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return NULL_AS_VALUE();
++  }
++  return host_names_array(p_ok, names, count);
++}
++
++// sys.clock / sys.monotonic: seconds as doubles. fixtures assert
++// relations (>=, later >= earlier), never values - the host's clock is
++// not the suite's to know.
++static ok_value native_sys_clock(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_ok;
++  (void)p_argc;
++  (void)p_argv;
++  double now = 0.0;
++  ok_time_wall(&now);
++  return NUMBER_AS_VALUE(now);
++}
++
++static ok_value native_sys_monotonic(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_ok;
++  (void)p_argc;
++  (void)p_argv;
++  double now = 0.0;
++  ok_time_monotonic(&now);
++  return NUMBER_AS_VALUE(now);
++}
++
++// sys.exit(code): the host request. sets the code, then rides the error
++// lane (a native's only control-flow escape) as OK_EK_EXIT - the unwind
++// closes frames and runs defers, no catch may take it, and ok_run maps
++// the end to OK_EXITED. a failing defer on the way out replaces the
++// request (a real error outranks a mere ask - first-failure-wins).
++static ok_value native_sys_exit(ok* p_ok, uint8_t p_argc, const ok_value* p_argv) {
++  (void)p_argc;
++  if (!IS_VALUE_NUMBER(p_argv[0])) {
++    host_error(p_ok, "invalid argument: '%s' expects a number (the exit code).", "sys.exit");
++    return NULL_AS_VALUE();
++  }
++  const double code = VALUE_AS_NUMBER(p_argv[0]);
++  if (isnan(code) || isinf(code) || code != floor(code) || code < -2147483648.0 || code > 2147483647.0) {
++    host_error(p_ok, "invalid argument: '%s' expects a whole number between -2147483648 and 2147483647.", "sys.exit");
++    return NULL_AS_VALUE();
++  }
++  p_ok->exit_requested = true;
++  p_ok->exit_code = (int32_t)code;
++  vm_raise_exit(ok_vm(p_ok));
++  return NULL_AS_VALUE();
++}
++
++// the hidden globals the std tables harvest - the same lane math uses.
++// never seeded flat: the module is the only door.
++static bool ok_define_fs_members(ok* p_ok) {
++  bool status = true;
++#define FS_GLOBAL(id, arity)                                                                                             \
++  status &= ok_global_define_native_function(                                                                            \
++      p_ok, ok_create_string_view(" " #id, OK_STRING_VIEW_CALCULATE_LENGTH, true), arity, native_##id);
++  FS_GLOBAL(fs_read, 1)
++  FS_GLOBAL(fs_write, 2)
++  FS_GLOBAL(fs_append, 2)
++  FS_GLOBAL(fs_exists, 1)
++  FS_GLOBAL(fs_is_file, 1)
++  FS_GLOBAL(fs_is_dir, 1)
++  FS_GLOBAL(fs_remove, 1)
++  FS_GLOBAL(fs_mkdir, 1)
++  FS_GLOBAL(fs_list, 1)
++  FS_GLOBAL(fs_cwd, 0)
++  FS_GLOBAL(fs_join, 2)
++#undef FS_GLOBAL
++  return status;
++}
++
++static bool ok_define_sys_members(ok* p_ok) {
++  bool status = true;
++#define SYS_GLOBAL(id, arity)                                                                                            \
++  status &= ok_global_define_native_function(                                                                            \
++      p_ok, ok_create_string_view(" " #id, OK_STRING_VIEW_CALCULATE_LENGTH, true), arity, native_##id);
++  SYS_GLOBAL(sys_env_get, 1)
++  SYS_GLOBAL(sys_env_set, 2)
++  SYS_GLOBAL(sys_env_unset, 1)
++  SYS_GLOBAL(sys_env_keys, 0)
++  SYS_GLOBAL(sys_clock, 0)
++  SYS_GLOBAL(sys_monotonic, 0)
++  SYS_GLOBAL(sys_exit, 1)
++#undef SYS_GLOBAL
++  return status;
++}
++
+ // the natives-as-classes step: mount the method surfaces on the builtin
+ // singletons, then seal them. the container C handlers are the SAME
+ // functions the free-function spellings use - they were receiver-first all
+@@ -1126,6 +1572,14 @@ ok* ok_create(ok_specs p_specs) {
+     ok_free(okay);
+     return NULL;
+   }
++  if (!ok_define_fs_members(okay)) { // std.fs's hidden globals: the host door (P4)
++    ok_free(okay);
++    return NULL;
++  }
++  if (!ok_define_sys_members(okay)) { // std.sys's hidden globals: the host door (P4)
++    ok_free(okay);
++    return NULL;
++  }
+   if (!ok_define_builtin_surfaces(okay)) { // mount the method tables, then seal
+     ok_free(okay);
+     return NULL;
+@@ -1153,6 +1607,10 @@ ok_result ok_run(ok* p_ok, ok_source p_source) {
+   // a fresh run starts with a clean error lane: ok_last_error reads the
+   // most recent failed run, and this run hasn't failed yet.
+   vm_clear_error(&p_ok->vm);
++  // and a clean exit lane: a previous run's half-spent request (or its
++  // code) never leaks into this one.
++  p_ok->exit_requested = false;
++  p_ok->exit_code = 0;
+   const uint32_t source_id = vm_begin_source(&p_ok->vm, p_source.code, p_source.path);
+   if (source_id == VM_SOURCE_UNSTAMPED) {
+     return OK_INIT_ERROR;
+@@ -1238,6 +1696,12 @@ void ok_caps_drop(ok* p_ok, uint32_t p_caps) {
+   p_ok->caps_dropped |= p_caps;
+ }
+ 
++// P4: the code sys.exit requested. meaningful after ok_run answered
++// OK_EXITED; 0 otherwise (the guard makes a stale code unreadable).
++int32_t ok_exit_code(ok* p_ok) {
++  return p_ok->exit_requested ? p_ok->exit_code : 0;
++}
++
+ /* the loader (OR-3, the public ok_module.h door) */
+ 
+ // install the loader before ok_run. replaces the default (fs reads + the
+@@ -1595,7 +2059,9 @@ static ok_result ok_run_inner(ok* p_ok, uint32_t p_source_id, parse_result* p_pa
+   value_array_deinit(&interpret_specs.top_level_values, &p_ok->alloc);
+   if (interpret_result.status != RUNTIME_OK) {
+     interpret_result_deinit(&interpret_result);
+-    return OK_RUNTIME_ERROR;
++    // P4: sys.exit unwound to the top as an uncatchable error - the run
++    // ENDED, it did not fail. the code reads back through ok_exit_code.
++    return p_ok->exit_requested ? OK_EXITED : OK_RUNTIME_ERROR;
+   }
+ 
+   return OK;
+diff --git a/src/ok_env.c b/src/ok_env.c
+new file mode 100644
+index 0000000..6e79833
+--- /dev/null
++++ b/src/ok_env.c
+@@ -0,0 +1,77 @@
++#include "ok_posix.h" // FIRST: the deliberate POSIX opt-in (see its header)
++
++#include "ok_env.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++// POSIX. glibc and friends expose it; a host without it owns the layer
++// rewrite (the same stance okdylib takes with its platform tables).
++extern char** environ;
++
++const char* ok_env_get(const char* p_name) {
++  return getenv(p_name);
++}
++
++bool ok_env_set(const char* p_name, const char* p_value) {
++  return setenv(p_name, p_value, 1) == 0;
++}
++
++bool ok_env_unset(const char* p_name) {
++  return unsetenv(p_name) == 0;
++}
++
++static int ok_env_list_cmp(const void* p_a, const void* p_b) {
++  const char* const* a = (const char* const*)p_a;
++  const char* const* b = (const char* const*)p_b;
++  return strcmp(*a, *b);
++}
++
++bool ok_env_list(const ok_allocators* p_alloc, char*** p_out_names, uint32_t* p_out_count) {
++  char** names = NULL;
++  uint32_t count = 0;
++  uint32_t capacity = 0;
++  for (char** entry = environ; entry != NULL && *entry != NULL; ++entry) {
++    const char* equals = strchr(*entry, '=');
++    const size_t length = equals != NULL ? (size_t)(equals - *entry) : strlen(*entry);
++    if (count == capacity) {
++      const uint32_t grown = capacity == 0 ? 16 : capacity * 2;
++      char** moved = (char**)p_alloc->reallocate(names, (size_t)grown * sizeof(char*));
++      if (moved == NULL) {
++        goto fail;
++      }
++      names = moved;
++      capacity = grown;
++    }
++    char* copy = (char*)p_alloc->allocate(length + 1);
++    if (copy == NULL) {
++      goto fail;
++    }
++    memcpy(copy, *entry, length);
++    copy[length] = '\0';
++    names[count++] = copy;
++  }
++  if (count > 1) {
++    qsort(names, count, sizeof(char*), ok_env_list_cmp);
++  }
++  // dedupe adjacent twins (a repeated name is legal in environ; the
++  // first-in-sort-order survives, the walk keeps one of each)
++  uint32_t unique = 0;
++  for (uint32_t i = 0; i < count; ++i) {
++    if (unique > 0 && strcmp(names[unique - 1], names[i]) == 0) {
++      p_alloc->release(names[i]);
++      continue;
++    }
++    names[unique++] = names[i];
++  }
++  *p_out_names = names;
++  *p_out_count = unique;
++  return true;
++
++fail:
++  for (uint32_t i = 0; i < count; ++i) {
++    p_alloc->release(names[i]);
++  }
++  p_alloc->release(names);
++  return false;
++}
+diff --git a/src/ok_env.h b/src/ok_env.h
+new file mode 100644
+index 0000000..c7883fd
+--- /dev/null
++++ b/src/ok_env.h
+@@ -0,0 +1,29 @@
++#ifndef OK_ENV_H
++#define OK_ENV_H
++
++// ok_env: the environment door (the P4 audit). libok's own OKPATH read
++// and std.sys's env surface ride these, and nothing else in the library
++// touches the environment. get() answers the borrowed live entry (the
++// libc contract - copy it before mutating); set/unset take effect in the
++// process environment the host gave ok.
++
++#include <ok/ok.h>
++
++#include <stdbool.h>
++#include <stdint.h>
++
++// the entry's value, or NULL when the name is unset. borrowed.
++const char* ok_env_get(const char* p_name);
++
++// false on an invalid name (embedded '=' or NUL - EINVAL's lanes).
++bool ok_env_set(const char* p_name, const char* p_value);
++
++// idempotent: unsetting an unset name succeeds.
++bool ok_env_unset(const char* p_name);
++
++// the environment's names, sorted by strcmp, deduped (the determinism
++// rule). each name and the array itself come from p_alloc; the caller
++// releases them all.
++bool ok_env_list(const ok_allocators* p_alloc, char*** p_out_names, uint32_t* p_out_count);
++
++#endif // OK_ENV_H
+diff --git a/src/ok_fs.c b/src/ok_fs.c
+new file mode 100644
+index 0000000..501e23e
+--- /dev/null
++++ b/src/ok_fs.c
+@@ -0,0 +1,152 @@
++#include "ok_posix.h" // FIRST: the deliberate POSIX opt-in (see its header)
++
++#include "ok_fs.h"
++
++#include <dirent.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++// the 1 GiB read cap. a bigger "file" is either real (bring a streaming
++// api when one exists) or ftell lying about a special node - both refuse.
++#define OK_FS_MAX_READ (1u << 30)
++
++bool ok_fs_read_file(const char* p_path, const ok_allocators* p_alloc, ok_fs_buffer* p_out) {
++  // a regular file only: fopen alone happily "opens" a directory on
++  // linux, and ftell then answers a garbage-huge size (the allocation
++  // blast asan caught once already). the probe contract needs the read
++  // to fail for anything that is not a file.
++  struct stat info;
++  if (stat(p_path, &info) != 0 || !S_ISREG(info.st_mode)) {
++    return false;
++  }
++  FILE* file = fopen(p_path, "rb");
++  if (file == NULL) {
++    return false;
++  }
++  if (fseek(file, 0L, SEEK_END) != 0) {
++    fclose(file);
++    return false;
++  }
++  const long size = ftell(file);
++  rewind(file);
++  if (size < 0 || (unsigned long)size > OK_FS_MAX_READ) {
++    // unreadable or absurd: refuse rather than trust ftell on exotic nodes
++    fclose(file);
++    return false;
++  }
++  char* buff = (char*)p_alloc->allocate((size_t)size + 1);
++  if (buff == NULL) {
++    fclose(file);
++    return false;
++  }
++  const size_t read = fread(buff, sizeof(char), (size_t)size, file);
++  fclose(file);
++  if (read != (size_t)size) {
++    p_alloc->release(buff);
++    return false;
++  }
++  buff[read] = '\0';
++  p_out->chars = buff;
++  p_out->length = (uint64_t)read;
++  return true;
++}
++
++bool ok_fs_write_file(const char* p_path, const char* p_data, uint64_t p_length, bool p_append) {
++  FILE* file = fopen(p_path, p_append ? "ab" : "wb");
++  if (file == NULL) {
++    return false;
++  }
++  const size_t written = p_length > 0 ? fwrite(p_data, sizeof(char), (size_t)p_length, file) : 0;
++  const bool ok = written == (size_t)p_length && fflush(file) == 0;
++  fclose(file);
++  return ok;
++}
++
++bool ok_fs_exists(const char* p_path) {
++  struct stat info;
++  return stat(p_path, &info) == 0;
++}
++
++bool ok_fs_is_file(const char* p_path) {
++  struct stat info;
++  return stat(p_path, &info) == 0 && S_ISREG(info.st_mode);
++}
++
++bool ok_fs_is_dir(const char* p_path) {
++  struct stat info;
++  return stat(p_path, &info) == 0 && S_ISDIR(info.st_mode);
++}
++
++bool ok_fs_remove(const char* p_path) {
++  if (unlink(p_path) == 0) {
++    return true;
++  }
++  return rmdir(p_path) == 0;
++}
++
++bool ok_fs_mkdir(const char* p_path) {
++  return mkdir(p_path, 0777) == 0;
++}
++
++static int ok_fs_list_cmp(const void* p_a, const void* p_b) {
++  const char* const* a = (const char* const*)p_a;
++  const char* const* b = (const char* const*)p_b;
++  return strcmp(*a, *b);
++}
++
++bool ok_fs_list(const char* p_path, const ok_allocators* p_alloc, char*** p_out_names, uint32_t* p_out_count) {
++  DIR* dir = opendir(p_path);
++  if (dir == NULL) {
++    return false;
++  }
++  char** names = NULL;
++  uint32_t count = 0;
++  uint32_t capacity = 0;
++  bool ok = true;
++  const struct dirent* entry;
++  while ((entry = readdir(dir)) != NULL) {
++    const char* name = entry->d_name;
++    if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) {
++      continue; // "." and ".." are structure, not entries
++    }
++    if (count == capacity) {
++      const uint32_t grown = capacity == 0 ? 8 : capacity * 2;
++      char** moved = (char**)p_alloc->reallocate(names, (size_t)grown * sizeof(char*));
++      if (moved == NULL) {
++        ok = false;
++        break;
++      }
++      names = moved;
++      capacity = grown;
++    }
++    const size_t length = strlen(name);
++    char* copy = (char*)p_alloc->allocate(length + 1);
++    if (copy == NULL) {
++      ok = false;
++      break;
++    }
++    memcpy(copy, name, length + 1);
++    names[count++] = copy;
++  }
++  closedir(dir);
++  if (ok) {
++    if (count > 1) {
++      qsort(names, count, sizeof(char*), ok_fs_list_cmp);
++    }
++    *p_out_names = names;
++    *p_out_count = count;
++    return true;
++  }
++  for (uint32_t i = 0; i < count; ++i) {
++    p_alloc->release(names[i]);
++  }
++  p_alloc->release(names);
++  return false;
++}
++
++bool ok_fs_cwd(char* p_buffer, size_t p_capacity) {
++  return getcwd(p_buffer, p_capacity) != NULL;
++}
+diff --git a/src/ok_fs.h b/src/ok_fs.h
+new file mode 100644
+index 0000000..f0a3035
+--- /dev/null
++++ b/src/ok_fs.h
+@@ -0,0 +1,60 @@
++#ifndef OK_FS_H
++#define OK_FS_H
++
++// ok_fs: the ONE door libok's file and directory host calls go through
++// (the P4 audit). everything else in the library reaches the filesystem
++// through these functions - the module loader's source reads, the dylib
++// probe, std.fs - so an embedder auditing the library reads one file to
++// know every byte ok touches on disk. the CLI keeps its own POSIX lane
++// per its ruling; embedders own their own host code.
++//
++// buffers come from the caller's raw allocators (no gc - these are
++// plain byte buffers, never object roots). every path is a C string; the
++// natives above this layer are responsible for rejecting embedded NULs
++// before they get here.
++
++#include <ok/ok.h>
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++typedef struct {
++  char* chars;     // p_alloc's allocate; NUL-terminated for tooling
++  uint64_t length; // bytes read (the NUL is not counted)
++} ok_fs_buffer;
++
++// whole-file read of a REGULAR file. false for anything else: missing,
++// unreadable, a directory (fopen happily "opens" those on linux - the
++// probe contract refuses), a special node, or absurd size (the 1 GiB
++// cap: ftell on exotic nodes answers garbage-huge, and the module lane
++// learned that the hard way). the buffer is the caller's to release.
++bool ok_fs_read_file(const char* p_path, const ok_allocators* p_alloc, ok_fs_buffer* p_out);
++
++// whole-file write. p_append selects the append mode over the truncate
++// mode; both create the file when missing. one fwrite, checked: a short
++// write is a failure, not a warning.
++bool ok_fs_write_file(const char* p_path, const char* p_data, uint64_t p_length, bool p_append);
++
++bool ok_fs_exists(const char* p_path);
++bool ok_fs_is_file(const char* p_path); // a regular file
++bool ok_fs_is_dir(const char* p_path);  // a directory (not a symlink to one - stat, not lstat)
++
++// unlink first, rmdir second: a file, or an EMPTY directory, dies; a
++// non-empty directory refuses (rmdir's own semantics - the safe shape,
++// no recursive deletes exist at this layer, ever).
++bool ok_fs_remove(const char* p_path);
++
++// one level, no parents created. 0777 before umask.
++bool ok_fs_mkdir(const char* p_path);
++
++// the directory's entry names, sorted by strcmp (the determinism rule),
++// "." and ".." excluded. each name and the array itself come from
++// p_alloc; the caller releases them all.
++bool ok_fs_list(const char* p_path, const ok_allocators* p_alloc, char*** p_out_names, uint32_t* p_out_count);
++
++// the process working directory. false when it is unreadable or does
++// not fit p_capacity.
++bool ok_fs_cwd(char* p_buffer, size_t p_capacity);
++
++#endif // OK_FS_H
+diff --git a/src/ok_posix.h b/src/ok_posix.h
+new file mode 100644
+index 0000000..fb424bc
+--- /dev/null
++++ b/src/ok_posix.h
+@@ -0,0 +1,16 @@
++#ifndef OK_POSIX_H
++#define OK_POSIX_H
++
++// the one place libok opts into POSIX (the P4 audit's ask: "all host stuff
++// are behind abstractions"). libok compiles c99-strict; every translation
++// unit that needs a POSIX surface includes this FIRST, so the opt-in is
++// deliberate, per-layer, and visible in one file. anything not included
++// here stays ISO C by construction - the audit greps for that.
++//
++// 200809L covers the whole list the layers use: stat, opendir/readdir,
++// unlink/rmdir/mkdir/getcwd, environ, setenv/unsetenv, clock_gettime,
++// realpath, dlopen. the CLI keeps its own lane (its ruling: strictly
++// POSIX is acceptable there) and does not include this file.
++#define _POSIX_C_SOURCE 200809L
++
++#endif // OK_POSIX_H
+diff --git a/src/ok_time.c b/src/ok_time.c
+new file mode 100644
+index 0000000..d72770e
+--- /dev/null
++++ b/src/ok_time.c
+@@ -0,0 +1,23 @@
++#include "ok_posix.h" // FIRST: the deliberate POSIX opt-in (see its header)
++
++#include "ok_time.h"
++
++#include <time.h>
++
++void ok_time_wall(double* p_out) {
++  struct timespec ts;
++  if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
++    *p_out = 0.0; // unreachable on a conforming POSIX 2008 host; defensive
++    return;
++  }
++  *p_out = (double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9;
++}
++
++void ok_time_monotonic(double* p_out) {
++  struct timespec ts;
++  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
++    *p_out = 0.0; // same defensive stance
++    return;
++  }
++  *p_out = (double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9;
++}
+diff --git a/src/ok_time.h b/src/ok_time.h
+new file mode 100644
+index 0000000..6dac946
+--- /dev/null
++++ b/src/ok_time.h
+@@ -0,0 +1,19 @@
++#ifndef OK_TIME_H
++#define OK_TIME_H
++
++// ok_time: the clock door (the P4 audit). std.sys's clock() and
++// monotonic() ride these, and nothing else in libok touches a clock.
++// both answer seconds as doubles (nanosecond precision inside the f64 -
++// the ~104 day monotonic horizon where the fraction thins is far past
++// any process lifetime that matters).
++
++// wall-clock seconds since the unix epoch. the calendar itself (local
++// time, formatting) is deliberately NOT here: it is std work, and only
++// when someone needs it.
++void ok_time_wall(double* p_out);
++
++// monotonic seconds since an arbitrary fixed point. never negative, never
++// steps back; the interval-measurement clock.
++void ok_time_monotonic(double* p_out);
++
++#endif // OK_TIME_H
+diff --git a/src/okdylib.c b/src/okdylib.c
+index 1941342..8dc9955 100644
+--- a/src/okdylib.c
++++ b/src/okdylib.c
+@@ -20,11 +20,11 @@
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <string.h>
+-#include <sys/stat.h>
+ 
+ #include "ok/ok.h"
+ #include "ok/ok_module.h"
+ 
++#include "ok_fs.h" // P4: the probe routes through the one fs door
+ #include "okstate.h"
+ 
+ // one formatted error into the caller's lane, NULL-safe (a NULL p_err just
+@@ -196,8 +196,7 @@ bool ok_load_native_default(ok* p_ok,
+   // continues) from "a native candidate exists but is broken" (a message,
+   // the hard error). a file that is not a regular file is a miss, not a
+   // broken native (the ladder's directory candidates die here).
+-  struct stat info;
+-  if (stat(p_path, &info) != 0 || !S_ISREG(info.st_mode)) {
++  if (!ok_fs_is_file(p_path)) {
+     return false; // clean miss: no message
+   }
+   char err[256];
+diff --git a/src/okmodules.c b/src/okmodules.c
+index a7565c9..22c08b6 100644
+--- a/src/okmodules.c
++++ b/src/okmodules.c
+@@ -20,11 +20,12 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <sys/stat.h>
+ 
+ #include "okmodules.h"
+ 
+ #include "okdiag.h"
++#include "ok_env.h" // P4: the OKPATH read routes through the one env door
++#include "ok_fs.h"  // P4: the source reads route through the one fs door
+ #include "okparser.h"
+ #include "okstate.h"
+ #include "okutils.h"
+@@ -87,43 +88,13 @@ static char* mod_strdup(const ok_allocators* p_a, const char* p_text) {
+ // allocator", and the default loader honors it by construction.
+ static bool fs_read_source(void* p_ctx, const char* p_path, ok_source* p_out) {
+   module_system* modules = (module_system*)p_ctx;
+-  const ok_allocators* a = &modules->ok->raw_alloc;
+-  // a regular file only: fopen alone happily "opens" a directory on linux,
+-  // and ftell then answers a garbage-huge size (the allocation blast asan
+-  // caught). the probe contract needs the read to fail for anything that is
+-  // not a file.
+-  struct stat info;
+-  if (stat(p_path, &info) != 0 || !S_ISREG(info.st_mode)) {
++  // P4: the read itself lives behind ok_fs now (the audit's one-door
++  // rule); this hook stays the embedder-replaceable loader contract.
++  ok_fs_buffer buffer;
++  if (!ok_fs_read_file(p_path, &modules->ok->raw_alloc, &buffer)) {
+     return false;
+   }
+-  FILE* file = fopen(p_path, "rb");
+-  if (file == NULL) {
+-    return false;
+-  }
+-  if (fseek(file, 0L, SEEK_END) != 0) {
+-    fclose(file);
+-    return false;
+-  }
+-  const long size = ftell(file);
+-  rewind(file);
+-  if (size < 0 || (unsigned long)size > (1u << 30)) {
+-    // unreadable or absurd: refuse rather than trust ftell on exotic nodes
+-    fclose(file);
+-    return false;
+-  }
+-  char* buff = (char*)mod_alloc(a, (size_t)size + 1);
+-  if (buff == NULL) {
+-    fclose(file);
+-    return false;
+-  }
+-  const size_t read = fread(buff, sizeof(char), (size_t)size, file);
+-  fclose(file);
+-  if (read != (size_t)size) {
+-    mod_free(a, buff);
+-    return false;
+-  }
+-  buff[read] = '\0';
+-  p_out->code = buff;
++  p_out->code = buffer.chars;
+   p_out->path = p_path;
+   return true;
+ }
+@@ -1313,6 +1284,10 @@ typedef struct {
+   const char* stem;
+   const std_member_def* members;
+   uint32_t member_count;
++  // P4: std.fs/std.sys touch the host (files, environment, clocks) - the
++  // import refuses unless the instance holds OK_CAP_HOST. the first std
++  // modules the capability families were built for.
++  bool host_gated;
+ } std_module_def;
+ 
+ static const std_member_def std_array_members[] = {
+@@ -1357,12 +1332,41 @@ static const std_member_def std_math_members[] = {
+     {"atan2", " atan2"},
+     {"idiv", " idiv"},
+ };
++// std.fs (P4): the host's file system through the ok_fs door. the list is
++// sorted (determinism), remove refuses non-empty directories, read caps
++// at 1 GiB, join is pure compute riding the module for convenience.
++static const std_member_def std_fs_members[] = {
++    {"append", " fs_append"},
++    {"cwd", " fs_cwd"},
++    {"exists", " fs_exists"},
++    {"is_dir", " fs_is_dir"},
++    {"is_file", " fs_is_file"},
++    {"join", " fs_join"},
++    {"list", " fs_list"},
++    {"mkdir", " fs_mkdir"},
++    {"read", " fs_read"},
++    {"remove", " fs_remove"},
++    {"write", " fs_write"},
++};
++// std.sys (P4): the running program's system context - the environment,
++// the clocks, the exit request - through the ok_env/ok_time doors.
++static const std_member_def std_sys_members[] = {
++    {"clock", " sys_clock"},
++    {"env_get", " sys_env_get"},
++    {"env_keys", " sys_env_keys"},
++    {"env_set", " sys_env_set"},
++    {"env_unset", " sys_env_unset"},
++    {"exit", " sys_exit"},
++    {"monotonic", " sys_monotonic"},
++};
+ static const std_module_def std_modules[] = {
+-    {"array", std_array_members, sizeof(std_array_members) / sizeof(std_array_members[0])},
+-    {"io", std_io_members, sizeof(std_io_members) / sizeof(std_io_members[0])},
+-    {"map", std_map_members, sizeof(std_map_members) / sizeof(std_map_members[0])},
+-    {"math", std_math_members, sizeof(std_math_members) / sizeof(std_math_members[0])},
+-    {"str", NULL, 0},
++    {"array", std_array_members, sizeof(std_array_members) / sizeof(std_array_members[0]), false},
++    {"fs", std_fs_members, sizeof(std_fs_members) / sizeof(std_fs_members[0]), true},
++    {"io", std_io_members, sizeof(std_io_members) / sizeof(std_io_members[0]), false},
++    {"map", std_map_members, sizeof(std_map_members) / sizeof(std_map_members[0]), false},
++    {"math", std_math_members, sizeof(std_math_members) / sizeof(std_math_members[0]), false},
++    {"str", NULL, 0, false},
++    {"sys", std_sys_members, sizeof(std_sys_members) / sizeof(std_sys_members[0]), true},
+ };
+ 
+ static const std_module_def* std_module_find(const ok_string_view p_stem) {
+@@ -1503,7 +1507,7 @@ static bool resolve_import(module_system* p_modules,
+     const std_module_def* def = std_module_find(stem);
+     if (def == NULL) {
+       string message = asprint(&p_modules->ok->alloc,
+-                               "there is no std module '%.*s': the std modules are array, io, map, math, str.",
++                               "there is no std module '%.*s': the std modules are array, fs, io, map, math, str, sys.",
+                                (int)ok_string_view_get_length(&stem),
+                                stem.chars);
+       module_report(p_source, p_site, message.chars != NULL ? message.chars : "no such std module.");
+@@ -1511,6 +1515,21 @@ static bool resolve_import(module_system* p_modules,
+       str_list_deinit(&tried, a);
+       return false;
+     }
++    // P4: the HOST gate. fs/env/clock are data-plane host access (D16's
++    // family), so an instance that dropped OK_CAP_HOST at birth never
++    // sees the surface: the import refuses with the ratchet's shape (the
++    // same message the native lane uses). the where lane stays a pure
++    // resolution query - it reports where a load WOULD come from.
++    if (def->host_gated && p_where == NULL && (p_modules->ok->caps_dropped & OK_CAP_HOST) != 0) {
++      string message = asprint(&p_modules->ok->alloc,
++                               "std module 'std/%.*s' refused: OK_CAP_HOST is dropped in this ok instance.",
++                               (int)ok_string_view_get_length(&stem),
++                               stem.chars);
++      module_report(p_source, p_site, message.chars != NULL ? message.chars : "the std module is refused in this instance.");
++      string_deinit(&message, &p_modules->ok->alloc);
++      str_list_deinit(&tried, a);
++      return false;
++    }
+     if (p_where == NULL && std_build_module(p_modules, def) != OK) {
+       module_report(p_source, p_site, "out of memory while building the module's namespace.");
+       str_list_deinit(&tried, a);
+@@ -1585,7 +1604,7 @@ static bool resolve_import(module_system* p_modules,
+       }
+     }
+     // the OKPATH lane: colon-separated roots, the same ladder at each.
+-    const char* okpath = getenv("OKPATH");
++    const char* okpath = ok_env_get("OKPATH");
+     if (okpath != NULL && *okpath != '\0') {
+       char* roots = mod_strdup(a, okpath);
+       if (roots != NULL) {
+diff --git a/src/okstate.h b/src/okstate.h
+index 67ba35c..d62476e 100644
+--- a/src/okstate.h
++++ b/src/okstate.h
+@@ -48,6 +48,12 @@ struct ok {
+   const ok_dylib* dylib;
+   bool dump_bytecode;
+   bool dump_skip_run;
++  // P4: sys.exit's request. the native sets both; the exit unwinds like
++  // an uncaught error (no catch may take it), and ok_run maps the run's
++  // end to OK_EXITED with the code readable through ok_exit_code. every
++  // ok_run starts with the lane reset.
++  bool exit_requested;
++  int32_t exit_code;
+ };
+ 
+ // the seeds (ok.c): the builtin surface every TU's <main> pre-declares in its
+diff --git a/src/okvm.c b/src/okvm.c
+index 83a82a6..73a443a 100644
+--- a/src/okvm.c
++++ b/src/okvm.c
+@@ -52,6 +52,8 @@ const char* ok_error_kind_name(ok_error_kind p_kind) {
+     return "native";
+   case OK_EK_INTERNAL:
+     return "internal";
++  case OK_EK_EXIT:
++    return "exit";
+   }
+   return "internal";
+ }
+@@ -2649,6 +2651,13 @@ static unwind_resume __attribute__((noinline, cold)) attempt_unwind(vm* p_vm, ui
+     if (defer_failed) {
+       continue; // restart the walk for the defer's error (its chain already ran)
+     }
++    if (exe->error_kind == OK_EK_EXIT) {
++      // sys.exit rides the unwind - frames close, defers fire - but no
++      // catch may take it: it is a host request, not a script error. the
++      // record dies unconsumed and the walk keeps going outward.
++      exe->handlers.count--;
++      continue;
++    }
+     // consume the record and restore the handler frame
+     exe->handlers.count--;
+     call_frame* fr = &exe->call_stack.data[taken.frame];
+@@ -6407,6 +6416,14 @@ void runtime_error(vm* p_vm, ok_error_kind p_kind, const char* p_fmt, ...) {
+   exe->has_error = true;
+ }
+ 
++// raise the exit request (P4): sys.exit's uncatchable lane. the same
++// stash as runtime_error with the exit kind - the unwind's records all
++// decline it (attempt_unwind), the top level maps the end to OK_EXITED,
++// and the report lane prints nothing (vm_report_error's guard).
++void vm_raise_exit(vm* p_vm) {
++  runtime_error(p_vm, OK_EK_EXIT, "exit");
++}
++
+ // raise (hard): the oom lane. out of memory is not a value and not
+ // catchable, prints immediately (from the live state, the report
+ // path itself must not allocate) and resets: nothing may resume.
+@@ -6477,6 +6494,14 @@ static interpret_result __attribute__((cold)) vm_report_error(vm* p_vm) {
+   }
+   exe->error_reported = true;
+ 
++  if (exe->error_kind == OK_EK_EXIT) {
++    // sys.exit reached the top: the run ENDED by request, nothing failed.
++    // no diagnostic, no stack trace - ok_run answers OK_EXITED and the
++    // code reads back through ok_exit_code. marking reported also keeps
++    // every later lane (deferred reports, ok_last_error prints) quiet.
++    return result;
++  }
++
+   {
+     bool panic = false;
+     bool had_error = false;
+diff --git a/src/okvm.h b/src/okvm.h
+index 16de95f..a6568de 100644
+--- a/src/okvm.h
++++ b/src/okvm.h
+@@ -34,10 +34,18 @@ typedef enum {
+   OK_EK_CONVERSION,
+   OK_EK_NATIVE,
+   OK_EK_INTERNAL,
++  // sys.exit rides the error lane (the only control-flow escape a native
++  // has) but is a host request, not a script error: no catch may take it,
++  // the run unwinds to the top and answers OK_EXITED.
++  OK_EK_EXIT,
+ } ok_error_kind;
+ 
+ const char* ok_error_kind_name(ok_error_kind p_kind);
+ 
++// raise the exit request (P4): sys.exit's lane. uncatchable by design -
++// see OK_EK_EXIT above; the natives call this through ok_vm().
++void vm_raise_exit(vm* p_vm);
++
+ // one entry per compiled TU: the entry file's run, plus one per loaded
+ // module (OR-1) - appended at each load, alive until ok_free. the path is
+ // always ok's (copied): a chunk can name its source after the run that
+diff --git a/tests/capi/src/main.c b/tests/capi/src/main.c
+index 966339b..bfb0b25 100644
+--- a/tests/capi/src/main.c
++++ b/tests/capi/src/main.c
+@@ -900,6 +900,37 @@ int main(void) {
+     ok_free(m_ok);
+   }
+ 
++  // ---------- sys.exit (P4): the host request lane ----------
++  {
++    ok_specs xspecs = {0};
++    ok* x_ok = ok_create(xspecs);
++    CHECK(x_ok != NULL);
++    ok_set_print(x_ok, log_print, NULL);
++    // the exit lands as OK_EXITED carrying the code, nothing after it
++    // runs, and no diagnostic fires anywhere (the run ENDED, not failed)
++    log_reset();
++    ok_source leaving = {"import \"std/sys\" as sys;\nprint \"bye\";\nsys.exit(5);\nprint \"never\";\n", "exit.ok"};
++    CHECK(ok_run(x_ok, leaving) == OK_EXITED);
++    CHECK(ok_exit_code(x_ok) == 5);
++    CHECK(strstr(g_log, "bye") != NULL && strstr(g_log, "never") == NULL);
++    // the lane resets with every run: the next one on the same instance
++    // runs clean and reports 0
++    ok_source staying = {"print \"still here\";\n", "stay.ok"};
++    CHECK(ok_run(x_ok, staying) == OK);
++    CHECK(ok_exit_code(x_ok) == 0);
++    ok_free(x_ok);
++    // and the HOST gate: an instance born without the cap never sees the
++    // module - the import refuses with the ratchet's message
++    ok_specs locked = {0};
++    locked.caps_dropped = (uint32_t)OK_CAP_HOST;
++    ok* r_ok = ok_create(locked);
++    CHECK(r_ok != NULL);
++    ok_source gated = {"import \"std/fs\" as fs;\n", "gated.ok"};
++    CHECK(ok_run(r_ok, gated) == OK_COMPILE_ERROR);
++    CHECK(ok_exit_code(r_ok) == 0); // no exit ever happened
++    ok_free(r_ok);
++  }
++
+   ok_free(p_ok);
+ 
+   printf("capi: %d checks OK\n", g_checks);
+diff --git a/tests/e2e/src/main.cpp b/tests/e2e/src/main.cpp
+index fa89e78..9100103 100644
+--- a/tests/e2e/src/main.cpp
++++ b/tests/e2e/src/main.cpp
+@@ -64,6 +64,7 @@ struct test_case {
+   std::string name;
+   std::string expected_result;
+   std::optional<std::string> expected_error;
++  std::optional<int> expected_exit;
+   bool has_expectation = false;
+ };
+ 
+@@ -75,6 +76,8 @@ test_case parse_test_file(const std::filesystem::path& p_path) {
+   std::string line;
+   std::regex expect_out_re(R"(//\s*expect:\s*(.*))");
+   std::regex expect_err_re(R"(//\s*expect\s+error(?::\s*(.*))?)");
++  // the sys.exit lane (P4): the process's code is the assertion.
++  std::regex expect_exit_re(R"(//\s*expect\s+exit:\s*(-?\d+))");
+ 
+   while (std::getline(fs, line)) {
+     std::smatch match;
+@@ -87,6 +90,9 @@ test_case parse_test_file(const std::filesystem::path& p_path) {
+       else
+         tc.expected_error = "";
+       tc.has_expectation = true;
++    } else if (std::regex_search(line, match, expect_exit_re)) {
++      tc.expected_exit = std::stoi(match[1].str());
++      tc.has_expectation = true;
+     }
+   }
+   tc.expected_result = expected.str();
+@@ -272,7 +278,25 @@ int main(int argc, char** argv) {
+       continue;
+     }
+ 
+-    if (tc.expected_error.has_value()) {
++    if (tc.expected_exit.has_value()) {
++      // the exit lane: the requested code is the assertion; stdout still
++      // compares when expect lines are present.
++      if (rr.exit_code != tc.expected_exit.value()) {
++        std::println("{}[NOTOK]{}: '{}'", COLOR_RED, COLOR_RESET, test_path);
++        std::println("expected exit {}, got exit {}", tc.expected_exit.value(), rr.exit_code);
++        std::println("got:\nstdout: {}\nstderr: {}", rr.std_out, rr.std_err);
++        fail(notok, ok_debug_path, test_path);
++      } else if (!tc.expected_result.empty() && rr.std_out != tc.expected_result) {
++        std::println("{}[NOTOK]{}: '{}'", COLOR_RED, COLOR_RESET, test_path);
++        std::println("output mismatch (exit code matched)");
++        std::println("expected:\n{}", tc.expected_result);
++        std::println("got:\nstdout: {}\nstderr: {}", rr.std_out, rr.std_err);
++        fail(notok, ok_debug_path, test_path);
++      } else {
++        ok++;
++        std::println("{}[OK]{}: {}", COLOR_GREEN, COLOR_RESET, test_path);
++      }
++    } else if (tc.expected_error.has_value()) {
+       if (rr.exit_code == 0) {
+         std::println("{}[NOTOK]{}: '{}'", COLOR_RED, COLOR_RESET, test_path);
+         std::println("expected error, but non occurred");
+diff --git a/tests/e2e/tests/modules/std/errors/fs_list_not_dir.ok b/tests/e2e/tests/modules/std/errors/fs_list_not_dir.ok
+new file mode 100644
+index 0000000..ae8e1d3
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/fs_list_not_dir.ok
+@@ -0,0 +1,5 @@
++// listing a file (that exists!) is a shape error, not a miss
++import "std/fs" as fs;
++fs.write("e2e_fs_err_file.txt", "x");
++print fs.list("e2e_fs_err_file.txt");
++// expect error: fs.list failed: 'e2e_fs_err_file.txt' is not a readable directory.
+diff --git a/tests/e2e/tests/modules/std/errors/fs_mkdir_exists.ok b/tests/e2e/tests/modules/std/errors/fs_mkdir_exists.ok
+new file mode 100644
+index 0000000..fe68f50
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/fs_mkdir_exists.ok
+@@ -0,0 +1,8 @@
++// one level, no parents, no overwrite: an existing path refuses
++import "std/fs" as fs;
++if fs.exists("e2e_fs_taken_dir") {
++  fs.remove("e2e_fs_taken_dir");
++}
++fs.mkdir("e2e_fs_taken_dir");
++fs.mkdir("e2e_fs_taken_dir");
++// expect error: fs.mkdir failed: cannot create 'e2e_fs_taken_dir' (it may exist, or a parent is missing).
+diff --git a/tests/e2e/tests/modules/std/errors/fs_path_nul.ok b/tests/e2e/tests/modules/std/errors/fs_path_nul.ok
+new file mode 100644
+index 0000000..bad1df9
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/fs_path_nul.ok
+@@ -0,0 +1,5 @@
++// an embedded NUL would silently truncate a C path - a WRONG path - so
++// it refuses. the \0 escape is P3's escape set doing real work.
++import "std/fs" as fs;
++print fs.exists("a\0b");
++// expect error: invalid argument: the string passed to 'fs.exists' contains a NUL.
+diff --git a/tests/e2e/tests/modules/std/errors/fs_read_directory.ok b/tests/e2e/tests/modules/std/errors/fs_read_directory.ok
+new file mode 100644
+index 0000000..2d73e5a
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/fs_read_directory.ok
+@@ -0,0 +1,9 @@
++// fopen happily "opens" a directory on linux - the read refuses instead.
++// the start-clean keeps the fixture idempotent across runs.
++import "std/fs" as fs;
++if fs.exists("e2e_fs_err_dir") {
++  fs.remove("e2e_fs_err_dir");
++}
++fs.mkdir("e2e_fs_err_dir");
++print fs.read("e2e_fs_err_dir");
++// expect error: fs.read failed: 'e2e_fs_err_dir' is not a readable regular file.
+diff --git a/tests/e2e/tests/modules/std/errors/fs_read_missing.ok b/tests/e2e/tests/modules/std/errors/fs_read_missing.ok
+new file mode 100644
+index 0000000..89f1a3a
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/fs_read_missing.ok
+@@ -0,0 +1,4 @@
++// fs.read's miss: a plain 404 names the path and the shape it wanted
++import "std/fs" as fs;
++print fs.read("e2e_fs_absent_file.txt");
++// expect error: fs.read failed: 'e2e_fs_absent_file.txt' is not a readable regular file.
+diff --git a/tests/e2e/tests/modules/std/errors/fs_read_not_string.ok b/tests/e2e/tests/modules/std/errors/fs_read_not_string.ok
+new file mode 100644
+index 0000000..f587135
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/fs_read_not_string.ok
+@@ -0,0 +1,3 @@
++import "std/fs" as fs;
++print fs.read(5);
++// expect error: invalid argument: 'fs.read' expects a string.
+diff --git a/tests/e2e/tests/modules/std/errors/fs_remove_missing.ok b/tests/e2e/tests/modules/std/errors/fs_remove_missing.ok
+new file mode 100644
+index 0000000..3daa0f8
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/fs_remove_missing.ok
+@@ -0,0 +1,3 @@
++import "std/fs" as fs;
++fs.remove("e2e_fs_absent_thing");
++// expect error: fs.remove failed: 'e2e_fs_absent_thing' is not an existing file or empty directory.
+diff --git a/tests/e2e/tests/modules/std/errors/fs_remove_nonempty.ok b/tests/e2e/tests/modules/std/errors/fs_remove_nonempty.ok
+new file mode 100644
+index 0000000..57da84c
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/fs_remove_nonempty.ok
+@@ -0,0 +1,10 @@
++// remove never recurses: a non-empty directory refuses (the safe shape)
++import "std/fs" as fs;
++if fs.exists("e2e_fs_full_dir") {
++  fs.remove("e2e_fs_full_dir/inner.txt");
++  fs.remove("e2e_fs_full_dir");
++}
++fs.mkdir("e2e_fs_full_dir");
++fs.write("e2e_fs_full_dir/inner.txt", "i");
++fs.remove("e2e_fs_full_dir");
++// expect error: fs.remove failed: 'e2e_fs_full_dir' is not an existing file or empty directory.
+diff --git a/tests/e2e/tests/modules/std/errors/fs_write_missing_parent.ok b/tests/e2e/tests/modules/std/errors/fs_write_missing_parent.ok
+new file mode 100644
+index 0000000..4e1f513
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/fs_write_missing_parent.ok
+@@ -0,0 +1,4 @@
++// no implicit mkdir: writing into a missing directory fails, teaching it
++import "std/fs" as fs;
++fs.write("e2e_fs_missing_dir/x.txt", "data");
++// expect error: fs.write failed: cannot write 'e2e_fs_missing_dir/x.txt'.
+diff --git a/tests/e2e/tests/modules/std/errors/sys_env_get_not_string.ok b/tests/e2e/tests/modules/std/errors/sys_env_get_not_string.ok
+new file mode 100644
+index 0000000..5f95305
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/sys_env_get_not_string.ok
+@@ -0,0 +1,3 @@
++import "std/sys" as sys;
++print sys.env_get(1);
++// expect error: invalid argument: 'sys.env_get' expects a string.
+diff --git a/tests/e2e/tests/modules/std/errors/sys_env_set_bad_name.ok b/tests/e2e/tests/modules/std/errors/sys_env_set_bad_name.ok
+new file mode 100644
+index 0000000..178b257
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/sys_env_set_bad_name.ok
+@@ -0,0 +1,4 @@
++// setenv's EINVAL lane: an '=' inside the name is not a name
++import "std/sys" as sys;
++sys.env_set("OK_E2E_BAD=NAME", "value");
++// expect error: sys.env_set failed: 'OK_E2E_BAD=NAME' is not a valid environment name.
+diff --git a/tests/e2e/tests/modules/std/errors/sys_exit_not_number.ok b/tests/e2e/tests/modules/std/errors/sys_exit_not_number.ok
+new file mode 100644
+index 0000000..4005203
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/sys_exit_not_number.ok
+@@ -0,0 +1,3 @@
++import "std/sys" as sys;
++sys.exit("seven");
++// expect error: invalid argument: 'sys.exit' expects a number (the exit code).
+diff --git a/tests/e2e/tests/modules/std/errors/sys_exit_not_whole.ok b/tests/e2e/tests/modules/std/errors/sys_exit_not_whole.ok
+new file mode 100644
+index 0000000..aa57b6f
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/errors/sys_exit_not_whole.ok
+@@ -0,0 +1,4 @@
++// the code is a process status: whole, inside int32
++import "std/sys" as sys;
++sys.exit(1.5);
++// expect error: invalid argument: 'sys.exit' expects a whole number between -2147483648 and 2147483647.
+diff --git a/tests/e2e/tests/modules/std/exit/basic.ok b/tests/e2e/tests/modules/std/exit/basic.ok
+new file mode 100644
+index 0000000..4917e4f
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/exit/basic.ok
+@@ -0,0 +1,6 @@
++// sys.exit ends the run: nothing after it executes, nothing fails
++import "std/sys" as sys;
++print "before";
++sys.exit(0);
++print "after";
++// expect: before
+diff --git a/tests/e2e/tests/modules/std/exit/catch.ok b/tests/e2e/tests/modules/std/exit/catch.ok
+new file mode 100644
+index 0000000..ca2a603
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/exit/catch.ok
+@@ -0,0 +1,11 @@
++// exit is uncatchable: the catch never runs, the run ends with the code
++import "std/sys" as sys;
++print "before";
++try {
++  sys.exit(3);
++} catch e {
++  print "caught";
++}
++print "after";
++// expect: before
++// expect exit: 3
+diff --git a/tests/e2e/tests/modules/std/exit/code.ok b/tests/e2e/tests/modules/std/exit/code.ok
+new file mode 100644
+index 0000000..ffb5b4d
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/exit/code.ok
+@@ -0,0 +1,6 @@
++// the requested code is the process's code
++import "std/sys" as sys;
++print "leaving";
++sys.exit(7);
++// expect: leaving
++// expect exit: 7
+diff --git a/tests/e2e/tests/modules/std/exit/defer.ok b/tests/e2e/tests/modules/std/exit/defer.ok
+new file mode 100644
+index 0000000..ee55a30
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/exit/defer.ok
+@@ -0,0 +1,21 @@
++// the exit unwind runs the defers - the callee's and the top level's -
++// exactly like an uncaught error's walk, then ends with the code
++import "std/sys" as sys;
++fu cleanup_inner() {
++  print "cleanup-inner";
++}
++fu cleanup_top() {
++  print "cleanup-top";
++}
++fu work() {
++  defer cleanup_inner();
++  sys.exit(0);
++}
++defer cleanup_top();
++print "before";
++work();
++print "after";
++// expect: before
++// expect: cleanup-inner
++// expect: cleanup-top
++// expect exit: 0
+diff --git a/tests/e2e/tests/modules/std/fs.ok b/tests/e2e/tests/modules/std/fs.ok
+new file mode 100644
+index 0000000..e66aa80
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/fs.ok
+@@ -0,0 +1,60 @@
++// std.fs (P4): the host's file system, HOST-gated at the import. the
++// fixture is self-contained: everything happens inside one scratch
++// directory under the runner's cwd, cleaned at entry AND exit, so a
++// failed earlier run never poisons this one.
++import "std/fs" as fs;
++
++// join is pure compute - no host contact of its own
++print fs.join("a", "b"); // expect: a/b
++print fs.join("", "b"); // expect: b
++print fs.join("a", ""); // expect: a
++print fs.join("dir/", "file"); // expect: dir/file
++
++// the clean slate (a previous failed run may have left the scratch behind)
++if fs.exists("e2e_fs_dir") {
++  for let name : fs.list("e2e_fs_dir") {
++    fs.remove(fs.join("e2e_fs_dir", name));
++  }
++  fs.remove("e2e_fs_dir");
++}
++if fs.exists("e2e_fs_file.txt") {
++  fs.remove("e2e_fs_file.txt");
++}
++
++// the write/read/append round trip
++fs.write("e2e_fs_file.txt", "hello ");
++fs.append("e2e_fs_file.txt", "world");
++print fs.read("e2e_fs_file.txt"); // expect: hello world
++
++// the probes
++print fs.exists("e2e_fs_file.txt"); // expect: true
++print fs.is_file("e2e_fs_file.txt"); // expect: true
++print fs.is_dir("e2e_fs_file.txt"); // expect: false
++print fs.exists("e2e_fs_absent.txt"); // expect: false
++print fs.is_file("."); // expect: false
++print fs.is_dir("."); // expect: true
++
++// directories: one level, sorted listing, no . or ..
++fs.mkdir("e2e_fs_dir");
++fs.write("e2e_fs_dir/zebra.txt", "z");
++fs.write("e2e_fs_dir/apple.txt", "a");
++fs.mkdir("e2e_fs_dir/mid");
++print fs.is_dir("e2e_fs_dir"); // expect: true
++let names = fs.list("e2e_fs_dir");
++print names.len(); // expect: 3
++print names[0]; // expect: apple.txt
++print names[1]; // expect: mid
++print names[2]; // expect: zebra.txt
++
++// cwd: host state - the fixture asserts shape, never content
++print fs.cwd().len() > 0; // expect: true
++print fs.is_dir(fs.cwd()); // expect: true
++
++// the cleanup: files first, then dirs (remove refuses non-empty)
++fs.remove("e2e_fs_dir/zebra.txt");
++fs.remove("e2e_fs_dir/apple.txt");
++fs.remove("e2e_fs_dir/mid");
++fs.remove("e2e_fs_dir");
++fs.remove("e2e_fs_file.txt");
++print fs.exists("e2e_fs_dir"); // expect: false
++print fs.exists("e2e_fs_file.txt"); // expect: false
+diff --git a/tests/e2e/tests/modules/std/restrict/host_gated_fs.ok b/tests/e2e/tests/modules/std/restrict/host_gated_fs.ok
+new file mode 100644
+index 0000000..1c7f781
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/restrict/host_gated_fs.ok
+@@ -0,0 +1,4 @@
++// okflags: --restrict
++// std.fs under a dropped OK_CAP_HOST: the import refuses, teaching the cap
++import "std/fs" as fs;
++// expect error: std module 'std/fs' refused: OK_CAP_HOST is dropped in this ok instance.
+diff --git a/tests/e2e/tests/modules/std/restrict/host_gated_sys.ok b/tests/e2e/tests/modules/std/restrict/host_gated_sys.ok
+new file mode 100644
+index 0000000..793ada5
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/restrict/host_gated_sys.ok
+@@ -0,0 +1,4 @@
++// okflags: --restrict
++// the same gate on the sys side: env/clock are host access too
++import "std/sys" as sys;
++// expect error: std module 'std/sys' refused: OK_CAP_HOST is dropped in this ok instance.
+diff --git a/tests/e2e/tests/modules/std/sys.ok b/tests/e2e/tests/modules/std/sys.ok
+new file mode 100644
+index 0000000..3665b2d
+--- /dev/null
++++ b/tests/e2e/tests/modules/std/sys.ok
+@@ -0,0 +1,40 @@
++// std.sys (P4): the environment + the clocks, HOST-gated at the import
++// (the exit fixtures live under exit/). one dedicated env name only - the
++// surrounding environment (CI, shells, flavors) must never leak into the
++// output.
++import "std/sys" as sys;
++
++sys.env_set("OK_E2E_SYS_VAR", "first");
++print sys.env_get("OK_E2E_SYS_VAR"); // expect: first
++
++let mut seen = false;
++for let name : sys.env_keys() {
++  if name == "OK_E2E_SYS_VAR" {
++    seen = true;
++  }
++}
++print seen; // expect: true
++
++sys.env_set("OK_E2E_SYS_VAR", "second");
++print sys.env_get("OK_E2E_SYS_VAR"); // expect: second
++
++sys.env_unset("OK_E2E_SYS_VAR");
++print sys.env_get("OK_E2E_SYS_VAR"); // expect: null
++
++let mut gone = true;
++for let name : sys.env_keys() {
++  if name == "OK_E2E_SYS_VAR" {
++    gone = false;
++  }
++}
++print gone; // expect: true
++
++// unset is idempotent: an unset name unsets clean
++sys.env_unset("OK_E2E_SYS_VAR");
++
++// clocks: relations only - the host's clock is not the suite's to know
++print sys.monotonic() >= 0.0; // expect: true
++print sys.clock() > 1000000000.0; // expect: true
++let start = sys.monotonic();
++print sys.monotonic() >= start; // expect: true
++print sys.monotonic() - start < 60.0; // expect: true
+-- 
+2.47.3
+

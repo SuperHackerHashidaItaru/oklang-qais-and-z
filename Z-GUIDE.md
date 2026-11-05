@@ -52,34 +52,48 @@ source of truth: `https://codeberg.org/qais/oklang`, master at `9ad153c`,
 **tagged v0.1.0**. the `register` branch is history — deletion pending Q's
 confidence, don't touch it.
 
-current phase [perishable — refresh at round end] (nov 5, session 44):
-the 0.9.0 wave (Reconciliation, P1-P7) is in flight to v1.0-rc, landing
-on Q's hand-applied `reconciliation` branch on codeberg: P1+P2 (patches
-53-54) ride 057309c, patch 55 (f"" interpolation + m""/fm"" multiline)
-landed as f05445a, patch 56 (P3 complete: the str method toolkit +
-std.math + the deprecation windows) landed as 54fd30f — both zero
-drift, gates green on the landings (544x7, then 560x7). patches 57
-(the math constants lane: pi + e, the registry was value-blind so it
-was two table rows + hidden number globals) and 58 (the complete escape
-set: \a \b \e \f \v \0 \xNN, \x ascii-capped, no octal) are
-DELIVERED, stack clean on 54fd30f, awaiting Q's hand. P3's semantic
-calls STAND (Q agreed). the wave is 3/7 with P3's tail tied. next: P4
-(fs/env/clock behind OK_CAP_HOST), P5 (parser hardening + fuzz), P6
-(optimization), P7 (REPL + the GC attempt). master still sits at v0.4.0 ON PURPOSE: the
-ruled release plan (ROADMAP-0.9.0-draft) runs the wave to rc, then the
-review + amend pass, then releases v0.5.0 → v1.0.0 as their own cuts —
-the git mechanics are `docs/drafts/RELEASE-RUNBOOK.md` (round two
-folded the tidy correction: rel/ branches pin coros-family shas, tidy
-is in no command). all six survivors RULED (round two): len =
-codepoints, Reconciliation, property tests post-v1, no perf target
-("the best version of itself"), GC incremental in v1 / generational
-post-v1, the std door + sys.args/name/err + math.idiv. ${} is the
-interpolation delimiter — landed. tree-sitter still owes the grammar
-catch-up (Q's flank — interpolation + multiline grammar now too). the
-bench workflow is live (automated runs pin oklang 0666651, a lane ref).
-workspace note: `oklang-qais-and-z/` at the root is a stale pre-42
-relic — `collab/` is the live clone (PAT remote); never push from the
-relic.
+current phase [perishable — refresh at round end] (nov 5, session 45):
+the 0.9.0 wave (Reconciliation) is 4/7 landed and the series is now
+CONDENSED per Q's ruling ("condense the remaining patches as
+appropriate" — one patch per workstream, whole workstreams per
+session when the session holds). P1-P3 landed through d48edf4
+(patches 53-58; that landing verified zero drift + full matrix:
+564x7, capi 325x5, delta flat). patch 59 (P4, the host doors:
+std.fs + std.sys behind OK_CAP_HOST, the ok_fs/ok_time/ok_env
+one-door layers + the audit reroutes, sys.exit as the uncatchable
+OK_EK_EXIT lane with OK_EXITED + ok_exit_code public) is DELIVERED
+as 65d8885 on the sandbox clone's reconciliation, one over d48edf4,
+awaiting Q's hand — gates on its head: e2e 585x7 (564 → 585), capi
+334x5, delta flat. what remains: P5 the front-door patch (parser
+hardening: the four classes + the zero-dep fuzzer + corpus + the
+REPL round — termios, history, auto-print, multi-line) and P6 the
+measurement patch (delta blue's pub-fields rewrite + re-baseline,
+compare+jump fusion, allocation shaving, OP_TAILCALL, the bench
+bridge + baseline column, the incremental GC attempt behind its
+bar) — P7 dissolved into both. sys.args/name/err are ruled in but
+not yet scheduled (the next round's call). master still sits at
+v0.4.0 ON PURPOSE: the ruled release plan (ROADMAP-0.9.0-draft) runs
+the wave to rc, then the review + amend pass, then releases
+v0.5.0 → v1.0.0 as their own cuts — the git mechanics are
+`docs/drafts/RELEASE-RUNBOOK.md` (round two folded the tidy
+correction: rel/ branches pin coros-family shas, tidy is in no
+command). all six survivors RULED (round two): len = codepoints
+(landed in P2), Reconciliation, property tests post-v1, no perf
+target ("the best version of itself"), GC incremental in v1 /
+generational post-v1, the std door + sys.args/name/err + math.idiv.
+${} is the interpolation delimiter — landed. tree-sitter still owes
+the grammar catch-up (Q's flank — interpolation + multiline grammar
+now too). the bench workflow is live (automated runs pin oklang
+0666651, a lane ref). workspace: the sandbox `oklang/` clone is the
+live language tree (reconciliation, ahead by exactly the delivered
+patch); THIS repo is the live collab clone (PAT remote).
+`oklang-qais-and-z/` at the sandbox root is the stale relic — never
+push from it; session 45 fired that warning for real (a rejected
+non-fast-forward push from a diverged copy — the dodge is recorded
+in session 45's worklog entry) and the relic had also been
+re-deriving history the live clone already held. one more: the
+sandbox reaps background processes between tool calls — gates run in
+foreground chunks, never nohup.
 
 ## first 60 seconds of every round
 

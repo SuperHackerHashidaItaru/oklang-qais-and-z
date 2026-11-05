@@ -1329,3 +1329,49 @@ replay is clean.
 a note for future rounds: the tool-result display strips SGR-looking
 sequences ("\x1B[31m" vanishes from view, files untouched) - verify
 ANSI fixture content with grep -cF, never by eye.
+
+## 59-p4-the-host-doors-fs-sys-and-the-audit.patch
+
+P4, the host doors, the first real OK_CAP_HOST consumers. three
+abstraction layers open behind the one-door rule - ok_fs (the whole
+file read with the loader's 1 GiB cap and regular-files-only probe,
+write/append, the probes, remove (file or EMPTY directory - no
+recursion ever), one-level mkdir, sorted listing, cwd), ok_time (wall
++ monotonic, seconds as doubles), ok_env (get/set/unset + the sorted,
+deduped keys walk) - and the audit reroutes every libok caller through
+them: the module loader's source read, the OKPATH getenv, the dylib
+probe's stat. ok_posix.h is the one deliberate POSIX opt-in for the
+new layers (the older files keep their per-file _XOPEN_SOURCE until
+touched); okdiag's stderr write stays the sanctioned diagnostic door.
+
+std.fs and std.sys join the built-in registry as the first HOST-gated
+std modules: the import refuses with the ratchet's message when the
+instance was born without the cap (the where lane stays a pure
+resolution query). the surfaces ride the same hidden-globals harvest
+as math - fs: read/write/append/exists/is_file/is_dir/remove/mkdir/
+list/cwd/join (join is pure compute riding the module); sys:
+env_get/env_set/env_unset/env_keys/clock/monotonic/exit.
+
+sys.exit is the round's one new public lane: the native sets the code
+then rides the error unwind as OK_EK_EXIT - uncatchable by design
+(attempt_unwind declines every record for it, frames still close and
+defers still fire, exactly the uncaught-error walk), the report lane
+prints nothing (the run ENDED, not failed), ok_run answers the new
+OK_EXITED with the code readable through ok_exit_code, and the CLI
+maps it to the process status. the ratchet discipline: a failing defer
+on the way out replaces the request (a real error outranks an ask).
+
+the e2e runners (bash + C++) grow the `// expect exit: N` lane; 21
+fixtures (fs.ok the self-cleaning round trip, sys.ok the env + clock
+relations, 13 error pins including the NUL-path refusal where \0 does
+real work, the two restrict gates, the four exit fixtures with the
+defer contract pinned). capi +9 (OK_EXITED, the code, the reset lane,
+the HOST gate). one gate-caught bug en route: a two-conversion pattern
+fed one argument in fs.write's failure message - undefined behavior
+that segfaulted the moment the missing-parent fixture ran; the splice
+is two-step now, one format arg each.
+
+applies on reconciliation after d48edf4. gates: e2e 585/585 x7 (564 ->
+585), capi 334 x5 (325 -> 334), unit + embed x3, cli lane, delta blue
+correct 1.40654e7, 1.95x/1.87x of wren - flat, the hot paths
+untouched.

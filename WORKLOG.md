@@ -2510,3 +2510,74 @@ ROADMAP-0.9.0-draft) and the round summaries.]
   sandbox clone. the wave is 3/7 with P3's tail tied.
 - next: P4 (fs/env/clock behind OK_CAP_HOST), then P5 (parser
   hardening + fuzz), P6 (optimization), P7 (REPL + the GC attempt).
+
+## session 45 (2026-11-05): the re-sync, the relic dodge, P4 lands - the host doors
+
+context: Q confirmed d48edf4 ("perfect, it landed") and ruled the
+delivery cadence - "now also that the session don't cut off as
+aggressively you can condense the remaining patches as appropriate":
+one patch per workstream, whole workstreams per session when the
+session holds. the roadmap's series section is re-densed accordingly
+(this entry's commit).
+
+- the d48edf4 receipt: fetch, reset, zero drift against the local
+  mirror commits (3fba974 + e769e9c), and the full matrix on the
+  landed tip - builds 9/9 under -Werror, e2e 564/564 x7, unit+embed
+  x3, capi 325 x5, cli lane, delta blue correct (1.40654e7; 1.94x/1.87x
+  of wren, flat).
+- the relic dodge, recorded for the next amnesiac round: the session's
+  first banking attempt went to git push from the STALE relic
+  (oklang-qais-and-z/ - the directory Z-GUIDE itself warns about; it
+  had sat diverged since session 41 with its own unpushed 39-41 chain
+  and, on top of those, freshly reconstructed 42-44 entries and
+  regenerated patch files that duplicated history the live clone
+  already held). the push refused non-fast-forward - which was the
+  save. the real history lived here in collab/ through 345b90d all
+  along. the banking you are reading happened on the live clone; the
+  relic stays untouched, and its warning line has now earned itself
+  twice.
+- patch 59 (P4, the condensation ruling's first fruit - one whole
+  workstream, one patch): the host doors. ok_fs/ok_time/ok_env open as
+  the one-door abstraction layers (the audit's ask), every libok
+  caller rerouted (the loader's read, the OKPATH getenv, the dylib
+  probe's stat; okdiag's stderr stays the sanctioned diagnostic door),
+  ok_posix.h the deliberate POSIX opt-in. std.fs and std.sys join the
+  built-in registry as the FIRST HOST-gated std modules - the import
+  refuses with the ratchet's message under a dropped cap, where stays
+  a pure query. sys.exit rides a new OK_EK_EXIT error lane:
+  uncatchable (attempt_unwind declines every record, defers still
+  fire), silent at the top (vm_report_error's guard), mapped to the
+  new public OK_EXITED + ok_exit_code, the CLI passing the code
+  through.
+- the exit contract, pinned by fixtures: print-before/exit(0)/print-
+  after ends after "before"; try/catch cannot take it ("caught" never
+  prints, the code surfaces); the defer walk runs BOTH the callee's
+  and the top level's defers on the way out; a whole int32 code is
+  required (1.5 and "seven" refuse). one gate-caught bug en route: a
+  two-conversion pattern fed one argument in fs.write's failure
+  message - undefined behavior that segfaulted on the missing-parent
+  fixture; the splice is two-step now.
+- the runners (bash + C++) grow the `// expect exit: N` lane. 21 new
+  fixtures: fs.ok (the self-cleaning round trip - join, write/read/
+  append, the probes, sorted listing, cwd by shape not content, the
+  teardown), sys.ok (one dedicated env name only, clock relations
+  never values), 13 error pins (including the NUL-path refusal, where
+  P3's \0 escape does real work, and remove's no-recursion stand),
+  the two restrict gates, the four exit fixtures. capi +9: OK_EXITED,
+  the code, the per-run reset, the HOST-dropped import refusal.
+- gates on the patch head: builds 9/9, e2e 585/585 x7 (564 -> 585),
+  capi 334 x5 (325 -> 334), unit+embed x3, cli lane, delta blue
+  correct 1.40654e7 at 1.95x/1.87x - flat, the hot paths untouched.
+- delivered: patches/59-p4-the-host-doors-fs-sys-and-the-audit.patch
+  (mirrored in download/), its README entry, the roadmap amendment
+  (P1-P4 landed, the series condensed per Q's ruling), Z-GUIDE's
+  perishable section refreshed, this entry. language side: 65d8885 on
+  the sandbox clone's reconciliation, one commit over d48edf4,
+  awaiting Q's hand.
+- next: P5 the front-door patch (parser hardening: the four classes +
+  the zero-dep fuzzer + corpus + the cross-check growth + the REPL
+  round - termios, history, auto-print, multi-line), then P6 the
+  measurement patch (delta blue's pub-fields rewrite + re-baseline,
+  compare+jump fusion, allocation shaving, OP_TAILCALL, the bench
+  bridge + baseline column, the incremental GC attempt behind its
+  bar). Q applies 59 by hand to reconciliation per the protocol.
