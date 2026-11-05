@@ -2836,3 +2836,141 @@ session holds. the roadmap's series section is re-densed accordingly
     happened to point at) - caught in the push receipt (5 files, no
     bench/), ported to the LIVE collab/bench as 4c30b14, and the
     sandbox script repointed. the relic stays untouched from now on.
+
+## session 49 (2026-11-05): P6 round two - the condition chains, two standing-branch finds, and the measurement (63)
+
+- context: Q landed round one - 4c0dc5a "tailcalls" (+ 5b3714d "run gen",
+  the healed seed) is 934e4bc's content byte-identical, diff EMPTY.
+  patch 62's landing receipt: zero-drift, the corpus healed, all lanes
+  green on Q's side without intervention. "lets get this done with" -
+  round two opened per the plan.
+- round two's scope (the worklog's own list): compare+jump fusion pass 2,
+  the allocation shave against the new baseline, the bench bridge +
+  baseline column, the incremental GC attempt behind its bar.
+- the fusion, as landed (okcompiler.c, pure compiler change, zero vm and
+  zero bytecode-surface delta):
+  - `X and Y` / `X or Y` in an if/while/for condition compile to a CHAIN
+    of branches per De Morgan: jump-when-(and) is false -> two jumps that
+    share the branch target; jump-when-(or) is false -> the left's jumps
+    bend to Lend (the position after the chain) while the right's carry
+    the branch; the mirror shapes for the flipped sense. the sketched
+    S-flag proved UNNECESSARY for the logical ops - the p operand
+    already carries the sense, and the value lane's and/or ARE
+    truthiness-based (JUMP_IF_SET), so the chain is exact for every
+    value shape including 0-truthy (lua-shaped is_falsy: only strict
+    false and null).
+  - `not X` CANNOT ride the polarity inversion, and this is the round's
+    semantics lesson: oklang's `!` is bool-STRICT (perform_not: numbers
+    and objects are TYPE ERRORS), so a flipped branch would swallow the
+    error lane - `not (x < y)` with an overloaded comparison returning a
+    non-bool must error, not branch on truthiness. negation keeps its
+    literal shape (the operand's value, OP_NOT with its runtime check,
+    one JUMP_IF) - the same instructions the old fallback spent. IF a
+    fused negated comparison is ever wanted, the lane is: the R bit on
+    OP_JUMP_IF_CMP (free in that encoding - it is the field-define ops'
+    pub flag) as a strict-bool consume; sketched here, not built, no
+    benchmark asks for it.
+  - every other leaf (calls, identifiers, ternaries, assignments) takes
+    the generic operand lane: expression to a temp, one OP_JUMP_IF -
+    the chain's VALUE is dead in condition position. each leaf rolls
+    its temps back after its jump (execution order guarantees the jump
+    consumed them before any later leaf's code reuses the slots), so a
+    chain of any length holds at most two temps. the jump ledger is a
+    fixed 256-cap struct - the parser's depth guard (200) bounds leaves
+    under it; overflow is a loud error, never a miscompile.
+- FIND ONE - the value-lane miscompile (live on the standing branch
+  since the register rewrite 1697066, 2026-10-25): `X or Y` / `X and Y`
+  in VALUE position with an identifier rhs returned the STALE LEFT
+  value or unwritten null - `let x = false; let y = 42; print(x or y)`
+  printed null; `print(a > b or a)` printed false where 3 is right. the
+  cause: materialize_into_if_not_register's any-register check let the
+  lazy rhs location (an identifier resolves to its own register without
+  emitting anything) skip the move into p_dest, but the fall-through
+  path's result IS p_dest. compile_logical_operator's rhs now rides the
+  strict materialize_into - the same discipline the ternary's arms kept
+  all along (its comment documents exactly this hazard; one lane
+  slipped in the rewrite). the lhs keeps the loose read (sound: the
+  jump reads wherever the lhs lives, the SET writes p_dest from there).
+  proven pre-existing on a pristine 4c0dc5a worktree before the fix.
+  the `flag or default` idiom was silently broken for two weeks.
+- FIND TWO - the bitwise crash lanes (the fuzzer's own, minutes after
+  the new seed joined): `a & b` (and `|`, `^`) parsed clean - the
+  operator tables have spelled them since the beginning - and crashed
+  compile_binary_value_operator's internal-bug default; `a &= b` (and
+  the four other compounds) tripped the infix dispatcher's assertion.
+  the tokens now REJECT at parse (same shape as `<<`, which never had a
+  rule); the spellings stay reserved in the tables for the day a ruling
+  lands them real lanes (vm has no bit opcodes at all today - that
+  ruling is Q's, recorded OPEN). operators.ok's corpus seed gained the
+  eight shapes; bitwise_reject.ok pins them in e2e.
+- the measurement, as the round was named for:
+  - delta blue: 1.38x (release) / 1.32x (threaded) of wren_cli - FLAT
+    against the 1.35x pub-fields baseline (run noise; the chains in
+    choose_method fuse but conditions were never the profile). checksum
+    1.40654e+07 intact. the fusion is kept for codegen quality, not the
+    number - honestly recorded.
+  - the GC census (paranoid build, OK_LOG_GC): the ENTIRE 40-iteration
+    run triggers TWO collections - allocated_bytes is a cumulative
+    counter (release never reports to gc_collect, so it never shrinks)
+    and the trigger is next = allocated*2 after each collect: an
+    exponential cadence. 5114 objects swept across both; the death
+    census: 1980 empty arrays (remove_constraint's fresh-array filter,
+    extract_plan's sources), 1010 Variable, 400 EqualityConstraint, 716
+    array-2, 331 array-1, 304 StayConstraint, 300 ScaleConstraint - and
+    ZERO bound methods, zero closures: the round-one suspect list's
+    "bound-method materialization on GET_MEMBER method hits" is
+    answered NOT GUILTY - OP_INVOKE covers every call delta blue makes.
+  - the incremental GC attempt: DEFERRED ON DATA. at two collections
+    per run the stop-the-world cost is microseconds against a 170ms
+    run; incremental pacing would buy nothing and its write barriers
+    would tax every STORE_FIELD/array store (millions in this
+    benchmark) - a certain regression for zero collectable time. the
+    trigger's exponential backoff already amortizes the collector to
+    near-zero for batch shapes. recorded: the lane becomes interesting
+    only for interactive/long-lived hosts, and only with a live-heap-
+    aware trigger first (the counter never shrinks - `reclaimed` in the
+    OK_LOG_GC output is vestigial, always 0).
+- the bench bridge + baseline column (collab CI side):
+  - benches.yml gained a schedule (every 6h, :17) with a SHA gate: the
+    bridge job resolves reconciliation's tip via ls-remote, compares
+    with results/latest/run-info.txt, and skips the whole run when the
+    tip was already benched - push/dispatch pass through (human
+    intent). BRIDGED_REF is the knob when the landing branch changes.
+  - the baseline column: baseline-diff.py publishes baseline-diff.md
+    per run against bench/baseline.json (pinned from the consistent
+    2026-11-04T09:17 runner, 36 benchmarks, three same-week runs agreed
+    within ~2%). ADVISORY, never a gate - and the wiring itself found
+    the honest caveat: the 09:38 run of the same sha measured ~2x
+    FASTER than the three consistent runs across every target including
+    lua and python - a runner instance class, not code. a delta that
+    moves all targets together is the machine; only the oklang column
+    moving is the landing. the re-baseline door is manual (--write +
+    human commit) because an auto-moving baseline can never catch a
+    regression.
+  - the pair lane: discovery now admits .ok + .py with lua OPTIONAL -
+    which admits exactly one new benchmark, delta_blue (wren's repo
+    ships no lua port). the P6 flagship now has CI cadence, listed in
+    classes-benches.txt so the probe guards it. its first bridged run
+    will show baseline: - until the next re-pin.
+- receipts: builds 9/9 under -Werror, e2e 608/608 x7 (605 -> 608: the
+  chains file, the chains error file, bitwise_reject), unit + embed
+  5x3, capi 334x5, cli 10/10, fuzz x2 gcc == asan byte-identical
+  (58083 diagnostics, 0 unlocated - the new seed's mutations), delta
+  blue correct and flat. patch 63 is pure ascii, applies clean on
+  4c0dc5a, and the applied tree diffs EMPTY against 6c6cee3
+  (zero-drift by construction).
+- delivered: patches/63-p6-round-two-condition-chains.patch (mirrored
+  in download/), its README entry, the collab bench bridge (workflow,
+  baseline.json, baseline-diff.py, the runner's pair lane, the
+  classes-benches entry), the README's bridge documentation, this
+  entry.
+- Q's steps: apply patch 63 (byte-identical, the worktree check), push.
+  no healer run needed - no binary seed changed (gen.sh stays
+  idempotent if run anyway). the manifest and checksums ride in the
+  patch.
+- next: the math constants registry lane (approved pre-v1, if not very
+  complex), the open semantics items (full ansi escape support, the
+  \u{} braces ruling - drop unless technically necessary), and a perf
+  profile of the remaining 1.3x gap (dispatch machinery, not GC, not
+  conditions - the census says so). the portability lane stays
+  recorded, stays untouched.

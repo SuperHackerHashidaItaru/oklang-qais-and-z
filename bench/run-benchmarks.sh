@@ -122,10 +122,14 @@ run_one() {
   commands+=("$command")
   names+=("ok-register")
 
-  # Lua.
-  printf -v command '%q %q' "$(command -v lua)" "$source.lua"
-  commands+=("$command")
-  names+=("lua")
+  # Lua (optional per benchmark: only when a .lua port exists - delta_blue
+  # ships .py/.wren from wren's repo but no lua, and it is exactly the pair
+  # the discovery lane below now admits).
+  if [[ -f "$source.lua" ]]; then
+    printf -v command '%q %q' "$(command -v lua)" "$source.lua"
+    commands+=("$command")
+    names+=("lua")
+  fi
 
   # Python.
   printf -v command '%q %q' "$(command -v python3)" "$source.py"
@@ -172,20 +176,18 @@ for ok_file in "${ok_files[@]}"; do
     continue
   fi
 
-  if [[ -f "$RUN_DIR/$name.lua" && -f "$RUN_DIR/$name.py" ]]; then
+  # the pair lane (P6 round two): a .py companion admits a benchmark -
+  # lua is optional per benchmark (delta_blue ships .py/.wren from wren's
+  # repo but no lua port, and it is exactly the benchmark this admits).
+  if [[ -f "$RUN_DIR/$name.py" ]]; then
     discovered+=("$name")
   else
-    missing=()
-
-    [[ -f "$RUN_DIR/$name.lua" ]] || missing+=("$name.lua")
-    [[ -f "$RUN_DIR/$name.py" ]] || missing+=("$name.py")
-
-    skipped+=("$name (missing: ${missing[*]})")
+    skipped+=("$name (missing: $name.py)")
   fi
 done
 
 if (( ${#skipped[@]} > 0 )); then
-  echo "Ignoring incomplete benchmark triplets:"
+  echo "Ignoring incomplete benchmarks (no .py companion):"
 
   printf '  - %s\n' "${skipped[@]}"
 fi

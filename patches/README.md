@@ -1559,3 +1559,61 @@ tailcalls fixture), unit+embed 5x3, capi 334x5, cli 10/10, fuzz x2
 gcc == asan (50047 diagnostics, 0 unlocated; the corpus grew to 17
 seeds), delta blue correct 1.40654e7, flat at the new baseline.
 applies clean on b42d605; pure ascii end to end.
+
+## 63 - P6 round two: the condition chains, two standing-branch finds, and the measurement
+
+okcompiler.c + okparser.c + tests + corpus. three stories:
+
+- **the condition chains (fusion pass 2)**: `X and Y` / `X or Y` in an
+  if/while/for condition compile to a chain of branches per De Morgan
+  (the deciding shapes share the branch target, the probing shapes bend
+  the left's jumps to Lend), each comparison leaf riding OP_JUMP_IF_CMP
+  with the p operand as the sense - the sketched S-flag proved
+  unnecessary. `not X` deliberately keeps its literal shape: oklang's
+  `!` is bool-strict (numbers/objects are type errors), so a polarity
+  inversion would swallow the error lane; the exact OP_NOT + one
+  JUMP_IF stays (the R-bit lane for a fused strict-bool comparison is
+  sketched in the worklog, not built). every other leaf (calls,
+  identifiers, ternaries) takes the generic operand lane - one branch
+  per leaf, temps rolled back per leaf, the ledger capped at 256 under
+  the parser's depth guard. value-position and/or is untouched.
+- **the logical rhs miscompile** (live since the register rewrite
+  1697066): `x or y` in VALUE position with an identifier rhs returned
+  the stale left value or unwritten null - the loose any-register
+  materialize let the lazy rhs skip the move into p_dest, whose stale
+  content the fall-through then reported. `print(x or y)` printed
+  null; `print(a > b or a)` printed false. the rhs now rides the
+  strict materialize_into (the ternary's arm discipline); the lhs
+  keeps the loose read (sound - the jump reads the lhs wherever it
+  lives). proven pre-existing on a pristine 4c0dc5a worktree.
+- **the bitwise crash lanes** (the fuzzer's find, minutes after the new
+  seed joined): `a & b` (also `|`, `^`) parsed clean into
+  compile_binary_value_operator's internal-bug default; the five
+  compound forms tripped the infix dispatcher's assertion. the tokens
+  reject at parse now (the `<<` shape); the spellings stay reserved.
+  whether they become real bitwise lanes is Q's OPEN ruling (the vm
+  has no bit opcodes).
+
+the measurement the round was named for: delta blue FLAT at 1.38x /
+1.32x (the pub-fields baseline was 1.35x - run noise; conditions were
+never the profile), checksum 1.40654e7. the GC census: TWO collections
+in the whole 40-iteration run (the cumulative-counter trigger doubles
+exponentially), 5114 swept - 1980 empty arrays, 1010 Variable, the
+constraint instances - and ZERO bound methods (OP_INVOKE covers every
+call delta blue makes; the round-one suspect is not guilty). the
+incremental GC attempt is DEFERRED ON DATA: at two collections per run
+the stop-the-world cost is noise, and write barriers would tax every
+field store for zero collectable time.
+
+rides with the collab-side bench bridge: the benches workflow's SHA-
+gated schedule (reconciliation's tip, benched once), the baseline
+column (baseline.json + baseline-diff.py, advisory, manual re-pin
+door), and the pair lane that admits delta_blue into CI (lua column
+optional where no port exists).
+
+gates: builds 9/9, e2e 608x7 (605 -> 608: the chains fixture, the
+chains error fixture, bitwise_reject), unit+embed 5x3, capi 334x5,
+cli 10/10, fuzz x2 gcc == asan (58083 diagnostics, 0 unlocated; the
+corpus grew to 18 seeds), delta blue correct and flat. applies clean
+on 4c0dc5a; the applied tree diffs empty against 6c6cee3. pure ascii
+end to end.

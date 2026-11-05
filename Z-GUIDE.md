@@ -52,42 +52,50 @@ source of truth: `https://codeberg.org/qais/oklang`, master at `9ad153c`,
 **tagged v0.1.0**. the `register` branch is history — deletion pending Q's
 confidence, don't touch it.
 
-current phase [perishable — refresh at round end] (nov 5, session 48):
-the 0.9.0 wave (Reconciliation) is 6/7 landed. P5 is Q's 4ad2cbd
-(landed with the FIRST DRIFT - the invalid-utf-8 seed mangled to
-U+FFFD by the medium; patch 61's integrity lane answered the class,
-and Q applied it as b42d605 - BUT gen.sh has NOT run yet: the seed
-still carries the mangled bytes and Q's fuzz/crosscheck lanes run red
-until `bash tests/fuzz/corpus/gen.sh` + commit). patch 62 (P6 round
-one) is DELIVERED as 934e4bc on the sandbox clone's reconciliation:
-the member-store receiver fix (a pre-existing miscompile the bench
-rewrite found: obj.field = <call rhs> erased its staged receiver),
-OP_TAILCALL (return name(args) hands the frame over in place - a
-million mutual tailcalls, one frame slot; defers run first, non-
-closure callees degrade through the vm_call lane), and the regen
-door's healer-pins-manifest ordering. WITH IT, on the collab side:
-delta_blue.ok's pub-fields rewrite (every accessor call became the
-direct field access wren uses - 1.93x/1.88x of wren -> 1.35x/1.33x,
-the accessor tax was ~30% of the benchmark; results/delta_blue.md
-re-baselined). gates on 934e4bc: e2e 605x7, capi 334x5, fuzz x2
-(50047 diagnostics, 0 unlocated, 17 seeds), delta flat at the new
-baseline. what remains (P6 round two): fusion pass 2 (and/or
-comparison operands), the allocation shaving pass against the NEW
-baseline, the bench bridge trigger + baseline column, the incremental
-GC attempt or its measured deferral. sys.args/name/err remain
-ruled-in-unscheduled. THE PORTABILITY LANE stays recorded, untouched.
+current phase [perishable — refresh at round end] (nov 5, session 49):
+the 0.9.0 wave (Reconciliation) is 6/7 landed, P6 two rounds in. patch
+62 landed ZERO-DRIFT (Q's 4c0dc5a "tailcalls" + 5b3714d "run gen" -
+the healed seed - is 934e4bc's content byte-identical, diff empty).
+patch 63 (P6 round two) is DELIVERED as 6c6cee3 on the sandbox clone's
+reconciliation: the condition chains (and/or per De Morgan through the
+fused compare+jump, p as the sense - the S-flag proved unnecessary;
+negation kept literal because oklang's `!` is bool-strict, inversion
+would swallow the error lane), the value-lane `x or y` rhs miscompile
+fix (live since the register rewrite - an identifier rhs skipped the
+move into p_dest; `print(x or y)` printed null), and the bitwise
+tokens' crash lanes turned parse rejections (the fuzzer's find; real
+bitwise lanes are Q's OPEN ruling). the measurement: delta blue FLAT
+1.38x/1.32x (conditions were never the profile; checksum intact), the
+GC census (two collections per run, exponential trigger, zero bound
+methods in the death list) answers the round-one suspects and DEFERS
+incremental GC on data. with it, on the collab side: the bench bridge
+(SHA-gated schedule watching reconciliation's tip), the baseline
+column (baseline.json pinned from the consistent 11-04 runner,
+baseline-diff.py advisory + manual re-pin door; NOTE the observed ~2x
+runner instance-class swing - all-targets-together deltas are the
+machine), and the pair lane admitting delta_blue into CI (lua column
+optional where no port exists). gates on 6c6cee3: e2e 608x7, capi
+334x5, fuzz x2 (58083 diagnostics, 0 unlocated, 18 seeds). what
+remains of P6: the perf profile of the residual ~1.3x (dispatch
+machinery), if Q wants the number pushed. then the math constants
+registry lane (approved pre-v1) and the open semantics items (full
+ansi escape support; the \u{} braces ruling - drop unless technically
+necessary). sys.args/name/err remain ruled-in-unscheduled. THE
+PORTABILITY LANE stays recorded, untouched.
 master still sits at v0.4.0 ON PURPOSE: the ruled release plan
 (ROADMAP-0.9.0-draft) runs the wave to rc, then the review + amend
 pass, then releases v0.5.0 -> v1.0.0 as their own cuts - the git
 mechanics are docs/drafts/RELEASE-RUNBOOK.md. all six survivors RULED
 (round two): len = codepoints (landed in P2), Reconciliation,
 property tests post-v1, no perf target ("the best version of
-itself"), GC incremental in v1 / generational post-v1, the std door +
-sys.args/name/err + math.idiv. ${} is the interpolation delimiter -
-landed.${} is the interpolation delimiter — landed. tree-sitter still owes
+itself"), GC incremental in v1 / generational post-v1 (P6's data now
+says: not in v1 unless a live-heap-aware trigger lands first), the
+std door + sys.args/name/err + math.idiv. ${} is the interpolation
+delimiter - landed. tree-sitter still owes
 the grammar catch-up (Q's flank — interpolation + multiline grammar
 now too). the bench workflow is live (automated runs pin oklang
-0666651, a lane ref). workspace: the sandbox `oklang/` clone is the
+0666651, a lane ref; the bridge now watches reconciliation). workspace:
+the sandbox `oklang/` clone is the
 live language tree (reconciliation, ahead by exactly the delivered
 patch); THIS repo is the live collab clone (PAT remote).
 `oklang-qais-and-z/` at the sandbox root is the stale relic — never

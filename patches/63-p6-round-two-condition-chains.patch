@@ -1,0 +1,924 @@
+From 6c6cee3de8bd713016c8a37f02f5b13bb8b27328 Mon Sep 17 00:00:00 2001
+From: Z <z@z.ai>
+Date: Thu, 5 Nov 2026 07:29:04 +0000
+Subject: [PATCH] P6 round two: the condition chains (and/or per De Morgan, the
+ p-polarity sense, negation kept literal for the bool-strict not), the logical
+ rhs miscompile fix (the register rewrite's loose any-register check), and the
+ bitwise token rejection (the fuzzer's find: & | ^ and compounds parsed clean
+ into crash lanes)
+
+---
+ src/okcompiler.c                              | 373 +++++++++++-------
+ src/okparser.c                                |  24 +-
+ .../e2e/tests/loops/fused_condition_chains.ok | 164 ++++++++
+ .../loops/fused_condition_chains_errors.ok    |  31 ++
+ .../tests/operators/errors/bitwise_reject.ok  |  17 +
+ tests/e2e/tests/operators/logical.ok          |  34 ++
+ tests/fuzz/corpus/checksums                   |   3 +-
+ tests/fuzz/corpus/condition_chains.ok         |  21 +
+ tests/fuzz/corpus/operators.ok                |   9 +
+ tests/fuzz/crosscheck-manifest.txt            |   4 +
+ 10 files changed, 534 insertions(+), 146 deletions(-)
+ create mode 100644 tests/e2e/tests/loops/fused_condition_chains.ok
+ create mode 100644 tests/e2e/tests/loops/fused_condition_chains_errors.ok
+ create mode 100644 tests/e2e/tests/operators/errors/bitwise_reject.ok
+ create mode 100644 tests/fuzz/corpus/condition_chains.ok
+
+diff --git a/src/okcompiler.c b/src/okcompiler.c
+index a7f33da..9ce8115 100644
+--- a/src/okcompiler.c
++++ b/src/okcompiler.c
+@@ -2802,93 +2802,160 @@ static bool emit_incomplete_jump_if_set(
+ }
+ 
+ // the fused condition lane (the compare+jump fusion's condition half, the
+-// "branch no materialize" sizing): a DIRECT comparison as an if/while/for
+-// condition emits one instruction instead of the binop's bool + OP_JUMP_IF
+-// pair. the operands keep their natural homes - a local's register is used
+-// as-is (the vm saves and restores it around the result), a constant rhs
+-// rides the k-operand - so the fused shape adds zero staging. every other
+-// condition shape (logical operators, negation, plain values) returns
+-// UNSUPPORTED having emitted nothing, and the caller runs the generic path.
+-typedef enum {
+-  FUSED_CONDITION_UNSUPPORTED,
+-  FUSED_CONDITION_OK,
+-  FUSED_CONDITION_ERROR,
+-} fused_condition_result;
+-
+-static fused_condition_result compile_fused_condition_jump(
+-    compiler* p_compiler, ast_expression* p_condition, bool p_truthy, uint32_t* p_out, ast_node* p_author) {
+-  if (p_condition->node.node_type != AST_INFIX_BINARY_EXPRESSION) {
+-    return FUSED_CONDITION_UNSUPPORTED;
+-  }
+-  ast_infix_binary_expression* binexpr = (ast_infix_binary_expression*)p_condition;
+-  comparison cmp;
+-  switch (binexpr->_operator) {
++// "branch no materialize" sizing): a condition in an if/while/for compiles
++// to a CHAIN of branches that never materialize the condition's boolean
++// value. pass 1 fused the direct comparison (one OP_JUMP_IF_CMP where the
++// generic path spends the binop's bool + OP_JUMP_IF's re-read); pass 2
++// extends the lane over the logical shapes:
++//   - `X and Y` / `X or Y` compile per De Morgan:
++//       jump when (X and Y) is false -> jump when X is false, jump when Y is false
++//       jump when (X or Y) is true   -> jump when X is true,  jump when Y is true
++//       jump when (X and Y) is true  -> jump when X is false to Lend, jump when Y is true
++//       jump when (X or Y) is false  -> jump when X is true to Lend,  jump when Y is false
++//     where Lend is the position after the chain: the operand that already
++//     decided the outcome skips the remaining tests. the p operand carries
++//     the sense (the sketched S-flag proved unnecessary - p inversion is
++//     total for the logical ops, whose value lane IS truthiness-based).
++//   - `not X` / `!X` CANNOT ride the inversion: oklang's `!` is bool-STRICT
++//     (perform_not: numbers and objects are type errors), so a polarity
++//     flip would swallow the error lane - `not (x < y)` with an overloaded
++//     comparison returning a non-bool must error exactly as the value lane
++//     does. negation keeps its literal shape: the whole `not` node compiles
++//     as a generic leaf (the operand's value, OP_NOT with its runtime
++//     check, one JUMP_IF on the bool) - the same instructions the old
++//     fallback spent, minus the chain-level value bookkeeping.
++//   - every other leaf takes the generic operand lane: the expression
++//     compiles to a temp, one OP_JUMP_IF reads it - the same pair the value
++//     lane spends on that operand, minus the value bookkeeping. the chain's
++//     VALUE is dead in condition position (`a or b` evaluating to a rather
++//     than true is only observable in value position, which still compiles
++//     through compile_logical_operator).
++// evaluation order and short-circuit match the generic lane exactly: the
++// left operand always runs first, the right is skipped when the left
++// decides. each leaf rolls its temps back once its jump is emitted - the
++// jump consumed them in execution order before any later leaf's code can
++// overwrite the slots - so a chain of any length holds at most two temps.
++
++// the ledger of jumps that must all reach the condition's branch target:
++// every leaf contributes exactly one jump. the parser's depth guard
++// (OK_PARSER_MAX_DEPTH) bounds any single condition's
++// leaves under the cap, so overflow is structurally unreachable; the guard
++// stays defensive anyway (a loud error, never a miscompile).
++#define OK_CONDITION_JUMPS_MAX 256u
++
++typedef struct {
++  uint32_t jumps[OK_CONDITION_JUMPS_MAX];
++  uint32_t count;
++} condition_jumps;
++
++static bool condition_jumps_append(condition_jumps* p_jumps, uint32_t p_at) {
++  if (p_jumps->count >= OK_CONDITION_JUMPS_MAX) {
++    return false;
++  }
++  p_jumps->jumps[p_jumps->count++] = p_at;
++  return true;
++}
++
++// the comparator table for the fusable comparisons (pass 1's set, unchanged).
++static bool condition_comparison_of(operator_type p_operator, comparison* p_out) {
++  switch (p_operator) {
+   case OPERATOR_BIN_EQUALS:
+-    cmp = CMP_EQUALS;
+-    break;
++    *p_out = CMP_EQUALS;
++    return true;
+   case OPERATOR_BIN_BANG_EQUAL:
+-    cmp = CMP_NOT_EQUAL;
+-    break;
++    *p_out = CMP_NOT_EQUAL;
++    return true;
+   case OPERATOR_BIN_LESS:
+-    cmp = CMP_LESS;
+-    break;
++    *p_out = CMP_LESS;
++    return true;
+   case OPERATOR_BIN_LESS_EQUAL:
+-    cmp = CMP_LESS_EQUAL;
+-    break;
++    *p_out = CMP_LESS_EQUAL;
++    return true;
+   case OPERATOR_BIN_GREATER:
+-    cmp = CMP_GREATER;
+-    break;
++    *p_out = CMP_GREATER;
++    return true;
+   case OPERATOR_BIN_GREATER_EQUAL:
+-    cmp = CMP_GREATER_EQUAL;
+-    break;
++    *p_out = CMP_GREATER_EQUAL;
++    return true;
+   case OPERATOR_BIN_STRICT_EQUALS:
+-    cmp = CMP_STRICT_EQUAL;
+-    break;
++    *p_out = CMP_STRICT_EQUAL;
++    return true;
+   case OPERATOR_BIN_IS:
+-    cmp = CMP_IS;
+-    break;
++    *p_out = CMP_IS;
++    return true;
+   default:
+-    return FUSED_CONDITION_UNSUPPORTED;
++    return false;
++  }
++}
++
++static bool compile_condition_chain(compiler* p_compiler,
++                                    ast_expression* p_condition,
++                                    bool p_jump_when_true,
++                                    condition_jumps* p_jumps,
++                                    ast_node* p_author);
++
++// the probing shape patches its Lend jumps before the definition below.
++static bool patch_jump_if(compiler* p_compiler,
++                          bool p_is_loop,
++                          uint32_t p_jump_instruction,
++                          uint32_t p_jump_end,
++                          ast_node* p_author);
++
++// the comparison leaf: pass 1's whole shape, generalized over the branch
++// polarity. the operands keep their natural homes - a local's register is
++// used as-is (the vm saves and restores it around the result), a constant
++// rhs rides the k-operand - so the fused shape adds zero staging.
++static bool compile_condition_comparison_leaf(compiler* p_compiler,
++                                              ast_infix_binary_expression* p_binexpr,
++                                              bool p_jump_when_true,
++                                              condition_jumps* p_jumps,
++                                              ast_node* p_author) {
++  comparison cmp;
++  if (!condition_comparison_of(p_binexpr->_operator, &cmp)) {
++    // unreachable from the chain dispatcher; kept as a guard so the leaf
++    // stays callable on its own terms.
++    return false;
+   }
+   register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
+   // temps for the operands the compiler cannot address in place (constants
+   // never load, locals keep their registers, expressions stage here)
++  const uint32_t checkpoint = regalloc->temp_top;
+   _register lhs_dest;
+   if (!register_allocator_allocate_temp(regalloc, &lhs_dest)) {
+     report_oom(p_compiler, p_author);
+-    return FUSED_CONDITION_ERROR;
++    return false;
+   }
+   expression_result lhs;
+-  if (!compile_expression(p_compiler, binexpr->left, lhs_dest, 1, &lhs)) {
+-    return FUSED_CONDITION_ERROR;
++  if (!compile_expression(p_compiler, p_binexpr->left, lhs_dest, 1, &lhs)) {
++    return false;
+   }
+   _register rhs_dest;
+   if (!register_allocator_allocate_temp(regalloc, &rhs_dest)) {
+     report_oom(p_compiler, p_author);
+-    return FUSED_CONDITION_ERROR;
++    return false;
+   }
+   expression_result rhs;
+-  if (!compile_expression(p_compiler, binexpr->right, rhs_dest, 1, &rhs)) {
+-    return FUSED_CONDITION_ERROR;
++  if (!compile_expression(p_compiler, p_binexpr->right, rhs_dest, 1, &rhs)) {
++    return false;
+   }
+   // the lhs lands in a register (its temp, or the local it already is); the
+   // rhs may stay a constant - the same operand policy the value binops use.
+   if (!materialize_into_if_not_register(p_compiler, &lhs.value, lhs_dest, p_author)) {
+-    return FUSED_CONDITION_ERROR;
++    return false;
+   }
+   bool is_rhs_const = false;
+   if (!materialize_into_if_not_common(
+           p_compiler, &is_rhs_const, LOCATION_KIND_CONSTANT, &rhs.value, rhs_dest, p_author)) {
+-    return FUSED_CONDITION_ERROR;
++    return false;
+   }
+   // (P1 sweep note: no width guard is needed here - ok_index and the 2w
+   // operand fields are both 16 bit, so the fused window is structural.
+   // the guard this replaces compared a uint16 against UINT16_MAX and
+   // could never fire.)
+-  *p_out = current_chunk(p_compiler)->code.count;
++  uint32_t at = current_chunk(p_compiler)->code.count;
+   if (!emit_word2(p_compiler,
+                   encode_OPPABCQC(OP_JUMP_IF_CMP,
+-                                  p_truthy,
++                                  p_jump_when_true,
+                                   0,
+                                   lhs.value.index,
+                                   rhs.value.index,
+@@ -2896,9 +2963,98 @@ static fused_condition_result compile_fused_condition_jump(
+                                   (uint8_t)cmp),
+                   p_author)) {
+     report_oom(p_compiler, p_author);
+-    return FUSED_CONDITION_ERROR;
++    return false;
+   }
+-  return FUSED_CONDITION_OK;
++  // the jump consumed the operand temps (it is the next instruction to
++  // execute after everything the operands staged), so the next leaf may
++  // reuse the slots.
++  register_allocator_reset_temps(regalloc, checkpoint);
++  if (!condition_jumps_append(p_jumps, at)) {
++    error_at(p_compiler,
++             p_author,
++             ok_create_string_view("condition is too large to compile.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return false;
++  }
++  return true;
++}
++
++static bool compile_condition_chain(compiler* p_compiler,
++                                    ast_expression* p_condition,
++                                    bool p_jump_when_true,
++                                    condition_jumps* p_jumps,
++                                    ast_node* p_author) {
++  // (`not X` / `!X` is deliberately NOT recursed into - see the lane comment
++  // above: oklang's `!` is bool-strict, so the node falls through to the
++  // generic leaf, compiling the operand's value + OP_NOT + one JUMP_IF.)
++  if (p_condition->node.node_type == AST_INFIX_BINARY_EXPRESSION) {
++    ast_infix_binary_expression* binexpr = (ast_infix_binary_expression*)p_condition;
++    if (binexpr->_operator == OPERATOR_LOG_AND || binexpr->_operator == OPERATOR_LOG_OR) {
++      const bool is_and = binexpr->_operator == OPERATOR_LOG_AND;
++      if (is_and != p_jump_when_true) {
++        // the deciding shape (and when jumping on false, or when jumping on
++        // true): either operand deciding the outcome decides the branch, so
++        // both operands' jumps share the caller's target.
++        return compile_condition_chain(p_compiler, binexpr->left, p_jump_when_true, p_jumps, p_author) &&
++               compile_condition_chain(p_compiler, binexpr->right, p_jump_when_true, p_jumps, p_author);
++      }
++      // the probing shape (and when jumping on true, or when jumping on
++      // false): the left operand deciding means the chain must NOT jump,
++      // so its jumps bend to Lend - the position after the right operand's
++      // tests - while the right operand's jumps carry the branch.
++      condition_jumps decided = {.count = 0};
++      if (!compile_condition_chain(p_compiler, binexpr->left, !p_jump_when_true, &decided, p_author)) {
++        return false;
++      }
++      if (!compile_condition_chain(p_compiler, binexpr->right, p_jump_when_true, p_jumps, p_author)) {
++        return false;
++      }
++      const uint32_t lend = current_chunk(p_compiler)->code.count;
++      for (uint32_t i = 0; i < decided.count; ++i) {
++        if (!patch_jump_if(p_compiler, false, decided.jumps[i], lend, p_author)) {
++          return false;
++        }
++      }
++      return true;
++    }
++    if (condition_comparison_of(binexpr->_operator, &(comparison){0})) {
++      return compile_condition_comparison_leaf(p_compiler, binexpr, p_jump_when_true, p_jumps, p_author);
++    }
++  }
++  // the generic leaf: any other expression compiles to a temp and one
++  // OP_JUMP_IF reads it - the caller's old fallback shape for that operand,
++  // minus the value bookkeeping the condition never observes.
++  register_allocator* regalloc = &current_context(p_compiler)->register_allocator;
++  const uint32_t checkpoint = regalloc->temp_top;
++  _register temp;
++  if (!register_allocator_allocate_temp(regalloc, &temp)) {
++    report_oom(p_compiler, p_author);
++    return false;
++  }
++  expression_result value;
++  if (!compile_expression(p_compiler, p_condition, temp, 1, &value)) {
++    return false;
++  }
++  // the value may live anywhere (a local's register, a constant, the temp);
++  // constants materialize into the temp, registers stay put.
++  if (!materialize_into_if_not_register(p_compiler, &value.value, temp, p_author)) {
++    return false;
++  }
++  _register cond;
++  cond.index = value.value.index;
++  cond.flags = REGISTER_FLAG_NONE;
++  cond.errors = REGISTER_OK;
++  uint32_t at;
++  if (!emit_incomplete_jump_if(p_compiler, p_jump_when_true, cond, &at, p_author)) {
++    return false;
++  }
++  register_allocator_reset_temps(regalloc, checkpoint);
++  if (!condition_jumps_append(p_jumps, at)) {
++    error_at(p_compiler,
++             p_author,
++             ok_create_string_view("condition is too large to compile.", OK_STRING_VIEW_CALCULATE_LENGTH, true));
++    return false;
++  }
++  return true;
+ }
+ 
+ // defaults ladder guard: jump forward when the argument for parameter position
+@@ -3010,33 +3166,10 @@ static bool patch_jump_if_set(compiler* p_compiler,
+ }
+ 
+ bool compile_if_statement(compiler* p_compiler, ast_if_statement* p_if) {
+-  uint32_t cons_jump;
+-  const fused_condition_result fused =
+-      compile_fused_condition_jump(p_compiler, p_if->condition, false, &cons_jump, (ast_node*)p_if);
+-  if (fused == FUSED_CONDITION_ERROR) {
++  condition_jumps cons_jumps = {.count = 0};
++  if (!compile_condition_chain(p_compiler, p_if->condition, false, &cons_jumps, (ast_node*)p_if)) {
+     return false;
+   }
+-  if (fused == FUSED_CONDITION_UNSUPPORTED) {
+-    expression_result condition;
+-    _register condition_register;
+-    if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &condition_register)) {
+-      report_oom(p_compiler, (ast_node*)p_if);
+-      return false;
+-    }
+-    if (!compile_expression(p_compiler, p_if->condition, condition_register, 1, &condition)) {
+-      return false;
+-    }
+-    if (!materialize_into_if_not_register(p_compiler, &condition.value, condition_register, (ast_node*)p_if)) {
+-      return false;
+-    }
+-    condition_register.error = REGISTER_OK;
+-    condition_register.index = condition.value.index;
+-    condition_register.flags = REGISTER_FLAG_NONE; // for all that it matters this is a temp
+-
+-    if (!emit_incomplete_jump_if(p_compiler, false, condition_register, &cons_jump, (ast_node*)p_if)) {
+-      return false;
+-    }
+-  }
+ 
+   if (!compile_statement(p_compiler, p_if->consequence)) {
+     return false;
+@@ -3048,8 +3181,10 @@ bool compile_if_statement(compiler* p_compiler, ast_if_statement* p_if) {
+     return false;
+   }
+ 
+-  if (!patch_jump_if(p_compiler, false, cons_jump, chunk->code.count, (ast_node*)p_if)) {
+-    return false;
++  for (uint32_t i = 0; i < cons_jumps.count; ++i) {
++    if (!patch_jump_if(p_compiler, false, cons_jumps.jumps[i], chunk->code.count, (ast_node*)p_if)) {
++      return false;
++    }
+   }
+ 
+   if (p_if->alternative != NULL) {
+@@ -3094,34 +3229,10 @@ bool compile_while_statement(compiler* p_compiler, ast_while_statement* p_while)
+   CTX.handlers_at_entry = ctx->active_handlers;
+   chunk* chunk = current_chunk(p_compiler);
+   const uint32_t loop_start = chunk->code.count;
+-  uint32_t exit_jmp;
+-  const fused_condition_result fused =
+-      compile_fused_condition_jump(p_compiler, p_while->condition, false, &exit_jmp, (ast_node*)p_while);
+-  if (fused == FUSED_CONDITION_ERROR) {
++  condition_jumps exit_jumps = {.count = 0};
++  if (!compile_condition_chain(p_compiler, p_while->condition, false, &exit_jumps, (ast_node*)p_while)) {
+     return false;
+   }
+-  if (fused == FUSED_CONDITION_UNSUPPORTED) {
+-    expression_result condition;
+-    _register condition_reg;
+-    if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &condition_reg)) {
+-      report_oom(p_compiler, (ast_node*)p_while);
+-      return false;
+-    }
+-    if (!compile_expression(p_compiler, p_while->condition, condition_reg, 1, &condition)) {
+-      return false;
+-    }
+-    if (!materialize_into_if_not_register(p_compiler, &condition.value, condition_reg, (ast_node*)p_while)) {
+-      return false;
+-    }
+-
+-    condition_reg.error = REGISTER_OK;
+-    condition_reg.index = condition.value.index;
+-    condition_reg.flags = REGISTER_FLAG_NONE;
+-
+-    if (!emit_incomplete_jump_if(p_compiler, false, condition_reg, &exit_jmp, (ast_node*)p_while)) {
+-      return false;
+-    }
+-  }
+ 
+   if (!compile_statement(p_compiler, p_while->body)) {
+     return false;
+@@ -3131,9 +3242,12 @@ bool compile_while_statement(compiler* p_compiler, ast_while_statement* p_while)
+     return false;
+   }
+ 
+-  if (!patch_jump_if(p_compiler, false, exit_jmp, current_chunk(p_compiler)->code.count, (ast_node*)p_while)) {
+-    return false;
++  for (uint32_t i = 0; i < exit_jumps.count; ++i) {
++    if (!patch_jump_if(p_compiler, false, exit_jumps.jumps[i], current_chunk(p_compiler)->code.count, (ast_node*)p_while)) {
++      return false;
++    }
+   }
++
+   CTX.continue_target = loop_start;
+   CTX.break_target = chunk->code.count;
+   if (!patch_loop_context(p_compiler, &CTX, (ast_node*)p_while)) {
+@@ -3168,39 +3282,13 @@ bool compile_for_statement(compiler* p_compiler, ast_for_statement* p_for) {
+     goto fail;
+   }
+   bool is_exit_set = false;
+-  uint32_t exit_jump;
++  condition_jumps exit_jumps = {.count = 0};
+   const uint32_t loop_start = chunk->code.count;
+   if (p_for->condition != NULL) {
+-    const fused_condition_result fused =
+-        compile_fused_condition_jump(p_compiler, p_for->condition, false, &exit_jump, (ast_node*)p_for->condition);
+-    if (fused == FUSED_CONDITION_ERROR) {
++    if (!compile_condition_chain(p_compiler, p_for->condition, false, &exit_jumps, (ast_node*)p_for->condition)) {
+       goto fail;
+     }
+-    if (fused == FUSED_CONDITION_OK) {
+-      is_exit_set = true;
+-    } else {
+-      expression_result condition;
+-      _register condition_reg;
+-      if (!register_allocator_allocate_temp(&current_context(p_compiler)->register_allocator, &condition_reg)) {
+-        report_oom(p_compiler, (ast_node*)p_for);
+-        return false;
+-      }
+-      if (!compile_expression(p_compiler, p_for->condition, condition_reg, 1, &condition)) {
+-        goto fail;
+-      }
+-      if (!materialize_into_if_not_register(p_compiler, &condition.value, condition_reg, (ast_node*)p_for)) {
+-        goto fail;
+-      }
+-
+-      condition_reg.error = REGISTER_OK;
+-      condition_reg.index = condition.value.index;
+-      condition_reg.flags = REGISTER_FLAG_NONE;
+-
+-      if (!emit_incomplete_jump_if(p_compiler, false, condition_reg, &exit_jump, (ast_node*)p_for->condition)) {
+-        goto fail;
+-      }
+-      is_exit_set = true;
+-    }
++    is_exit_set = true;
+   }
+   if (p_for->update != NULL) {
+     CTX.continue_forward = true;
+@@ -3226,8 +3314,11 @@ bool compile_for_statement(compiler* p_compiler, ast_for_statement* p_for) {
+     goto fail;
+   }
+   if (is_exit_set) {
+-    if (!patch_jump_if(p_compiler, false, exit_jump, current_chunk(p_compiler)->code.count, (ast_node*)p_for)) {
+-      goto fail;
++    for (uint32_t i = 0; i < exit_jumps.count; ++i) {
++      if (!patch_jump_if(
++              p_compiler, false, exit_jumps.jumps[i], current_chunk(p_compiler)->code.count, (ast_node*)p_for)) {
++        goto fail;
++      }
+     }
+   }
+   CTX.break_target = chunk->code.count;
+@@ -4003,7 +4094,15 @@ static bool compile_logical_operator(compiler* p_compiler,
+     return false;
+   }
+ 
+-  if (!materialize_into_if_not_register(p_compiler, &rhs.value, p_dest, (ast_node*)p_logical)) {
++  // the rhs must LAND in p_dest (the find of P6 round two): the fall-through
++  // path's result is whatever p_dest holds when the jump did not fire, and
++  // an identifier rhs resolves to its own register without emitting
++  // anything - the loose any-register check let `x or y` print the stale
++  // left value (or unwritten null) instead of y. the ternary's arms already
++  // kept this discipline; the logical lane now matches it. the lhs keeps
++  // the loose read: the jump reads wherever the lhs lives, and the set
++  // writes p_dest from there on the taken path.
++  if (!materialize_into(p_compiler, &rhs.value, p_dest, (ast_node*)p_logical)) {
+     return false;
+   }
+ 
+diff --git a/src/okparser.c b/src/okparser.c
+index c33a825..bd5d65d 100644
+--- a/src/okparser.c
++++ b/src/okparser.c
+@@ -118,19 +118,27 @@ static const parse_rule parse_rules[] = {
+     [TOKEN_ASTERISK] = {NULL, parse_binary_infix, PREC_PRODUCT},
+     [TOKEN_SLASH] = {NULL, parse_binary_infix, PREC_PRODUCT},
+     [TOKEN_MODULO] = {NULL, parse_binary_infix, PREC_PRODUCT},
+-    [TOKEN_CARET] = {NULL, parse_binary_infix, PREC_BITWISE_XOR},
+-    [TOKEN_AMPERSAND] = {NULL, parse_binary_infix, PREC_AND},
+-    [TOKEN_BAR] = {NULL, parse_binary_infix, PREC_OR},
++    // the bitwise four (& | ^ and their compounds) reject at parse: the
++    // operator tables have spelled them since the beginning, but the
++    // compiler never implemented a lane for any of them (the fuzzer's P6
++    // round-two find - `a & b` parsed clean and crashed the internal-bug
++    // lane, `a &= b` tripped the infix dispatcher's assertion). the tokens
++    // stay reserved (the spellings live on in the operator table); when a
++    // ruling lands the lanes, these rules flip back on with real opcodes
++    // behind them. same rejection shape as `<<`, which never had a rule.
++    [TOKEN_CARET] = {NULL, NULL, PREC_NONE},
++    [TOKEN_AMPERSAND] = {NULL, NULL, PREC_NONE},
++    [TOKEN_BAR] = {NULL, NULL, PREC_NONE},
+     [TOKEN_PLUS_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+     [TOKEN_MINUS_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+     [TOKEN_ASTERISK_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+     [TOKEN_SLASH_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+     [TOKEN_MODULO_EQUAL] = {NULL, parse_compound_assign_expression, PREC_ASSIGNMENT},
+-    [TOKEN_CARET_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+-    [TOKEN_AMPERSAND_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+-    [TOKEN_BAR_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+-    [TOKEN_SHIFT_LEFT_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
+-    [TOKEN_SHIFT_RIGHT_EQUAL] = {NULL, parse_binary_infix, PREC_ASSIGNMENT},
++    [TOKEN_CARET_EQUAL] = {NULL, NULL, PREC_NONE},
++    [TOKEN_AMPERSAND_EQUAL] = {NULL, NULL, PREC_NONE},
++    [TOKEN_BAR_EQUAL] = {NULL, NULL, PREC_NONE},
++    [TOKEN_SHIFT_LEFT_EQUAL] = {NULL, NULL, PREC_NONE},
++    [TOKEN_SHIFT_RIGHT_EQUAL] = {NULL, NULL, PREC_NONE},
+     [TOKEN_COMMA] = {NULL, NULL, PREC_NONE},
+     [TOKEN_COLON] = {NULL, NULL, PREC_NONE},
+     [TOKEN_BANG] = {parse_unary_prefix, NULL, PREC_PREFIX},
+diff --git a/tests/e2e/tests/loops/fused_condition_chains.ok b/tests/e2e/tests/loops/fused_condition_chains.ok
+new file mode 100644
+index 0000000..4276941
+--- /dev/null
++++ b/tests/e2e/tests/loops/fused_condition_chains.ok
+@@ -0,0 +1,164 @@
++// the fused condition lane, pass 2: the logical shapes. `X and Y` and
++// `X or Y` in an if/while/for condition compile to a CHAIN of branches
++// (per De Morgan) that never materialize the chain's boolean - the
++// comparisons ride OP_JUMP_IF_CMP with the polarity carrying the sense, the
++// operand that decides the outcome skips the remaining tests, and each leaf
++// costs one branch. `not X` keeps its literal shape (oklang's `!` is
++// bool-strict, so it cannot ride the polarity inversion - see
++// fused_condition_chains_errors.ok for the error-lane pins). this file
++// pins the semantics against the value lane: short-circuit order, side
++// effects, non-bool truthiness, overloaded comparisons in chains, and the
++// for/while window shapes.
++let a = 3;
++let b = 7;
++let n = 4;
++
++// the deciding shapes: either operand deciding decides the branch
++if a < b and b < 10 { print "and-both"; } // expect: and-both
++if a > b and b < 10 { print "and-bad"; }
++if a < 1 and b < 10 { print "and-bad2"; }
++if a > b or b > a { print "or-second"; } // expect: or-second
++if a > b or a > 10 { print "or-bad"; }
++
++// the probing shapes: the left operand deciding means NO branch (its jumps
++// bend to Lend, the position after the chain)
++if a < b or a == 99 { print "or-left-decides"; } // expect: or-left-decides
++if a > b or a == 99 { print "or-bad2"; }
++if a > 99 or a == 3 { print "or-right-decides"; } // expect: or-right-decides
++if (a > b and b > 1) or a == 3 { print "and-under-or"; } // expect: and-under-or
++if (a < b and b < 10) or a == 99 { print "or-under-and"; } // expect: or-under-and
++if (a < 1 and b < 10) or a == 99 { print "or-under-and-bad"; }
++
++// negation keeps its literal shape and still works in every position
++if not (a < b) { print "not-cmp-bad"; } else { print "not-cmp"; } // expect: not-cmp
++if !(a > b) { print "bang-cmp"; } // expect: bang-cmp
++if not not (a < b) { print "double-not"; } // expect: double-not
++let flag = true;
++if not flag { print "not-flag-bad"; } else { print "not-flag"; } // expect: not-flag
++
++// chains of three and more, mixed operators (left associative)
++if a < b and b < 10 and a == 3 { print "and-3"; } // expect: and-3
++if a < b and b < 10 and a == 4 { print "and-3-bad"; }
++if a > b or b > a or a == 99 { print "or-3"; } // expect: or-3
++if a > b or a > 10 or a == 99 { print "or-3-bad"; }
++
++// mixed nesting: and over or, or over and, negation inside chains
++if a < b and (b > 10 or a == 3) { print "and-or"; } // expect: and-or
++if a < b and (b > 10 or a == 4) { print "and-or-bad"; }
++if (a > b or b > a) and a == 3 { print "or-and"; } // expect: or-and
++if (a > b or b > a) and a == 4 { print "or-and-bad"; }
++if a < b and not (b > 10) { print "and-not"; } // expect: and-not
++if not (a > b) or a == 3 { print "not-or-2"; } // expect: not-or-2
++
++// non-comparison leaves ride the generic operand lane
++let t = true;
++let f = false;
++if t and a < b { print "value-and-cmp"; } // expect: value-and-cmp
++if f or a > b { print "value-or-bad"; }
++if f or a < b { print "value-or-cmp"; } // expect: value-or-cmp
++if a < b and t { print "cmp-and-value"; } // expect: cmp-and-value
++// oklang truthiness is lua-shaped: only strict false and null are falsy -
++// 0 is TRUTHY, so these run the then arm through the chain exactly as the
++// value lane would
++if 0 and a < b { print "zero-and"; } // expect: zero-and
++if 1 or a > b { print "one-or"; } // expect: one-or
++
++// calls as chain leaves
++fu truthy() { return true; }
++fu falsy() { return false; }
++if truthy() and a < b { print "call-and-cmp"; } // expect: call-and-cmp
++if falsy() or a > b { print "call-or-bad"; }
++if not falsy() and a < b { print "not-call-and"; } // expect: not-call-and
++
++// short-circuit order and side effects: the right operand must not run
++// when the left decides
++let mut trace = "";
++fu mark_first() { trace = trace + "first"; return true; }
++fu mark_second() { trace = trace + "second"; return true; }
++if mark_first() and mark_second() { trace = trace + "-then"; }
++print trace; // expect: firstsecond-then
++trace = "";
++if mark_first() or mark_second() { trace = trace + "-then"; }
++print trace; // expect: first-then
++trace = "";
++if not mark_first() or mark_second() { trace = trace + "-then"; }
++print trace; // expect: firstsecond-then
++trace = "";
++if mark_first() and not mark_second() { trace = trace + "-then"; } else { trace = trace + "-else"; }
++print trace; // expect: firstsecond-else
++
++// comparison operands in chains keep their evaluation order too
++let mut order = "";
++fu lt_probe(x, y) { order = order + "p"; return x < y; }
++if lt_probe(1, 2) and lt_probe(3, 4) { order = order + "!"; }
++print order; // expect: pp!
++
++// while with a chained condition: runs and exits, locals survive
++let mut i = 0;
++let limit = 4;
++while i < limit and i >= 0 { i = i + 1; }
++print i; // expect: 4
++
++// while with a negated chain (the not node rides the generic leaf)
++let mut j = 0;
++while not (j >= 3 or j < 0) { j = j + 1; }
++print j; // expect: 3
++
++// while with an or chain that stays true too long: the break exits
++let mut k = 0;
++while k < 100 or k < 200 {
++  k = k + 1;
++  if k == 5 { break; }
++}
++print k; // expect: 5
++
++// c-style for with a chained condition
++let mut total = 0;
++for let mut f2 = 0; f2 < 5 and f2 >= 0; f2 = f2 + 1 { total = total + f2; }
++print total; // expect: 10
++
++// c-style for with a negated condition
++let mut g = 0;
++for ; not (g >= 3); g = g + 1 { }
++print g; // expect: 3
++
++// chained conditions over class instances with overloaded comparisons
++class Version {
++  let major = 0;
++  let minor = 0;
++  fu init(major, minor) { this.major = major; this.minor = minor; }
++  pub fu operator <(o) { return major < o.major or (major == o.major and minor < o.minor); }
++  pub fu operator ==(o) { return major == o.major and minor == o.minor; }
++}
++let v1 = Version(1, 0);
++let v2 = Version(1, 0);
++let v3 = Version(2, 1);
++if v1 < v3 and v1 == v2 { print "op-chain"; } // expect: op-chain
++if v3 < v1 or v1 == v3 { print "op-chain-bad"; }
++let mut vc = Version(0, 3);
++let mut steps = 0;
++while vc < v3 and steps < 10 {
++  steps = steps + 1;
++  vc = Version(steps, 3);
++}
++print steps; // expect: 2
++
++// an overloaded comparison returning a NON-BOOL truthy value: the chain's
++// truthiness read must match the value lane exactly (the fused compare
++// consumes the result with is_falsy, exactly like OP_JUMP_IF would)
++class Weird {
++  fu init() { }
++  pub fu operator <(o) { return "definitely"; }
++  pub fu operator >(o) { return 0; }
++}
++let w = Weird();
++if w < 5 { print "weird-truthy"; } // expect: weird-truthy
++if w < 5 and a < b { print "weird-and"; } // expect: weird-and
++if w > 5 or a > b { print "weird-or"; } // expect: weird-or
++print(w < 5); // expect: definitely
++
++// the VALUE lane is untouched: `a or b` is still a, `a and b` is still b
++print(a > b or a); // expect: 3
++print(a < b and b); // expect: 7
++print(flag or "fallback"); // expect: true
++print(f and "fallback"); // expect: false
+diff --git a/tests/e2e/tests/loops/fused_condition_chains_errors.ok b/tests/e2e/tests/loops/fused_condition_chains_errors.ok
+new file mode 100644
+index 0000000..c3d2e5d
+--- /dev/null
++++ b/tests/e2e/tests/loops/fused_condition_chains_errors.ok
+@@ -0,0 +1,31 @@
++// the fused condition lane, pass 2 - the negation error pins. oklang's `!`
++// is bool-STRICT (perform_not: numbers and objects are type errors), so a
++// negated condition CANNOT ride the chain's polarity inversion: `not (x < y)`
++// with an overloaded comparison returning a non-bool must error exactly as
++// the value lane does, and `not <non-bool>` must keep its runtime error.
++// these pins hold the chain to that exactness.
++let a = 3;
++let zero = 0;
++
++// `not` over a non-bool value: the runtime type error stands
++if not zero { print "unreachable"; } // expect error: invalid operand for unary '!'
++
++// `not` over an overloaded comparison returning a non-bool truthy value:
++// the chain must not swallow the error by branching on truthiness instead
++class Weird {
++  fu init() { }
++  pub fu operator <(o) { return "definitely"; }
++  pub fu operator >(o) { return 0; }
++}
++let w = Weird();
++if not (w < 5) { print "unreachable"; } // expect error: invalid operand for unary '!'
++
++// the same shape through the while window
++let mut i = 0;
++while not (w > 5) { i = i + 1; } // expect error: invalid operand for unary '!'
++
++// and inside an and-chain: the right operand's error still surfaces
++if a < 10 and not (w < 5) { print "unreachable"; } // expect error: invalid operand for unary '!'
++
++// the value lane agrees (the error is not chain-specific)
++print(not (w < 5)); // expect error: invalid operand for unary '!'
+diff --git a/tests/e2e/tests/operators/errors/bitwise_reject.ok b/tests/e2e/tests/operators/errors/bitwise_reject.ok
+new file mode 100644
+index 0000000..c153863
+--- /dev/null
++++ b/tests/e2e/tests/operators/errors/bitwise_reject.ok
+@@ -0,0 +1,17 @@
++// the bitwise tokens reject at parse: the operator tables have spelled
++// & | ^ (and their compounds) since the beginning, but no compile lane was
++// ever implemented for them - before the P6 round-two fix, `a & b` parsed
++// clean and crashed the compiler's internal-bug lane, and `a &= b` tripped
++// the infix dispatcher's assertion. they now reject exactly like `<<`
++// (which never had a parse rule); the spellings stay reserved in the
++// operator table for the day a ruling lands them real lanes.
++let mut a = 5;
++let b = 2;
++a & b; // expect error: expected ';'
++a | b; // expect error: expected ';'
++a ^ b; // expect error: expected ';'
++a &= b; // expect error: expected ';'
++a |= b; // expect error: expected ';'
++a ^= b; // expect error: expected ';'
++a <<= b; // expect error: expected ';'
++a >>= b; // expect error: expected ';'
+diff --git a/tests/e2e/tests/operators/logical.ok b/tests/e2e/tests/operators/logical.ok
+index 392d967..776107e 100644
+--- a/tests/e2e/tests/operators/logical.ok
++++ b/tests/e2e/tests/operators/logical.ok
+@@ -44,3 +44,37 @@ print(1 and 2 and 3); // expect: 3
+ print(null and 2 and 3); // expect: null
+ // 0 is truthy, so the chain stops at 0
+ print(null or 0 or 7); // expect: 0
++// identifier operands (the P6-round-two find): an identifier rhs resolves
++// to its own register without emitting anything, so the fall-through path
++// must explicitly land it in the result register - before the fix these
++// printed the stale left value (or unwritten null)
++let x = false;
++let y = 42;
++print(x or y); // expect: 42
++print(x and y); // expect: false
++print(true and y); // expect: 42
++print(false or y); // expect: 42
++print(y or x); // expect: 42
++print(y and x); // expect: false
++let a = 3;
++let b = 7;
++print(a > b or a); // expect: 3
++print(a < b and b); // expect: 7
++print(a < b or b); // expect: true
++print(a > b and a); // expect: false
++// the same shapes inside a larger expression
++print((x or y) + 1); // expect: 43
++print(not (x or x)); // expect: true
++// and as a call argument (the window discipline)
++fu echo(v) { return v; }
++print(echo(x or y)); // expect: 42
++print(echo(y and x)); // expect: false
++// upvalue and global homes for the lazy rhs (a lambda capture, a glob)
++glob let g = 9;
++fu capture() {
++  let u = 5;
++  return fu() { return x or u; };
++}
++print(capture()()); // expect: 5
++print(x or g); // expect: 9
++print(g and x); // expect: false
+diff --git a/tests/fuzz/corpus/checksums b/tests/fuzz/corpus/checksums
+index 6c70506..4806c51 100644
+--- a/tests/fuzz/corpus/checksums
++++ b/tests/fuzz/corpus/checksums
+@@ -5,6 +5,7 @@
+ # or a mangled landing - run crosscheck.sh to settle both.
+ fnv1a64 1f35eef0788e9b2a class_shapes.ok
+ fnv1a64 635abcf17bc08623 comments_only.ok
++fnv1a64 44c65e845a8da819 condition_chains.ok
+ fnv1a64 b485e1927d57b66b coroutines.ok
+ fnv1a64 25aa92676f596cc7 deep_blocks.ok
+ fnv1a64 6f3f1244ed271c43 deep_parens.ok
+@@ -15,7 +16,7 @@ fnv1a64 9d3edeaa4c650bd6 fstring_chain.ok
+ fnv1a64 fe018a1ec808ecf7 invalid_utf8.bin
+ fnv1a64 ee55bdfdff37bedb modules.ok
+ fnv1a64 93cd53309a16da5b numbers.ok
+-fnv1a64 c770bbd0b78ad6a9 operators.ok
++fnv1a64 2e65a856fdc179da operators.ok
+ fnv1a64 223311471f71c209 strings_multiline.ok
+ fnv1a64 1cc87409902bd746 tailcalls.ok
+ fnv1a64 933397058c73a3b0 unterminated.ok
+diff --git a/tests/fuzz/corpus/condition_chains.ok b/tests/fuzz/corpus/condition_chains.ok
+new file mode 100644
+index 0000000..107fe0d
+--- /dev/null
++++ b/tests/fuzz/corpus/condition_chains.ok
+@@ -0,0 +1,21 @@
++// the condition chain lane's shapes: and/or chains with comparison,
++// value, and call leaves; negation in every position (the bool-strict
++// op stays literal); while/for windows; overloaded comparisons returning
++// non-bools - one seed the mutations can remix.
++let a = 3;
++let b = 7;
++let flag = true;
++if a < b and b < 10 { print("and-both"); }
++if a > b or b > a { print("or-second"); }
++if a < b or a == 99 { print("or-probe"); }
++if not (a > b and b < 10) { print("not-and"); }
++if not flag { print("no"); } else { print("not-flag"); }
++if flag and a < b and not (b > 10) { print("mixed"); }
++fu probe(x) { return x; }
++if probe(a) < b or probe(b) < a { print("call-leaf"); }
++let mut i = 0;
++while i < 4 and i >= 0 { i = i + 1; }
++while not (i >= 3 or i < 0) { i = i + 1; }
++for let mut f = 0; f < 3 and f >= 0; f = f + 1 { print(f); }
++print(a < b or a);
++print(a > b and b);
+diff --git a/tests/fuzz/corpus/operators.ok b/tests/fuzz/corpus/operators.ok
+index a118e78..32a363a 100644
+--- a/tests/fuzz/corpus/operators.ok
++++ b/tests/fuzz/corpus/operators.ok
+@@ -4,3 +4,12 @@ let c = a == b != 1 === 2 !== 3 < 4 <= 5 > 6 >= 7;
+ let d = !c && true || false;
+ let e = a ?? b;
+ print(-a);
++let mut bits = 5;
++bits & 3;
++bits | 3;
++bits ^ 3;
++bits &= 3;
++bits |= 3;
++bits ^= 3;
++bits <<= 3;
++bits >>= 3;
+diff --git a/tests/fuzz/crosscheck-manifest.txt b/tests/fuzz/crosscheck-manifest.txt
+index b5185ec..eb34011 100644
+--- a/tests/fuzz/crosscheck-manifest.txt
++++ b/tests/fuzz/crosscheck-manifest.txt
+@@ -249,6 +249,8 @@ accept  loops/for/nested_break.ok
+ accept  loops/for/nested_continue.ok
+ accept  loops/for/one_iter.ok
+ accept  loops/for/zero_iter.ok
++accept  loops/fused_condition_chains.ok
++accept  loops/fused_condition_chains_errors.ok
+ accept  loops/fused_conditions.ok
+ accept  loops/numeric/basic.ok
+ accept  loops/numeric/bounds_evaluated_once.ok
+@@ -527,6 +529,7 @@ accept  operators/assignment.ok
+ accept  operators/chain.ok
+ accept  operators/comparison.ok
+ accept  operators/equality.ok
++reject  operators/errors/bitwise_reject.ok  (parse)
+ accept  operators/errors/modulo_invalid.ok
+ accept  operators/errors/modulo_zero.ok
+ accept  operators/grouping.ok
+@@ -691,6 +694,7 @@ accept  variables/use_before_decl_error.ok
+ # root: tests/fuzz/corpus
+ reject  class_shapes.ok  (parse)
+ accept  comments_only.ok
++accept  condition_chains.ok
+ reject  coroutines.ok  (parse)
+ reject  deep_blocks.ok  (parse)
+ reject  deep_parens.ok  (parse)
+-- 
+2.47.3
+

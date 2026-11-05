@@ -13,6 +13,13 @@ on:
         description: "oklang ref to bench (codeberg)"
         required: false
         default: "master"
+  # the bench bridge (P6 round two): a cadence that watches the oklang
+  # landing branch and benches each NEW tip exactly once. the gate job
+  # below skips the run when the tip was already benched, so the schedule
+  # costs a git ls-remote when nothing moved. 17 past the hour, every 6h,
+  # off the top-of-hour load.
+  schedule:
+    - cron: "17 */6 * * *"
 
 permissions:
   contents: write
@@ -23,7 +30,50 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # the bridge gate: for scheduled runs, resolve the oklang landing branch's
+  # tip and compare it with the last published run's sha (bench/results/
+  # run-info.txt). push- and dispatch-triggered runs pass through - they are
+  # human intent, the gate only exists to keep the cadence idempotent.
+  bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      oklang_ref: ${{ steps.gate.outputs.oklang_ref }}
+    steps:
+      - name: checkout collab (for the last run-info)
+        uses: actions/checkout@v4
+      - name: gate
+        id: gate
+        env:
+          BRIDGED_REF: reconciliation
+        run: |
+          if [[ "${{ github.event_name }}" != "schedule" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "oklang_ref=${{ inputs.oklang_ref || 'master' }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tip="$(git ls-remote https://codeberg.org/qais/oklang.git "refs/heads/${BRIDGED_REF}" | cut -f1)"
+          if [[ -z "$tip" ]]; then
+            echo "ls-remote came back empty; running anyway (fail open)"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "oklang_ref=${BRIDGED_REF}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          prev="$(sed -n 's/^oklang_ref:.*(\([0-9a-fA-F]\{7,40\}\)).*$/\1/p' bench/results/latest/run-info.txt 2>/dev/null | head -1)"
+          if [[ "$tip" == "$prev" ]]; then
+            echo "${BRIDGED_REF} tip ${tip:0:7} already benched; skipping"
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "oklang_ref=${BRIDGED_REF}" >> "$GITHUB_OUTPUT"
+          else
+            echo "${BRIDGED_REF} moved: ${prev:-none} -> ${tip:0:7}; benching"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "oklang_ref=${BRIDGED_REF}" >> "$GITHUB_OUTPUT"
+          fi
+
   bench:
+    needs: bridge
+    if: always() && needs.bridge.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -48,7 +98,7 @@ jobs:
           git clone --depth 1 --branch "${OKLANG_REF}" \
             https://codeberg.org/qais/oklang.git /tmp/oklang
         env:
-          OKLANG_REF: ${{ inputs.oklang_ref || 'master' }}
+          OKLANG_REF: ${{ needs.bridge.outputs.oklang_ref }}
 
       - name: record ref
         run: echo "OKLANG_SHA=$(git -C /tmp/oklang rev-parse HEAD)" >> "$GITHUB_ENV"
@@ -89,6 +139,10 @@ jobs:
       - name: combine markdown
         working-directory: bench
         run: python3 combine.py -s results/_staging -o results/_staging/combined.md -e .md
+
+      - name: baseline diff (the advisory column)
+        working-directory: bench
+        run: python3 baseline-diff.py results/_staging
 
       - name: generate plots
         working-directory: bench

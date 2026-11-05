@@ -1,6 +1,16 @@
 # ROADMAP 0.9.0 — the last pre-v1 wave (draft, round one folded)
 
 status: DRAFT, round one complete (2026-11-04), round two folded. 2026-11-05
+(session 49): P6 ROUND TWO delivered (patch 63: the condition chains -
+and/or per De Morgan through the fused compare+jump, negation kept
+literal for the bool-strict `!`; TWO standing-branch finds fixed - the
+value-lane `x or y` rhs miscompile live since the register rewrite, and
+the bitwise tokens' crash lanes, the fuzzer's find). the measurement's
+verdict: delta blue FLAT (~1.35x, run noise), the GC census answers the
+round-one suspects (zero bound methods - OP_INVOKE covers every call;
+two collections per run - incremental GC DEFERRED ON DATA), and the
+bench bridge + baseline column now run delta_blue in CI (the pair
+lane). 2026-11-05
 (session 48): P6 ROUND ONE delivered (patch 62: OP_TAILCALL + the
 member-store fix; the pub-fields bench rewrite re-baselined delta blue
 from 1.93x to 1.35x of wren). 2026-11-05
@@ -473,11 +483,24 @@ one session each, gated by the full matrix every time:
   flushed out and fixed a pre-existing member-store miscompile),
   OP_TAILCALL (the frame hands over in place; a million mutual
   tailcalls ride one frame slot), the regen door's ordering fix.
-  ROUND TWO REMAINS: compare+jump fusion pass 2 (the and/or comparison
-  operands + negated conditions), allocation shaving against the NEW
-  baseline, the bench bridge trigger + the baseline column — and the
-  incremental GC attempt (or its measured deferral, with data) rides
-  the same patch's measurement bar.
+  ROUND TWO LANDED (patch 63): the condition chains (and/or per De
+  Morgan through the fused lane; negation kept literal — oklang's `!`
+  is bool-strict, the S-flag's inversion would swallow the error
+  lane), two standing-branch finds fixed (the `x or y` value-lane rhs
+  miscompile from the register rewrite; the bitwise tokens' crash
+  lanes -> parse rejection, real bitwise lanes stay Q's OPEN ruling),
+  and the measurement's verdict: delta blue FLAT (conditions were
+  never the profile), the census answers the suspects (zero bound
+  methods; two collections per run), the bench bridge + baseline
+  column run delta_blue in CI. the INCREMENTAL GC question is
+  ANSWERED BY DATA: DEFERRED — at the exponential trigger's cadence
+  the stop-the-world cost is noise against the barriers' certain tax
+  on every field store; revisit only for interactive hosts and only
+  behind a live-heap-aware trigger (the counter never shrinks
+  today).
+  WHAT REMAINS OF P6: a perf profile of the residual ~1.3x (dispatch
+  machinery — the census rules out GC and conditions), if Q wants
+  the number pushed before v1.
 - P7 as a slot DISSOLVES into P5 + P6 above; the leftovers the next
   round decides stay collected in the worklog.
 

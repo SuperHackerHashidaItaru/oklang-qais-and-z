@@ -135,3 +135,43 @@ The multiplication/division benchmarks use a factor of `1.0000001` over two mill
 ## Validation checklist
 
 Before comparing results, run each `.ok` file once with `./ok` and verify the output. In particular, check numeric-for step semantics, array `push`/indexing, `for-in`, and each compound operator. Run with 10 measured runs for exploration and 20+ for final comparisons.
+
+## The bench bridge and the baseline column (P6 round two)
+
+The `benches` workflow now watches the oklang landing branch, not just this
+repo. Two additions:
+
+- **The bridge trigger.** A `schedule` cadence (every 6h, :17 past the hour)
+  resolves the tip of oklang's `reconciliation` branch on Codeberg and
+  compares it with the sha recorded in `bench/results/latest/run-info.txt`.
+  A moved tip gets one full bench run and publish; an already-benched tip
+  costs a single `git ls-remote` and skips. Push- and dispatch-triggered
+  runs bypass the gate - they are human intent. When the landing branch
+  changes after v1, update `BRIDGED_REF` in the workflow.
+- **The baseline column.** Every run publishes `baseline-diff.md`: current
+  medians against the pins in `bench/baseline.json` (first pin: the
+  2026-11-04T09:17 runner, oklang `0666651`, 36 benchmarks - three
+  same-week runs agreed within ~2%). The column is advisory, never a gate:
+  GitHub runners of the same nominal class wobble a few percent across
+  instances, so read shapes (a 30% jump is a signal, a 4% wiggle is noise).
+  Observed already: the 2026-11-04T09:38 run (published as `latest/` at
+  pin time) measured ~2x faster than the three consistent runs across
+  EVERY target including lua and python - that is the machine, not the
+  code. A delta that moves all four targets together is an instance-class
+  artifact; a delta that moves only the oklang column is the landing. The
+  re-baseline door is deliberately manual - an auto-moving baseline can
+  never catch a regression:
+
+  ```bash
+  python3 bench/baseline-diff.py --write bench/results/latest
+  ```
+
+  Review the diff, then commit `baseline.json` alongside the results it
+  came from.
+
+`delta_blue` (the P6 flagship, `.ok`/`.py`/`.wren`, no lua port exists in
+wren's repo) is now part of the suite under the pair lane: a `.py`
+companion admits a benchmark, the lua column simply drops when no `.lua`
+exists. It is listed in `classes-benches.txt`, so the probe skips it on
+builds that do not speak classes. Its first bridged run will show
+`baseline: —` until the next manual re-pin.
