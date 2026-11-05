@@ -2831,3 +2831,8 @@ session holds. the roadmap's series section is re-densed accordingly
   bench bridge trigger + baseline column (collab CI side), and the
   incremental GC attempt behind its bar - or its measured deferral,
   with data. the portability lane stays recorded, stays untouched.
+  - the relic dodge (session 48's own): the rewrite first landed in
+    oklang-qais-and-z/ (the STALE RELIC clone the sandbox bench script
+    happened to point at) - caught in the push receipt (5 files, no
+    bench/), ported to the LIVE collab/bench as 4c30b14, and the
+    sandbox script repointed. the relic stays untouched from now on.
