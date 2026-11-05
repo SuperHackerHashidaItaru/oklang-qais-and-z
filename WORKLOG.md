@@ -2678,3 +2678,70 @@ session holds. the roadmap's series section is re-densed accordingly
   re-baseline, compare+jump fusion, allocation shaving, OP_TAILCALL,
   the bench bridge + baseline column, the incremental GC attempt
   behind its bar). sys.args/name/err remain ruled-in-unscheduled.
+
+## session 47 (2026-11-05): the first drift, and the corpus becomes pinned (61)
+
+- context: Q confirmed P5's landing ("okay, accepted and pushed to
+  reconciliation"). re-grounded per protocol: fetch, log, drift check.
+- the 4ad2cbd receipt - THE FIRST DRIFT IN FIVE LANDINGS: Q's
+  "parsser hardne + fuzz + better cli (repl)" is 36c0b75's content
+  except ONE file - tests/fuzz/corpus/invalid_utf8.bin, where the
+  seed's genuinely-invalid bytes (the ff fe pair, the truncated lone
+  c3) arrived as ef bf bd - U+FFFD, one replacement char per byte,
+  the signature of a WHATWG-style replacement decoder somewhere in
+  Q's application route this time. the damage was LIVE, not cosmetic:
+  the mangled seed parses clean, so okfuzz --crosscheck on Q's tree
+  says accept while the committed manifest pins reject (parse) - the
+  patch-16 discipline broken on reconciliation, silently, until a
+  sweep runs. (the byte-identical streak proves the medium CAN pass
+  raw bytes - patch 54's gate_malformed.ok ff and gate_overlong.ok
+  c0 80 landed intact - so the route differed this round. the route
+  is Q's to choose; the class is ours to kill.)
+- patch 61, the corpus integrity lane: the moment the fuzzer committed
+  a corpus, the corpus became an integrity-critical input - now it is
+  pinned like one.
+  - tests/fuzz/corpus/gen.sh: the binary seeds regenerate from
+    pure-ascii octal escapes. the escapes are the source of truth,
+    the committed bytes the cache, the healer idempotent. the medium
+    between us never gets the last word again.
+  - tests/fuzz/corpus/checksums: fnv1a64 per seed (16 pins, walk
+    order, comment header) - not cryptography, a tripwire; accidental
+    mangling moves it essentially never.
+  - okfuzz --checksums <dir>: the regen lane (data to stdout, summary
+    to stderr). BOTH consuming lanes - the fuzz loop and --crosscheck
+    - verify the pins at corpus load: a seed whose bytes moved, a
+    seed nobody pinned, a pin naming a missing seed - three failure
+    shapes, all loud, all naming the file, all carrying the command
+    that settles it.
+  - crosscheck.sh: the one regen door - gen.sh heals FIRST, then
+    manifest + checksums regenerate together.
+  - the manifest catch-up: this lane's own regen found patch 60's
+    delivery staleness - the 8 repl fixtures shipped in the e2e tree
+    but never registered in the committed manifest (698 -> 706 lines;
+    4 intentional rejects, the continuation-shaped entries; nothing
+    on Q's side consumed the manifest bidirectionally yet, so it was
+    latent, not live).
+- receipts: builds 9/9, e2e 603/603 x7, unit + embed 5x3, capi 334x5,
+  cli 10/10, fuzz x2 - gcc == asan == the session-46 line to the byte
+  (47702 diagnostics, 0 unlocated), delta blue correct 1.40654e7 at
+  1.93x/1.87x - flat (run noise; no library code moved). the negative
+  lanes: Q's exact mangling reproduced in /tmp -> the tripwire fires
+  (exit 70, file named, both hashes, the gen.sh command) -> gen.sh
+  heals -> green; an unpinned rogue seed -> fatal with the regen
+  hint. the full simulation on a 4ad2cbd worktree: patch 61 applies
+  clean (--check dry run first), gen.sh runs, and `git diff` against
+  8a5a015 is EMPTY - zero drift restored through Q's exact path. the
+  patch itself is pure ascii end to end (iconv-verified): no landing
+  medium, however lossy, can change what it says.
+- Q's three steps: apply 61, run `bash tests/fuzz/corpus/gen.sh`,
+  commit the healed seed (the drift receipt closes with that commit).
+- delivered: patches/61-corpus-integrity-lane.patch (mirrored in
+  download/), its README entry, the roadmap's P5-landed-on-4ad2cbd
+  marker, Z-GUIDE's perishable section refreshed, this entry.
+- next: P6 the measurement patch (delta blue's pub-fields rewrite +
+  re-baseline, compare+jump fusion, allocation shaving, OP_TAILCALL,
+  the bench bridge + baseline column, the incremental GC attempt
+  behind its bar) - the tree goes green FIRST, then the measurement
+  runs on a clean baseline. sys.args/name/err remain
+  ruled-in-unscheduled. the portability lane stays recorded, stays
+  untouched.

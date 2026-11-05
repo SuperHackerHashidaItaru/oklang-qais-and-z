@@ -1475,3 +1475,50 @@ x2 (20k inputs, 47702 diagnostics, 0 unlocated, gcc == asan
 byte-identical), delta blue correct 1.40654e7 at 1.92x/1.87x —
 flat, the hot paths untouched. replay: applies clean on bb740c0
 and the result is byte-identical (diff empty).
+
+## 61-corpus-integrity-lane.patch
+
+what happened: P5 landed as Q's 4ad2cbd — and for the first time in
+five landings the drift check was NOT empty. one file:
+tests/fuzz/corpus/invalid_utf8.bin, whose genuinely-invalid bytes
+(the ff fe pair, the truncated lone c3) arrived as ef bf bd —
+U+FFFD, one replacement char per byte, the signature of a WHATWG-
+style replacement decoder in the application route. the damage was
+live, not cosmetic: the mangled seed parses clean, so the native
+crosscheck on Q's tree says accept while the committed manifest
+pins reject (parse) — the patch-16 discipline broken, silently.
+(patch 54's raw ff and c0 80 landed intact, so the medium CAN pass
+bytes; the route differed this round. the route is Q's to choose —
+the class is ours to kill.)
+
+the answer, whole:
+- tests/fuzz/corpus/gen.sh — the binary seeds regenerate from
+  pure-ascii octal escapes, idempotently. the escapes are the
+  source of truth, the committed bytes the cache. the medium
+  between us never gets the last word again.
+- tests/fuzz/corpus/checksums — fnv1a64 per seed, 16 pins, walk
+  order. not cryptography: a tripwire. accidental mangling moves
+  it essentially never.
+- okfuzz --checksums <dir> — the regen lane; and BOTH consuming
+  lanes (the fuzz loop, --crosscheck) verify the pins at corpus
+  load: bytes moved / seed unpinned / pin naming a missing seed —
+  three failure shapes, all loud, all naming the file, all
+  carrying the command that settles it.
+- crosscheck.sh — the one regen door: gen.sh heals FIRST, then
+  manifest + checksums regenerate together.
+- the manifest catch-up: this lane's own regen found that patch 60
+  shipped the 8 repl fixtures unregistered (698 -> 706 lines; 4
+  intentional rejects — the continuation-shaped entries).
+
+Q's three steps after applying: run
+`bash tests/fuzz/corpus/gen.sh`, commit the healed seed (plus the
+patch's own files), and the trees are byte-identical again —
+simulated end-to-end on a 4ad2cbd worktree: apply clean, heal,
+`git diff` empty.
+
+gates on its head: builds 9/9, e2e 603/603 x7, unit + embed 5x3,
+capi 334x5, cli 10/10, fuzz x2 — byte-identical to session 46's
+line (47702 diagnostics, 0 unlocated, gcc == asan), delta blue
+correct 1.40654e7 at 1.93x/1.87x, flat. the patch is pure ascii
+end to end (iconv-verified) — no landing medium, however lossy,
+can change what it says.

@@ -1,6 +1,11 @@
 # ROADMAP 0.9.0 — the last pre-v1 wave (draft, round one folded)
 
 status: DRAFT, round one complete (2026-11-04), round two folded. 2026-11-05
+(session 47): P5 landed on reconciliation (Q's 4ad2cbd) carrying the FIRST
+DRIFT in five landings — the invalid-utf-8 corpus seed mangled to U+FFFD
+by the landing medium, verdict silently flipped; patch 61 (the corpus
+integrity lane) answers the class: gen.sh + fnv1a64 checksums + load-time
+verification. 2026-11-05
 (session 46): P1-P5 LANDED (patches 53-60; P5 delivered whole — hardening +
 fuzzer + cross-check + REPL, with the fuzzer's four pre-existing bug finds
 fixed), the PORTABILITY LANE recorded (pure c99 at compile time, lua-shaped,
@@ -438,7 +443,7 @@ one session each, gated by the full matrix every time:
   uncatchable OK_EK_EXIT lane (OK_EXITED + ok_exit_code public) + 21
   fixtures + the runners' `// expect exit:` lane + capi +9 (the
   sandbox lane got its first real HOST consumers).
-- **P5**: LANDED (patch 60, awaiting Q's hand) — the front-door patch,
+- **P5**: LANDED on reconciliation as Q's 4ad2cbd — the front-door patch,
   condensed with P7's REPL round. the four hardening classes (the parse
   arena, the shared 200 depth funnel, the 25-report cap, nesting-aware
   statement-boundary recovery; bounded peek/eat closed by audit) + the
@@ -451,7 +456,13 @@ one session each, gated by the full matrix every time:
   auto-print of lone expressions with `;` suppression, nesting-aware
   multi-line continuation, glob persistence - the repl invents nothing,
   `glob` survives the entry, plain `let` and imports are per-entry).
-  continuation — POSIX termios, CLI layer only).
+  the landing carried the FIRST DRIFT in five landings - the medium
+  replaced the invalid-utf-8 corpus seed's bytes with U+FFFD, flipping
+  its pinned verdict - answered by patch 61, the corpus integrity lane
+  (gen.sh ascii-escape healer, fnv1a64 checksums verified at corpus
+  load, crosscheck.sh the one regen door): apply 61, run
+  `bash tests/fuzz/corpus/gen.sh`, commit the healed seed, and the
+  trees are byte-identical again (simulated on 4ad2cbd: empty diff).
 - **P6** (condensed with P7's GC question — the measurement patch):
   optimization round 1 — delta blue's pub-fields rewrite + re-baseline,
   compare+jump fusion, allocation shaving, OP_TAILCALL, the bench

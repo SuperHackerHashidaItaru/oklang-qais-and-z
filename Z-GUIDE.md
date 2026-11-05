@@ -52,15 +52,25 @@ source of truth: `https://codeberg.org/qais/oklang`, master at `9ad153c`,
 **tagged v0.1.0**. the `register` branch is history — deletion pending Q's
 confidence, don't touch it.
 
-current phase [perishable — refresh at round end] (nov 5, session 46):
+current phase [perishable — refresh at round end] (nov 5, session 47):
 the 0.9.0 wave (Reconciliation) is 5/7 landed, the series CONDENSED
-per Q's ruling. P1-P4 landed through bb740c0 (Q's "fs/sys/en";
-zero-drift verified, the fourth byte-identical landing in a row).
-patch 60 (P5, the front-door patch, delivered WHOLE) is DELIVERED
-as 36c0b75 on the sandbox clone's reconciliation, one over bb740c0,
-awaiting Q's hand — gates on its head: e2e 603x7 (585 → 603), capi
-334x5, the NEW fuzz lane x2 (20k inputs, 0 unlocated, gcc == asan),
-delta flat at 1.92x/1.87x. P5 carried: the four hardening classes
+per Q's ruling. P1-P5 landed: P5 is Q's 4ad2cbd ("parsser hardne +
+fuzz + better cli (repl)") — the FIRST landing with drift: the
+medium replaced the invalid-utf-8 corpus seed's bytes with U+FFFD,
+silently flipping its crosscheck verdict (accept vs the committed
+reject). patch 61 (the corpus integrity lane) is DELIVERED as 8a5a015
+on the sandbox clone's reconciliation, one over 36c0b75: gen.sh (the
+binary seeds regenerate from pure-ascii octal escapes — the healer),
+tests/fuzz/corpus/checksums (fnv1a64 pins), okfuzz --checksums +
+load-time verification in both consuming lanes (mismatch/unpinned/
+pin-without-seed all fail loudly naming the file), crosscheck.sh as
+the one regen door (heals first), and the manifest catching up the
+8 repl fixtures patch 60 shipped unregistered. after Q applies 61 and
+runs `bash tests/fuzz/corpus/gen.sh`, the trees are byte-identical
+again — the simulation on 4ad2cbd proved the empty diff. gates on
+8a5a015's head: e2e 603x7, capi 334x5, fuzz x2 byte-identical to
+session 46 (47702 diagnostics, 0 unlocated), delta flat 1.93x/1.87x.
+P5 carried: the four hardening classes
 (parse arena, 200 depth funnel, 25-report cap, statement-boundary
 recovery), the zero-dep fuzzer + committed corpus + the okdiag-sink
 location bar (which found FOUR pre-existing bugs day one, all fixed:
