@@ -66,8 +66,9 @@ in-language timers agree (wren System.clock 0.126s, python process_time
 ## files
 
 - `benchmarks/delta_blue.ok` — the port (see its header for the mechanical
-  mapping notes: then/otherwise ternary, accessor methods, pop/push,
-  exclusive-range loops, the no-floor note).
+  mapping notes: then/otherwise ternary, pub fields for wren's properties
+  since the P6 rewrite, pop/push, exclusive-range loops, the no-floor
+  note).
 - `benchmarks/delta_blue.wren`, `benchmarks/delta_blue.py` — borrowed
   verbatim from wren's repo (upstream license headers retained).
 - `delta_blue_bench.py` — the runner (env-overridable paths, cross-check
@@ -83,3 +84,46 @@ in-language timers agree (wren System.clock 0.126s, python process_time
 - a possible `class_field_loop`-style companion with fields accessed
   ring-internally (no accessors) to isolate how much of the 1.9x is the
   accessor tax vs the allocation tax.
+
+## re-baseline (2026-11-05, session 48): the pub-fields rewrite
+
+the finding above became the fix: patch 51 had already opened the ring
+(`pub let`), and P6's first move rewrote the port to use it — every
+cross-class accessor call (`v.mark()`, `out.set_walk_strength(...)`,
+`this.strength()`) became the direct field access wren's original uses
+(`v.mark_`, `out.walk_strength_ = ...`, `strength_`). the rewrite is a
+mechanical transformation of the committed file (statement orders,
+overrides, and the load-bearing `init` orders all preserved — the
+ScaleConstraint constructor assigns its fields BEFORE super, because the
+construction chain dispatches into overrides that read them); the diff is
+237 lines, every one an accessor-to-field shape change. output unchanged:
+1.40654e+07, byte for byte.
+
+the rewrite also found a real compiler bug on its first run:
+`obj.field = <call-shaped rhs>` miscompiled — the member store's staged
+receiver sat inside the call rhs's callee register window and was
+null-filled before the store read it (the subscript lane had the
+discipline; the member lane did not). patch 62 fixes it with the same
+fresh-rhs-temp rule, plus the regression fixture and the fuzz seed.
+
+| engine | median (before) | median (after) | delta |
+|---|---:|---:|---|
+| ok (release, -O2) | 249.7 ms | 176.1 ms | -29.5% |
+| ok (release, threaded dispatch) | 243.3 ms | 173.4 ms | -28.7% |
+| wren_cli | 129.5 ms | 130.4 ms | reference |
+| python3 | 201.9 ms | 204.2 ms | — |
+
+relative to wren: **ok 1.35x slower (was 1.93x), ok-threaded 1.33x (was
+1.88x)**. the accessor tax was ~30% of the whole benchmark. patch 62's
+OP_TAILCALL lane landed in the same window and delta blue did not move
+(the benchmark has no tail-shaped returns) — the numbers above are the
+new standing baseline for the remaining P6 passes (fusion pass 2,
+allocation shaving, the GC question).
+
+honest notes: (1) the remaining 1.35x is now dominated by what PERF-PASS-1
+already named — instantiate + operator + poly-dispatch + short-call churn
+(the allocation-shaped profile); the shaving pass has its work cut out.
+(2) sandbox absolute values wobble ~3% run to run; ratios were stable
+across sessions. (3) `Strength.value_` reads inside Strength's own
+statics were already ring-legal; the pub is for uniformity with the
+Variable surface, not necessity.
