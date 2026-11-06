@@ -1,8 +1,21 @@
-# patches — the staging area
+# patches — the staging area (FROZEN, session 50)
 
-deliverables awaiting Q's review + hand-application live here, newest last,
-stacked in apply order. **when Q applies + pushes, they move to
-`archive/patches/` and this dir empties.**
+**This directory is now permanently empty.** Every patch ever staged here —
+17 through 63 — landed on Codeberg reconciliation and moved to
+`archive/patches/`, per this dir's own convention. The era is closed: Q
+takes the project back via a self-rewrite (the plan, method, dossiers, and
+git recipe live in `download/oklang-self-rewrite-guide.pdf` at the sandbox
+root and in the final session's worklog entry); this mirror freezes as the
+reference library — patches, worklog, docs. Nothing lands from here again.
+
+The entries below are kept as the historical index: 63 patches with their
+what/why/blast-radius and verification receipts. Read them like you read a
+design doc — rung two of the reference ladder in the rewrite guide.
+
+deliverables awaiting Q's review + hand-application USED TO live here,
+newest last, stacked in apply order. **when Q applied + pushed, they moved
+to `archive/patches/` and this dir emptied — which is why it is empty
+now, and forever.**
 
 1. `17-map-core-and-globals-store.patch` — vs v0.1.0 (Credence, `9ad153c`).
    the 0.2.0 maps series, patch A of three (plan + rulings:

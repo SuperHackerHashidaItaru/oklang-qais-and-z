@@ -52,40 +52,31 @@ source of truth: `https://codeberg.org/qais/oklang`, master at `9ad153c`,
 **tagged v0.1.0**. the `register` branch is history — deletion pending Q's
 confidence, don't touch it.
 
-current phase [perishable — refresh at round end] (nov 5, session 49):
-the 0.9.0 wave (Reconciliation) is 6/7 landed, P6 two rounds in. patch
-62 landed ZERO-DRIFT (Q's 4c0dc5a "tailcalls" + 5b3714d "run gen" -
-the healed seed - is 934e4bc's content byte-identical, diff empty).
-patch 63 (P6 round two) is DELIVERED as 6c6cee3 on the sandbox clone's
-reconciliation: the condition chains (and/or per De Morgan through the
-fused compare+jump, p as the sense - the S-flag proved unnecessary;
-negation kept literal because oklang's `!` is bool-strict, inversion
-would swallow the error lane), the value-lane `x or y` rhs miscompile
-fix (live since the register rewrite - an identifier rhs skipped the
-move into p_dest; `print(x or y)` printed null), and the bitwise
-tokens' crash lanes turned parse rejections (the fuzzer's find; real
-bitwise lanes are Q's OPEN ruling). the measurement: delta blue FLAT
-1.38x/1.32x (conditions were never the profile; checksum intact), the
-GC census (two collections per run, exponential trigger, zero bound
-methods in the death list) answers the round-one suspects and DEFERS
-incremental GC on data. with it, on the collab side: the bench bridge
-(SHA-gated schedule watching reconciliation's tip), the baseline
-column (baseline.json pinned from the consistent 11-04 runner,
-baseline-diff.py advisory + manual re-pin door; NOTE the observed ~2x
-runner instance-class swing - all-targets-together deltas are the
-machine), and the pair lane admitting delta_blue into CI (lua column
-optional where no port exists). gates on 6c6cee3: e2e 608x7, capi
-334x5, fuzz x2 (58083 diagnostics, 0 unlocated, 18 seeds). what
-remains of P6: the perf profile of the residual ~1.3x (dispatch
-machinery), if Q wants the number pushed. then the math constants
-registry lane (approved pre-v1) and the open semantics items (full
-ansi escape support; the \u{} braces ruling - drop unless technically
-necessary). sys.args/name/err remain ruled-in-unscheduled. THE
-PORTABILITY LANE stays recorded, untouched.
-master still sits at v0.4.0 ON PURPOSE: the ruled release plan
-(ROADMAP-0.9.0-draft) runs the wave to rc, then the review + amend
-pass, then releases v0.5.0 -> v1.0.0 as their own cuts - the git
-mechanics are docs/drafts/RELEASE-RUNBOOK.md. all six survivors RULED
+current phase [perishable — refresh at round end] (nov 6, session 50):
+**THE ERA IS CLOSED.** the 0.9.0 wave landed whole (P1-P6, patches 53-63);
+Q's bc1588b "optimizations fuse" is reconciliation's tip, tree-identical
+to the final delivery 6c6cee3 (zero drift, the sixth clean landing of the
+series). Q's decision, this session: he rewrites the releases himself
+(v0.0.5 through the RC arc), keeping all history, amending the tags with
+his own commits, master back to v0.0.4 — my tree becomes the frozen
+reference, used the way he used lua. the deliverables of the close:
+`download/oklang-self-rewrite-guide.pdf` (30 pages: method, git recipe,
+per-release dossiers, war stories, the 202/276/378-hour effort model) and
+`download/archive-and-retag.sh` (the repo surgery, tested end-to-end on a
+Codeberg stand-in; dry-run default, idempotent, annotated-tag-safe).
+this mirror FREEZES as the reference library: patches/ is emptied to
+archive/patches/ per its own convention (README reheadered as the frozen
+index), WORKLOG.md is the complete 50-session diary, docs/drafts/ stays
+readable forever. NOTHING LANDS FROM HERE AGAIN — no patches, no pushes to
+codeberg (that protocol is retired; there is nothing left to land). the
+open items (residual ~1.3x profile, \u{} braces, sys trio, bitwise
+ruling, C99-from-day-one) transfer to the rewrite, mapped in the guide's
+chapter 7. if a future session touches this repo at all, it is to READ —
+rung two of the reference ladder is patches/README.md, rung one is
+docs/drafts/.
+master still sits at v0.4.0 ON PURPOSE — and under the handover it will
+sit there until Q's own rewrite walks it forward tag by tag (the surgery
+recipe + script are the guide's chapter 5). all six survivors RULED
 (round two): len = codepoints (landed in P2), Reconciliation,
 property tests post-v1, no perf target ("the best version of
 itself"), GC incremental in v1 / generational post-v1 (P6's data now
@@ -94,10 +85,12 @@ std door + sys.args/name/err + math.idiv. ${} is the interpolation
 delimiter - landed. tree-sitter still owes
 the grammar catch-up (Q's flank — interpolation + multiline grammar
 now too). the bench workflow is live (automated runs pin oklang
-0666651, a lane ref; the bridge now watches reconciliation). workspace:
+0666651, a lane ref; the bridge watches reconciliation and will go
+quiet when the branch archives — expected, not broken). workspace:
 the sandbox `oklang/` clone is the
-live language tree (reconciliation, ahead by exactly the delivered
-patch); THIS repo is the live collab clone (PAT remote).
+frozen reference tree (reconciliation at bc1588b — read-only from
+now on); THIS repo is the frozen collab mirror (PAT remote, final
+push this session).
 `oklang-qais-and-z/` at the sandbox root is the stale relic — never
 push from it; session 45 fired that warning for real (a rejected
 non-fast-forward push from a diverged copy — the dodge is recorded

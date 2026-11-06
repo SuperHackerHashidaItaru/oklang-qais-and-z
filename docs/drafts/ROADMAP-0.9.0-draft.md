@@ -1,6 +1,16 @@
 # ROADMAP 0.9.0 — the last pre-v1 wave (draft, round one folded)
 
-status: DRAFT, round one complete (2026-11-04), round two folded. 2026-11-05
+status: COMPLETE + CLOSED (2026-11-06, session 50). the wave landed whole:
+P1-P6, patches 53-63, all on reconciliation (Q's bc1588b is the tip, tree-
+identical to the final delivery). the era closes with the handover — Q
+rewrites the releases himself and this mirror freezes as reference; the
+plan, method, and effort model live in the self-rewrite guide (worklog,
+session 50). what follows below is the historical status log.
+(session 50): P6 LANDED WHOLE — round two is Q's bc1588b "optimizations
+fuse", tree-identical to 6c6cee3 (zero drift, sixth clean landing).
+the WAVE IS COMPLETE, the ERA CLOSES: the handover decision (Q's
+self-rewrite, the guide, the tested archive-and-retag.sh script) is
+recorded in the worklog session-50 entry. 2026-11-06
 (session 49): P6 ROUND TWO delivered (patch 63: the condition chains -
 and/or per De Morgan through the fused compare+jump, negation kept
 literal for the bool-strict `!`; TWO standing-branch finds fixed - the

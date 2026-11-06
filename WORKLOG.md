@@ -2974,3 +2974,87 @@ session holds. the roadmap's series section is re-densed accordingly
   profile of the remaining 1.3x gap (dispatch machinery, not GC, not
   conditions - the census says so). the portability lane stays
   recorded, stays untouched.
+
+## session 50 (2026-11-06): the wave completes, the era closes — the handover
+
+- context: Q landed P6 round two — `bc1588b "optimizations fuse"`, the
+  hand-apply of patch 63. the tree is IDENTICAL to the delivered 6c6cee3
+  (`git diff 6c6cee3 origin/reconciliation` is EMPTY — zero drift at tree
+  level, the sixth and final landing of the series). patch 62's landing
+  (4c0dc5a "tailcalls" + 5b3714d "run gen") was recorded in session 49.
+  **the 0.9.0 wave is COMPLETE: P1-P6 all on reconciliation, the tree
+  green at e2e 608x7, delta blue honest at ~1.35x of wren_cli with the
+  checksum intact.**
+- the era's decision (Q's message, kept close to verbatim in spirit): the
+  distance is real — "i am designing and reviewing but i still don't feel
+  the same about oklang as before the rewrite or during it". Q will keep
+  ALL history intact, amend the tagged releases from v0.0.5 (first feature
+  after the rewrite) through the staging branches by REWRITING THEM
+  HIMSELF — my code as reference only, exactly how he used lua — and
+  wants master back at "right after the rewrite, no features". the LOC
+  inflation is named (src/ went ~10k to 32k; the honest census: 11,437 at
+  v0.0.4 to 34,724 at bc1588b, +23.3k) and Q intends to beat it. this is
+  the right call and the best possible ending for the collaboration: the
+  tree was always going to be re-owned or slowly abandoned.
+- the last favor (delivered): **the self-rewrite field guide** —
+  `download/oklang-self-rewrite-guide.pdf` (30 pages, A4, cover + TOC +
+  10 chapters + appendix), with its source cover
+  `download/oklang-self-rewrite-guide-cover.html`. contents, one line
+  each: (1) why the rewrite is right — the register rewrite as precedent,
+  same discipline, new oracle; (2) the lay of the land — three repos, the
+  tag/branch timeline with every sha, the design-doc library map; (3) the
+  honest LOC autopsy — the curve, the per-file table, intrinsic vs
+  integration vs style inflation (~4-7k honestly beatable), "aim 20-24k
+  not 10k"; (4) the method — port the 608-test e2e corpus FIRST (the
+  oracle), the four-rung reference ladder (doc -> README entry -> patch
+  diff -> source, stop when unstuck) with a worked example, the gate
+  suite, the byte-identical corpus discipline (patch 61's rules), when to
+  diverge; (5) git history management — amend = retag, never filter-repo;
+  the command-level recipe (bundle -> archive/* refs -> master reset to
+  v0.0.4 -> per-release tag flips); the do-nots; a repo FAQ; (6-7) per-
+  release dossiers with dossier cards (key files, tests-to-port-first
+  order, divergence candidates, era receipts) and per-arc patch maps;
+  (8) the trickiest things ranked — ten war stories with their
+  disciplines (GC rooting, defer x GC, register windows, the NaN-box
+  budget, okmap's cached hashes, source lifetimes, MIC under the seal,
+  byte integrity through transports, bench honesty, the ABI window);
+  (9) the effort model — optimist/realist/pessimist per arc (202/276/378
+  hours), two cadences (part-time 8-10h/wk = 7-8 months realist;
+  full-time = 8 weeks), a week-by-week part-time sequence with the
+  hardening arc interleaved early; (10) open lanes and the handover; the
+  appendix — tag map, gate commands, the ladder index, script usage,
+  provenance of every number in the guide.
+- the companion script: `download/archive-and-retag.sh` — steps 1-5 of
+  chapter 5 (bundle backup, archive tags v0.0.1-v0.4.0, archive the eight
+  branches, push archives, master reset to v0.0.4 via force-with-lease).
+  dry-run by default, idempotent, annotated-tag-safe (peels v0.0.4 to its
+  commit before pushing to refs/heads — the bug the test caught),
+  aborts if master has moved off Eyrie. **tested end-to-end on a local
+  bare-repo stand-in of Codeberg's exact ref layout**: apply run left
+  master at cdefd61, archive/reconciliation at bc1588b, 9 archive tags,
+  old tags untouched; the manual tag-flip loop simulated (v0.0.5 flipped
+  to a fresh commit, archive/v0.0.5 still c28d92d, the diff between them
+  is the parity report). syntax-checked, +x.
+- receipts: every number in the guide computed from the repos this
+  session (git ls-tree/show per tag, git log ranges, the patch index, the
+  worklog) — the guide's appendix says so and says who to blame. the
+  guide passed the pdf qa gates (fonts, toc, blank pages, overflow,
+  fill, margins) and a visual pass (cover, toc, charts, code pages,
+  dossier tables, last page).
+- protocol end state: **the codeberg hand-apply protocol is retired** —
+  nothing left to land, and nothing will be. the mirror's staging dir is
+  emptied to archive/patches/ per its own convention (17-63 all landed);
+  patches/README.md reheadered as the frozen index. the mirror FREEZES
+  as the reference library after this push. this worklog — 50 sessions,
+  the whole era — is the diary, complete.
+- transfers to the rewrite (mapped in the guide, chapter 7): the
+  residual ~1.3x delta-blue profile (dispatch machinery — the census
+  rules out GC and conditions), the \u{} braces ruling (drop unless
+  technically necessary), sys.args/name/err (ruled-in, unscheduled), the
+  bitwise ruling (tokens parse-reject today, spellings reserved), and
+  the portability lane's rebirth as pure-C99-from-day-one (OK_PURE as
+  the default posture, not the gate). the standing vetoes are restated
+  in the guide so they survive the transfer.
+- next: there is no next on this side. good hunting, Q. the tree is
+  small enough to hold in one head — that was always the point, and now
+  it will be yours.
